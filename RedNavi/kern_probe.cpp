@@ -2392,6 +2392,11 @@ void RedNaviProbe::sdmaTest() {
                         rnPublish(this, "mes-mec-pc", mpn, mr.mec_pc, 16);
                         const char *epn[6] = {"kiq_rptr", "active", "pq_base", "mqd_base", "db_ctl", "kiq_wptr"};
                         rnPublish(this, "mes-early", epn, mr.early, 6);
+                        {
+                            static const char *pn[32] = {"START","START_HI","INTR_RTN","INTR_RTN_HI","CNTL","MIE","PC","MSCR_HI","MSCR_LO","MSTAT_LO","MSTAT_HI","MEPC","MCAUSE","MBADADDR","MIP","IC_OP","DC_OP","GP0","GP0H","GP1","GP1H","GP2","GP2H","GP3","GP3H","GP4","GP4H","IC_BASE","IC_BASE_HI","IC_CNTL","DC_BASE","DC_BASE_HI"};
+                            rnPublish(this, "mes-pipe0-regs", pn, gMesPipeRegs[0], 32);
+                            rnPublish(this, "mes-pipe1-regs", pn, gMesPipeRegs[1], 32);
+                        }
                         const char *kpn[6] = {"k0", "k1", "k2", "k3", "idle0", "idle1"};
                         uint32_t kpv[6] = {mr.kiq_pc_end[0], mr.kiq_pc_end[1], mr.kiq_pc_end[2], mr.kiq_pc_end[3], mr.kiq_pc_pre[0], mr.kiq_pc_pre[1]};
                         rnPublish(this, "mes-kiq-pc", kpn, kpv, 6);

@@ -1292,6 +1292,8 @@ void rn_mes_doorbell_regs(struct rn_device *adev, u32 out[12]) {
 bool gMesDmDump = false;
 u32 gMesDm[2][256];
 u32 gMesMqd[512];
+u32 gMesPipeRegs[2][32];
+const u32 kMesPipeRegDw[32] = {0xc800,0xc89d,0xc801,0xc802,0xc807,0xc80e,0xc813,0xc814,0xc815,0xc816,0xc817,0xc818,0xc81a,0xc81c,0xc81e,0xc820,0xc837,0xc843,0xc844,0xc845,0xc846,0xc847,0xc848,0xc849,0xc84a,0xc84b,0xc84c,0xf850,0xf851,0xf852,0xf854,0xf855};
 u32 gMesKiqRing[96];
 bool gMesCleaner = false;
 bool gMesHwResLinux = false;
@@ -1324,8 +1326,10 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     if (progress) progress(ctx, 1);
     const u64 logOff = base + 0x40000, logVa = vaBase + logOff;           // MES event log (amdgpu_mes_log_enable): history in the first half, scratch in the second
     for (u32 o = 0; o < 0x8000; o += 4) rn_vram_wr32(adev, logOff + o, 0);
-    WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_LO, lower_32_bits(logVa + 0x4000));
-    WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_HI, upper_32_bits(logVa + 0x4000));
+    if (!gMesHwResLinux) {                                  // rednavi_mes_hwres=1: as Linux without mes_log_enable, MSCRATCH stays 0 (the firmware enables more interrupts when it is set)
+        WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_LO, lower_32_bits(logVa + 0x4000));
+        WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_HI, upper_32_bits(logVa + 0x4000));
+    }
     u32 d = RREG32_SOC15(RN_GC, 0, regCP_MES_CNTL);
     d = REG_SET_FIELD(d, CP_MES_CNTL, MES_PIPE0_RESET, 1);
     d = REG_SET_FIELD(d, CP_MES_CNTL, MES_PIPE1_RESET, 1);
@@ -1516,8 +1520,10 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
             p.gds_size = 0x1000;                           // adev->gds.gds_size for GFX11 (gfx_v11_0_set_gds_init)
             p.oversubscription_timer = 50;
         }
-        p.enable_mes_event_int_logging = 1;
-        p.event_intr_history_gpu_mc_ptr = logVa;
+        if (!gMesHwResLinux) {                             // Linux without amdgpu.mes_log_enable (the default) sends neither; they also change the scheduler's CP_MES_MIE (0x31ffe against 0x1ffe)
+            p.enable_mes_event_int_logging = 1;
+            p.event_intr_history_gpu_mc_ptr = logVa;
+        }
         p.use_different_vmid_compute = 1;
         p.enable_reg_active_poll = 1;
         p.enable_level_process_quantum_check = 1;
@@ -1750,6 +1756,11 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     res->sched_wptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
     grbmSelect(adev, 3, 1, 0, 0);
     for (u32 i = 0; i < 4; i++) { res->kiq_pc_end[i] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR); udelay(53 * (i + 1)); }   // the KIQ pipe's own program counter after the failed map
+    for (u32 pipe = 0; pipe < 2; pipe++) {                              // the per-pipe MES registers of both pipes, for the same read on Linux (tools/linux_pipe_pcs.py)
+        grbmSelect(adev, 3, pipe, 0, 0);
+        for (u32 i = 0; i < 32; i++) gMesPipeRegs[pipe][i] = rn_rreg32(adev, kMesPipeRegDw[i]);
+    }
+    grbmSelect(adev, 3, 1, 0, 0);
     res->kiq_version = RREG32_SOC15(RN_GC, 0, regCP_MES_GP3_LO);
     grbmSelect(adev, 0, 0, 0, 0);
     res->mes_db[0] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL1);

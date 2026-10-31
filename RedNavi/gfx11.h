@@ -173,6 +173,8 @@ extern bool gMesCleaner;      // rednavi_mes_cleaner=1: a cleaner shader (one s_
 extern bool gMesHwResLinux;   // rednavi_mes_hwres=1: SET_HW_RESOURCES with Linux's gds_size 0x1000, oversubscription_timer 50 and disable_mes_log 1
 extern bool gMesEarlyMap;  // rednavi_mes_earlymap=1: a MAP_QUEUES for the MEC queue on the KIQ ring before the scheduler gets any frame
 extern bool gMesSelfMap;   // rednavi_mes_selfmap=1: after the stuck map, put the scheduler's MAP_QUEUES on the KIQ ring ourselves
+extern u32 gMesPipeRegs[2][32];   // per-pipe MES registers, order in kMesPipeRegDw (gfx11.cpp)
+extern const u32 kMesPipeRegDw[32];
 extern bool gMesDmDump;   // rednavi_mes_dm=1: read the two event log windows after the last frame
 extern u32 gMesDbg[2][256];   // MES firmware log (mes_dbgext): the first 2 KB of the buffer, dwords 0..3 are the header the firmware leaves
 extern bool gMesDbgExt;   // rednavi_mes_dbgext=1 (host buffer, as Linux) or 2 (the VRAM area): hand the scheduler a log buffer after the resource frames and dump what it wrote

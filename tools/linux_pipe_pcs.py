@@ -17,6 +17,7 @@ import time
 CP_MEC_RS64_INSTR_PNTR = 0xC908
 CP_MES_INSTR_PNTR = 0xC813
 CP_MES_CNTL = 0xC807
+MES_REGS = [('START', 51200), ('START_HI', 51357), ('INTR_RTN', 51201), ('INTR_RTN_HI', 51202), ('CNTL', 51207), ('MIE', 51214), ('PC', 51219), ('MSCR_HI', 51220), ('MSCR_LO', 51221), ('MSTAT_LO', 51222), ('MSTAT_HI', 51223), ('MEPC', 51224), ('MCAUSE', 51226), ('MBADADDR', 51228), ('MIP', 51230), ('IC_OP', 51232), ('DC_OP', 51255), ('GP0', 51267), ('GP0H', 51268), ('GP1', 51269), ('GP1H', 51270), ('GP2', 51271), ('GP2H', 51272), ('GP3', 51273), ('GP3H', 51274), ('GP4', 51275), ('GP4H', 51276), ('IC_BASE', 63568), ('IC_BASE_HI', 63569), ('IC_CNTL', 63570), ('DC_BASE', 63572), ('DC_BASE_HI', 63573)]
 HQD = [("CP_HQD_ACTIVE", 0x320B), ("CP_HQD_VMID", 0x320C), ("CP_MQD_BASE_ADDR", 0x3209), ("CP_HQD_PQ_BASE", 0x3211), ("CP_HQD_PQ_CONTROL", 0x321A),
        ("CP_HQD_PQ_DOORBELL_CONTROL", 0x3218), ("CP_HQD_PQ_RPTR", 0x3213), ("CP_HQD_PQ_WPTR_LO", 0x323F), ("CP_HQD_PERSISTENT_STATE", 0x320D)]
 
@@ -57,6 +58,9 @@ def main():
         for pipe in range(2):
             emit("MES_PC me3 pipe%d sample%d 0x%08x" % (pipe, sample, read(CP_MES_INSTR_PNTR, 3, pipe)))
         time.sleep(0.05)
+    for pipe in range(2):
+        for name, dword in MES_REGS:
+            emit("MESREG pipe%d %s 0x%08x" % (pipe, name, read(dword, 3, pipe)))
     emit("CP_MES_CNTL 0x%08x" % read(CP_MES_CNTL, 3, 0))
     for me, pipes, queues in ((1, 4, 8), (3, 2, 1)):
         for pipe in range(pipes):
