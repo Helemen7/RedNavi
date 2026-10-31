@@ -2210,6 +2210,7 @@ void RedNaviProbe::sdmaTest() {
             // =2: the VRAM area at base + 0x50000, the two runs of 2026-10-31 that stayed empty.
             gMesDbgExt = false; gMesDbgHostVa = 0; gMesDbgHostMem = nullptr;
             gMesHostWbVa = 0; gMesHostWbMem = nullptr;
+            gMesPostMap = true;   // the post-map test runs whenever the map succeeded (the boot-arg rednavi_mes_post=1 coincided with failed maps 9 times of 9, cause unknown)
             { uint32_t em = 0; gMesEarlyMap = PE_parse_boot_argn("rednavi_mes_earlymap", &em, sizeof(em)) && em == 1; }
             { uint32_t sm = 0; gMesSelfMap = PE_parse_boot_argn("rednavi_mes_selfmap", &sm, sizeof(sm)) && sm == 1; }
             gMesHostRingVa = 0; gMesHostRingMem = nullptr;
@@ -2397,6 +2398,8 @@ void RedNaviProbe::sdmaTest() {
                             rnPublish(this, "mes-pipe0-regs", pn, gMesPipeRegs[0], 32);
                             rnPublish(this, "mes-pipe1-regs", pn, gMesPipeRegs[1], 32);
                         }
+                        const char *pon[10] = {"db_before", "target", "db_after", "rptr_after", "active_after", "db_005", "db_05", "db_2", "db_5", "db_10"};
+                        rnPublish(this, "mes-post", pon, mr.post, 10);
                         const char *ktn[6] = {"a_scratch", "a_pc", "b_scratch", "b_pc", "c_scratch", "c_pc"};
                         rnPublish(this, "mes-kiq-test", ktn, mr.ktest, 6);
                         const char *kpn[6] = {"k0", "k1", "k2", "k3", "idle0", "idle1"};

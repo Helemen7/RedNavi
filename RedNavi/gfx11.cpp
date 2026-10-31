@@ -1060,6 +1060,7 @@ void rn_compute_diag2(struct rn_device *adev, u32 out[8]) {
 }
 
 // MQD image for a compute queue (struct v11_compute_mqd, offsets in dwords), as gfx_v11_0_compute_mqd_init fills it.
+bool gMesPostMap = false;
 bool gMesSelfMap = false;
 bool gMesEarlyMap = false;
 u64 gMesHostWbVa = 0;            // rednavi_mes_hostwb=1: GART address of a host page that holds the legacy queue's rptr (+0) and wptr (+8), as Linux's write-back slots do
@@ -1706,6 +1707,40 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         rn_gc_safe_mode(adev, 1);
         res->add_ok = sendFrame(&p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4);
         rn_gc_safe_mode(adev, 0);
+    }
+    if (gMesPostMap && res->add_ok) {
+        // rednavi_mes_post=1: the first thing done with the queue the MES has just mapped, before anything else touches it: a WRITE_DATA to VRAM through its
+        // ring and the doorbell, then the doorbell control register at growing delays. The hand-programmed queues died at their first doorbell with the enable
+        // bit cleared; this shows whether a queue the MES mapped does the same, and when.
+        const u64 target = qOff + 0x6000;
+        rn_vram_wr32(adev, target, 0xCAFEDEADu);
+        u32 pk[16];
+        memset(pk, 0, sizeof(pk));
+        pk[0] = RN_PACKET3(0x37u, 3);                                      // WRITE_DATA, memory destination, write confirm
+        pk[1] = (1u << 20) | (5u << 8);
+        pk[2] = lower_32_bits(vaBase + target); pk[3] = upper_32_bits(vaBase + target);
+        pk[4] = 0x600DC0DEu;
+        pk[5] = RN_PACKET3(0x10u, 9);                                      // NOP to 16 dwords
+        for (u32 i = 0; i < 16; i++) rn_vram_wr32(adev, qOff + i * 4, pk[i]);
+        rn_vram_wr32(adev, qOff + 0x1008, 16); rn_vram_wr32(adev, qOff + 0x100c, 0);
+        grbmSelect(adev, 1, 0, 0, 0);
+        res->post[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);                  // before the doorbell
+        grbmSelect(adev, 0, 0, 0, 0);
+        *reinterpret_cast<volatile u64 *>(gDoorbellBase + legDb * 4) = 16;
+        for (int i = 0; i < 200 && rn_vram_rd32(adev, target) != 0x600DC0DEu; i++) msleep(1);
+        res->post[1] = rn_vram_rd32(adev, target);                                              // 0x600DC0DE if the queue ran it
+        grbmSelect(adev, 1, 0, 0, 0);
+        res->post[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
+        res->post[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
+        res->post[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
+        grbmSelect(adev, 0, 0, 0, 0);
+        static const u32 waits[] = {50, 450, 1500, 3000, 5000};                                 // ms, so sampled at 0.05, 0.5, 2, 5, 10 s after the doorbell
+        for (u32 w = 0; w < 5; w++) {
+            msleep(waits[w]);
+            grbmSelect(adev, 1, 0, 0, 0);
+            res->post[5 + w] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
+            grbmSelect(adev, 0, 0, 0, 0);
+        }
     }
     // The process path lets the MES pick the hardware queue itself (from the mask 0xf0): look for the HQD that carries our doorbell.
     u32 foundPipe = qPipe, foundQueue = qQueue;

@@ -172,6 +172,7 @@ extern u32 gMesKiqRing[96];   // the first 96 dwords of the MES KIQ ring after t
 extern bool gMesCleaner;      // rednavi_mes_cleaner=1: a cleaner shader (one s_endpgm) and its address in the KIQ SET_RESOURCES, as gfx11_kiq_set_resources sends it
 extern bool gMesHwResLinux;   // rednavi_mes_hwres=1: SET_HW_RESOURCES with Linux's gds_size 0x1000, oversubscription_timer 50 and disable_mes_log 1
 extern bool gMesEarlyMap;  // rednavi_mes_earlymap=1: a MAP_QUEUES for the MEC queue on the KIQ ring before the scheduler gets any frame
+extern bool gMesPostMap;   // rednavi_mes_post=1: run one WRITE_DATA through the MES-mapped queue right after the map and watch its doorbell control
 extern bool gMesSelfMap;   // rednavi_mes_selfmap=1: after the stuck map, put the scheduler's MAP_QUEUES on the KIQ ring ourselves
 extern u32 gMesPipeRegs[2][32];   // per-pipe MES registers, order in kMesPipeRegDw (gfx11.cpp)
 extern const u32 kMesPipeRegDw[32];
@@ -194,6 +195,7 @@ struct rn_mes_result {
     u32 hw_res1_status;
     int dbg_ok; u32 dbg_status;                    // SETUP_MES_DBGEXT frame and its completion word (opt-in, rednavi_mes_dbgext=1)
     u32 early[6];                                  // rednavi_mes_earlymap=1: KIQ rptr, then the target HQD's ACTIVE, PQ_BASE, MQD_BASE, DOORBELL_CONTROL, and our KIQ wptr
+    u32 post[10];                                  // rednavi_mes_post=1: db control before the doorbell, the target word, db control/rptr/active after, db control at 0.05/0.5/2/5/10 s
     u32 ktest[6];                                  // KIQ ring test (WRITE_DATA to SCRATCH_REG0, 0xDEADBEEF expected) and the KIQ pc after it: after the scheduler queue map, after SET_RESOURCES, after the stuck map
     u32 kiq_pc_pre[2];                             // the same pointer after SET_RESOURCES, before ADD_QUEUE (the KIQ pipe idle)
     u32 kiq_pc_end[4];                             // CP_MES_INSTR_PNTR of the KIQ pipe (ME 3 pipe 1), four samples after the failed map
