@@ -1302,6 +1302,28 @@ u64 gMesDbgHostVa = 0;
 void *gMesDbgHostMem = nullptr;
 u32 gMesDbg[2][256];
 
+// amdgpu_ring_test_helper on the KIQ ring (gfx_v11_0_ring_test_ring): SCRATCH_REG0 is set to 0xCAFEDEAD, a WRITE_DATA with write confirm puts 0xDEADBEEF in it
+// through the ring, and the register is read back. Returns the register and the KIQ pipe's program counter afterwards.
+static void mesKiqRingTest(struct rn_device *adev, u64 kiqOff, u64 *kiqWptr, u32 *scratch, u32 *pc) {
+    WREG32_SOC15(RN_GC, 0, regSCRATCH_REG0, 0xCAFEDEADu);
+    u32 pk[8];
+    pk[0] = RN_PACKET3(0x37u, 3);                                                 // WRITE_DATA
+    pk[1] = 1u << 16;                                                             // write confirm, destination register
+    pk[2] = 0xa000u + regSCRATCH_REG0;                                            // SCRATCH_REG0, absolute dword
+    pk[3] = 0;
+    pk[4] = 0xDEADBEEFu;
+    pk[5] = RN_PACKET3(0x10u, 1); pk[6] = 0; pk[7] = 0;                           // NOP to the 8-dword boundary
+    mesRingSubmit(adev, kiqOff, kiqOff + 0x1008, kMesKiqDoorbell, kiqWptr, pk, 8);
+    for (int i = 0; i < 100; i++) {
+        if (RREG32_SOC15(RN_GC, 0, regSCRATCH_REG0) == 0xDEADBEEFu) break;
+        msleep(1);
+    }
+    *scratch = RREG32_SOC15(RN_GC, 0, regSCRATCH_REG0);
+    grbmSelect(adev, 3, 1, 0, 0);
+    *pc = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR);
+    grbmSelect(adev, 0, 0, 0, 0);
+}
+
 void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_gmc *gmc, const u32 start[4], u32 maxStep, void (*progress)(void *, u32), void *ctx,
                   struct rn_mes_result *res) {
     static_assert(sizeof(union MESAPI_SET_HW_RESOURCES) == 256 && sizeof(union MESAPI__ADD_QUEUE) == 256 &&
@@ -1401,6 +1423,7 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     grbmSelect(adev, 0, 0, 0, 0);
     mesPcSample(adev, 0, &res->p0_pc, &res->p0_pc10);
     mesPcSample(adev, 1, &res->p1_pc, &res->p1_pc10);
+    mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[0], &res->ktest[1]);   // the KIQ right after it mapped the scheduler queue
     res->step = 3;
     if (maxStep < 4 || !(res->sched_active & 1u)) return;
 
@@ -1609,6 +1632,7 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         pk[2] = 0xffffffffu; pk[3] = 0xffffffffu; pk[4] = lower_32_bits(cleanerMc); pk[5] = upper_32_bits(cleanerMc); pk[6] = 0; pk[7] = 0;
         mesRingSubmit(adev, kiqOff, kiqOff + 0x1008, kMesKiqDoorbell, &kiqWptr, pk, 8);
         msleep(20);
+        mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[2], &res->ktest[3]);   // and after SET_RESOURCES, as amdgpu_gfx_mes_enable_kcq does
         grbmSelect(adev, 3, 1, 0, 0);
         res->kiq_rptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);       // 0x10 once both the MAP_QUEUES and the SET_RESOURCES are consumed
         for (u32 i = 0; i < 2; i++) { res->kiq_pc_pre[i] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR); udelay(47); }   // the KIQ pipe idle, SET_RESOURCES consumed
@@ -1722,6 +1746,7 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     }
     grbmSelect(adev, 0, 0, 0, 0);
     for (u32 i = 0; i < 96; i++) gMesKiqRing[i] = rn_vram_rd32(adev, kiqOff + i * 4);   // everything on the KIQ ring: our packets and what the scheduler appended
+    if (!res->add_ok) { kiqWptr = res->kiq_end[0]; mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[4], &res->ktest[5]); }   // and after the stuck map: does the KIQ still run packets?
     if (gMesSelfMap && !res->add_ok) {
         // rednavi_mes_selfmap=1: send the MAP_QUEUES the scheduler put on the KIQ ring ourselves (same packet: ME 1 pipe 0 queue 0, our MQD), after the scheduler
         // is stuck. If the KIQ firmware programs the HQD for our packet, the KIQ and the MQD are fine and the scheduler's own request is what fails.
