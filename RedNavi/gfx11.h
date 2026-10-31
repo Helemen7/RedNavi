@@ -176,6 +176,10 @@ extern bool gMesPostMap;   // rednavi_mes_post=1: run one WRITE_DATA through the
 extern bool gMesSelfMap;   // rednavi_mes_selfmap=1: after the stuck map, put the scheduler's MAP_QUEUES on the KIQ ring ourselves
 extern u32 gMesPipeRegs[2][32];   // per-pipe MES registers, order in kMesPipeRegDw (gfx11.cpp)
 extern const u32 kMesPipeRegDw[32];
+extern u32 gKiqTrace[3][32];   // KIQ pc runs {pc, repeats}: before the first packet, while it is processed, after
+extern u64 gMesHostLogBase;       // rednavi_mes_host=1: logical offset of the host buffer (GART address minus the VRAM MC base), its CPU mapping and size
+extern volatile u8 *gMesHostMem;
+extern u64 gMesHostSize;
 extern bool gMesDmDump;   // rednavi_mes_dm=1: read the two event log windows after the last frame
 extern u32 gMesDbg[2][256];   // MES firmware log (mes_dbgext): the first 2 KB of the buffer, dwords 0..3 are the header the firmware leaves
 extern bool gMesDbgExt;   // rednavi_mes_dbgext=1 (host buffer, as Linux) or 2 (the VRAM area): hand the scheduler a log buffer after the resource frames and dump what it wrote

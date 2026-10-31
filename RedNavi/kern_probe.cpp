@@ -2334,7 +2334,21 @@ void RedNaviProbe::sdmaTest() {
                 // which one it is varies from boot to boot for reasons not found. A failed map is retried from the pipe reset, a few times.
                 uint32_t attempts = 0;
                 for (; attempts < 1; attempts++) {
-                    rn_mes_start(&gpu, kRNVramMcBase, 0x0C0A0000, &gmc, start, mesStep,
+                    uint64_t mesBase = 0x0C0A0000;
+                gMesHostMem = nullptr; gMesHostSize = 0; gMesHostLogBase = 0;
+                {   // rednavi_mes_host=1: the MES working memory in host memory behind the GART, as Linux has it (see gfx11.cpp)
+                    uint32_t mh = 0;
+                    if (PE_parse_boot_argn("rednavi_mes_host", &mh, sizeof(mh)) && mh == 1) {
+                        const int hb = createHostBo(0x60000);
+                        if (hb >= 0) {
+                            gMesHostMem = static_cast<volatile uint8_t *>(bos[hb].md->getBytesNoCopy());
+                            gMesHostSize = 0x60000;
+                            gMesHostLogBase = bos[hb].gpuVa - kRNVramMcBase;
+                            mesBase = gMesHostLogBase;
+                        }
+                    }
+                }
+                rn_mes_start(&gpu, kRNVramMcBase, mesBase, &gmc, start, mesStep,
                                  [](void *ctx, uint32_t step) {
                                      RedNaviProbe *self = static_cast<RedNaviProbe *>(ctx);
                                      const char *pn[1] = {"about_to_run"};
@@ -2407,6 +2421,14 @@ void RedNaviProbe::sdmaTest() {
                         }
                         const char *pon[10] = {"db_before", "target", "db_after", "rptr_after", "active_after", "db_005", "db_05", "db_2", "db_5", "db_10"};
                         rnPublish(this, "mes-post", pon, mr.post, 10);
+                        {
+                            static char tn[32][6];
+                            static const char *tp[32];
+                            for (int i = 0; i < 32; i++) { snprintf(tn[i], 6, "%c%02d", (i & 1) ? 'n' : 'p', i / 2); tp[i] = tn[i]; }
+                            rnPublish(this, "mes-trace0", tp, gKiqTrace[0], 32);
+                            rnPublish(this, "mes-trace1", tp, gKiqTrace[1], 32);
+                            rnPublish(this, "mes-trace2", tp, gKiqTrace[2], 32);
+                        }
                         const char *isn[10] = {"cntl", "rlc_sched", "pc0", "pc1", "act0", "act1", "db0", "db1", "mec_active", "bootload"};
                         rnPublish(this, "mes-init", isn, mr.init_state, 10);
                         {
