@@ -2328,17 +2328,24 @@ void RedNaviProbe::sdmaTest() {
             // Opt-in (rednavi_mes_step=N, 1..5): bring up the MES in stages (docs/COMPAT.md); "mes-progress" names the stage about to run.
             uint32_t mesStep = 0;
             if (PE_parse_boot_argn("rednavi_mes_step", &mesStep, sizeof(mesStep)) && mesStep >= 1) {
-                struct rn_mes_result mr;
+                static struct rn_mes_result mr;      // static: the kernel stack of sdmaTest is nearly full
                 const uint32_t start[4] = {kRNMes0StartLo, kRNMes0StartHi, kRNMes1StartLo, kRNMes1StartHi};
-                rn_mes_start(&gpu, kRNVramMcBase, 0x0C0A0000, &gmc, start, mesStep,
-                             [](void *ctx, uint32_t step) {
-                                 RedNaviProbe *self = static_cast<RedNaviProbe *>(ctx);
-                                 const char *pn[1] = {"about_to_run"};
-                                 uint32_t pv[1] = {step};
-                                 rnPublish(self, "mes-progress", pn, pv, 1);
-                                 IOLog("RedNavi: MES step %u\n", step);
-                                 IOSleep(100);
-                             }, this, &mr);
+                // The KIQ pipe lands in one of two states after its first packets (program counter 0x518c as on Linux, or 0x51ad and the map is then dropped), and
+                // which one it is varies from boot to boot for reasons not found. A failed map is retried from the pipe reset, a few times.
+                uint32_t attempts = 0;
+                for (; attempts < 1; attempts++) {
+                    rn_mes_start(&gpu, kRNVramMcBase, 0x0C0A0000, &gmc, start, mesStep,
+                                 [](void *ctx, uint32_t step) {
+                                     RedNaviProbe *self = static_cast<RedNaviProbe *>(ctx);
+                                     const char *pn[1] = {"about_to_run"};
+                                     uint32_t pv[1] = {step};
+                                     rnPublish(self, "mes-progress", pn, pv, 1);
+                                     IOLog("RedNavi: MES step %u\n", step);
+                                     IOSleep(100);
+                                 }, this, &mr);
+                    if (mr.add_ok || mesStep < 5) { attempts++; break; }
+                }
+                { const char *an[1] = {"attempts"}; uint32_t av[1] = {attempts}; rnPublish(this, "mes-attempts", an, av, 1); }
                 const char *mn[29] = {"step", "cntl", "p0_pc", "p0_pc10", "p1_pc", "p1_pc10", "kiq_active", "kiq_doorbell_ctl", "kiq_rptr", "sched_active",
                                       "ring_fence", "api_status", "hw_res_ok", "add_ok", "q_active", "q_doorbell_ctl", "fault_status", "sched_version", "kiq_version", "sched_rptr", "sched_wptr", "mepc", "mcause", "ring_fence_late", "p0_pc_end", "q_pipe", "q_queue", "dbg_ok", "dbg_status"};
                 uint32_t mv[29] = {mr.step, mr.cntl, mr.p0_pc, mr.p0_pc10, mr.p1_pc, mr.p1_pc10, mr.kiq_active, mr.kiq_doorbell_ctl, mr.kiq_rptr,
@@ -2400,6 +2407,18 @@ void RedNaviProbe::sdmaTest() {
                         }
                         const char *pon[10] = {"db_before", "target", "db_after", "rptr_after", "active_after", "db_005", "db_05", "db_2", "db_5", "db_10"};
                         rnPublish(this, "mes-post", pon, mr.post, 10);
+                        const char *isn[10] = {"cntl", "rlc_sched", "pc0", "pc1", "act0", "act1", "db0", "db1", "mec_active", "bootload"};
+                        rnPublish(this, "mes-init", isn, mr.init_state, 10);
+                        {
+                            static const char *sn[10] = {"db", "rptr", "wptr", "act", "pers", "pqc", "mecpc", "rw", "ww", "dw142"};
+                            rnPublish(this, "mes-snap0", sn, mr.snap[0], 10);
+                            rnPublish(this, "mes-snap1", sn, mr.snap[1], 10);
+                            rnPublish(this, "mes-snap2", sn, mr.snap[2], 10);
+                        }
+                        const char *p2n[5] = {"t01", "t05", "t2", "t6", "t15"};
+                        rnPublish(this, "mes-post2", p2n, mr.post2, 5);
+                        const char *p3n[5] = {"c01", "c05", "c2", "c6", "c15"};
+                        rnPublish(this, "mes-post3", p3n, mr.post3, 5);
                         const char *ktn[6] = {"a_scratch", "a_pc", "b_scratch", "b_pc", "c_scratch", "c_pc"};
                         rnPublish(this, "mes-kiq-test", ktn, mr.ktest, 6);
                         const char *kpn[6] = {"k0", "k1", "k2", "k3", "idle0", "idle1"};

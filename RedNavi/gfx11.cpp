@@ -1345,6 +1345,23 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     const u32 qPipe = 0, qQueue = 0;   // a kernel-owned queue (outside the MES hqd mask 0xc), as Linux maps its first compute ring
     const u32 legDb = 6;               // mec_ring0 << 1
 
+    // What the previous boot left in the card (a warm reboot may not reset it): MES control and both pipes' program counters, the scheduler and KIQ queues'
+    // HQD state, the RLC scheduler register, the MEC queues that are active. Read before anything of this boot's touches the MES.
+    res->init_state[0] = RREG32_SOC15(RN_GC, 0, regCP_MES_CNTL);
+    res->init_state[1] = RREG32_SOC15(RN_GC, 0, regRLC_CP_SCHEDULERS);
+    for (u32 pipe = 0; pipe < 2; pipe++) {
+        grbmSelect(adev, 3, pipe, 0, 0);
+        res->init_state[2 + pipe] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR);
+        res->init_state[4 + pipe] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
+        res->init_state[6 + pipe] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
+    }
+    for (u32 pipe = 0; pipe < 4; pipe++)
+        for (u32 q = 0; q < 8; q++) {
+            grbmSelect(adev, 1, pipe, 0, q);
+            if (RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE) & 1u) res->init_state[8] |= 1u << (pipe * 8 + q);
+        }
+    grbmSelect(adev, 0, 0, 0, 0);
+    res->init_state[9] = RREG32_SOC15(RN_GC, 0, regRLC_RLCS_BOOTLOAD_STATUS);
     // step 1: enable (mes_v11_0_enable): reset both pipes, give each its program counter, then un-halt and activate both
     if (progress) progress(ctx, 1);
     const u64 logOff = base + 0x40000, logVa = vaBase + logOff;           // MES event log (amdgpu_mes_log_enable): history in the first half, scratch in the second
@@ -1708,11 +1725,28 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         res->add_ok = sendFrame(&p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4);
         rn_gc_safe_mode(adev, 0);
     }
-    if (gMesPostMap && res->add_ok) {
+    if (gMesPostMap && res->add_ok && maxStep < 7 && gMesHostRingVa == 0) {      // legacy queue only: the process path uses another doorbell, a VM and an HQD the MES picks
         // rednavi_mes_post=1: the first thing done with the queue the MES has just mapped, before anything else touches it: a WRITE_DATA to VRAM through its
         // ring and the doorbell, then the doorbell control register at growing delays. The hand-programmed queues died at their first doorbell with the enable
         // bit cleared; this shows whether a queue the MES mapped does the same, and when.
         const u64 target = qOff + 0x6000;
+        // Full state of the mapped queue at three moments (after the map, after the first doorbell, after the second): HQD registers, the memory words, the MEC pipe.
+        auto snap = [&](u32 idx) {
+            grbmSelect(adev, 1, 0, 0, 0);
+            u32 *o = res->snap[idx];
+            o[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
+            o[1] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
+            o[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
+            o[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
+            o[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PERSISTENT_STATE);
+            o[5] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_CONTROL);
+            o[6] = RREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_INSTR_PNTR);
+            grbmSelect(adev, 0, 0, 0, 0);
+            o[7] = rn_vram_rd32(adev, qOff + 0x1000);        // rptr word in memory
+            o[8] = rn_vram_rd32(adev, qOff + 0x1008);        // wptr word in memory
+            o[9] = rn_vram_rd32(adev, qOff + 0x2000 + 142 * 4);   // MQD dword 142: wptr poll address high, as the MES left it
+        };
+        snap(0);
         rn_vram_wr32(adev, target, 0xCAFEDEADu);
         u32 pk[16];
         memset(pk, 0, sizeof(pk));
@@ -1729,11 +1763,34 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         *reinterpret_cast<volatile u64 *>(gDoorbellBase + legDb * 4) = 16;
         for (int i = 0; i < 200 && rn_vram_rd32(adev, target) != 0x600DC0DEu; i++) msleep(1);
         res->post[1] = rn_vram_rd32(adev, target);                                              // 0x600DC0DE if the queue ran it
+        snap(1);
         grbmSelect(adev, 1, 0, 0, 0);
         res->post[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
         res->post[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
         res->post[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
         grbmSelect(adev, 0, 0, 0, 0);
+        // More doorbells through the same queue at growing delays after the first one: packet n goes at ring dword 16 * n, its own result word, the doorbell
+        // control is read after each. The first doorbell works; this shows after how long the next one stops being run (the enable bit gets cleared).
+        static const u32 delays[] = {100, 400, 1500, 4000, 9000};                     // ms of idle before each doorbell, from the previous one (so 0.1, 0.5, 2, 6, 15 s after the first)
+        u32 wptrNow = 16;
+        for (u32 n = 0; n < 5; n++) {
+            msleep(delays[n]);
+            const u64 tgt = qOff + 0x6004 + n * 4;
+            rn_vram_wr32(adev, tgt, 0xCAFEDEADu);
+            u32 q2[16];
+            memcpy(q2, pk, sizeof(q2));
+            q2[2] = lower_32_bits(vaBase + tgt); q2[3] = upper_32_bits(vaBase + tgt);
+            for (u32 k = 0; k < 16; k++) rn_vram_wr32(adev, qOff + (wptrNow + k) * 4, q2[k]);
+            wptrNow += 16;
+            rn_vram_wr32(adev, qOff + 0x1008, wptrNow); rn_vram_wr32(adev, qOff + 0x100c, 0);
+            *reinterpret_cast<volatile u64 *>(gDoorbellBase + legDb * 4) = wptrNow;
+            for (int w = 0; w < 200 && rn_vram_rd32(adev, tgt) != 0x600DC0DEu; w++) msleep(1);
+            res->post2[n] = rn_vram_rd32(adev, tgt);                                  // 0x600DC0DE: the packet ran
+            if (n == 0) snap(2);
+            grbmSelect(adev, 1, 0, 0, 0);
+            res->post3[n] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
+            grbmSelect(adev, 0, 0, 0, 0);
+        }
         static const u32 waits[] = {50, 450, 1500, 3000, 5000};                                 // ms, so sampled at 0.05, 0.5, 2, 5, 10 s after the doorbell
         for (u32 w = 0; w < 5; w++) {
             msleep(waits[w]);

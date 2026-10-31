@@ -196,6 +196,10 @@ struct rn_mes_result {
     int dbg_ok; u32 dbg_status;                    // SETUP_MES_DBGEXT frame and its completion word (opt-in, rednavi_mes_dbgext=1)
     u32 early[6];                                  // rednavi_mes_earlymap=1: KIQ rptr, then the target HQD's ACTIVE, PQ_BASE, MQD_BASE, DOORBELL_CONTROL, and our KIQ wptr
     u32 post[10];                                  // rednavi_mes_post=1: db control before the doorbell, the target word, db control/rptr/active after, db control at 0.05/0.5/2/5/10 s
+    u32 init_state[10];                            // at the start of rn_mes_start: CP_MES_CNTL, RLC_CP_SCHEDULERS, pc pipe 0/1, HQD ACTIVE me3 pipe 0/1, doorbell control me3 pipe 0/1, MEC active queue mask, bootload status
+    u32 snap[3][10];                               // queue state after the map, after the first doorbell, after the second: db ctl, rptr, wptr, active, persistent state, pq control, MEC pc, rptr word, wptr word, MQD dw 142
+    u32 post3[5];                                  // doorbell control after each of the five later doorbells
+    u32 post2[5];                                  // result word of each of the five later packets (0x600DC0DE: ran), after 0.1, 0.5, 2, 6 and 15 s from the first doorbell
     u32 ktest[6];                                  // KIQ ring test (WRITE_DATA to SCRATCH_REG0, 0xDEADBEEF expected) and the KIQ pc after it: after the scheduler queue map, after SET_RESOURCES, after the stuck map
     u32 kiq_pc_pre[2];                             // the same pointer after SET_RESOURCES, before ADD_QUEUE (the KIQ pipe idle)
     u32 kiq_pc_end[4];                             // CP_MES_INSTR_PNTR of the KIQ pipe (ME 3 pipe 1), four samples after the failed map
