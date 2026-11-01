@@ -1,0 +1,77 @@
+# RADV on macOS: what the Mesa build and code need
+
+Read-only analysis, 2026-11-01, of Mesa `main` at commit `01bab93` (sparse checkout of `src/amd`, `src/util`, `src/vulkan`, `include/`; the scan is reproducible with `tools/mesa_linux_scan.sh`). Nothing here was built: `meson` and `glslang` are not installed on the Mac the analysis ran on, and a `meson setup` needs the whole tree. Everything below is read from the sources, none of it verified by a build.
+
+## Short answer
+
+The Linux-specific surface of RADV is small and already has seams. ACO, NIR, addrlib and the Vulkan runtime carry nothing that stops them on Darwin (Mesa builds Zink and KosmicKrisp there already). What does not build on Darwin is concentrated in five places, and for four of them Mesa has an extension point that its own virtio and Windows ports use:
+
+1. **Device discovery and open** (`radv_physical_device.c`, `radv_device.c`): a DRM render node is opened and its file descriptor is the device.
+2. **`ac_linux_drm.{c,h}`**: the one layer that turns the winsys's calls into `DRM_AMDGPU_*` ioctls. About 60 functions, all named `ac_drm_*`.
+3. **Syncobjs**: Vulkan fences and semaphores are DRM syncobjs through `vk_drm_syncobj`, which can run on a `struct util_sync_provider` instead of a file descriptor.
+4. **External handles** (`sync_file`, dma-buf, opaque fds): advertised unconditionally, not needed headless.
+5. **The meson build**: three places that require libdrm_amdgpu or the Linux winsys.
+
+The plan is therefore a small Mesa patch set plus one new file, `ac_apple_iokit.c`, not a port.
+
+## The meson build on Darwin
+
+- `-Dvulkan-drivers=auto` gives an empty list on Darwin (`meson.build:288`, "no vulkan driver supports windows or macOS currently"): pass `-Dvulkan-drivers=amd`.
+- `system_has_kms_drm` is false, so `dep_libdrm` is a null dependency (`meson.build:804`). That is what we want. But `_libdrm_checks['amdgpu']` is enabled for `with_amd_vk and not with_platform_windows` (line 784) and then `dependency('libdrm_amdgpu', ...)` is required: **patch 1**, treat Darwin like Windows there.
+- `src/amd/vulkan/meson.build`: the `winsys/amdgpu/*.c` files are compiled `if not with_platform_windows` (line 221) and `dep_libdrm_amdgpu` is in the link line (294): **patch 2**, same condition plus our new winsys file.
+- Darwin forces `with_vulkan_beta` (portability and beta extensions, line 449) and `with_dri_platform = 'apple'`; both harmless for RADV.
+- `-Dplatforms=auto` on Darwin means `x11,macos`. Headless needs neither (`-Dplatforms=` empty if meson accepts it, otherwise `macos`); the X11 WSI would pull in xcb.
+- Build-time tools: python3 with `mako` (not installed here), `glslang` for the BVH shaders (`src/amd/vulkan/bvh/*.comp`, `bvh_spv` in the radv meson), bison and flex (present), `-Dllvm=disabled` (ACO is the default compiler; the LLVM backend is optional), zlib, expat. No `mesa_clc` dependency was found in the radv meson. `brew install meson glslang` and `pip install mako` would cover it.
+
+## Linux constructs in the code
+
+From `tools/mesa_linux_scan.sh` over `src/amd/{vulkan,common,compiler,addrlib}`, `src/vulkan/{runtime,wsi}`, `src/util`:
+
+| Construct | Where | Verdict |
+|---|---|---|
+| `futex` | `src/util` only (`futex.h`, `simple_mtx.h`, `u_queue.c`) | not a blocker: `UTIL_FUTEX_SUPPORTED` is 0 on Darwin and the mutex falls back; Vulkan timeline semaphores (`vk_sync_timeline`) use a mutex and condition variable, not futexes |
+| `memfd_create`, `shm_open` | `anon_file.c`, `os_memory_fd.c` | not in RADV's path (WSI, Wayland) |
+| `<linux/...>` headers | `libsync.h`, `futex.c`, `anon_file.c` | `libsync.h` is used by `radv_amdgpu_cs.c` and `radv_device_memory.c` for sync-file export; guard or stub |
+| `xf86drm.h` / `drmGetDevice*` / `drmIoctl` | `radv_physical_device.c`, `radv_device.c`, `radv_amdgpu_bo.c`, `ac_gpu_info.c`, `ac_surface.c`, `vk_drm_syncobj.c`, `u_sync_provider.c`, WSI | seam 1 and 3 below |
+| `/proc/self/fd`, `/sys` | `ac_gpu_info.c:1952` (PCI info from an fd), `radv_rmv.c`, `radv_sqtt.c`, `ac_sqtt.c`, `ac_rgp.c` | the first is replaced by `ac_drm_query_pci_bus_info`; the others are tracing, off by default |
+| `mmap(` | `radv_amdgpu_bo.c` once | anonymous placeholder mappings for virtual BOs, fine on Darwin |
+| `epoll`, `eventfd`, `sched_setaffinity`, `prctl` | `src/util` | outside RADV's path or guarded by OS |
+| dma-buf | `radv_device_memory.c`, `radv_device.c`, `radv_formats.c` | external memory: do not advertise it |
+
+`radv_physical_device.c:719-723` sets `KHR_external_fence_fd`, `KHR_external_memory_fd` and `KHR_external_semaphore_fd` to `true` without a condition: **patch 3**, make them depend on the backend.
+
+## The seams Mesa already has
+
+- **Windows mode of `ac_linux_drm.h`** (2026): under `_WIN32` the header drops libdrm and `amdgpu.h`, defines the few constants it needs, and every `ac_drm_*` becomes a `static inline` stub through `util/u_stub.h`. The Darwin build needs the first half of that (no libdrm, own typedefs); the stubs are not wanted.
+- **The virtio / vpipe mode**: `RADV_DRM_DEVICE_AMDGPU_VPIPE` is a device without a file descriptor. `radv_create_winsys` passes `fd = -1`, `ac_drm_device_initialize(-1, is_virtio, ...)` creates a device whose calls all go to `amdvgpu_*` functions (`is_virtio` appears 38 times in `ac_linux_drm.c`). The set the virtio backend implements is the minimum RADV needs: `device_initialize/deinitialize/get_fd`, `bo_alloc/free/cpu_map/cpu_unmap/query_info/set_metadata/export/import/wait_for_idle/va_op_raw`, `va_range_alloc`, `cs_ctx_create2/free/stable_pstate/query_fence_status/query_reset_state2/cs_submit_raw2`, `query_info`, `query_sw_info`, `get_marketing_name`, `has_vm_always_valid`, `vm_reserve_vmid`. Our backend is the same shape: a device that is not a file descriptor, with its own implementations behind an `is_apple` flag.
+- **`struct util_sync_provider`** (`src/util/u_sync_provider.h`): the syncobj operations as a function table (`create`, `destroy`, `wait`, `reset`, `signal`, `timeline_signal`, `timeline_wait`, `query`, `transfer`, `import/export_sync_file`, `handle_to_fd`, `fd_to_handle`). `vk_drm_syncobj_get_type_from_provider` builds the Vulkan sync type from it: it needs `create` (with `DRM_SYNCOBJ_CREATE_SIGNALED`) and a `wait` that works with timeout 0; it advertises timeline semaphores only when `timeline_wait` is non-NULL. **Leaving `timeline_*` NULL makes the Vulkan runtime emulate timelines with `vk_sync_timeline`**, so the kernel only needs binary syncobjs.
+
+## The bridge: `ac_apple_iokit.c`
+
+One new file in `src/amd/common/`, plus a small `.h`, in a Mesa fork (Mesa is MIT; RedNavi's own code stays BSD-3, the patch set lives in a separate tree). It opens `RedNaviProbe` with `IOServiceOpen` and implements, over `IOConnectCallStructMethod` with the structs of `RedNavi/rn_uapi.h`:
+
+1. **Device**: `ac_drm_device_initialize` (opens the service, checks the interface version, returns `dev` with `fd = -1`), `deinitialize`, `get_fd` (-1), `get_sync_provider` (the provider below), `get_cookie`.
+2. **Queries** (all `DRM_AMDGPU_INFO` on Linux): `query_info`, `query_hw_ip_count`, `query_hw_ip_info`, `query_firmware_version`, `query_gpu_info`, `query_heap_info`, `query_sensor_info` (return an error: not supported), `query_video_caps_info` (error), `query_uq_fw_area_info` (error), `query_gpuvm_fault_info`, `query_sw_info`, `query_pci_bus_info`, `query_has_vm_always_valid`, `read_mm_registers`, `get_marketing_name`. The `AMDGPU_INFO_*` ids actually used are 32: `ACCEL_WORKING`, `DEV_INFO`, `HW_IP_INFO`, `HW_IP_COUNT`, `FW_VERSION` (`GFX_PFP`, `GFX_ME`, `GFX_MEC`, UVD, VCE, VCN), `MEMORY`, `VRAM_GTT`, `VRAM_USAGE`, `VIS_VRAM_USAGE`, `GTT_USAGE`, `TIMESTAMP`, `NUM_BYTES_MOVED`, `NUM_EVICTIONS`, `NUM_VRAM_CPU_PAGE_FAULTS`, `READ_MMR_REG`, `MAX_IBS`, `SENSOR` (`GPU_TEMP`, `GFX_SCLK`, `GFX_MCLK`), `GPUVM_FAULT`, `VIDEO_CAPS`, `UQ_FW_AREAS`.
+3. **Memory**: `bo_alloc`, `bo_free`, `bo_cpu_map/unmap` (IOConnectMapMemory), `bo_query_info`, `bo_set_metadata`, `bo_wait_for_idle`, `bo_export/import` (not supported), `create_bo_from_user_mem` (not supported), `bo_va_op_raw` and `bo_va_op_raw2` (the `VA_MAP`/`VA_UNMAP` of the kext), `va_range_alloc/free`. **The VA range allocator runs in user space** on Linux too (libdrm's `amdgpu_vamgr`): the bridge carries its own, over the window the kext reports.
+4. **Submission**: `cs_ctx_create2/free` (one kernel context per connection for now), `cs_submit_raw2` (parses the chunk array: `IB`, `FENCE`, `BO_HANDLES`, `SYNCOBJ_IN/OUT`, `SYNCOBJ_TIMELINE_*`; hands IBs and the syncobj lists to the kext), `cs_query_fence_status`, `cs_query_reset_state2`, `cs_ctx_stable_pstate`, `vm_reserve_vmid` (no-op).
+5. **Sync provider**: a `struct util_sync_provider` over kext syncobj methods: `create`, `destroy`, `wait`, `reset`, `signal`, `query`, `transfer`; `import/export_sync_file`, `handle_to_fd`, `fd_to_handle` and the `timeline_*` entries return an error or stay NULL.
+
+The expected size is of the order of 1500 lines of C. The structs on the wire are the native `drm_amdgpu_*` and `drm_syncobj_*` ones (trimmed copies of Mesa's `include/drm-uapi/amdgpu_drm.h` and `drm.h`, MIT, in `RedNavi/` for the kext and in the bridge), so that the bridge forwards what RADV builds without translating it.
+
+## The RADV patches around it
+
+1. `meson.build`, `src/amd/vulkan/meson.build`: Darwin takes the windows branch for libdrm_amdgpu and gets the new winsys file.
+2. `radv_physical_device.h/.c`, `radv_device.c`: a `RADV_DRM_DEVICE_APPLE` type. `radv_physical_device_try_create` has an Apple variant that finds the IOService and fills the PCI info instead of `drmGetVersion` and `open`; `radv_create_winsys` and `radv_create_drm_device_locked` pass `fd = -1` as for the vpipe device. Physical device enumeration must go through the generic `enumerate` hook of `vk_instance` (the DRM path calls `drmGetDevices2`).
+3. `radv_amdgpu_winsys.c:362`: `info->syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(provider)` instead of `vk_drm_syncobj_get_type(fd)`; `radv_amdgpu_winsys.c:283` (`copy_sync_payloads`) works through the provider already.
+4. External handle extensions off (`radv_physical_device.c:719-723`), `libsync` stubs for `radv_amdgpu_cs.c` and `radv_device_memory.c`.
+5. `ac_linux_drm.h`: a third branch next to `_WIN32`: no libdrm, the constants and opaque typedefs, the real prototypes.
+
+## Not known yet
+
+- Whether the Vulkan loader on macOS (LunarG's) lists an ICD that is not a portability driver without flags, and which JSON it wants. `vulkaninfo` may need `VK_LOADER_DRIVERS_SELECT` or the portability enumeration flag set for the first runs.
+- Whether `-Dplatforms=` empty is accepted by this Mesa.
+- What else `radv_physical_device.c` asks of the fd at creation (`wsi_master_fd`, `render_devid`, `local_fd`): the DRM variables are scattered in `radv_physical_device_try_create` over about 350 lines.
+- The BVH shader build and `glslang` on macOS.
+- How much memory model RADV insists on: it expects CPU-visible device-local memory and a GTT heap. The kext has host memory only for now (docs/M5_PLAN.md).
+
+The first useful measurement is `meson setup` of a full checkout with the patches of this page applied, with `-Dvulkan-drivers=amd -Dllvm=disabled -Dgallium-drivers= -Dglx=disabled -Degl=disabled`. It was not done.
