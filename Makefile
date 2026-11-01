@@ -35,7 +35,8 @@ LDFLAGS := $(ARCH) -Xlinker -kext -nostdlib -lkmod -L$(SDK)/Library -lkmodc++ -l
 
 all: $(KEXT) $(FBKEXT)
 
-$(OUT)/kern_probe.o: RedNavi/kern_probe.cpp $(wildcard RedNavi/psp_fw.h RedNavi/dmub_fw.h RedNavi/smu_fw.h RedNavi/gc_fw.h RedNavi/smu13.h compat/include/*/*.h)
+# Every header of the kext: gfx11.h, rn_uapi.h, the generated splash and register headers changed behind a stale object once (a new splash that never reached the build).
+$(OUT)/kern_probe.o: RedNavi/kern_probe.cpp $(wildcard RedNavi/*.h compat/include/*/*.h)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -47,7 +48,7 @@ $(OUT)/mode_regs.o: RedNavi/mode_regs.cpp RedNavi/mode_regs.h RedNavi/edid.h
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-$(OUT)/gfx11.o: RedNavi/gfx11.cpp RedNavi/gfx11.h RedNavi/gc_regs.h $(wildcard compat/include/*/*.h)
+$(OUT)/gfx11.o: RedNavi/gfx11.cpp $(wildcard RedNavi/*.h compat/include/*/*.h)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
