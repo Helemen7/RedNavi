@@ -37,6 +37,7 @@ static int createBo(io_connect_t c, uint64_t size, Bo *bo) {
     return 0;
 }
 
+static uint32_t gStatus;                                   // the status of the last sequence wait: RN_UC_SEQ_DONE or RN_UC_SEQ_LOST
 static uint32_t gSeq;                                      // the sequence number of the last submit that worked
 
 static kern_return_t submitIb(io_connect_t c, uint64_t ibVa, uint32_t ibDwords) {
@@ -54,6 +55,7 @@ static kern_return_t waitSeq(io_connect_t c, uint32_t seq, uint32_t ms, uint32_t
     size_t outSize = sizeof(out);
     kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_WAIT_SEQ, &in, sizeof(in), &out, &outSize);
     *reached = out.reached;
+    gStatus = out.status;
     if (signaled) *signaled = out.signaled;
     return kr;
 }
@@ -323,14 +325,42 @@ int main(int argc, char **argv) {
                    (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000), r, data.cpu[0]);
             diag(c, 0, &d);
             printf("fault status after: 0x%x, address page 0x%x%08x (the bad address is page 0x%llx), GRBM_STATUS 0x%x\n", d.fault_status, d.fault_addr_hi, d.fault_addr_lo, bad >> 12, d.grbm_status);
-            if (data.cpu[0] != 0xDEAD0000u || d.fault_status == 0) ok = 0;   // isolation: nothing written, the fault latched. That the fence never comes is a known gap, below
+            if (data.cpu[0] != 0xDEAD0000u || d.fault_status == 0) ok = 0;   // isolation: nothing written, the fault latched
+            const uint32_t badSeq = gSeq;
             diag(c, RN_UC_DIAG_CLEAR_FAULT, &d);
+            // Recovery 1: the client's own watchdog asks for the reset.
+            struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+            kr = IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, NULL, 0, &rr, &rrSize);
+            printf("queue reset on request: 0x%x, status %u, resets %u, lost %u..%u (the bad dispatch was %u)\n", kr, rr.status, rr.resets, rr.lost_from, rr.lost_to, badSeq);
+            if (kr || rr.status || (int32_t)(badSeq - rr.lost_from) < 0 || (int32_t)(rr.lost_to - badSeq) < 0) ok = 0;
+            waitSeq(c, badSeq, 1000, &r, NULL);
+            printf("waiting for the lost sequence %u: reached %u, status %u (expect 1 and %u = lost)\n", badSeq, r, gStatus, RN_UC_SEQ_LOST);
+            if (!r || gStatus != RN_UC_SEQ_LOST) ok = 0;
             const uint32_t n4 = buildDispatch(code.cpu, codeVa, dataVa2);
             data.cpu[0] = 0xDEAD0000u;
             if (submitIb(c, codeVa, n4)) ok = 0;
             uint32_t rs = 0, rd = 0;
             waitSeq(c, gSeq, 2000, &rs, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &rd);
-            printf("a good dispatch afterwards: result 0x%08x, stored %u, fence reached %u%s\n", data.cpu[0], rd, rs, rs ? "" : " (known: after a faulting wave no fence is written until reboot, see docs/COMPAT.md)"); if (!rd) ok = 0;
+            printf("a good dispatch after the reset: result 0x%08x, stored %u, fence reached %u, status %u\n", data.cpu[0], rd, rs, gStatus);
+            if (!rd || !rs || gStatus != RN_UC_SEQ_DONE) ok = 0;
+            // Recovery 2: nobody asks. A wait that sees the fence stand still for rednavi_hang_ms (8 s) makes the kernel reset the queue.
+            const uint32_t n5 = buildDispatch(code.cpu, codeVa, bad);
+            data.cpu[0] = 0xDEAD0000u;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (submitIb(c, codeVa, n5)) ok = 0;
+            const uint32_t bad2 = gSeq;
+            waitSeq(c, bad2, 10000, &r, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            printf("waiting 10 s for the second bad dispatch (sequence %u): reached %u, status %u after %ld ms (expect reached, lost, about 8000 ms)\n", bad2, r, gStatus,
+                   (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000));
+            if (!r || gStatus != RN_UC_SEQ_LOST) ok = 0;
+            diag(c, RN_UC_DIAG_CLEAR_FAULT, &d);
+            const uint32_t n6 = buildDispatch(code.cpu, codeVa, dataVa2);
+            data.cpu[0] = 0xDEAD0000u;
+            if (submitIb(c, codeVa, n6)) ok = 0;
+            waitSeq(c, gSeq, 2000, &rs, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &rd);
+            printf("a good dispatch after the automatic reset: result 0x%08x, stored %u, fence reached %u, status %u\n", data.cpu[0], rd, rs, gStatus);
+            if (!rd || !rs || gStatus != RN_UC_SEQ_DONE) ok = 0;
         }
     }
     printf("%s\n", ok ? "PASS" : "FAIL");

@@ -7,7 +7,7 @@
 
 #include <stdint.h>
 
-#define RN_UAPI_VERSION 3
+#define RN_UAPI_VERSION 4
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -19,6 +19,7 @@ enum {
     RN_UC_WAIT_SEQ = 6,    // in rn_uc_wait_seq, out rn_uc_wait_seq_result
     RN_UC_VA_MAP = 7,      // in rn_uc_va_map
     RN_UC_VA_UNMAP = 8,    // in rn_uc_va_unmap
+    RN_UC_QUEUE_RESET = 9, // out rn_uc_reset_result
     RN_UC_COUNT
 };
 
@@ -94,9 +95,25 @@ struct rn_uc_wait_seq {
     uint32_t timeout_ms;       // 0: only look (a fence status query); at most 10000
 };
 
+// A shader that hangs or faults can leave the compute queue stuck. When a wait for a sequence number ran for rednavi_hang_ms (boot-arg, default 8000) without
+// the fence moving, the kernel resets the queue (as Linux resets a hung kernel compute queue through the MES): everything in the ring and running is
+// dropped, the fences of all connections jump to their last submitted number so that nobody waits for good, and the numbers that did not complete are
+// reported as lost to the connection that owned them (RN_UC_SEQ_LOST, from wait_seq). The queue is usable again afterwards. RN_UC_QUEUE_RESET asks for
+// the same reset right away, for a client that has its own watchdog.
+#define RN_UC_SEQ_DONE 0
+#define RN_UC_SEQ_LOST 1
 struct rn_uc_wait_seq_result {
     uint32_t reached;
     uint32_t signaled;         // the fence value now: every sequence number up to it is done
+    uint32_t status;           // RN_UC_SEQ_DONE, or RN_UC_SEQ_LOST: reached because the queue was reset, the work did not (all) run
+    uint32_t pad;
+};
+
+struct rn_uc_reset_result {
+    uint32_t status;           // 0: the queue was reset and mapped again; otherwise the step that failed (see rn_compute_queue_reset in gfx11.cpp)
+    uint32_t resets;           // resets since boot
+    uint32_t lost_from;        // this connection's sequence numbers lost in the reset, from..to; none when lost_from > lost_to
+    uint32_t lost_to;
 };
 
 struct rn_uc_bo_wait {

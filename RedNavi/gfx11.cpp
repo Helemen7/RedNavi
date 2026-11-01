@@ -1581,6 +1581,40 @@ static void mesKiqRingTest(struct rn_device *adev, u64 kiqOff, u64 *kiqWptr, u32
     grbmSelect(adev, 0, 0, 0, 0);
 }
 
+// What rn_mes_start leaves for later scheduler frames (a reset, then a re-map): where the scheduler ring and the completion words are, how far the ring has been
+// written, the last completion number used, and the legacy queue that was mapped.
+static struct {
+    bool valid;
+    u64 vaBase, schedOff, qOff, ringFenceOff, apiStatusOff, schedWptr;
+    u32 seq, doorbell, pipe, queue, schedVersion;
+} gMesCtx;
+
+// One scheduler frame after boot, as the sendFrame of rn_mes_start does it: the frame, then QUERY_SCHEDULER_STATUS whose fence proves the scheduler got through it.
+static bool mesSendLate(struct rn_device *adev, void *frame, u32 statusDwordOff, u32 *apiStatus) {
+    u32 *f = static_cast<u32 *>(frame);
+    const u64 stAddr = gMesCtx.vaBase + gMesCtx.apiStatusOff;
+    f[statusDwordOff] = lower_32_bits(stAddr); f[statusDwordOff + 1] = upper_32_bits(stAddr);
+    f[statusDwordOff + 2] = 1; f[statusDwordOff + 3] = 0;
+    rn_vram_wr32(adev, gMesCtx.apiStatusOff, 0); rn_vram_wr32(adev, gMesCtx.apiStatusOff + 4, 0);
+    const u32 seq = ++gMesCtx.seq;
+    union MESAPI__QUERY_MES_STATUS q;
+    memset(&q, 0, sizeof(q));
+    q.header.type = MES_API_TYPE_SCHEDULER;
+    q.header.opcode = MES_SCH_API_QUERY_SCHEDULER_STATUS;
+    q.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+    q.api_status.api_completion_fence_addr = gMesCtx.vaBase + gMesCtx.ringFenceOff;
+    q.api_status.api_completion_fence_value = seq;
+    mesRingSubmit(adev, gMesCtx.schedOff, kSchedRingBytes, 1, 0, gMesCtx.schedOff + 0x1008, kMesSchedDoorbell, &gMesCtx.schedWptr, f, API_FRAME_SIZE_IN_DWORDS);
+    mesRingSubmit(adev, gMesCtx.schedOff, kSchedRingBytes, 1, 0, gMesCtx.schedOff + 0x1008, kMesSchedDoorbell, &gMesCtx.schedWptr, reinterpret_cast<const u32 *>(&q), API_FRAME_SIZE_IN_DWORDS);
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    for (int i = 0; i < 2000; i++) {
+        if (rn_vram_rd32(adev, gMesCtx.ringFenceOff) >= seq) break;
+        msleep(1);
+    }
+    *apiStatus = rn_vram_rd32(adev, gMesCtx.apiStatusOff);
+    return rn_vram_rd32(adev, gMesCtx.ringFenceOff) >= seq && *apiStatus != 0;
+}
+
 void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_gmc *gmc, const u32 start[4], u32 maxStep, void (*progress)(void *, u32), void *ctx,
                   struct rn_mes_result *res) {
     static_assert(sizeof(union MESAPI_SET_HW_RESOURCES) == 256 && sizeof(union MESAPI__ADD_QUEUE) == 256 &&
@@ -1958,6 +1992,76 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     grbmSelect(adev, 0, 0, 0, 0);
     res->step = 5;
     if ((res->q_active & 1u) || res->add_ok) { gMapped = true; gMappedWptr = 0; gMappedRingAt = kRingAt; gMappedRingBytes = kKcqRingBytes; gMappedPipe = foundPipe; gMappedQueue = foundQueue; }   // later rn_compute_submit_ib calls use this queue
+    if (gMapped) gMesCtx = {true, vaBase, schedOff, qOff, ringFenceOff, apiStatusOff, schedWptr, seq, legDb, foundPipe, foundQueue, res->sched_version};
+}
+
+// Gets a hung legacy compute queue going again, the way Linux resets a kernel compute queue through the MES (gfx_v11_0_reset_kcq, mes_v11_0_reset_queue_mmio,
+// amdgpu_gfx_mes_reset_queue_start): dequeue the hardware queue and reset its waves, have the MES remove it (REMOVE_QUEUE with unmap_legacy_queue and remove_queue_after_reset),
+// put the MQD and the ring back as they were at boot and have the MES map it again (ADD_QUEUE with map_legacy_kq). Everything that was in the ring or running is lost. Returns 0, or
+// -ENODEV (no mapped queue), -EIO with info[0] the step that failed: 1 the hardware queue did not go inactive, 2 REMOVE_QUEUE, 3 ADD_QUEUE, 4 the queue is not active afterwards.
+int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]) {
+    memset(info, 0, 4 * sizeof(u32));
+    if (!gMesCtx.valid || !gMapped) return -ENODEV;
+    if (gSubmitLock) IOLockLock(gSubmitLock);                                // no submit while the ring and the wptr are rebuilt
+    int rc = -EIO;
+    rn_gc_safe_mode(adev, 1);
+    grbmSelect(adev, 1, gMesCtx.pipe, 0, gMesCtx.queue);
+    WREG32_SOC15(RN_GC, 0, regCP_HQD_DEQUEUE_REQUEST, 2);
+    WREG32_SOC15(RN_GC, 0, regSPI_COMPUTE_QUEUE_RESET, 1);
+    bool inactive = false;
+    for (int i = 0; i < 100000; i++) {                                       // up to ~100 ms, as adev->usec_timeout
+        if (!(RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE) & 1u)) { inactive = true; break; }
+        udelay(1);
+    }
+    info[1] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
+    grbmSelect(adev, 0, 0, 0, 0);
+    if (!inactive) { info[0] = 1; goto out; }
+    {
+        union MESAPI__REMOVE_QUEUE r;
+        memset(&r, 0, sizeof(r));
+        r.header.type = MES_API_TYPE_SCHEDULER;
+        r.header.opcode = MES_SCH_API_REMOVE_QUEUE;
+        r.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+        r.doorbell_offset = gMesCtx.doorbell;
+        r.gang_context_addr = 0;
+        r.pipe_id = gMesCtx.pipe;
+        r.queue_id = gMesCtx.queue;
+        r.unmap_legacy_queue = 1;
+        r.queue_type = MES_QUEUE_TYPE_COMPUTE;
+        if ((gMesCtx.schedVersion & 0xfffu) >= 0x60) r.remove_queue_after_reset = 1;
+        u32 st = 0;
+        if (!mesSendLate(adev, &r, offsetof(union MESAPI__REMOVE_QUEUE, api_status) / 4, &st)) { info[0] = 2; info[2] = st; goto out; }
+    }
+    // amdgpu_gfx_mqd_reset_restore: the MQD as it was built at boot, the ring empty, the read and write words back at 0
+    writeComputeMqd(adev, gMesCtx.vaBase, gMesCtx.qOff, kKcqRingBytes, gMesCtx.qOff + 0x2000, gMesCtx.qOff + 0x4000, gMesCtx.doorbell, false, kRingAt);
+    for (u32 o = 0; o < kKcqRingBytes; o += 4) rn_vram_wr32(adev, gMesCtx.qOff + kRingAt + o, 0);
+    for (u32 o = 0; o < 16; o += 4) rn_vram_wr32(adev, gMesCtx.qOff + 0x1000 + o, 0);
+    gMappedWptr = 0;
+    {
+        union MESAPI__ADD_QUEUE p;
+        memset(&p, 0, sizeof(p));
+        p.header.type = MES_API_TYPE_SCHEDULER;
+        p.header.opcode = MES_SCH_API_ADD_QUEUE;
+        p.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+        p.pipe_id = gMesCtx.pipe;
+        p.queue_id = gMesCtx.queue;
+        p.doorbell_offset = gMesCtx.doorbell;
+        p.mqd_addr = gMesCtx.vaBase + gMesCtx.qOff + 0x2000;
+        p.wptr_addr = gMesCtx.vaBase + gMesCtx.qOff + 0x1008;
+        p.queue_type = MES_QUEUE_TYPE_COMPUTE;
+        p.map_legacy_kq = 1;
+        u32 st = 0;
+        if (!mesSendLate(adev, &p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4, &st)) { info[0] = 3; info[2] = st; goto out; }
+    }
+    grbmSelect(adev, 1, gMesCtx.pipe, 0, gMesCtx.queue);
+    info[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
+    grbmSelect(adev, 0, 0, 0, 0);
+    if (!(info[3] & 1u)) { info[0] = 4; goto out; }
+    rc = 0;
+out:
+    rn_gc_safe_mode(adev, 0);
+    if (gSubmitLock) IOLockUnlock(gSubmitLock);
+    return rc;
 }
 
 void rn_kiq_map_compute(struct rn_device *adev, u64 vaBase, u64 kiqOff, u64 queueOff, u32 maxStep, void (*progress)(void *, u32),

@@ -171,6 +171,7 @@ void rn_compute_diag(struct rn_device *adev, u32 out[11]);   // out[8..10]: SDMA
 // RLC safe mode (gfx_v11_0_set_safe_mode): keeps the graphics block out of GFXOFF while it is being used; enter 0 leaves it again.
 // The doorbell and queue registers as they are now (compare with the values that were programmed): HQD doorbell control, CP_PQ_STATUS, the
 // MEC doorbell range (lower, upper), NBIO DOORBELL_APER_EN, HQD PQ base, PQ control, MQD base.
+int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]);   // see gfx11.cpp; info: [0] failed step, [1] HQD_ACTIVE after the dequeue, [2] api status of the failing frame, [3] HQD_ACTIVE after the re-map
 void rn_compute_ring_state(struct rn_device *adev, u32 out[4]);   // [0] rptr write-back word, [1] wptr word, [2] driver wptr of the mapped compute ring, all in dwords, [3] submits that had to wait for room
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]);
 void rn_mes_state(struct rn_device *adev, u32 out[15]);

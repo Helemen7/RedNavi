@@ -259,6 +259,8 @@ static void rnPublishOne(OSDictionary *d, const char *key, uint64_t v) {
     if (n) { d->setObject(key, n); n->release(); }
 }
 
+class RedNaviClient;
+
 class RedNaviProbe : public IOService {
     OSDeclareDefaultStructors(RedNaviProbe)
 
@@ -290,6 +292,11 @@ class RedNaviProbe : public IOService {
     void vmFree(int vmid);
     bool vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages);   // copies the buffer's GART PTEs into the VMID's tables; false: the pool ran out (nothing stays mapped)
     void vmUnmap(int vmid, uint64_t vaPage, uint32_t pages);
+    IOLock *queueLock {nullptr};                   // sequence numbers, submits and resets of the compute queue, in that order
+    uint32_t queueResets {0};
+    uint32_t hangMs {8000};                        // a wait this long without the fence moving resets the queue (rednavi_hang_ms)
+    RedNaviClient *vmClient[8] {};                 // the connection of each VMID
+    int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
     int createHostBo(uint32_t size, bool writeCombine = false);
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
@@ -1717,6 +1724,8 @@ class RedNaviClient : public IOUserClient {
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
     uint32_t seqSubmitted {0};
+    uint32_t lostFrom {1}, lostTo {0};             // sequence numbers dropped by the last queue reset (none when lostFrom > lostTo)
+    friend class RedNaviProbe;
 
     // The buffer behind a handle, or -1.
     int boOf(uint32_t handle) const {
@@ -1743,7 +1752,13 @@ class RedNaviClient : public IOUserClient {
     }
     void freeAll() {
         for (uint32_t i = 0; i < kMaxMaps; i++) if (maps[i].used) unmapSlot(i);   // the GPU must not reach a page after it is released
-        if (vmid > 0) { gpuOwner->vmFree(vmid); vmid = 0; }
+        if (vmid > 0) {
+            IOLockLock(gpuOwner->queueLock);
+            if (gpuOwner->vmClient[vmid] == this) gpuOwner->vmClient[vmid] = nullptr;    // a reset must not look at this connection while its fence page goes away
+            IOLockUnlock(gpuOwner->queueLock);
+            gpuOwner->vmFree(vmid);
+            vmid = 0;
+        }
         for (uint32_t i = 0; i < kMaxHandles; i++)
             if (boIdx[i] >= 0) { gpuOwner->destroyBo(boIdx[i]); boIdx[i] = -1; }
         boUsed = 0;
@@ -1763,7 +1778,11 @@ public:
         vmid = gpuOwner->vmAlloc();
         if (vmid < 0) { vmid = 0; return false; }      // all seven address spaces are in use
         fenceIdx = gpuOwner->createHostBo(4096);
-        return fenceIdx >= 0 && IOUserClient::start(provider);
+        if (fenceIdx < 0) return false;
+        IOLockLock(gpuOwner->queueLock);
+        gpuOwner->vmClient[vmid] = this;
+        IOLockUnlock(gpuOwner->queueLock);
+        return IOUserClient::start(provider);
     }
     void free() APPLE_KEXT_OVERRIDE {
         if (lock && gpuOwner) freeAll();                // normally clientClose did it already
@@ -1859,11 +1878,19 @@ public:
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
                 uint64_t ibVa = 0;
                 if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !canonical(in->ib_va, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                IOLockLock(gpuOwner->queueLock);
                 const uint32_t seq = seqSubmitted + 1;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                const int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                if (r == -EAGAIN) {                                  // the ring stayed full for about 2 s: the queue is not draining, it is stuck
+                    uint32_t info[4];
+                    const int rr = gpuOwner->resetQueue(info);
+                    IOLog("RedNavi: ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
+                    if (rr == 0) r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                }
+                if (r == 0) seqSubmitted = seq;                      // taken under the queue lock, in the order the packets reach the ring
+                IOLockUnlock(gpuOwner->queueLock);
                 if (r == 0) {
-                    seqSubmitted = seq;                              // taken under the connection's lock, in the order the packets reach the ring
                     rn_uc_submit_result *o = static_cast<rn_uc_submit_result *>(args->structureOutput);
                     memset(o, 0, sizeof(*o));
                     o->seq = seq;
@@ -1878,12 +1905,26 @@ public:
                 const rn_uc_wait_seq *in = static_cast<const rn_uc_wait_seq *>(args->structureInput);
                 if (static_cast<int32_t>(seqSubmitted - in->seq) < 0 || in->seq == 0) break;   // never submitted
                 const uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
+                const uint32_t fence0 = fenceNow();
                 uint32_t ms = 0;
-                while (ms < timeout && static_cast<int32_t>(fenceNow() - in->seq) < 0) { IOSleep(1); ms++; }
+                while (ms < timeout && static_cast<int32_t>(fenceNow() - in->seq) < 0) {
+                    IOSleep(1);
+                    ms++;
+                    if (ms == gpuOwner->hangMs && fenceNow() == fence0) {          // no progress for the whole hang time: the queue is stuck
+                        uint32_t info[4];
+                        IOLockLock(gpuOwner->queueLock);
+                        const int rr = gpuOwner->resetQueue(info);
+                        IOLockUnlock(gpuOwner->queueLock);
+                        IOLog("RedNavi: queue hung while waiting for sequence %u, reset: %d (step %u)\n", in->seq, rr, info[0]);
+                    }
+                }
                 rn_uc_wait_seq_result *o = static_cast<rn_uc_wait_seq_result *>(args->structureOutput);
                 memset(o, 0, sizeof(*o));
+                IOLockLock(gpuOwner->queueLock);
                 o->signaled = fenceNow();
                 o->reached = static_cast<int32_t>(o->signaled - in->seq) >= 0;
+                if (o->reached && static_cast<int32_t>(in->seq - lostFrom) >= 0 && static_cast<int32_t>(lostTo - in->seq) >= 0) o->status = RN_UC_SEQ_LOST;
+                IOLockUnlock(gpuOwner->queueLock);
                 if (timeout) rn_gc_safe_mode(&gpuOwner->gpu, 0);
                 rc = kIOReturnSuccess;
             }
@@ -1934,6 +1975,21 @@ public:
                     if (maps[i].used && maps[i].va == va && maps[i].size == in->size) { unmapSlot(i); rc = kIOReturnSuccess; break; }
             }
             break;
+        case RN_UC_QUEUE_RESET:
+            if (sized(args, 0, sizeof(rn_uc_reset_result)) && fenceIdx >= 0) {
+                uint32_t info[4];
+                IOLockLock(gpuOwner->queueLock);
+                const int rr = gpuOwner->resetQueue(info);
+                rn_uc_reset_result *o = static_cast<rn_uc_reset_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->status = rr == 0 ? 0 : (info[0] ? info[0] : 0xff);
+                o->resets = gpuOwner->queueResets;
+                o->lost_from = lostFrom;
+                o->lost_to = lostTo;
+                IOLockUnlock(gpuOwner->queueLock);
+                rc = kIOReturnSuccess;
+            }
+            break;
         case RN_UC_DIAG:
             if (sized(args, sizeof(rn_uc_diag_req), sizeof(rn_uc_diag))) {
                 const rn_uc_diag_req *req = static_cast<const rn_uc_diag_req *>(args->structureInput);
@@ -1960,6 +2016,24 @@ public:
     }
 };
 OSDefineMetaClassAndStructors(RedNaviClient, IOUserClient)
+
+// The queue is shared by every connection, so a reset drops everybody's work. Each connection's numbers from the last fence value it saw to the last it
+// submitted are lost; the fence then jumps to the last submitted number so that no wait is left hanging (the work that finished before keeps its result).
+int RedNaviProbe::resetQueue(uint32_t info[4]) {
+    uint32_t before[8];
+    for (int v = 1; v <= 7; v++) before[v] = vmClient[v] ? vmClient[v]->fenceNow() : 0;
+    const int rr = rn_compute_queue_reset(&gpu, info);
+    queueResets++;
+    if (rr != 0) return rr;
+    for (int v = 1; v <= 7; v++) {
+        RedNaviClient *c = vmClient[v];
+        if (!c) continue;
+        c->lostFrom = before[v] + 1;
+        c->lostTo = c->seqSubmitted;
+        *reinterpret_cast<volatile uint32_t *>(bos[c->fenceIdx].md->getBytesNoCopy()) = c->seqSubmitted;
+    }
+    return 0;
+}
 
 IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
     if (!gpuLive || !doorbellKeep || !handler) return kIOReturnNotReady;
@@ -2945,6 +3019,8 @@ bool RedNaviProbe::start(IOService *provider) {
 
     modeLock = IOLockAlloc();
     boLock = IOLockAlloc();
+    queueLock = IOLockAlloc();
+    { uint32_t v = 0; if (PE_parse_boot_argn("rednavi_hang_ms", &v, sizeof(v)) && v >= 100 && v <= 9000) hangMs = v; }
     rn_compute_lock_init();
     pci->setMemoryEnable(true);
     dumpPci();
@@ -3025,6 +3101,7 @@ void RedNaviProbe::stop(IOService *provider) {
     for (uint32_t i = 0; i < boCount; i++) { if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); } if (bos[i].md) bos[i].md->release(); }
     boCount = 0;
     if (boLock) { IOLockFree(boLock); boLock = nullptr; }
+    if (queueLock) { IOLockFree(queueLock); queueLock = nullptr; }
     if (doorbellKeep) { rn_set_doorbell(nullptr, 0); doorbellKeep->release(); doorbellKeep = nullptr; }
     if (hostDma) { hostDma->complete(); hostDma->clearMemoryDescriptor(); hostDma->release(); hostDma = nullptr; }
     if (hostBuf) { hostBuf->release(); hostBuf = nullptr; }
