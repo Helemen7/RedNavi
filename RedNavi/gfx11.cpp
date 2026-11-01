@@ -12,6 +12,8 @@
 // rednavi_mes_host=1: the MES working memory (rings, write-back words, fences, contexts, MQDs, EOP buffers) lives in one host buffer mapped through the GART, as
 // in Linux, where every one of these is a GTT buffer or a write-back slot. Its "offset" is chosen so that vaBase + offset is the GART address; the accessors
 // below send an offset inside that range to the host mapping and everything else to VRAM through MM_INDEX/MM_DATA.
+bool gMesCleaner = false;      // rednavi_mes_cleaner=1: see gfx11.h
+bool gMesHwResLinux = false;   // rednavi_mes_hwres=1: see gfx11.h
 u64 gMesHostLogBase = 0;
 volatile u8 *gMesHostMem = nullptr;
 u64 gMesHostSize = 0;

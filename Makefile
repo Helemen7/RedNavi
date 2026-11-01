@@ -70,7 +70,7 @@ $(OUT)/kern_info.o: RedNavi/kern_info.c
 $(KEXT): $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(COMPAT_OBJ) $(OUT)/kern_info.o RedNavi/Info.plist.in
 	@mkdir -p $(KEXT)/Contents/MacOS
 	$(CXX) $(LDFLAGS) $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(COMPAT_OBJ) $(OUT)/kern_info.o -o $(KEXT)/Contents/MacOS/RedNavi
-	@if nm -u $(KEXT)/Contents/MacOS/RedNavi | grep -E "RedNavi|rn_|kRN"; then echo "unresolved RedNavi symbols in the kext"; exit 1; fi
+	@if nm -u $(KEXT)/Contents/MacOS/RedNavi | grep -E "RedNavi|rn_|kRN|^ *_g[A-Z]" | grep -vE "_g(IO|OS)"; then echo "unresolved RedNavi symbols in the kext"; exit 1; fi
 	cp RedNavi/Info.plist.in $(KEXT)/Contents/Info.plist
 	@echo "built $(KEXT)"
 
