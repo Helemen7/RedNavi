@@ -50,9 +50,13 @@ void rn_gart_clear(struct rn_device *adev, const struct rn_gmc *gmc) {
     for (u64 o = 0; o < pages * 8; o += 4) rn_vram_wr32(adev, gmc->pt_vram_offset + o, 0);   // every PTE invalid
 }
 
-int rn_gart_flush(struct rn_device *adev) {
-    u32 req = 0;                                                             // gfxhub_v3_0_3_get_invalidate_req(vmid 0, flush type 0)
-    req = REG_SET_FIELD(req, GCVM_INVALIDATE_ENG17_REQ, PER_VMID_INVALIDATE_REQ, 1);
+static IOLock *gFlushLock;              // invalidation engine 17 is one request/acknowledge register pair: one flush at a time
+
+// Invalidates the TLBs of every VMID in `mask` (bit n = VMID n) through engine 17, the one Linux uses for flushes done by register (amdgpu_gmc_flush_gpu_tlb).
+static int flushVmids(struct rn_device *adev, u32 mask) {
+    if (gFlushLock) IOLockLock(gFlushLock);
+    u32 req = 0;                                                             // gfxhub_v3_0_3_get_invalidate_req(flush type 0)
+    req = REG_SET_FIELD(req, GCVM_INVALIDATE_ENG17_REQ, PER_VMID_INVALIDATE_REQ, mask);
     req = REG_SET_FIELD(req, GCVM_INVALIDATE_ENG17_REQ, FLUSH_TYPE, 0);
     req = REG_SET_FIELD(req, GCVM_INVALIDATE_ENG17_REQ, INVALIDATE_L2_PTES, 1);
     req = REG_SET_FIELD(req, GCVM_INVALIDATE_ENG17_REQ, INVALIDATE_L2_PDE0, 1);
@@ -63,7 +67,7 @@ int rn_gart_flush(struct rn_device *adev) {
     WREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_REQ, req);
     int rc = -1;
     for (int i = 0; i < 100000; i++) {                                       // up to ~100 ms
-        if (RREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ACK) & 1u) { rc = 0; break; }
+        if ((RREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ACK) & mask) == mask) { rc = 0; break; }
         udelay(1);
     }
     // The engine acknowledged but a changed PTE was still used on hardware (gart-dynamic test): also do what rn_gfxhub_enable does to
@@ -73,8 +77,11 @@ int rn_gart_flush(struct rn_device *adev) {
     tmp = REG_SET_FIELD(tmp, GCVM_L2_CNTL2, INVALIDATE_L2_CACHE, 1);
     WREG32_SOC15(RN_GC, 0, regGCVM_L2_CNTL2, tmp);
     udelay(100);
+    if (gFlushLock) IOLockUnlock(gFlushLock);
     return rc;
 }
+
+int rn_gart_flush(struct rn_device *adev) { return flushVmids(adev, 1); }
 
 int rn_gart_update_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 bus) {
     if (bus) {
@@ -96,6 +103,83 @@ void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page
     const u64 slot = gmc->pt_vram_offset + (u64)page * 8;
     rn_vram_wr32(adev, slot, lower_32_bits(pte));
     rn_vram_wr32(adev, slot + 4, upper_32_bits(pte));
+}
+
+#define VMR(reg, off) (adev->reg_offset[RN_GC_HWIP][0][reg##_BASE_IDX] + (reg) + (off))
+
+// The user VMIDs (1 and up, the ones the MES does not own): one flat page table each in VRAM, like the VMID 0 GART table (PAGE_TABLE_DEPTH 0), a window of
+// 4 KB pages from startVa to endVa. Linux's setup_vmid_config gives them 4 levels over the whole 48-bit space; a flat window is the first step (docs/M5_PLAN.md).
+void rn_vm_enable_contexts(struct rn_device *adev, u64 startVa, u64 endVa, u32 firstVmid, u32 lastVmid) {
+    u32 tmp = RREG32_SOC15(RN_GC, 0, regCP_DEBUG);                           // gfxhub_v3_0_set_fault_enable_default(true): the CP keeps going after a fault, faults go to the default page
+    tmp = REG_SET_FIELD(tmp, CP_DEBUG, CPG_UTCL1_ERROR_HALT_DISABLE, 1);
+    WREG32_SOC15(RN_GC, 0, regCP_DEBUG, tmp);
+    tmp = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, PDE1_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, PDE2_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, TRANSLATE_FURTHER_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, NACK_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, CRASH_ON_NO_RETRY_FAULT, 0);
+    tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, CRASH_ON_RETRY_FAULT, 0);
+    WREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL, tmp);
+    for (u32 vmid = firstVmid; vmid <= lastVmid; vmid++) {
+        const u32 c = vmid - 1, a = 2 * (vmid - 1);                          // ctx_distance 1, ctx_addr_distance 2 (LO32 and HI32)
+        tmp = rn_rreg32(adev, VMR(regGCVM_CONTEXT1_CNTL, c));
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, ENABLE_CONTEXT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PAGE_TABLE_DEPTH, 0);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, VALID_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, READ_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, WRITE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, EXECUTE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PAGE_TABLE_BLOCK_SIZE, 0);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, RETRY_PERMISSION_OR_INVALID_PAGE_FAULT, 0);   // no retry: a fault must not stall the L2 (no fault interrupt handler yet)
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_CNTL, c), tmp);
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_START_ADDR_LO32, a), (u32)(startVa >> 12));
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_START_ADDR_HI32, a), (u32)(startVa >> 44));
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_END_ADDR_LO32, a), (u32)(endVa >> 12));
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_END_ADDR_HI32, a), (u32)(endVa >> 44));
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32, a), 0);
+        rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_HI32, a), 0);
+    }
+    WREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ADDR_RANGE_LO32, 0xffffffffu);   // gfxhub_v3_0_program_invalidation: an invalidation covers the whole address range
+    WREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ADDR_RANGE_HI32, 0x1f);
+}
+
+// Points VMID `vmid` at a page table in VRAM (valid bit set, as VMID 0's base), or at nothing (tableVramOffset 0), then drops what the TLBs held for it.
+int rn_vm_bind(struct rn_device *adev, u32 vmid, u64 tableVramOffset) {
+    const u32 a = 2 * (vmid - 1);
+    const u64 base = tableVramOffset ? (tableVramOffset | 1ull) : 0;
+    rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_LO32, a), lower_32_bits(base));
+    rn_wreg32(adev, VMR(regGCVM_CONTEXT1_PAGE_TABLE_BASE_ADDR_HI32, a), upper_32_bits(base));
+    return flushVmids(adev, 1u << vmid);
+}
+
+void rn_vm_write_pte(struct rn_device *adev, u64 tableVramOffset, u32 index, u64 pte) {
+    rn_vram_wr32(adev, tableVramOffset + (u64)index * 8, lower_32_bits(pte));
+    rn_vram_wr32(adev, tableVramOffset + (u64)index * 8 + 4, upper_32_bits(pte));
+}
+
+int rn_vm_flush(struct rn_device *adev, u32 vmid) { return flushVmids(adev, 1u << vmid); }
+
+u64 rn_gart_read_pte(struct rn_device *adev, const struct rn_gmc *gmc, u32 page) {
+    const u64 slot = gmc->pt_vram_offset + (u64)page * 8;
+    return (u64)rn_vram_rd32(adev, slot) | ((u64)rn_vram_rd32(adev, slot + 4) << 32);
+}
+
+// GCVM_L2_PROTECTION_FAULT_STATUS keeps the first fault until this clears it (gmc_v11_0_process_interrupt).
+void rn_vm_clear_fault(struct rn_device *adev) {
+    u32 tmp = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL);
+    WREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL, REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, CLEAR_PROTECTION_FAULT_STATUS_ADDR, 1));
+    WREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL, REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, CLEAR_PROTECTION_FAULT_STATUS_ADDR, 0));
 }
 
 void rn_gart_unmap_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page) {
@@ -1106,14 +1190,16 @@ u32 rn_build_dispatch_ib(struct rn_device *adev, u32 *ring, u64 shaderVa) {
 
 int rn_compute_lock_init(void) {
     if (!gSubmitLock) gSubmitLock = IOLockAlloc();
-    return gSubmitLock ? 0 : -ENOMEM;
+    if (!gFlushLock) gFlushLock = IOLockAlloc();
+    return gSubmitLock && gFlushLock ? 0 : -ENOMEM;
 }
 
 void rn_compute_lock_free(void) {
     if (gSubmitLock) { IOLockFree(gSubmitLock); gSubmitLock = nullptr; }
+    if (gFlushLock) { IOLockFree(gFlushLock); gFlushLock = nullptr; }
 }
 
-static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue) {
+static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
     (void)vaBase;
     const u32 mask = ringBytes / 4 - 1;
     const u64 wptrOff = ringOff + 0x1008;
@@ -1123,7 +1209,7 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
     pk[n++] = RN_PACKET3(0x3Fu, 2);
     pk[n++] = lower_32_bits(ibVa) & 0xfffffffcu;
     pk[n++] = upper_32_bits(ibVa) & 0xFFFFu;
-    pk[n++] = (1u << 23) | (ibDwords & 0xFFFFFu);
+    pk[n++] = (1u << 23) | (ibDwords & 0xFFFFFu) | ((vmid & 0xFu) << 24);
     pk[n++] = RN_PACKET3(RN_PACKET3_RELEASE_MEM, 6);
     pk[n++] = (1u << 22) | (1u << 21) | (1u << 13) | (1u << 12) | (3u << 25) | RN_CACHE_FLUSH_AND_INV_TS_EVENT | (5u << 8);
     pk[n++] = (1u << 29);
@@ -1169,9 +1255,9 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
     return 0;
 }
 
-int rn_compute_submit_ib(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue) {
+int rn_compute_submit_ib(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
     if (gSubmitLock) IOLockLock(gSubmitLock);                                // slot reservation, packet writes, flush and doorbell are one critical section
-    const int rc = computeSubmitLocked(adev, vaBase, ringOff, ringBytes, ibVa, ibDwords, fenceVa, fenceValue);
+    const int rc = computeSubmitLocked(adev, vaBase, ringOff, ringBytes, ibVa, ibDwords, fenceVa, fenceValue, vmid);
     if (gSubmitLock) IOLockUnlock(gSubmitLock);
     return rc;
 }

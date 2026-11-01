@@ -156,7 +156,14 @@ void rn_set_doorbell(volatile void *base, u32 dword_index);
 int rn_compute_lock_init(void);   // allocates the lock rn_compute_submit_ib takes; call before the first submit
 void rn_compute_lock_free(void);
 int rn_compute_submit_ib(struct rn_device *adev, u64 va_base, u64 ring_vram_offset, u32 ring_bytes, u64 ib_va, u32 ib_dwords,
-                         u64 fence_va, u32 fence_value);
+                         u64 fence_va, u32 fence_value, u32 vmid);   // vmid: the VM the IB's addresses are translated in (0: the GART window, 1 to 7: a user VM)
+// The user VMIDs 1 to 7 (the MES owns 8 to 15): a flat page table each, in VRAM, over a window of 4 KB pages [start_va, end_va].
+void rn_vm_enable_contexts(struct rn_device *adev, u64 start_va, u64 end_va, u32 first_vmid, u32 last_vmid);
+int rn_vm_bind(struct rn_device *adev, u32 vmid, u64 table_vram_offset);   // 0 unbinds; flushes the VMID's TLBs
+void rn_vm_write_pte(struct rn_device *adev, u64 table_vram_offset, u32 index, u64 pte);
+int rn_vm_flush(struct rn_device *adev, u32 vmid);
+u64 rn_gart_read_pte(struct rn_device *adev, const struct rn_gmc *gmc, u32 page);
+void rn_vm_clear_fault(struct rn_device *adev);
 // Fills ib with the PM4 of a 1x1x1 dispatch of the shader at shader_va (the packets of rn_compute_dispatch_test, without the fence)
 // and returns the number of dwords.
 // What the compute queue and the memory hub say now: HQD read pointer, wptr, active, CP_STAT, the VM fault status and address.
