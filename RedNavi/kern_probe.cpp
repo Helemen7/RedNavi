@@ -287,6 +287,7 @@ class RedNaviProbe : public IOService {
     uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
     bool vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff);
     uint64_t vmPageAlloc(int vmid);                  // a zeroed pool page (VRAM offset), 0 when the pool is empty
+    uint32_t vramMbytes {16384};                     // RCC_CONFIG_MEMSIZE (the INFO queries answer with it)
     uint32_t vmidUsed {0};                           // bit n: VMID n is a connection's
     bool vmReady {false};
     int vmAlloc();                                   // a VMID with an empty page table bound to it, or -1
@@ -437,6 +438,7 @@ void RedNaviProbe::dumpDiscovery() {
         vramMB = kRNFallbackVramMB;
         IOLog("RedNavi: memsize register unusable, assuming %u MB\n", vramMB);
     }
+    vramMbytes = vramMB;
 
     uint64_t base = ((uint64_t)vramMB << 20) - kRNDiscoveryTmrOffset;
     uint32_t sig = vramRead(base);
@@ -1744,6 +1746,18 @@ class RedNaviClient : public IOUserClient {
     uint32_t lostFrom {1}, lostTo {0};             // sequence numbers dropped by the last queue reset (none when lostFrom > lostTo)
     friend class RedNaviProbe;
 
+    // Synchronisation objects (rn_uapi.h): the binary state and a timeline per object. Work that signals one is attached as a number of this connection's
+    // fence and counts as done when the fence has reached it; nothing here is in the kernel's way, it is all evaluated when somebody looks.
+    struct Syncobj {
+        bool used, binSignaled;
+        uint32_t binSeq;                           // work attached to the binary state (0: none)
+        uint64_t tlValue;                          // the timeline, as far as it is known to be done
+        struct { uint64_t point; uint32_t seq; } pend[8];   // work attached to timeline points
+        uint32_t npend;
+    };
+    static constexpr uint32_t kMaxSync = 32;
+    Syncobj sync[kMaxSync];
+
     // The buffer behind a handle, or -1.
     int boOf(uint32_t handle) const {
         if (handle == 0 || handle > kMaxHandles) return -1;
@@ -1784,6 +1798,118 @@ class RedNaviClient : public IOUserClient {
     uint32_t fenceNow() const {
         return *reinterpret_cast<volatile uint32_t *>(gpuOwner->bos[fenceIdx].md->getBytesNoCopy());
     }
+    bool reached(uint32_t seq) const { return static_cast<int32_t>(fenceNow() - seq) >= 0; }
+    Syncobj *findSync(uint32_t h) { return (h == 0 || h > kMaxSync || !sync[h - 1].used) ? nullptr : &sync[h - 1]; }
+    // The timeline value: the highest point whose work is done. Done work leaves the pending list.
+    uint64_t tlNow(Syncobj &s) {
+        uint64_t v = s.tlValue;
+        uint32_t keep = 0;
+        for (uint32_t i = 0; i < s.npend; i++) {
+            if (reached(s.pend[i].seq)) { if (s.pend[i].point > v) v = s.pend[i].point; }
+            else s.pend[keep++] = s.pend[i];
+        }
+        s.npend = keep;
+        s.tlValue = v;
+        return v;
+    }
+    bool binDone(Syncobj &s) {
+        if (s.binSignaled) return true;
+        if (s.binSeq && reached(s.binSeq)) { s.binSignaled = true; s.binSeq = 0; return true; }
+        return false;
+    }
+    bool isDone(Syncobj &s, uint64_t point) { return point == 0 ? binDone(s) : tlNow(s) >= point; }
+    // Is there work attached for this point, or has it been done?
+    bool isAttached(Syncobj &s, uint64_t point) {
+        if (isDone(s, point)) return true;
+        if (point == 0) return s.binSeq != 0;
+        for (uint32_t i = 0; i < s.npend; i++) if (s.pend[i].point >= point) return true;
+        return false;
+    }
+    bool canAttach(Syncobj &s, uint64_t point) {
+        if (point == 0) return true;
+        tlNow(s);
+        return s.npend < 8;
+    }
+    void attachWork(Syncobj &s, uint64_t point, uint32_t seq) {
+        if (point == 0) { s.binSignaled = false; s.binSeq = seq; return; }
+        if (s.npend < 8) { s.pend[s.npend].point = point; s.pend[s.npend].seq = seq; s.npend++; }
+    }
+    void signalNow(Syncobj &s, uint64_t point) {
+        if (point == 0) { s.binSignaled = true; s.binSeq = 0; }
+        else if (point > s.tlValue) s.tlValue = point;
+    }
+    // INFO queries (DRM_AMDGPU_INFO), answered in the caller's buffer, min(size, what the query returns) bytes as Linux does. What the kext cannot say yet is
+    // refused (kIOReturnUnsupported): the device info (DEV_INFO), the firmware versions, the timestamp and the sensors.
+    static void putOut(void *out, uint32_t outSize, const void *v, size_t n) { memcpy(out, v, n < outSize ? n : outSize); }
+    IOReturn infoQuery(const drm_amdgpu_info *r, void *out, uint32_t outSize) {
+        memset(out, 0, outSize);
+        const uint64_t visible = 256ull << 20;                                // what BAR0 maps
+        const uint64_t vram = static_cast<uint64_t>(gpuOwner->vramMbytes) << 20;
+        const uint64_t gttTotal = 16384ull * 4096, gttUsed = static_cast<uint64_t>(gpuOwner->gartNextPage) * 4096;
+        switch (r->query) {
+        case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
+        case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue
+            const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : 0;
+            putOut(out, outSize, &v, sizeof(v));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_HW_IP_INFO: {
+            drm_amdgpu_info_hw_ip ip;
+            memset(&ip, 0, sizeof(ip));
+            if (r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE && r->query_hw_ip.ip_instance == 0) {
+                ip.hw_ip_version_major = 11;                                  // gfx_v11_0, the GC 11.0.3 of the discovery table
+                ip.hw_ip_version_minor = 0;
+                ip.ib_start_alignment = 32;                                   // amdgpu_kms.c, AMDGPU_HW_IP_COMPUTE
+                ip.ib_size_alignment = 32;
+                ip.available_rings = 1;
+                ip.ip_discovery_version = (11u << 16) | (0u << 8) | 3u;
+            }
+            putOut(out, outSize, &ip, sizeof(ip));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_MEMORY: {
+            drm_amdgpu_memory_info m;
+            memset(&m, 0, sizeof(m));
+            m.vram.total_heap_size = vram; m.vram.usable_heap_size = vram; m.vram.max_allocation = 0;            // nothing is allocated in VRAM yet (docs/M5_PLAN.md)
+            m.cpu_accessible_vram.total_heap_size = visible; m.cpu_accessible_vram.usable_heap_size = visible;
+            m.gtt.total_heap_size = gttTotal; m.gtt.usable_heap_size = gttTotal; m.gtt.heap_usage = gttUsed; m.gtt.max_allocation = 1u << 20;
+            putOut(out, outSize, &m, sizeof(m));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_VRAM_GTT: {
+            drm_amdgpu_info_vram_gtt g;
+            g.vram_size = vram; g.vram_cpu_accessible_size = visible; g.gtt_size = gttTotal;
+            putOut(out, outSize, &g, sizeof(g));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_VRAM_USAGE: case AMDGPU_INFO_VIS_VRAM_USAGE: case AMDGPU_INFO_NUM_BYTES_MOVED: case AMDGPU_INFO_NUM_EVICTIONS: case AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS: {
+            const uint64_t v = 0;
+            putOut(out, outSize, &v, sizeof(v));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_GTT_USAGE: putOut(out, outSize, &gttUsed, sizeof(gttUsed)); return kIOReturnSuccess;
+        case AMDGPU_INFO_MAX_IBS: {                                          // AMDGPU_CS_MAX_IBS_PER_SUBMIT, one value per IP type
+            uint32_t v[9];
+            for (int i = 0; i < 9; i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE) ? 1 : 0;
+            putOut(out, outSize, v, sizeof(v));
+            return kIOReturnSuccess;
+        }
+        default:
+            return kIOReturnUnsupported;
+        }
+    }
+
+    // Waits for one (object, point): until work is attached (when `forSubmit`, else an object nothing was ever attached to is an error), then until it is done.
+    IOReturn syncWaitOne(Syncobj &s, uint64_t point, uint32_t timeoutMs, bool forSubmit, bool availableOnly) {
+        uint32_t ms = 0;
+        for (;;) {
+            if (availableOnly ? isAttached(s, point) : isDone(s, point)) return kIOReturnSuccess;
+            if (!forSubmit && !isAttached(s, point)) return kIOReturnBadArgument;
+            if (ms >= timeoutMs) return kIOReturnTimeout;
+            IOSleep(1);
+            ms++;
+        }
+    }
 
 public:
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
@@ -1792,6 +1918,7 @@ public:
         for (uint32_t i = 0; i < kMaxHandles; i++) boIdx[i] = -1;
         if (!gpuOwner || !lock) return false;
         memset(maps, 0, sizeof(maps));
+        memset(sync, 0, sizeof(sync));
         vmid = gpuOwner->vmAlloc();
         if (vmid < 0) { vmid = 0; return false; }      // all seven address spaces are in use
         fenceIdx = gpuOwner->createHostBo(4096);
@@ -1895,6 +2022,14 @@ public:
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
                 uint64_t ibVa = 0;
                 if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !canonical(in->ib_va, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                if (in->in_count > RN_UC_SUBMIT_SYNC_MAX || in->out_count > RN_UC_SUBMIT_SYNC_MAX) break;
+                bool badSync = false;
+                for (uint32_t i = 0; i < in->in_count; i++) if (!findSync(in->in[i].handle)) badSync = true;
+                for (uint32_t i = 0; i < in->out_count; i++) { Syncobj *o = findSync(in->out[i].handle); if (!o || !canAttach(*o, in->out[i].point)) badSync = true; }
+                if (badSync) break;
+                IOReturn waitRc = kIOReturnSuccess;                                 // the objects this work waits for, before anything goes to the ring
+                for (uint32_t i = 0; i < in->in_count && waitRc == kIOReturnSuccess; i++) waitRc = syncWaitOne(*findSync(in->in[i].handle), in->in[i].point, 10000, true, false);
+                if (waitRc != kIOReturnSuccess) { rc = waitRc; break; }
                 IOLockLock(gpuOwner->queueLock);
                 const uint32_t seq = seqSubmitted + 1;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
@@ -1908,6 +2043,7 @@ public:
                 if (r == 0) seqSubmitted = seq;                      // taken under the queue lock, in the order the packets reach the ring
                 IOLockUnlock(gpuOwner->queueLock);
                 if (r == 0) {
+                    for (uint32_t i = 0; i < in->out_count; i++) attachWork(*findSync(in->out[i].handle), in->out[i].point, seq);
                     rn_uc_submit_result *o = static_cast<rn_uc_submit_result *>(args->structureOutput);
                     memset(o, 0, sizeof(*o));
                     o->seq = seq;
@@ -1990,6 +2126,115 @@ public:
                 if (!canonical(in->va, &va)) break;
                 for (uint32_t i = 0; i < kMaxMaps; i++)
                     if (maps[i].used && maps[i].va == va && maps[i].size == in->size) { unmapSlot(i); rc = kIOReturnSuccess; break; }
+            }
+            break;
+        case RN_UC_INFO_QUERY:
+            if (args->structureInputSize == sizeof(drm_amdgpu_info) && args->structureInput && args->structureOutput && args->structureOutputSize > 0 && args->structureOutputSize <= 4096 &&
+                args->scalarInputCount == 0 && args->scalarOutputCount == 0) {
+                const drm_amdgpu_info *req = static_cast<const drm_amdgpu_info *>(args->structureInput);
+                const uint32_t outSize = req->return_size < args->structureOutputSize ? req->return_size : args->structureOutputSize;
+                rc = infoQuery(req, args->structureOutput, outSize);
+            }
+            break;
+        case RN_UC_SYNCOBJ_CREATE:
+            if (sized(args, sizeof(rn_uc_syncobj_create), sizeof(rn_uc_syncobj_create_result))) {
+                const rn_uc_syncobj_create *in = static_cast<const rn_uc_syncobj_create *>(args->structureInput);
+                if (in->flags & ~RN_UC_SYNCOBJ_CREATE_SIGNALED) break;
+                uint32_t h = 0;
+                while (h < kMaxSync && sync[h].used) h++;
+                if (h == kMaxSync) { rc = kIOReturnNoResources; break; }
+                memset(&sync[h], 0, sizeof(sync[h]));
+                sync[h].used = true;
+                sync[h].binSignaled = (in->flags & RN_UC_SYNCOBJ_CREATE_SIGNALED) != 0;
+                rn_uc_syncobj_create_result *o = static_cast<rn_uc_syncobj_create_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->handle = h + 1;
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_SYNCOBJ_DESTROY:
+            if (sized(args, sizeof(rn_uc_syncobj_destroy), 0)) {
+                Syncobj *so = findSync(static_cast<const rn_uc_syncobj_destroy *>(args->structureInput)->handle);
+                if (!so) break;
+                so->used = false;
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_SYNCOBJ_WAIT:
+            if (sized(args, sizeof(rn_uc_syncobj_wait), sizeof(rn_uc_syncobj_wait_result))) {
+                const rn_uc_syncobj_wait *in = static_cast<const rn_uc_syncobj_wait *>(args->structureInput);
+                if (in->count == 0 || in->count > RN_UC_SYNC_MAX || in->timeout_nsec < 0 || (in->flags & ~7u)) break;
+                Syncobj *so[RN_UC_SYNC_MAX];
+                bool bad = false;
+                for (uint32_t i = 0; i < in->count; i++) { so[i] = findSync(in->handles[i]); if (!so[i]) bad = true; }
+                if (bad) break;
+                const bool all = in->flags & RN_UC_SYNCOBJ_WAIT_ALL, forSubmit = in->flags & RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, availOnly = in->flags & RN_UC_SYNCOBJ_WAIT_AVAILABLE;
+                const uint64_t ns = static_cast<uint64_t>(in->timeout_nsec) > 10000000000ull ? 10000000000ull : static_cast<uint64_t>(in->timeout_nsec);
+                const uint32_t timeoutMs = static_cast<uint32_t>(ns / 1000000);
+                uint32_t ms = 0;
+                for (;;) {
+                    uint32_t nDone = 0, first = 0xffffffffu;
+                    bool noWork = false;
+                    for (uint32_t i = 0; i < in->count; i++) {
+                        const bool ok = availOnly ? isAttached(*so[i], in->points[i]) : isDone(*so[i], in->points[i]);
+                        if (ok) { nDone++; if (first == 0xffffffffu) first = i; }
+                        else if (!forSubmit && !isAttached(*so[i], in->points[i])) noWork = true;
+                    }
+                    if (noWork) { rc = kIOReturnBadArgument; break; }       // as drm_syncobj_array_wait_timeout: an object nothing was ever attached to is an error unless the caller waits for a submit
+                    if (all ? nDone == in->count : nDone > 0) {
+                        rn_uc_syncobj_wait_result *o = static_cast<rn_uc_syncobj_wait_result *>(args->structureOutput);
+                        memset(o, 0, sizeof(*o));
+                        o->first_signaled = first == 0xffffffffu ? 0 : first;
+                        rc = kIOReturnSuccess;
+                        break;
+                    }
+                    if (ms >= timeoutMs) { rc = kIOReturnTimeout; break; }
+                    IOSleep(1);
+                    ms++;
+                }
+            }
+            break;
+        case RN_UC_SYNCOBJ_RESET:
+        case RN_UC_SYNCOBJ_SIGNAL:
+            if (sized(args, sizeof(rn_uc_syncobj_array), 0)) {
+                const rn_uc_syncobj_array *in = static_cast<const rn_uc_syncobj_array *>(args->structureInput);
+                if (in->count == 0 || in->count > RN_UC_SYNC_MAX) break;
+                Syncobj *so[RN_UC_SYNC_MAX];
+                bool bad = false;
+                for (uint32_t i = 0; i < in->count; i++) { so[i] = findSync(in->handles[i]); if (!so[i]) bad = true; }
+                if (bad) break;
+                for (uint32_t i = 0; i < in->count; i++) {
+                    if (selector == RN_UC_SYNCOBJ_RESET) { so[i]->binSignaled = false; so[i]->binSeq = 0; }
+                    else signalNow(*so[i], in->points[i]);
+                }
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_SYNCOBJ_QUERY:
+            if (sized(args, sizeof(rn_uc_syncobj_array), sizeof(rn_uc_syncobj_array))) {
+                const rn_uc_syncobj_array *in = static_cast<const rn_uc_syncobj_array *>(args->structureInput);
+                if (in->count == 0 || in->count > RN_UC_SYNC_MAX) break;
+                rn_uc_syncobj_array *o = static_cast<rn_uc_syncobj_array *>(args->structureOutput);
+                bool bad = false;
+                for (uint32_t i = 0; i < in->count; i++) if (!findSync(in->handles[i])) bad = true;
+                if (bad) break;
+                memcpy(o, in, sizeof(*o));
+                for (uint32_t i = 0; i < in->count; i++) o->points[i] = tlNow(*findSync(in->handles[i]));
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_SYNCOBJ_TRANSFER:
+            if (sized(args, sizeof(rn_uc_syncobj_transfer), 0)) {
+                const rn_uc_syncobj_transfer *in = static_cast<const rn_uc_syncobj_transfer *>(args->structureInput);
+                Syncobj *src = findSync(in->src_handle), *dst = findSync(in->dst_handle);
+                if (!src || !dst || in->flags != 0) break;
+                if (isDone(*src, in->src_point)) { signalNow(*dst, in->dst_point); rc = kIOReturnSuccess; break; }
+                uint32_t seq = 0;                                                     // not done yet: the destination waits for the same work
+                if (in->src_point == 0) seq = src->binSeq;
+                else for (uint32_t i = 0; i < src->npend; i++) if (src->pend[i].point >= in->src_point) { seq = src->pend[i].seq; break; }
+                if (seq == 0 || !canAttach(*dst, in->dst_point)) break;
+                attachWork(*dst, in->dst_point, seq);
+                rc = kIOReturnSuccess;
             }
             break;
         case RN_UC_QUEUE_RESET:

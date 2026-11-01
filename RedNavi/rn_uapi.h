@@ -7,7 +7,9 @@
 
 #include <stdint.h>
 
-#define RN_UAPI_VERSION 4
+#include "rn_drm_uapi.h"
+
+#define RN_UAPI_VERSION 5
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -20,6 +22,14 @@ enum {
     RN_UC_VA_MAP = 7,      // in rn_uc_va_map
     RN_UC_VA_UNMAP = 8,    // in rn_uc_va_unmap
     RN_UC_QUEUE_RESET = 9, // out rn_uc_reset_result
+    RN_UC_INFO_QUERY = 10, // in struct drm_amdgpu_info (return_pointer unused), out: the answer, as many bytes as the caller asks for in return_size
+    RN_UC_SYNCOBJ_CREATE = 11,   // in rn_uc_syncobj_create, out rn_uc_syncobj_create_result
+    RN_UC_SYNCOBJ_DESTROY = 12,  // in rn_uc_syncobj_destroy
+    RN_UC_SYNCOBJ_WAIT = 13,     // in rn_uc_syncobj_wait, out rn_uc_syncobj_wait_result
+    RN_UC_SYNCOBJ_RESET = 14,    // in rn_uc_syncobj_array
+    RN_UC_SYNCOBJ_SIGNAL = 15,   // in rn_uc_syncobj_array (points: 0 signals the binary state, a point signals the timeline up to it)
+    RN_UC_SYNCOBJ_QUERY = 16,    // in rn_uc_syncobj_array, out rn_uc_syncobj_array (points filled)
+    RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
     RN_UC_COUNT
 };
 
@@ -79,10 +89,58 @@ struct rn_uc_va_unmap {
     uint64_t size;
 };
 
+// Synchronisation objects, after DRM's (drm_syncobj_*), per connection: a handle names an object of this connection. One object has a binary state
+// (point 0: signaled or not) and a timeline (points above 0, a 64-bit value that only grows). Work that signals an object does it when its fence is done:
+// `rn_uc_sync_ref` is drm_amdgpu_cs_chunk_syncobj (handle, flags, point) and goes in a submit as a wait before the IB or a signal after it.
+// Arrays are inline, up to RN_UC_SYNC_MAX entries, where DRM passes a pointer.
+#define RN_UC_SYNC_MAX 16
+#define RN_UC_SYNCOBJ_CREATE_SIGNALED 1u                 // DRM_SYNCOBJ_CREATE_SIGNALED
+#define RN_UC_SYNCOBJ_WAIT_ALL 1u                        // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
+#define RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT 2u                 // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: wait for work to be attached first
+#define RN_UC_SYNCOBJ_WAIT_AVAILABLE 4u                  // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: work attached is enough, it need not be done
+
+struct rn_uc_syncobj_create { uint32_t flags; uint32_t pad; };
+struct rn_uc_syncobj_create_result { uint32_t handle; uint32_t pad; };
+struct rn_uc_syncobj_destroy { uint32_t handle; uint32_t pad; };
+
+struct rn_uc_syncobj_wait {
+    int64_t timeout_nsec;      // relative, at most 10 s, 0 only looks
+    uint32_t count;            // handles
+    uint32_t flags;            // RN_UC_SYNCOBJ_WAIT_*
+    uint32_t handles[RN_UC_SYNC_MAX];
+    uint64_t points[RN_UC_SYNC_MAX];   // 0: the binary state
+};
+struct rn_uc_syncobj_wait_result { uint32_t first_signaled; uint32_t pad; };
+
+struct rn_uc_syncobj_array {
+    uint32_t count;
+    uint32_t flags;
+    uint32_t handles[RN_UC_SYNC_MAX];
+    uint64_t points[RN_UC_SYNC_MAX];
+};
+
+struct rn_uc_syncobj_transfer {
+    uint32_t src_handle, dst_handle;
+    uint64_t src_point, dst_point;
+    uint32_t flags, pad;
+};
+
+struct drm_amdgpu_cs_chunk_syncobj_ref {                  // drm_amdgpu_cs_chunk_syncobj, field for field
+    uint32_t handle;
+    uint32_t flags;
+    uint64_t point;
+};
+typedef struct drm_amdgpu_cs_chunk_syncobj_ref rn_uc_sync_ref;
+
+#define RN_UC_SUBMIT_SYNC_MAX 8
 struct rn_uc_submit {
     uint64_t ib_va;            // inside one mapping of this connection
     uint32_t ib_dwords;
     uint32_t flags;            // 0
+    uint32_t in_count;         // syncobjs to wait for before the IB runs (the CPU waits before the packets go to the ring, at most 10 s)
+    uint32_t out_count;        // syncobjs the IB signals when it is done (at their point)
+    rn_uc_sync_ref in[RN_UC_SUBMIT_SYNC_MAX];
+    rn_uc_sync_ref out[RN_UC_SUBMIT_SYNC_MAX];
 };
 
 struct rn_uc_submit_result {

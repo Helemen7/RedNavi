@@ -49,6 +49,54 @@ static kern_return_t submitIb(io_connect_t c, uint64_t ibVa, uint32_t ibDwords) 
     return kr;
 }
 
+static kern_return_t submitSync(io_connect_t c, uint64_t ibVa, uint32_t ibDwords, const rn_uc_sync_ref *in, uint32_t nIn, const rn_uc_sync_ref *out, uint32_t nOut) {
+    struct rn_uc_submit sub;
+    memset(&sub, 0, sizeof(sub));
+    sub.ib_va = ibVa; sub.ib_dwords = ibDwords; sub.in_count = nIn; sub.out_count = nOut;
+    for (uint32_t i = 0; i < nIn; i++) sub.in[i] = in[i];
+    for (uint32_t i = 0; i < nOut; i++) sub.out[i] = out[i];
+    struct rn_uc_submit_result res = {0, 0};
+    size_t resSize = sizeof(res);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_SUBMIT, &sub, sizeof(sub), &res, &resSize);
+    if (kr == KERN_SUCCESS) gSeq = res.seq;
+    return kr;
+}
+
+static kern_return_t soCreate(io_connect_t c, uint32_t flags, uint32_t *handle) {
+    struct rn_uc_syncobj_create in = {flags, 0};
+    struct rn_uc_syncobj_create_result out = {0, 0};
+    size_t outSize = sizeof(out);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_SYNCOBJ_CREATE, &in, sizeof(in), &out, &outSize);
+    *handle = out.handle;
+    return kr;
+}
+
+static kern_return_t soDestroy(io_connect_t c, uint32_t handle) {
+    struct rn_uc_syncobj_destroy in = {handle, 0};
+    return IOConnectCallStructMethod(c, RN_UC_SYNCOBJ_DESTROY, &in, sizeof(in), NULL, NULL);
+}
+
+static kern_return_t soWait(io_connect_t c, const uint32_t *handles, const uint64_t *points, uint32_t n, uint32_t flags, int64_t timeoutMs) {
+    struct rn_uc_syncobj_wait in;
+    struct rn_uc_syncobj_wait_result out;
+    size_t outSize = sizeof(out);
+    memset(&in, 0, sizeof(in));
+    in.timeout_nsec = timeoutMs * 1000000; in.count = n; in.flags = flags;
+    for (uint32_t i = 0; i < n; i++) { in.handles[i] = handles[i]; in.points[i] = points ? points[i] : 0; }
+    return IOConnectCallStructMethod(c, RN_UC_SYNCOBJ_WAIT, &in, sizeof(in), &out, &outSize);
+}
+
+static kern_return_t soArray(io_connect_t c, uint32_t selector, uint32_t handle, uint64_t point, uint64_t *pointOut) {
+    struct rn_uc_syncobj_array in, out;
+    size_t outSize = sizeof(out);
+    memset(&in, 0, sizeof(in));
+    in.count = 1; in.handles[0] = handle; in.points[0] = point;
+    kern_return_t kr = selector == RN_UC_SYNCOBJ_QUERY ? IOConnectCallStructMethod(c, selector, &in, sizeof(in), &out, &outSize)
+                                                      : IOConnectCallStructMethod(c, selector, &in, sizeof(in), NULL, NULL);
+    if (kr == KERN_SUCCESS && pointOut) *pointOut = out.points[0];
+    return kr;
+}
+
 static kern_return_t waitSeq(io_connect_t c, uint32_t seq, uint32_t ms, uint32_t *reached, uint32_t *signaled) {
     struct rn_uc_wait_seq in = {seq, ms};
     struct rn_uc_wait_seq_result out = {0, 0};
@@ -203,6 +251,121 @@ int main(int argc, char **argv) {
             printf("second connection, sequence 1 before any submit of its own: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
             gSeq = keep;
             IOServiceClose(c2);
+        }
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "info")) {          // the INFO queries, in the structures DRM_AMDGPU_INFO uses
+        struct drm_amdgpu_info req;
+        uint8_t buf[256];
+        size_t bufSize;
+#define QUERY(ID, SIZE) do { memset(&req, 0, sizeof(req)); req.query = (ID); req.return_size = (SIZE); bufSize = (SIZE); memset(buf, 0xAA, sizeof(buf)); \
+                              kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize); } while (0)
+        QUERY(AMDGPU_INFO_ACCEL_WORKING, 4);
+        printf("ACCEL_WORKING: 0x%x, %u (expect 1)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf != 1) ok = 0;
+        memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_HW_IP_COUNT; req.return_size = 4; req.query_hw_ip.type = AMDGPU_HW_IP_COMPUTE; bufSize = 4;
+        kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
+        printf("HW_IP_COUNT compute: 0x%x, %u (expect 1)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf != 1) ok = 0;
+        req.query_hw_ip.type = AMDGPU_HW_IP_GFX; bufSize = 4;
+        kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
+        printf("HW_IP_COUNT gfx: 0x%x, %u (the kext submits to no graphics queue yet: expect 0)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf != 0) ok = 0;
+        memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_HW_IP_INFO; req.return_size = sizeof(struct drm_amdgpu_info_hw_ip); req.query_hw_ip.type = AMDGPU_HW_IP_COMPUTE; bufSize = req.return_size;
+        kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
+        struct drm_amdgpu_info_hw_ip *ip = (struct drm_amdgpu_info_hw_ip *)buf;
+        printf("HW_IP_INFO compute: 0x%x, version %u.%u, rings 0x%x, alignment %u/%u, discovery 0x%x\n", kr, ip->hw_ip_version_major, ip->hw_ip_version_minor, ip->available_rings,
+               ip->ib_start_alignment, ip->ib_size_alignment, ip->ip_discovery_version);
+        if (kr || ip->hw_ip_version_major != 11 || ip->available_rings != 1) ok = 0;
+        QUERY(AMDGPU_INFO_MEMORY, sizeof(struct drm_amdgpu_memory_info));
+        struct drm_amdgpu_memory_info *mi = (struct drm_amdgpu_memory_info *)buf;
+        printf("MEMORY: 0x%x, vram %llu MB, visible %llu MB, gtt %llu MB (used %llu MB)\n", kr, mi->vram.total_heap_size >> 20, mi->cpu_accessible_vram.total_heap_size >> 20,
+               mi->gtt.total_heap_size >> 20, mi->gtt.heap_usage >> 20);
+        if (kr || mi->vram.total_heap_size < (1ull << 30) || mi->cpu_accessible_vram.total_heap_size == 0) ok = 0;
+        QUERY(AMDGPU_INFO_VRAM_GTT, sizeof(struct drm_amdgpu_info_vram_gtt));
+        printf("VRAM_GTT: 0x%x, %llu MB, %llu MB, %llu MB\n", kr, ((struct drm_amdgpu_info_vram_gtt *)buf)->vram_size >> 20, ((struct drm_amdgpu_info_vram_gtt *)buf)->vram_cpu_accessible_size >> 20,
+               ((struct drm_amdgpu_info_vram_gtt *)buf)->gtt_size >> 20);
+        if (kr) ok = 0;
+        QUERY(AMDGPU_INFO_GTT_USAGE, 8);
+        printf("GTT_USAGE: 0x%x, %llu KB\n", kr, *(uint64_t *)buf >> 10); if (kr) ok = 0;
+        QUERY(AMDGPU_INFO_ACCEL_WORKING, 2);
+        printf("a buffer of 2 bytes for a 4-byte answer: 0x%x, bytes %02x %02x then %02x (expect 01 00 then the fill byte aa)\n", kr, buf[0], buf[1], buf[2]);
+        if (kr || buf[0] != 1 || buf[1] != 0 || buf[2] != 0xAA) ok = 0;
+        QUERY(AMDGPU_INFO_DEV_INFO, sizeof(struct drm_amdgpu_info_device) < sizeof(buf) ? sizeof(struct drm_amdgpu_info_device) : sizeof(buf));
+        printf("DEV_INFO: 0x%x (not answered yet, needs the values from a Linux run: expect an error)\n", kr); if (!kr) ok = 0;
+        QUERY(0x7777, 4);
+        printf("an unknown query: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+#undef QUERY
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "syncobj")) {       // synchronisation objects: binary state, timeline, work attached by a submit, transfer
+        uint32_t b = 0, t = 0, dst = 0, sig = 0, never = 0, r_ = 0;
+        uint64_t pt = 0, p5 = 5, p6 = 6;
+        uint32_t two[2];
+        if (soCreate(c, 0, &b) || soCreate(c, 0, &t) || soCreate(c, 0, &dst) || soCreate(c, RN_UC_SYNCOBJ_CREATE_SIGNALED, &sig) || soCreate(c, 0, &never)) { printf("create failed\n"); ok = 0; }
+        else {
+            printf("handles %u %u %u %u %u\n", b, t, dst, sig, never);
+            kr = soWait(c, &sig, NULL, 1, RN_UC_SYNCOBJ_WAIT_ALL, 0);
+            printf("a signaled object, timeout 0: 0x%x (expect 0)\n", kr); if (kr) ok = 0;
+            kr = soWait(c, &b, NULL, 1, 0, 0);
+            printf("an object nothing is attached to, no wait for submit: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            kr = soWait(c, &b, NULL, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 5);
+            printf("the same, waiting for a submit for 5 ms: 0x%x (expect a timeout, 0xe00002d6)\n", kr); if (kr != (kern_return_t)0xe00002d6) ok = 0;
+            if (soArray(c, RN_UC_SYNCOBJ_SIGNAL, b, 0, NULL) || soWait(c, &b, NULL, 1, 0, 0)) { printf("signal then wait failed\n"); ok = 0; }
+            else printf("signaled by hand, then waited for: ok\n");
+            if (soArray(c, RN_UC_SYNCOBJ_RESET, b, 0, NULL)) ok = 0;
+            kr = soWait(c, &b, NULL, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 5);
+            printf("after a reset: 0x%x (expect a timeout)\n", kr); if (kr != (kern_return_t)0xe00002d6) ok = 0;
+
+            // work attached by a submit: signaled when the IB is done
+            data.cpu[0] = 0xDEAD0000u;
+            rn_uc_sync_ref outB = {b, 0, 0};
+            if (submitSync(c, codeVa, n, NULL, 0, &outB, 1)) { printf("submit with an output object failed\n"); ok = 0; }
+            kr = soWait(c, &b, NULL, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 2000);
+            waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &r_);
+            printf("binary object signaled by a submit: wait 0x%x, result 0x%08x (expect 0 and 0x600dc0de)\n", kr, data.cpu[0]); if (kr || !r_) ok = 0;
+
+            // the timeline
+            rn_uc_sync_ref out5 = {t, 0, 5};
+            if (submitSync(c, codeVa, n, NULL, 0, &out5, 1)) ok = 0;
+            kr = soWait(c, &t, &p5, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 2000);
+            soArray(c, RN_UC_SYNCOBJ_QUERY, t, 0, &pt);
+            printf("timeline point 5 signaled by a submit: wait 0x%x, value %llu (expect 0 and 5)\n", kr, pt); if (kr || pt != 5) ok = 0;
+            kr = soWait(c, &t, &p6, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 20);
+            printf("point 6, nobody signals it: 0x%x (expect a timeout)\n", kr); if (kr != (kern_return_t)0xe00002d6) ok = 0;
+            if (soArray(c, RN_UC_SYNCOBJ_SIGNAL, t, 6, NULL) || soWait(c, &t, &p6, 1, 0, 0)) { printf("signal of point 6 failed\n"); ok = 0; }
+            soArray(c, RN_UC_SYNCOBJ_QUERY, t, 0, &pt);
+            printf("point 6 signaled by hand: value %llu (expect 6)\n", pt); if (pt != 6) ok = 0;
+
+            // transfer: the destination takes the source's work
+            rn_uc_sync_ref out9 = {never, 0, 9};
+            if (submitSync(c, codeVa, n, NULL, 0, &out9, 1)) ok = 0;
+            struct rn_uc_syncobj_transfer tr = {never, dst, 9, 0, 0, 0};
+            kr = IOConnectCallStructMethod(c, RN_UC_SYNCOBJ_TRANSFER, &tr, sizeof(tr), NULL, NULL);
+            uint64_t zero = 0;
+            kern_return_t kw = soWait(c, &dst, &zero, 1, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, 2000);
+            printf("transfer of point 9 into a binary object: 0x%x, then wait 0x%x (expect 0 and 0)\n", kr, kw); if (kr || kw) ok = 0;
+
+            // an input object: the IB waits for it first
+            rn_uc_sync_ref inS = {sig, 0, 0};
+            kr = submitSync(c, codeVa, n, &inS, 1, NULL, 0);
+            printf("a submit that waits for a signaled object: 0x%x (expect 0)\n", kr); if (kr) ok = 0;
+            rn_uc_sync_ref inBad = {99, 0, 0};
+            const uint32_t before = gSeq;
+            kr = submitSync(c, codeVa, n, &inBad, 1, NULL, 0);
+            printf("a submit that waits for an object that does not exist: 0x%x, sequence stays %u (expect an error, same number)\n", kr, gSeq); if (!kr || gSeq != before) ok = 0;
+
+            two[0] = never; two[1] = t;                          // a list with an object nothing was attached to
+            kr = soWait(c, two, NULL, 2, 0, 5);
+            printf("wait on a list where one object has no work (never = point 0): 0x%x\n", kr);
+            uint32_t fresh = 0; soCreate(c, 0, &fresh);
+            two[0] = fresh; two[1] = sig;
+            kr = soWait(c, two, NULL, 2, 0, 5);
+            printf("any-wait where one object has no work and one is signaled: 0x%x (expect an error, as DRM)\n", kr); if (!kr) ok = 0;
+            io_connect_t c2;                                     // objects belong to their connection
+            if (IOServiceOpen(svc, mach_task_self(), 0, &c2) == KERN_SUCCESS) {
+                kr = soWait(c2, &t, &p5, 1, 0, 0);
+                printf("another connection waits for this one's object: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+                IOServiceClose(c2);
+            }
+            kr = soDestroy(c, b);
+            kern_return_t kr2 = soDestroy(c, b), kr3 = soWait(c, &b, NULL, 1, 0, 0);
+            printf("destroy: 0x%x, again: 0x%x, wait on it: 0x%x (expect 0 and two errors)\n", kr, kr2, kr3); if (kr || !kr2 || !kr3) ok = 0;
         }
     }
     if (ok && argc > 1 && !strcmp(argv[1], "bo")) {            // buffer lifetime: handles, ownership, release on close
