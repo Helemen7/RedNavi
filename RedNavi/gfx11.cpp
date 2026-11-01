@@ -107,9 +107,9 @@ void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page
 
 #define VMR(reg, off) (adev->reg_offset[RN_GC_HWIP][0][reg##_BASE_IDX] + (reg) + (off))
 
-// The user VMIDs (1 and up, the ones the MES does not own): one flat page table each in VRAM, like the VMID 0 GART table (PAGE_TABLE_DEPTH 0), a window of
-// 4 KB pages from startVa to endVa. Linux's setup_vmid_config gives them 4 levels over the whole 48-bit space; a flat window is the first step (docs/M5_PLAN.md).
-void rn_vm_enable_contexts(struct rn_device *adev, u64 startVa, u64 endVa, u32 firstVmid, u32 lastVmid) {
+// The user VMIDs (1 and up, the ones the MES does not own): a page table each in VRAM. Linux's setup_vmid_config (gmc_v11_0: amdgpu_vm_adjust_size(256 TB, 9, 3, 48))
+// gives them PAGE_TABLE_DEPTH 3 and PAGE_TABLE_BLOCK_SIZE 0 over the 48-bit space: three directory levels of 512 entries (PDB2, PDB1, PDB0) above 512-entry page tables.
+void rn_vm_enable_contexts(struct rn_device *adev, u64 startVa, u64 endVa, u32 depth, u32 firstVmid, u32 lastVmid) {
     u32 tmp = RREG32_SOC15(RN_GC, 0, regCP_DEBUG);                           // gfxhub_v3_0_set_fault_enable_default(true): the CP keeps going after a fault, faults go to the default page
     tmp = REG_SET_FIELD(tmp, CP_DEBUG, CPG_UTCL1_ERROR_HALT_DISABLE, 1);
     WREG32_SOC15(RN_GC, 0, regCP_DEBUG, tmp);
@@ -132,7 +132,7 @@ void rn_vm_enable_contexts(struct rn_device *adev, u64 startVa, u64 endVa, u32 f
         const u32 c = vmid - 1, a = 2 * (vmid - 1);                          // ctx_distance 1, ctx_addr_distance 2 (LO32 and HI32)
         tmp = rn_rreg32(adev, VMR(regGCVM_CONTEXT1_CNTL, c));
         tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, ENABLE_CONTEXT, 1);
-        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PAGE_TABLE_DEPTH, 0);
+        tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PAGE_TABLE_DEPTH, depth);
         tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
         tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, DUMMY_PAGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
         tmp = REG_SET_FIELD(tmp, GCVM_CONTEXT1_CNTL, PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);

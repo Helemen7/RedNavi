@@ -24,9 +24,10 @@ enum {
 
 // A buffer is mapped into the caller with IOConnectMapMemory64(connection, handle, ...): the memory type is the handle.
 //
-// Every connection owns a GPU virtual address space (a VMID, 1 to 7, so at most 7 connections at a time). Command buffers are addressed in it: a
-// buffer is put there with RN_UC_VA_MAP at an address the caller picks inside [vm_va_start, vm_va_start + vm_va_bytes), and only what is mapped is
-// reachable by the GPU for this connection's command buffers. Mapping is read, write and execute. The gpu_va that RN_UC_BO_CREATE returns is the
+// Every connection owns a GPU virtual address space (a VMID, 1 to 7, so at most 7 connections at a time): the lower half of the 48-bit space,
+// four levels of page table as in Linux. Command buffers are addressed in it: a buffer is put there with RN_UC_VA_MAP at an address the caller picks
+// from [vm_va_start, vm_va_start + vm_va_bytes) (the lowest 2 MB are kept free, as amdgpu does), and only what is mapped is reachable by the GPU
+// for this connection's command buffers. Addresses with bit 47 set (the upper half, 0xffff800000000000 and up in canonical form) are refused: see docs/COMPAT.md. Mapping is read, write and execute. The gpu_va that RN_UC_BO_CREATE returns is the
 // buffer's address in the kernel's own window and is not valid in a connection's address space.
 
 struct rn_uc_info {
@@ -37,7 +38,7 @@ struct rn_uc_info {
     uint64_t max_bo_bytes;
     uint32_t bo_count;         // buffers of this connection
     uint32_t bo_limit;         // buffers one connection can hold
-    uint64_t vm_va_start;      // the window of the connection's address space
+    uint64_t vm_va_start;      // the lowest address that can be mapped; the space ends at vm_va_start + vm_va_bytes = 2^47
     uint64_t vm_va_bytes;
     uint32_t vmid;
     uint32_t va_map_limit;     // mappings one connection can hold

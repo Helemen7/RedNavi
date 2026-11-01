@@ -157,8 +157,8 @@ int rn_compute_lock_init(void);   // allocates the lock rn_compute_submit_ib tak
 void rn_compute_lock_free(void);
 int rn_compute_submit_ib(struct rn_device *adev, u64 va_base, u64 ring_vram_offset, u32 ring_bytes, u64 ib_va, u32 ib_dwords,
                          u64 fence_va, u32 fence_value, u32 vmid);   // vmid: the VM the IB's addresses are translated in (0: the GART window, 1 to 7: a user VM)
-// The user VMIDs 1 to 7 (the MES owns 8 to 15): a flat page table each, in VRAM, over a window of 4 KB pages [start_va, end_va].
-void rn_vm_enable_contexts(struct rn_device *adev, u64 start_va, u64 end_va, u32 first_vmid, u32 last_vmid);
+// The user VMIDs 1 to 7 (the MES owns 8 to 15): a page table in VRAM each, `depth` directory levels (0: flat) over [start_va, end_va].
+void rn_vm_enable_contexts(struct rn_device *adev, u64 start_va, u64 end_va, u32 depth, u32 first_vmid, u32 last_vmid);   // depth: directory levels above the page table (Linux: 3 over 48 bits)
 int rn_vm_bind(struct rn_device *adev, u32 vmid, u64 table_vram_offset);   // 0 unbinds; flushes the VMID's TLBs
 void rn_vm_write_pte(struct rn_device *adev, u64 table_vram_offset, u32 index, u64 pte);
 int rn_vm_flush(struct rn_device *adev, u32 vmid);

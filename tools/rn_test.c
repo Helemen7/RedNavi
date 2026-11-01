@@ -243,7 +243,7 @@ int main(int argc, char **argv) {
             printf("the queue still works afterwards: %s\n", r2 ? "yes" : "no"); if (!r2) ok = 0;
         }
     }
-    if (ok && argc > 1 && (!strcmp(argv[1], "vm") || !strcmp(argv[1], "vmfault"))) {   // the address space itself; vmfault also makes the shader fault (the compute queue is stuck afterwards, see docs/COMPAT.md)
+    if (ok && argc > 1 && (!strcmp(argv[1], "vm") || !strcmp(argv[1], "vmfault") || !strcmp(argv[1], "vmhole"))) {   // the address space itself; vmfault also makes the shader fault (the compute queue is stuck afterwards, see docs/COMPAT.md)
         uint32_t r = 0;
         const uint64_t W = info.vm_va_start, WS = info.vm_va_bytes, dataVa2 = W + 0x200000;
         Bo b2;
@@ -277,6 +277,33 @@ int main(int argc, char **argv) {
                 waitSeq(c, gSeq, 2000, &r, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &r);
                 printf("the shader stores through the new address: result 0x%08x, reached %u\n", data.cpu[0], r); if (!r) ok = 0;
             }
+        }
+        if (ok && !strcmp(argv[1], "vmhole")) {   // the upper half is refused (an IB there hung the queue once, docs/COMPAT.md); nothing here goes to the GPU
+            kr = vaMap(c, code.handle, 0xffff800000200000ull, 0, 4096);
+            printf("a mapping in the upper half, canonical form: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            kr = vaMap(c, code.handle, 0x0000800000200000ull, 0, 4096);
+            printf("a mapping with bit 47 set: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            kr = vaMap(c, code.handle, 0x00007fffffffe000ull, 0, 8192);
+            printf("a mapping that crosses 2^47: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+        }
+        // Far apart addresses, so that all four levels of the page table are used: different entries at every directory level.
+        if (ok) {
+            const uint64_t farCode = 0x00007ffffffe0000ull;
+            const uint64_t farData = 0x0000400000001000ull;
+            if (vaMap(c, code.handle, farCode, 0, 4096) || vaMap(c, data.handle, farData, 0, 4096)) { printf("map at the far addresses failed\n"); ok = 0; }
+            else {
+                const uint32_t nf = buildDispatch(code.cpu, farCode, farData);
+                data.cpu[0] = 0xDEAD0000u;
+                if (submitIb(c, farCode, nf)) ok = 0;
+                waitSeq(c, gSeq, 2000, &r, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &r);
+                printf("command buffer at 0x%llx, store to 0x%llx: result 0x%08x, reached %u\n", farCode, farData, data.cpu[0], r); if (!r) ok = 0;
+                if (vaUnmap(c, farCode, 4096) || vaUnmap(c, farData, 4096)) { printf("unmap at the far addresses failed\n"); ok = 0; }
+                kr = submitIb(c, farCode, nf);
+                printf("a submit from the address just unmapped: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+                kr = vaMap(c, data.handle, 0x0001000000000000ull, 0, 4096);
+                printf("an address that is not canonical: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            }
+            buildDispatch(code.cpu, codeVa, dataVa2);
         }
         // A store to an address that is mapped nowhere in this address space: the access faults, nothing is written, the fault is latched.
         if (ok && !strcmp(argv[1], "vmfault")) {
