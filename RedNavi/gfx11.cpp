@@ -550,7 +550,6 @@ static bool gMapped;                    // the compute queue in use was mapped t
 static u32 gMappedWptr;
 static u64 gMappedRingAt = 0;        // where the mapped queue's ring data starts inside its block (kRingAt for a queue the MES mapped, 0 for the older KIQ-mapped one)
 static u32 gMappedRingBytes = 0;     // its ring size, 0: the caller's
-static u32 gPostWptr = 0;            // the write pointer the post-map test (rn_mes_start) left the mapped queue at
 static u32 gMappedPipe = 0;
 static u32 gMappedQueue = 3;           // queue index (ME 1, pipe 0) of the mapped queue: 3 through the KIQ, 4 through the MES
 static const u32 kMappedDoorbellDword = 8;
@@ -1180,21 +1179,10 @@ void rn_compute_diag2(struct rn_device *adev, u32 out[8]) {
 }
 
 // MQD image for a compute queue (struct v11_compute_mqd, offsets in dwords), as gfx_v11_0_compute_mqd_init fills it.
-bool gMesPostMap = false;
-bool gMesSelfMap = false;
-bool gMesEarlyMap = false;
-u64 gMesHostWbVa = 0;            // rednavi_mes_hostwb=1: GART address of a host page that holds the legacy queue's rptr (+0) and wptr (+8), as Linux's write-back slots do
-volatile u32 *gMesHostWbMem = nullptr;
-u64 gMesHostRingVa = 0;          // rednavi_mes_hostring=1: the legacy queue's 8 KB ring in host memory too (GART address), as Linux allocates it
-volatile u32 *gMesHostRingMem = nullptr;
-static bool gWbHostNow = false;  // set around the one writeComputeMqd call that builds that queue
-
 static void writeComputeMqd(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 mqdOff, u64 eopOff, u32 doorbellDword,
                             bool mesQueue = false, u64 ringAt = 0) {
-    const bool hostRing = gWbHostNow && gMesHostRingVa != 0 && gMesHostRingMem != nullptr;
-    const u64 ringVa = hostRing ? gMesHostRingVa : vaBase + ringOff + ringAt, rptrOff = ringOff + 0x1000, wptrOff = ringOff + 0x1008;
-    const bool hostWb = gWbHostNow && gMesHostWbVa != 0 && gMesHostWbMem != nullptr;
-    const u64 rptrVa = hostWb ? gMesHostWbVa : vaBase + rptrOff, wptrVa = hostWb ? gMesHostWbVa + 8 : vaBase + wptrOff;
+    const u64 ringVa = vaBase + ringOff + ringAt, rptrOff = ringOff + 0x1000, wptrOff = ringOff + 0x1008;
+    const u64 rptrVa = vaBase + rptrOff, wptrVa = vaBase + wptrOff;
     const u64 eopBase = (vaBase + eopOff) >> 8;
     u32 qOrder = 0;
     while ((4u << qOrder) < ringBytes) qOrder++;
@@ -1219,12 +1207,10 @@ static void writeComputeMqd(struct rn_device *adev, u64 vaBase, u64 ringOff, u32
     ibCtl = REG_SET_FIELD(ibCtl, CP_HQD_IB_CONTROL, MIN_IB_AVAIL_SIZE, 3);
     const u32 quantum = regCP_HQD_QUANTUM_DEFAULT;                           // Linux's compute MQD has the quantum at 0, not enabled
     for (u32 o = 0; o < 512 * 4; o += 4) rn_vram_wr32(adev, mqdOff + o, 0);
-    if (hostRing) for (u32 o = 0; o < ringBytes; o += 4) gMesHostRingMem[o / 4] = 0;
-    else for (u32 o = 0; o < ringBytes; o += 4) rn_vram_wr32(adev, ringOff + ringAt + o, 0);
+    for (u32 o = 0; o < ringBytes; o += 4) rn_vram_wr32(adev, ringOff + ringAt + o, 0);
     for (u32 o = 0; o < 2048; o += 4) rn_vram_wr32(adev, eopOff + o, 0);
     rn_vram_wr32(adev, rptrOff, 0); rn_vram_wr32(adev, rptrOff + 4, 0);
     rn_vram_wr32(adev, wptrOff, 0); rn_vram_wr32(adev, wptrOff + 4, 0);
-    if (hostWb) for (u32 i = 0; i < 4; i++) gMesHostWbMem[i] = 0;
     struct { u32 dw; u32 v; } mqd[] = {
         {0, 0xC0310800u}, {11, 1}, {23, 0xffffffffu}, {24, 0xffffffffu}, {26, 0xffffffffu}, {27, 0xffffffffu}, {32, 7},
         {165, lower_32_bits(eopBase)}, {166, upper_32_bits(eopBase)}, {167, eopCtl}, {143, doorbellCtl},
@@ -1324,7 +1310,6 @@ static const u64 kRingAt = 0x5000;        // a MES queue block: rptr +0x1000, wp
 // The MES working area. The event log Linux gives the firmware is AMDGPU_MES_LOG_BUFFER_SIZE (0x4000) followed by the MSCRATCH area (0x40000): 0x44000 in all, as the
 // size of the debugfs amdgpu_mes_event_log of the same card shows (713728 bytes of text at 82 per 32 of data). The firmware writes into the scratch area while the log is on; an
 // area of 0x8000 was too small, the writes ran past it (a GCVM fault on the page after the host buffer, and in VRAM mode over the GART page table behind it).
-static const u32 kMesDbgBytes = 0x4000;   // mes_dbgext buffer, at base + 0x94000
 static const u64 kMesAreaBytes = 0xA0000;   // kiq 0x00000, scheduler 0x20000, shared 0x30000, queue 0x40000, log 0x50000 (0x44000), dbgext 0x94000
 static const u32 kMesDbStart = 1024;      // mes->db_start_dw_offset: the page after the kernel doorbells (amdgpu_doorbell_create_kernel_doorbells)
 static const u32 kMesKiqDoorbell = 0x0C << 1, kMesSchedDoorbell = 0x0B << 1;      // AMDGPU_NAVI10_DOORBELL_MES_RING1/0, in dwords
@@ -1443,35 +1428,6 @@ void rn_mes_doorbell_regs(struct rn_device *adev, u32 out[12]) {
     grbmSelect(adev, 0, 0, 0, 0);
 }
 
-bool gMesDmDump = false;
-u32 gMesDm[2][256];
-u32 gMesMqd[512];
-u32 gMesPipeRegs[2][32];
-u32 gKiqTrace[3][32];
-const u32 kMesPipeRegDw[32] = {0xc800,0xc89d,0xc801,0xc802,0xc807,0xc80e,0xc813,0xc814,0xc815,0xc816,0xc817,0xc818,0xc81a,0xc81c,0xc81e,0xc820,0xc837,0xc843,0xc844,0xc845,0xc846,0xc847,0xc848,0xc849,0xc84a,0xc84b,0xc84c,0xf850,0xf851,0xf852,0xf854,0xf855};
-u32 gMesKiqRing[96];
-bool gMesCleaner = false;
-bool gMesHwResLinux = false;
-bool gMesDbgExt = false;
-u64 gMesDbgHostVa = 0;
-void *gMesDbgHostMem = nullptr;
-u32 gMesDbg[2][256];
-
-// The KIQ pipe's program counter read back to back, run-length compressed into {pc, repeats} pairs (up to 16): its path through the first packets, to see where a boot
-// that ends parked at 0x51ad departs from one that ends at Linux's 0x518c.
-__attribute__((unused)) static void mesKiqTrace(struct rn_device *adev, u32 *out, u32 reads) {
-    memset(out, 0, 32 * sizeof(u32));
-    grbmSelect(adev, 3, 1, 0, 0);
-    u32 last = 0xffffffffu, n = 0;
-    for (u32 i = 0; i < reads; i++) {
-        const u32 pc = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR);
-        if (pc == last) { if (n) out[(n - 1) * 2 + 1]++; continue; }
-        if (n >= 16) break;
-        out[n * 2] = pc; out[n * 2 + 1] = 1; n++; last = pc;
-    }
-    grbmSelect(adev, 0, 0, 0, 0);
-}
-
 // amdgpu_ring_test_helper on the KIQ ring (gfx_v11_0_ring_test_ring): SCRATCH_REG0 is set to 0xCAFEDEAD, a WRITE_DATA with write confirm puts 0xDEADBEEF in it
 // through the ring, and the register is read back. Returns the register and the KIQ pipe's program counter afterwards.
 static void mesKiqRingTest(struct rn_device *adev, u64 kiqOff, u64 *kiqWptr, u32 *scratch, u32 *pc) {
@@ -1499,7 +1455,6 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     static_assert(sizeof(union MESAPI_SET_HW_RESOURCES) == 256 && sizeof(union MESAPI__ADD_QUEUE) == 256 &&
                   sizeof(union MESAPI__QUERY_MES_STATUS) == 256, "MES API frames are 64 dwords");
     memset(res, 0, sizeof(*res));
-    gPostWptr = 0;
     res->bootload = RREG32_SOC15(RN_GC, 0, regRLC_RLCS_BOOTLOAD_STATUS);        // gfx_v11_0_wait_for_rlc_autoload_complete wants BOOTLOAD_COMPLETE (bit 31) and CP_STAT 0
     res->rlc_srm = RREG32_SOC15(RN_GC, 0, regRLC_SRM_CNTL);
     res->cp_stat0 = RREG32_SOC15(RN_GC, 0, regCP_STAT);
@@ -1635,35 +1590,6 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     res->step = 3;
     if (maxStep < 4 || !(res->sched_active & 1u)) return;
 
-    if (gMesEarlyMap) {
-        // rednavi_mes_earlymap=1: the KIQ's MAP_QUEUES for a MEC queue with no scheduler involved (it has not been given any frame yet). If the HQD of ME 1
-        // pipe 0 queue 0 comes up here, the KIQ firmware, the MQD and the MEC are fine and what differs is the scheduler's request.
-        gWbHostNow = false;
-        writeComputeMqd(adev, vaBase, qOff, kKcqRingBytes, qOff + 0x2000, qOff + 0x4000, legDb, false, kRingAt);
-        u32 pk[24];
-        memset(pk, 0, sizeof(pk));
-        pk[0] = RN_PACKET3(0xA0u, 6);                                      // SET_RESOURCES as amdgpu_gfx_mes_enable_kcq sends it
-        pk[1] = (0xau << 16);
-        pk[2] = 0xffffffffu; pk[3] = 0xffffffffu;
-        pk[8] = RN_PACKET3(0xA2u, 5);                                      // MAP_QUEUES: one queue, compute engine, ME 1, pipe 0, queue 0
-        pk[9] = 1u << 29;
-        pk[10] = legDb << 2;
-        pk[11] = lower_32_bits(vaBase + qOff + 0x2000); pk[12] = upper_32_bits(vaBase + qOff + 0x2000);
-        pk[13] = lower_32_bits(vaBase + qOff + 0x1008); pk[14] = upper_32_bits(vaBase + qOff + 0x1008);
-        pk[15] = RN_PACKET3(0x10u, 7);                                     // NOP to the 8-dword boundary
-        mesRingSubmit(adev, kiqOff, kKiqRingBytes, 0xff, kKiqNop, kiqOff + 0x1008, kMesKiqDoorbell, &kiqWptr, pk, 15);
-        msleep(50);
-        grbmSelect(adev, 3, 1, 0, 0);
-        res->early[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
-        grbmSelect(adev, 1, 0, 0, 0);
-        res->early[1] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-        res->early[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_BASE);
-        res->early[3] = RREG32_SOC15(RN_GC, 0, regCP_MQD_BASE_ADDR);
-        res->early[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-        res->early[5] = static_cast<u32>(kiqWptr);
-        grbmSelect(adev, 0, 0, 0, 0);
-    }
-
     // Send one API frame to the scheduler followed by QUERY_SCHEDULER_STATUS whose completion fence is the proof that the scheduler got through
     // the first (mes_v11_0_submit_pkt_and_poll_completion). The frame's own completion word is at apiStatusOff.
     u64 schedWptr = 0;
@@ -1708,18 +1634,6 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     // Where the buffer lives is a difference worth keeping switchable: Linux allocates it as a GTT BO in host memory and hands the firmware
     // its GART address, unlike the event log above, which is in VRAM. Two runs with it in VRAM (options word 0, then 3) had the frame
     // completed and the buffer untouched, not even a header (7800 XT, 2026-10-31), so the host buffer is the remaining arrangement to try.
-    const u64 dbgOff = base + 0x94000;
-    const bool dbgHost = gMesDbgHostVa != 0 && gMesDbgHostMem != nullptr;
-    const u64 dbgVa = dbgHost ? gMesDbgHostVa : vaBase + dbgOff;
-    auto dumpMesDbg = [&]() {
-        if (!gMesDbgExt) return;
-        if (dbgHost) {                                     // the first 2 KB, out of the host mapping instead of VRAM
-            const volatile u32 *p = static_cast<const volatile u32 *>(gMesDbgHostMem);
-            for (u32 i = 0; i < 512; i++) gMesDbg[i >> 8][i & 0xff] = p[i];
-            return;
-        }
-        for (u32 i = 0; i < 512; i++) gMesDbg[i >> 8][i & 0xff] = rn_vram_rd32(adev, dbgOff + i * 4);
-    };
 
     // step 4: SET_HW_RESOURCES
     if (progress) progress(ctx, 4);
@@ -1775,35 +1689,8 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         res->hw_res1_status = res->api_status;
     }
 
-    // 4b: arm the log here, as Linux does at the end of mes_v11_0_hw_init: after both resource frames, before the first queue frame, so the
-    // records of the ADD_QUEUE attempt are in it. The options word is not what the v11 header suggests: MES_DBGEXT_INIT_DATA defines only
-    // bit 0 (one host interrupt per record), yet Linux never sends 0. amdgpu_mes_dbgext_start translates its own options into the layout the
-    // firmware reads, where bit 1 enables logging and bit 0 is host_poll_msg with the sense inverted, and passes 0x3 when it polls, 0x2 when
-    // it takes interrupts. 0x3 is what is sent here: nothing in RedNavi services the MES host interrupt, and reading the buffer afterwards is
-    // the poll. Note that the VRAM runs of 2026-10-31 already sent 0x3 and still had the buffer untouched.
-    if (gMesDbgExt) {
-        if (dbgHost) {
-            volatile u32 *p = static_cast<volatile u32 *>(gMesDbgHostMem);
-            for (u32 i = 0; i < kMesDbgBytes / 4; i++) p[i] = 0;
-            p[0] = kMesDbgBytes;                           // the size in the first dword, as amdgpu_mes_dbgext_start seeds it
-        } else {
-            for (u32 o = 0; o < kMesDbgBytes; o += 4) rn_vram_wr32(adev, dbgOff + o, 0);
-            rn_vram_wr32(adev, dbgOff, kMesDbgBytes);
-        }
-        union MESAPI__MISC m;
-        memset(&m, 0, sizeof(m));
-        m.header.type = MES_API_TYPE_SCHEDULER;
-        m.header.opcode = MES_SCH_API_MISC;
-        m.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
-        m.opcode = MESAPI_MISC__SETUP_MES_DBGEXT;
-        m.dbgext_init_data.dbg_ext_mc_addr = dbgVa;
-        m.dbgext_init_data.u64_all = 3;
-        res->dbg_ok = sendFrame(&m, offsetof(union MESAPI__MISC, api_status) / 4);
-        res->dbg_status = res->api_status;
-    }
     mesPcSample(adev, 0, &res->p0_pc, &res->p0_pc10);
     res->step = 4;
-    dumpMesDbg();                                          // the records of the setup, even when the run stops at this step
     if (!res->hw_res_ok) {                                  // the scheduler did not answer SET_HW_RESOURCES: what it saw (HQD pointers, the ring head, the fence words)
         grbmSelect(adev, 3, 0, 0, 0);
         res->sched_rptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
@@ -1831,12 +1718,8 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
             if (RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE) & 1u) res->hqd_active |= 1u << (pipe * 8 + q);
         }
     grbmSelect(adev, 0, 0, 0, 0);
-    for (u32 pipe = 0; pipe < 4; pipe++) { grbmSelect(adev, 1, pipe, 0, 0); res->mec_pc[pipe] = RREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_INSTR_PNTR); }
-    grbmSelect(adev, 0, 0, 0, 0);
     gMappedDoorbell = legDb;
-    gWbHostNow = true;
     writeComputeMqd(adev, vaBase, qOff, kKcqRingBytes, qOff + 0x2000, qOff + 0x4000, legDb, false, kRingAt);
-    gWbHostNow = false;
     {
         // amdgpu_gfx_mes_enable_kcq: SET_RESOURCES on the KIQ ring with every queue in the mask comes before the legacy queue is mapped
         // Dwords 4 and 5 are the cleaner shader's MC address >> 8. Linux 7.0 enables the cleaner shader on GC 11.0.3 with these firmware versions
@@ -1860,7 +1743,6 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[2], &res->ktest[3]);   // and after SET_RESOURCES, as amdgpu_gfx_mes_enable_kcq does
         grbmSelect(adev, 3, 1, 0, 0);
         res->kiq_rptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);       // 0x10 once both the MAP_QUEUES and the SET_RESOURCES are consumed
-        for (u32 i = 0; i < 2; i++) { res->kiq_pc_pre[i] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR); udelay(47); }   // the KIQ pipe idle, SET_RESOURCES consumed
         grbmSelect(adev, 0, 0, 0, 0);
     }
     // The MQD must be 4 KB aligned and a full struct v11_compute_mqd (512 dwords, written and zeroed by writeComputeMqd above).
@@ -1925,88 +1807,12 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
         p.queue_id = qQueue;
         p.doorbell_offset = legDb;
         p.mqd_addr = vaBase + qOff + 0x2000;
-        p.wptr_addr = (gMesHostWbVa != 0 && gMesHostWbMem != nullptr) ? gMesHostWbVa + 8 : vaBase + qOff + 0x1008;
+        p.wptr_addr = vaBase + qOff + 0x1008;
         p.queue_type = MES_QUEUE_TYPE_COMPUTE;
         p.map_legacy_kq = 1;
         rn_gc_safe_mode(adev, 1);
         res->add_ok = sendFrame(&p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4);
         rn_gc_safe_mode(adev, 0);
-    }
-    if (gMesPostMap && res->add_ok && maxStep < 7 && gMesHostRingVa == 0) {      // legacy queue only: the process path uses another doorbell, a VM and an HQD the MES picks
-        // rednavi_mes_post=1: the first thing done with the queue the MES has just mapped, before anything else touches it: a WRITE_DATA to VRAM through its
-        // ring and the doorbell, then the doorbell control register at growing delays. The hand-programmed queues died at their first doorbell with the enable
-        // bit cleared; this shows whether a queue the MES mapped does the same, and when.
-        const u64 target = sharedOff + 0x6000;
-        // Full state of the mapped queue at three moments (after the map, after the first doorbell, after the second): HQD registers, the memory words, the MEC pipe.
-        auto snap = [&](u32 idx) {
-            grbmSelect(adev, 1, 0, 0, 0);
-            u32 *o = res->snap[idx];
-            o[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-            o[1] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
-            o[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
-            o[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-            o[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PERSISTENT_STATE);
-            o[5] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_CONTROL);
-            o[6] = RREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_INSTR_PNTR);
-            grbmSelect(adev, 0, 0, 0, 0);
-            o[7] = rn_vram_rd32(adev, qOff + 0x1000);        // rptr word in memory
-            o[8] = rn_vram_rd32(adev, qOff + 0x1008);        // wptr word in memory
-            o[9] = rn_vram_rd32(adev, qOff + 0x2000 + 142 * 4);   // MQD dword 142: wptr poll address high, as the MES left it
-        };
-        snap(0);
-        rn_vram_wr32(adev, target, 0xCAFEDEADu);
-        u32 pk[16];
-        memset(pk, 0, sizeof(pk));
-        pk[0] = RN_PACKET3(0x37u, 3);                                      // WRITE_DATA, memory destination, write confirm
-        pk[1] = (1u << 20) | (5u << 8);
-        pk[2] = lower_32_bits(vaBase + target); pk[3] = upper_32_bits(vaBase + target);
-        pk[4] = 0x600DC0DEu;
-        pk[5] = RN_PACKET3(0x10u, 9);                                      // NOP to 16 dwords
-        gPostWptr = 16;                                                       // the first packet below leaves the write pointer at 16
-        for (u32 i = 0; i < 16; i++) rn_vram_wr32(adev, qOff + kRingAt + i * 4, pk[i]);
-        rn_vram_wr32(adev, qOff + 0x1008, 16); rn_vram_wr32(adev, qOff + 0x100c, 0);
-        grbmSelect(adev, 1, 0, 0, 0);
-        res->post[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);                  // before the doorbell
-        grbmSelect(adev, 0, 0, 0, 0);
-        *reinterpret_cast<volatile u64 *>(gDoorbellBase + legDb * 4) = 16;
-        for (int i = 0; i < 200 && rn_vram_rd32(adev, target) != 0x600DC0DEu; i++) msleep(1);
-        res->post[1] = rn_vram_rd32(adev, target);                                              // 0x600DC0DE if the queue ran it
-        snap(1);
-        grbmSelect(adev, 1, 0, 0, 0);
-        res->post[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-        res->post[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
-        res->post[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-        grbmSelect(adev, 0, 0, 0, 0);
-        // More doorbells through the same queue at growing delays after the first one: packet n goes at ring dword 16 * n, its own result word, the doorbell
-        // control is read after each. The first doorbell works; this shows after how long the next one stops being run (the enable bit gets cleared).
-        static const u32 delays[] = {100, 400, 1500, 4000, 9000};                     // ms of idle before each doorbell, from the previous one (so 0.1, 0.5, 2, 6, 15 s after the first)
-        u32 wptrNow = 16;
-        for (u32 n = 0; n < 5; n++) {
-            msleep(delays[n]);
-            const u64 tgt = sharedOff + 0x6004 + n * 4;
-            rn_vram_wr32(adev, tgt, 0xCAFEDEADu);
-            u32 q2[16];
-            memcpy(q2, pk, sizeof(q2));
-            q2[2] = lower_32_bits(vaBase + tgt); q2[3] = upper_32_bits(vaBase + tgt);
-            for (u32 k = 0; k < 16; k++) rn_vram_wr32(adev, qOff + kRingAt + (wptrNow + k) * 4, q2[k]);
-            wptrNow += 16;
-            gPostWptr = wptrNow;
-            rn_vram_wr32(adev, qOff + 0x1008, wptrNow); rn_vram_wr32(adev, qOff + 0x100c, 0);
-            *reinterpret_cast<volatile u64 *>(gDoorbellBase + legDb * 4) = wptrNow;
-            for (int w = 0; w < 200 && rn_vram_rd32(adev, tgt) != 0x600DC0DEu; w++) msleep(1);
-            res->post2[n] = rn_vram_rd32(adev, tgt);                                  // 0x600DC0DE: the packet ran
-            if (n == 0) snap(2);
-            grbmSelect(adev, 1, 0, 0, 0);
-            res->post3[n] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-            grbmSelect(adev, 0, 0, 0, 0);
-        }
-        static const u32 waits[] = {50, 450, 1500, 3000, 5000};                                 // ms, so sampled at 0.05, 0.5, 2, 5, 10 s after the doorbell
-        for (u32 w = 0; w < 5; w++) {
-            msleep(waits[w]);
-            grbmSelect(adev, 1, 0, 0, 0);
-            res->post[5 + w] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-            grbmSelect(adev, 0, 0, 0, 0);
-        }
     }
     // The process path lets the MES pick the hardware queue itself (from the mask 0xf0): look for the HQD that carries our doorbell.
     u32 foundPipe = qPipe, foundQueue = qQueue;
@@ -2024,54 +1830,7 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     res->fault_status = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_STATUS);
     res->fault_addr[0] = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32);   // the address that faulted, with the status above
     res->fault_addr[1] = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32);
-    msleep(1000);
     res->ring_fence_late = rn_vram_rd32(adev, ringFenceOff);
-    // The MES KIQ queue (ME 3 pipe 1 queue 0) after the failed map: did the scheduler hand it anything? Its HQD pointers and the ring after our own packets.
-    grbmSelect(adev, 3, 1, 0, 0);
-    res->kiq_end[0] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
-    res->kiq_end[1] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
-    res->kiq_end[2] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-    res->kiq_end[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-    grbmSelect(adev, 0, 0, 0, 0);
-    grbmSelect(adev, 1, 0, 0, 0);                                      // the target of the scheduler's MAP_QUEUES: ME 1 pipe 0 queue 0
-    res->kiq_end[4] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-    res->kiq_end[5] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_BASE);
-    res->kiq_end[6] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_CONTROL);
-    res->kiq_end[7] = RREG32_SOC15(RN_GC, 0, regCP_MQD_BASE_ADDR);
-    res->kiq_end[8] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_DOORBELL_CONTROL);
-    res->kiq_end[9] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PERSISTENT_STATE);
-    res->kiq_end[10] = RREG32_SOC15(RN_GC, 0, regCP_HQD_VMID);
-    res->kiq_end[11] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
-    grbmSelect(adev, 0, 0, 0, 0);
-    for (u32 k = 0; k < 3; k++) {                                       // MEC pipes' program counters after the map, three samples apart
-        for (u32 pipe = 0; pipe < 4; pipe++) { grbmSelect(adev, 1, pipe, 0, 0); res->mec_pc[4 + k * 4 + pipe] = RREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_INSTR_PNTR); }
-        udelay(100);
-    }
-    grbmSelect(adev, 0, 0, 0, 0);
-    for (u32 i = 0; i < 96; i++) gMesKiqRing[i] = rn_vram_rd32(adev, kiqOff + kRingAt + i * 4);   // everything on the KIQ ring: our packets and what the scheduler appended
-    if (!res->add_ok) { kiqWptr = res->kiq_end[0]; mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[4], &res->ktest[5]); }   // and after the stuck map: does the KIQ still run packets?
-    if (gMesSelfMap && !res->add_ok) {
-        // rednavi_mes_selfmap=1: send the MAP_QUEUES the scheduler put on the KIQ ring ourselves (same packet: ME 1 pipe 0 queue 0, our MQD), after the scheduler
-        // is stuck. If the KIQ firmware programs the HQD for our packet, the KIQ and the MQD are fine and the scheduler's own request is what fails.
-        kiqWptr = res->kiq_end[0];
-        u32 pk[16];
-        memset(pk, 0, sizeof(pk));
-        pk[0] = RN_PACKET3(0xA2u, 5);
-        pk[1] = 1u << 29;                                                  // one queue, compute engine, ME 1, pipe 0, queue 0
-        pk[2] = legDb << 2;
-        pk[3] = lower_32_bits(vaBase + qOff + 0x2000); pk[4] = upper_32_bits(vaBase + qOff + 0x2000);
-        pk[5] = lower_32_bits(vaBase + qOff + 0x1008); pk[6] = upper_32_bits(vaBase + qOff + 0x1008);
-        pk[7] = RN_PACKET3(0x10u, 7);                                      // NOP to the 16-dword boundary
-        mesRingSubmit(adev, kiqOff, kKiqRingBytes, 0xff, kKiqNop, kiqOff + 0x1008, kMesKiqDoorbell, &kiqWptr, pk, 7);
-        msleep(50);
-        grbmSelect(adev, 3, 1, 0, 0);
-        res->kiq_end[12] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
-        grbmSelect(adev, 1, 0, 0, 0);
-        res->kiq_end[13] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
-        res->kiq_end[14] = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_BASE);
-        res->kiq_end[15] = RREG32_SOC15(RN_GC, 0, regCP_MQD_BASE_ADDR);
-        grbmSelect(adev, 0, 0, 0, 0);
-    }   // dwords 16..19: after the SET_RESOURCES and MAP_QUEUES packets
     res->rlc_sched = RREG32_SOC15(RN_GC, 0, regRLC_CP_SCHEDULERS);              // again, after the KIQ setting: Linux 0x000030e8
     res->cp_me_cntl = RREG32_SOC15(RN_GC, 0, regCP_ME_CNTL);
     res->api_status = rn_vram_rd32(adev, apiStatusOff);
@@ -2083,46 +1842,10 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     res->sched_rptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_RPTR);
     res->sched_wptr = RREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO);
     grbmSelect(adev, 3, 1, 0, 0);
-    for (u32 i = 0; i < 4; i++) { res->kiq_pc_end[i] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR); udelay(53 * (i + 1)); }   // the KIQ pipe's own program counter after the failed map
-    for (u32 pipe = 0; pipe < 2; pipe++) {                              // the per-pipe MES registers of both pipes, for the same read on Linux (tools/linux_pipe_pcs.py)
-        grbmSelect(adev, 3, pipe, 0, 0);
-        for (u32 i = 0; i < 32; i++) gMesPipeRegs[pipe][i] = rn_rreg32(adev, kMesPipeRegDw[i]);
-    }
-    grbmSelect(adev, 3, 1, 0, 0);
     res->kiq_version = RREG32_SOC15(RN_GC, 0, regCP_MES_GP3_LO);
     grbmSelect(adev, 0, 0, 0, 0);
-    res->mes_db[0] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL1);
-    res->mes_db[1] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL2);
-    res->mes_db[2] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL3);
-    res->mes_db[3] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL4);
-    res->mes_db[4] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL5);
-    res->mes_db[5] = RREG32_SOC15(RN_GC, 0, regCP_MES_DOORBELL_CONTROL6);
-    for (u32 i = 0; i < 16; i++) { res->log_hist[i] = rn_vram_rd32(adev, logOff + i * 4); res->log_scratch[i] = rn_vram_rd32(adev, logOff + 0x4000 + i * 4); }
-    // what the hung scheduler leaves behind: a series of instruction pointers, the queue's MQD and write-back words, the cleaner shader fence
-    grbmSelect(adev, 3, 0, 0, 0);
-    for (u32 i = 0; i < 8; i++) { res->log_hist[i] = RREG32_SOC15(RN_GC, 0, regCP_MES_INSTR_PNTR); udelay(37 * (i + 1)); }
-    grbmSelect(adev, 0, 0, 0, 0);
-    res->log_hist[8] = rn_vram_rd32(adev, qOff + 0x2000);
-    res->log_hist[9] = rn_vram_rd32(adev, qOff + 0x2000 + 130 * 4);
-    res->log_hist[10] = rn_vram_rd32(adev, qOff + 0x2000 + 143 * 4);
-    res->log_hist[11] = rn_vram_rd32(adev, sharedOff + 0x200);
-    res->log_hist[12] = rn_vram_rd32(adev, qOff + 0x1008);
-    res->log_hist[13] = rn_vram_rd32(adev, qOff + 0x1000);
-    res->log_hist[14] = rn_vram_rd32(adev, apiStatusOff);
-    res->log_hist[15] = rn_rreg32(adev, adev->reg_offset[RN_GC_HWIP][0][0] + 0xda4);   // GRBM_STATUS
-    // Two windows of the MES event log (the same file Linux shows in debugfs amdgpu_mes_event_log, where the first records sit at 0x900 and the API
-    // timeline at 0x1300 and up, 7 dwords each: opcode, start time (64 bit), end time (64 bit), 0, 1). The CP_MES_DM_INDEX registers read 0xffffffff, so this
-    // is the way to see what the firmware wrote for our frames.
-    if (gMesDmDump) {
-        for (u32 i = 0; i < 512; i++) gMesMqd[i] = rn_vram_rd32(adev, qOff + 0x2000 + i * 4);   // the legacy queue's MQD as the MES saw it, for the diff with Linux's
-        for (u32 i = 0; i < 256; i++) {
-            gMesDm[0][i] = rn_vram_rd32(adev, logOff + 0x900 + i * 4);
-            gMesDm[1][i] = rn_vram_rd32(adev, logOff + 0x1300 + i * 4);
-        }
-    }
-    dumpMesDbg();   // again after the queue frames: the records the ADD_QUEUE path wrote while it was stuck
     res->step = 5;
-    if ((res->q_active & 1u) || res->add_ok) { gMapped = true; gMappedWptr = gPostWptr; gMappedRingAt = kRingAt; gMappedRingBytes = kKcqRingBytes; gMappedPipe = foundPipe; gMappedQueue = foundQueue; }   // later rn_compute_submit_ib calls use this queue
+    if ((res->q_active & 1u) || res->add_ok) { gMapped = true; gMappedWptr = 0; gMappedRingAt = kRingAt; gMappedRingBytes = kKcqRingBytes; gMappedPipe = foundPipe; gMappedQueue = foundQueue; }   // later rn_compute_submit_ib calls use this queue
 }
 
 void rn_kiq_map_compute(struct rn_device *adev, u64 vaBase, u64 kiqOff, u64 queueOff, u32 maxStep, void (*progress)(void *, u32),

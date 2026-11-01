@@ -164,29 +164,11 @@ void rn_compute_diag(struct rn_device *adev, u32 out[11]);   // out[8..10]: SDMA
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]);
 void rn_mes_state(struct rn_device *adev, u32 out[15]);
 void rn_gfx_constants_init(struct rn_device *adev);   // gfx_v11_0_hw_init steps between the memory hub and the CP resume (golden TCP_CNTL, read timeout, SH_MEM per VMID, doorbell ranges)
-extern u32 gMesDm[2][256];   // MES event log windows at +0x900 and +0x1300 (1 KB each), read after the last frame; not in rn_mes_result, the kernel stack is 16 KB
-extern u32 gMesMqd[512];   // the legacy queue's MQD read back after the last frame (rednavi_mes_dm=1)
-extern u64 gMesHostWbVa;            // rednavi_mes_hostwb=1: the legacy queue's rptr/wptr words in host memory (GART address) instead of VRAM
-extern volatile u32 *gMesHostWbMem;
-extern u64 gMesHostRingVa;          // rednavi_mes_hostring=1: the legacy queue's ring (8 KB) in host memory, with the write-back words
-extern volatile u32 *gMesHostRingMem;
-extern u32 gMesKiqRing[96];   // the first 96 dwords of the MES KIQ ring after the failed map
 extern bool gMesCleaner;      // rednavi_mes_cleaner=1: a cleaner shader (one s_endpgm) and its address in the KIQ SET_RESOURCES, as gfx11_kiq_set_resources sends it
 extern bool gMesHwResLinux;   // rednavi_mes_hwres=1: SET_HW_RESOURCES with Linux's gds_size 0x1000, oversubscription_timer 50 and disable_mes_log 1
-extern bool gMesEarlyMap;  // rednavi_mes_earlymap=1: a MAP_QUEUES for the MEC queue on the KIQ ring before the scheduler gets any frame
-extern bool gMesPostMap;   // rednavi_mes_post=1: run one WRITE_DATA through the MES-mapped queue right after the map and watch its doorbell control
-extern bool gMesSelfMap;   // rednavi_mes_selfmap=1: after the stuck map, put the scheduler's MAP_QUEUES on the KIQ ring ourselves
-extern u32 gMesPipeRegs[2][32];   // per-pipe MES registers, order in kMesPipeRegDw (gfx11.cpp)
-extern const u32 kMesPipeRegDw[32];
-extern u32 gKiqTrace[3][32];   // KIQ pc runs {pc, repeats}: before the first packet, while it is processed, after
-extern u64 gMesHostLogBase;       // rednavi_mes_host=1: logical offset of the host buffer (GART address minus the VRAM MC base), its CPU mapping and size
+extern u64 gMesHostLogBase;       // the MES working area in host memory (the default; rednavi_mes_host=0 for VRAM): logical offset of the host buffer (GART address minus the VRAM MC base), its CPU mapping and size
 extern volatile u8 *gMesHostMem;
 extern u64 gMesHostSize;
-extern bool gMesDmDump;   // rednavi_mes_dm=1: read the two event log windows after the last frame
-extern u32 gMesDbg[2][256];   // MES firmware log (mes_dbgext): the first 2 KB of the buffer, dwords 0..3 are the header the firmware leaves
-extern bool gMesDbgExt;   // rednavi_mes_dbgext=1 (host buffer, as Linux) or 2 (the VRAM area): hand the scheduler a log buffer after the resource frames and dump what it wrote
-extern u64 gMesDbgHostVa;     // the log buffer's GART address when it lives in host memory; 0 means the VRAM area at base + 0x50000
-extern void *gMesDbgHostMem;  // its CPU mapping, for the seed and the dump
 void rn_hdp_flush(struct rn_device *adev);   // soc21_flush_hdp: write 0 to HDP_MEM_COHERENCY_FLUSH_CNTL and read it back
 void rn_mec_enable(struct rn_device *adev);   // MEC pipes out of reset and running, no queue
 void rn_mes_doorbell_regs(struct rn_device *adev, u32 out[12]);   // CP_MES_DOORBELL_CONTROL1..6 per MES pipe
@@ -200,30 +182,18 @@ struct rn_mes_result {
     u32 ring_fence, api_status;                    // QUERY_SCHEDULER_STATUS fence and the last frame's completion word
     int hw_res_ok, add_ok;
     u32 hw_res1_status;
-    int dbg_ok; u32 dbg_status;                    // SETUP_MES_DBGEXT frame and its completion word (opt-in, rednavi_mes_dbgext=1)
-    u32 early[6];                                  // rednavi_mes_earlymap=1: KIQ rptr, then the target HQD's ACTIVE, PQ_BASE, MQD_BASE, DOORBELL_CONTROL, and our KIQ wptr
-    u32 post[10];                                  // rednavi_mes_post=1: db control before the doorbell, the target word, db control/rptr/active after, db control at 0.05/0.5/2/5/10 s
     u32 init_state[10];                            // at the start of rn_mes_start: CP_MES_CNTL, RLC_CP_SCHEDULERS, pc pipe 0/1, HQD ACTIVE me3 pipe 0/1, doorbell control me3 pipe 0/1, MEC active queue mask, bootload status
-    u32 snap[3][10];                               // queue state after the map, after the first doorbell, after the second: db ctl, rptr, wptr, active, persistent state, pq control, MEC pc, rptr word, wptr word, MQD dw 142
     u32 fault_addr[2];                             // GCVM_L2_PROTECTION_FAULT_ADDR_LO32/HI32 (4 KB page number) at the end of the MES bring-up
     u32 ring_head[8];                              // when SET_HW_RESOURCES got no answer: scheduler ring dwords 0..3, rptr word, wptr word, ring fence, api status
     u32 sched_hqd[10];                             // the scheduler's HQD after the KIQ mapped it: PQ_BASE lo/hi, MQD_BASE, PQ_CONTROL, DOORBELL_CONTROL, RPTR, WPTR_LO, ACTIVE, RPTR_REPORT_ADDR, WPTR_POLL_ADDR
-    u32 post3[5];                                  // doorbell control after each of the five later doorbells
-    u32 post2[5];                                  // result word of each of the five later packets (0x600DC0DE: ran), after 0.1, 0.5, 2, 6 and 15 s from the first doorbell
     u32 ktest[6];                                  // KIQ ring test (WRITE_DATA to SCRATCH_REG0, 0xDEADBEEF expected) and the KIQ pc after it: after the scheduler queue map, after SET_RESOURCES, after the stuck map
-    u32 kiq_pc_pre[2];                             // the same pointer after SET_RESOURCES, before ADD_QUEUE (the KIQ pipe idle)
-    u32 kiq_pc_end[4];                             // CP_MES_INSTR_PNTR of the KIQ pipe (ME 3 pipe 1), four samples after the failed map
-    u32 mec_pc[16];                                // CP_MEC_RS64_INSTR_PNTR of MEC pipes 0..3: [0..3] before the map, [4..15] three samples after it
-    u32 kiq_end[16];                                // KIQ HQD wptr, rptr, doorbell control, active and ring dwords 16..19 after the failed map
     u32 parity[2];                                 // [0] cleaner shader address sent in the KIQ SET_RESOURCES (>> 8, low half), [1] bit 0 rednavi_mes_cleaner, bit 1 rednavi_mes_hwres
     u32 hqd_active;                                // MEC queues with CP_HQD_ACTIVE set before the legacy map, bit pipe * 8 + queue
     u32 cp_me_cntl, mec_cntl, rlc_sched;           // CP_ME_CNTL, CP_MEC_RS64_CNTL, RLC_CP_SCHEDULERS before the MES start
     u32 bootload, rlc_srm, cp_stat0;               // RLC_RLCS_BOOTLOAD_STATUS, RLC_SRM_CNTL and CP_STAT before the MES start
     u32 fw_ver0, fw_ver1;                         // CP_MES_GP3_LO of each pipe right after the start: the version of the image that runs
-    u32 mes_db[6];                                // CP_MES_DOORBELL_CONTROL1..6 after the queue was added
     int sched_cfg_ok;
     u32 q_pipe, q_queue;                          // the hardware queue the MES gave ours
-    u32 log_hist[16], log_scratch[16];            // first dwords of the two halves of the MES event log
     u32 q_active, q_doorbell_ctl, fault_status;    // the legacy compute queue mapped by ADD_QUEUE
     u32 sched_version, kiq_version, sched_rptr, sched_wptr, mepc, mcause, ring_fence_late, p0_pc_end;   // diagnostics after the last stage
 };

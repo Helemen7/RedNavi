@@ -295,6 +295,7 @@ private:
     uint32_t resubLog[3][7] {};
     uint32_t resubCount {0};
     void mqdSnapshot(const char *property);
+    void publishMes(const struct rn_mes_result &mr);
     void watchStep();
     IOInterruptEventSource *msiSrc {nullptr};      // the message-signalled interrupt of the GPU (rednavi_msi_test)
     volatile uint32_t msiCount {0};
@@ -1856,6 +1857,37 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
     return idx;
 }
 
+// The MES bring-up result as ioreg properties (ioreg -rn RedNaviProbe -l -x). Out of line so that its name tables do not sit in sdmaTest's frame.
+__attribute__((noinline)) void RedNaviProbe::publishMes(const struct rn_mes_result &mr) {
+    static const char *const sn[] = {"step", "cntl", "p0_pc", "p1_pc", "kiq_active", "kiq_doorbell_ctl", "kiq_rptr", "sched_active", "ring_fence", "api_status", "hw_res_ok",
+                                     "add_ok", "q_active", "q_doorbell_ctl", "fault_status", "sched_version", "kiq_version", "sched_rptr", "sched_wptr", "mepc", "mcause",
+                                     "ring_fence_late", "p0_pc_end", "q_pipe", "q_queue"};
+    const uint32_t sv[] = {mr.step, mr.cntl, mr.p0_pc, mr.p1_pc, mr.kiq_active, mr.kiq_doorbell_ctl, mr.kiq_rptr, mr.sched_active, mr.ring_fence, mr.api_status,
+                           static_cast<uint32_t>(mr.hw_res_ok), static_cast<uint32_t>(mr.add_ok), mr.q_active, mr.q_doorbell_ctl, mr.fault_status, mr.sched_version,
+                           mr.kiq_version, mr.sched_rptr, mr.sched_wptr, mr.mepc, mr.mcause, mr.ring_fence_late, mr.p0_pc_end, mr.q_pipe, mr.q_queue};
+    rnPublish(this, "mes-start", sn, sv, sizeof(sv) / sizeof(sv[0]));
+    static const char *const vn[] = {"sched", "kiq", "bootload", "rlc_srm", "cp_stat", "cp_me_cntl", "mec_cntl", "rlc_sched", "hqd_active"};
+    const uint32_t vv[] = {mr.fw_ver0, mr.fw_ver1, mr.bootload, mr.rlc_srm, mr.cp_stat0, mr.cp_me_cntl, mr.mec_cntl, mr.rlc_sched, mr.hqd_active};
+    rnPublish(this, "mes-fw-version", vn, vv, sizeof(vv) / sizeof(vv[0]));
+    static const char *const isn[] = {"cntl", "rlc_sched", "pc0", "pc1", "act0", "act1", "db0", "db1", "mec_active", "bootload"};
+    rnPublish(this, "mes-init", isn, mr.init_state, 10);
+    static const char *const hn[] = {"pqb", "pqb_hi", "mqdb", "pqc", "dbc", "rptr", "wptr", "act", "rptr_rep", "wptr_poll"};
+    rnPublish(this, "mes-sched-hqd", hn, mr.sched_hqd, 10);
+    static const char *const fn[] = {"lo32", "hi32"};
+    rnPublish(this, "mes-fault-addr", fn, mr.fault_addr, 2);
+    static const char *const rn[] = {"d0", "d1", "d2", "d3", "rptr_w", "wptr_w", "fence", "api"};
+    rnPublish(this, "mes-ring-head", rn, mr.ring_head, 8);
+    static const char *const ktn[] = {"a_scratch", "a_pc", "b_scratch", "b_pc", "c_scratch", "c_pc"};
+    rnPublish(this, "mes-kiq-test", ktn, mr.ktest, 6);
+    static const char *const pn[] = {"cleaner", "flags"};
+    rnPublish(this, "mes-parity", pn, mr.parity, 2);
+    static const char *const bn[] = {"gc0", "gc1", "gc2", "gc3", "mmhub0", "mmhub1", "mmhub2", "oss0", "oss1"};
+    const uint32_t bv[] = {gpu.reg_offset[RN_GC_HWIP][0][0], gpu.reg_offset[RN_GC_HWIP][0][1], gpu.reg_offset[RN_GC_HWIP][0][2], gpu.reg_offset[RN_GC_HWIP][0][3],
+                           gpu.reg_offset[RN_MMHUB_HWIP][0][0], gpu.reg_offset[RN_MMHUB_HWIP][0][1], gpu.reg_offset[RN_MMHUB_HWIP][0][2],
+                           gpu.reg_offset[RN_OSSSYS_HWIP][0][0], gpu.reg_offset[RN_OSSSYS_HWIP][0][1]};
+    rnPublish(this, "mes-bases", bn, bv, 9);   // the register bases SET_HW_RESOURCES gave the MES
+}
+
 // The memory image of the compute queue (MQD at VRAM 0x0C022000): the dwords the firmware may save and restore the queue state through.
 void RedNaviProbe::mqdSnapshot(const char *property) {
     static const uint32_t dw[12] = {130, 132, 136, 137, 138, 139, 143, 145, 162, 167, 182, 183};
@@ -2075,7 +2107,7 @@ void RedNaviProbe::sdmaTest() {
         rnPublish(this, "vram-persist", pn, pt, 8);
     }
     IOLog("RedNavi: SDMA test: GFXHUB enabled, starting SDMA0\n");
-    struct rn_sdma_result res;
+    static struct rn_sdma_result res;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
     rn_sdma0_test(&gpu, kRNVramMcBase, 0x0C000000, 4096, 0x0C002000, &res);   // MC addresses, through the system aperture
     trace[5] = rd(0x1295 * 4);
     {   // Did the write land somewhere else (fault default pages, an offset by the FB base)? Look for it in the whole work area.
@@ -2112,7 +2144,7 @@ void RedNaviProbe::sdmaTest() {
             2u, lower_32_bits(kGartVa), upper_32_bits(kGartVa), 0u, 0x11223344u,                       // WRITE_LINEAR one dword to host[0]
             1u, 3u, 0u, lower_32_bits(kGartVa + 4), upper_32_bits(kGartVa + 4), lower_32_bits(dstMc), upper_32_bits(dstMc),   // COPY_LINEAR 4 bytes host[1] to VRAM
         };
-        struct rn_sdma_run_result sr;
+        static struct rn_sdma_run_result sr;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
         rn_sdma0_run(&gpu, kRNVramMcBase, 0x0C0B0000, 4096, pkt, 12, &sr);
         const char *gn2[12] = {"run_ok", "rptr", "wptr", "host0", "host1", "vram_dst", "fault_status", "fault_addr_lo", "fault_addr_hi", "write_ok", "copy_ok", "rptr_shadow"};
         uint32_t gv2[12] = {static_cast<uint32_t>(sr.ok), sr.rptr, sr.wptr, host[0], host[1], rn_vram_rd32(&gpu, vramDst), sr.fault_status, sr.fault_addr_lo,
@@ -2173,7 +2205,7 @@ void RedNaviProbe::sdmaTest() {
     uint32_t gfx = 0;
     if (PE_parse_boot_argn("rednavi_gfx_test", &gfx, sizeof(gfx)) && gfx == 1) {
         struct rn_cp_start pc = {kRNGcPfpStartLo, kRNGcPfpStartHi, kRNGcMeStartLo, kRNGcMeStartHi, kRNGcMecStartLo, kRNGcMecStartHi};
-        struct rn_gfx_result gr;
+        static struct rn_gfx_result gr;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
         rn_gfx_ring_test(&gpu, kRNVramMcBase, 0x0C010000, 4096, &pc, &gr);
         const char *gn[21] = {"step", "me_cntl_before", "cp_stat_before", "me_cntl", "cp_stat", "rptr", "wptr", "scratch", "rptr_shadow", "ring0", "ok",
                               "me_cntl_imm", "me_cntl_10ms", "rb0_cntl_rd", "rb0_base_rd", "rb0_base_hi_rd", "rb_active_rd", "max_ctx_rd",
@@ -2210,44 +2242,14 @@ void RedNaviProbe::sdmaTest() {
                     IOLog("RedNavi: doorbell test: could not map BAR2\n");
                 }
             }
-            struct rn_compute_result cr;
+            static struct rn_compute_result cr;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
             uint32_t gcAwake = 0;     // rednavi_gc_awake=1: hold the RLC safe mode (the GC cannot enter GFXOFF) for the rest of the session; queues set up by hand
             PE_parse_boot_argn("rednavi_gc_awake", &gcAwake, sizeof(gcAwake));      // are lost when the GC powers down
             if (gcAwake == 1) rn_gc_safe_mode(&gpu, 1);
             uint32_t mesClean = 0;    // rednavi_mes_clean=1: no hand-programmed queue at all, only the MEC running and the doorbells mapped; the MES maps the queue
             PE_parse_boot_argn("rednavi_mes_clean", &mesClean, sizeof(mesClean));
-            { uint32_t dm = 0; gMesDmDump = PE_parse_boot_argn("rednavi_mes_dm", &dm, sizeof(dm)) && dm == 1; }
             { uint32_t v = 0; gMesCleaner = PE_parse_boot_argn("rednavi_mes_cleaner", &v, sizeof(v)) && v == 1; }
             { uint32_t v = 0; gMesHwResLinux = PE_parse_boot_argn("rednavi_mes_hwres", &v, sizeof(v)) && v == 1; }
-            // rednavi_mes_dbgext=1: the firmware log in host memory, a GART BO as Linux allocates it (its "mc address" is the GART window);
-            // =2: the VRAM area at base + 0x50000, the two runs of 2026-10-31 that stayed empty.
-            gMesDbgExt = false; gMesDbgHostVa = 0; gMesDbgHostMem = nullptr;
-            gMesHostWbVa = 0; gMesHostWbMem = nullptr;
-            gMesPostMap = true;   // the post-map test runs whenever the map succeeded (the boot-arg rednavi_mes_post=1 coincided with failed maps 9 times of 9, cause unknown)
-            { uint32_t em = 0; gMesEarlyMap = PE_parse_boot_argn("rednavi_mes_earlymap", &em, sizeof(em)) && em == 1; }
-            { uint32_t sm = 0; gMesSelfMap = PE_parse_boot_argn("rednavi_mes_selfmap", &sm, sizeof(sm)) && sm == 1; }
-            gMesHostRingVa = 0; gMesHostRingMem = nullptr;
-            { uint32_t hw = 0;
-              if (PE_parse_boot_argn("rednavi_mes_hostwb", &hw, sizeof(hw)) && hw == 1) {
-                  const int hb = createHostBo(0x1000);
-                  if (hb >= 0) { gMesHostWbVa = bos[hb].gpuVa; gMesHostWbMem = static_cast<volatile uint32_t *>(bos[hb].md->getBytesNoCopy()); }
-              }
-              if (PE_parse_boot_argn("rednavi_mes_hostring", &hw, sizeof(hw)) && hw == 1) {   // implies the write-back words in host memory
-                  if (!gMesHostWbVa) {
-                      const int wb = createHostBo(0x1000);
-                      if (wb >= 0) { gMesHostWbVa = bos[wb].gpuVa; gMesHostWbMem = static_cast<volatile uint32_t *>(bos[wb].md->getBytesNoCopy()); }
-                  }
-                  const int rb = createHostBo(0x2000);
-                  if (rb >= 0) { gMesHostRingVa = bos[rb].gpuVa; gMesHostRingMem = static_cast<volatile uint32_t *>(bos[rb].md->getBytesNoCopy()); }
-              } }
-            { uint32_t dx = 0;
-              if (PE_parse_boot_argn("rednavi_mes_dbgext", &dx, sizeof(dx)) && (dx == 1 || dx == 2)) {
-                  gMesDbgExt = true;
-                  if (dx == 1) {                                  // 16 KB, the size of the VRAM area it replaces
-                      const int hb = createHostBo(0x4000);
-                      if (hb >= 0) { gMesDbgHostVa = bos[hb].gpuVa; gMesDbgHostMem = bos[hb].md->getBytesNoCopy(); }
-                  }
-              } }
             if (mesClean == 1 || mesClean == 2) {
                 memset(&cr, 0, sizeof(cr));
                 rn_mec_enable(&gpu);
@@ -2271,7 +2273,7 @@ void RedNaviProbe::sdmaTest() {
             // finished by a RELEASE_MEM fence. Written from the Linux headers, not yet run on hardware.
             uint32_t disp = 0;
             if (cr.ok && PE_parse_boot_argn("rednavi_dispatch_test", &disp, sizeof(disp)) && disp == 1) {
-                struct rn_dispatch_result dr;
+                static struct rn_dispatch_result dr;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
                 // Opt-in (rednavi_ih_test=1): an interrupt ring in VRAM, and the fence packet asks the CP for an interrupt.
                 uint32_t ihTest = 0;
                 const bool ih = PE_parse_boot_argn("rednavi_ih_test", &ihTest, sizeof(ihTest)) && ihTest == 1;
@@ -2314,7 +2316,7 @@ void RedNaviProbe::sdmaTest() {
                                    dr.trace[3][0], dr.trace[3][1], dr.trace[4][0], dr.trace[4][1], dr.trace[5][0], dr.trace[5][1], dr.target, dr.target_before};
                 rnPublish(this, "dispatch-test", dn, dv, 25);
                 if (ih) {
-                    struct rn_ih_result ir;
+                    static struct rn_ih_result ir;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
                     rn_ih_read(&gpu, 0x0C040000, 0x0C041000, &ir);
                     const char *in[23] = {"rb_cntl", "wptr_reg", "wptr_shadow", "rptr_reg", "base", "cp_int", "e0", "e1", "e2", "e3", "e4", "e5", "e6", "e7",
                                           "f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7", "ok"};
@@ -2343,15 +2345,12 @@ void RedNaviProbe::sdmaTest() {
             if (PE_parse_boot_argn("rednavi_mes_step", &mesStep, sizeof(mesStep)) && mesStep >= 1) {
                 static struct rn_mes_result mr;      // static: the kernel stack of sdmaTest is nearly full
                 const uint32_t start[4] = {kRNMes0StartLo, kRNMes0StartHi, kRNMes1StartLo, kRNMes1StartHi};
-                // The KIQ pipe lands in one of two states after its first packets (program counter 0x518c as on Linux, or 0x51ad and the map is then dropped), and
-                // which one it is varies from boot to boot for reasons not found. A failed map is retried from the pipe reset, a few times.
-                uint32_t attempts = 0;
-                for (; attempts < 1; attempts++) {
-                    uint64_t mesBase = 0x0C400000;   // VRAM mode: above the SMU tables (0x0C300000) and well clear of the GART page table at 0x0C100000
+                uint64_t mesBase = 0x0C400000;   // VRAM mode: above the SMU tables (0x0C300000) and well clear of the GART page table at 0x0C100000
                 gMesHostMem = nullptr; gMesHostSize = 0; gMesHostLogBase = 0;
-                {   // rednavi_mes_host=1: the MES working memory in host memory behind the GART, as Linux has it (see gfx11.cpp)
-                    uint32_t mh = 0;
-                    if (PE_parse_boot_argn("rednavi_mes_host", &mh, sizeof(mh)) && mh == 1) {
+                {   // The MES working memory lives in host memory behind the GART, as in Linux (see gfx11.cpp); rednavi_mes_host=0 puts it in VRAM instead.
+                    uint32_t mh = 1;
+                    PE_parse_boot_argn("rednavi_mes_host", &mh, sizeof(mh));
+                    if (mh != 0) {
                         const int hb = createHostBo(0xA0000, true);   // write-combined: the CPU's stores go to memory without waiting in a cache line the GPU would have to snoop
                         if (hb >= 0) {
                             gMesHostMem = static_cast<volatile uint8_t *>(bos[hb].md->getBytesNoCopy());
@@ -2371,118 +2370,7 @@ void RedNaviProbe::sdmaTest() {
                                      IOLog("RedNavi: MES step %u\n", step);
                                      IOSleep(100);
                                  }, this, &mr);
-                    if (mr.add_ok || mesStep < 5) { attempts++; break; }
-                }
-                { const char *an[1] = {"attempts"}; uint32_t av[1] = {attempts}; rnPublish(this, "mes-attempts", an, av, 1); }
-                const char *mn[29] = {"step", "cntl", "p0_pc", "p0_pc10", "p1_pc", "p1_pc10", "kiq_active", "kiq_doorbell_ctl", "kiq_rptr", "sched_active",
-                                      "ring_fence", "api_status", "hw_res_ok", "add_ok", "q_active", "q_doorbell_ctl", "fault_status", "sched_version", "kiq_version", "sched_rptr", "sched_wptr", "mepc", "mcause", "ring_fence_late", "p0_pc_end", "q_pipe", "q_queue", "dbg_ok", "dbg_status"};
-                uint32_t mv[29] = {mr.step, mr.cntl, mr.p0_pc, mr.p0_pc10, mr.p1_pc, mr.p1_pc10, mr.kiq_active, mr.kiq_doorbell_ctl, mr.kiq_rptr,
-                                   mr.sched_active, mr.ring_fence, mr.api_status, static_cast<uint32_t>(mr.hw_res_ok), static_cast<uint32_t>(mr.add_ok),
-                                   mr.q_active, mr.q_doorbell_ctl, mr.fault_status,
-                                   mr.sched_version, mr.kiq_version, mr.sched_rptr, mr.sched_wptr, mr.mepc, mr.mcause, mr.ring_fence_late, mr.p0_pc_end, mr.q_pipe, mr.q_queue,
-                                   static_cast<uint32_t>(mr.dbg_ok), mr.dbg_status};
-                rnPublish(this, "mes-start", mn, mv, 29);
-                {
-                    char ln[32][12];
-                    const char *lp[32];
-                    uint32_t lv[32];
-                    for (int i = 0; i < 16; i++) {
-                        snprintf(ln[i], 12, "h%d", i); lp[i] = ln[i]; lv[i] = mr.log_hist[i];
-                        snprintf(ln[16 + i], 12, "s%d", i); lp[16 + i] = ln[16 + i]; lv[16 + i] = mr.log_scratch[i];
-                    }
-                    rnPublish(this, "mes-log", lp, lv, 32);
-                    {
-                        static char dmn[512][8];
-                        static const char *dp[256];   // static: sdmaTest's frame is already about 11 of the 16 KB kernel stack
-                        for (int half = 0; half < 2; half++) {
-                            for (int i = 0; i < 256; i++) { snprintf(dmn[half * 256 + i], 8, "%c%03x", half ? 'h' : 'l', i * 4); dp[i] = dmn[half * 256 + i]; }
-                            rnPublish(this, half ? "mes-evlog-b" : "mes-evlog-a", dp, gMesDm[half], 256);
-                        }
-                        for (int half = 0; half < 2; half++) {
-                            for (int i = 0; i < 256; i++) { snprintf(dmn[half * 256 + i], 8, "q%03x", half * 1024 + i * 4); dp[i] = dmn[half * 256 + i]; }
-                            rnPublish(this, half ? "mes-mqd-b" : "mes-mqd-a", dp, gMesMqd + half * 256, 256);
-                        }
-                        // The MES firmware's own log (rednavi_mes_dbgext=1), same key scheme: decode mes-dbg-lo/hi with
-                        // tools/decode_mes_dbgext.py. Reuses dp/dmn: the kernel stack of this frame is nearly full.
-                        if (gMesDbgExt) {
-                            for (int half = 0; half < 2; half++) {
-                                for (int i = 0; i < 256; i++) { snprintf(dmn[half * 256 + i], 8, "%c%03x", half ? 'h' : 'l', i * 4); dp[i] = dmn[half * 256 + i]; }
-                                rnPublish(this, half ? "mes-dbg-hi" : "mes-dbg-lo", dp, gMesDbg[half], 256);
-                            }
-                            {   // which of the two buffers the firmware was given: 1 host memory (GART), 0 the VRAM area
-                                const char *wn[1] = {"host"};
-                                uint32_t wv[1] = {gMesDbgHostVa != 0};
-                                rnPublish(this, "mes-dbg-where", wn, wv, 1);
-                            }
-                        }
-                    }
-                    {
-                        const char *dn[6] = {"c1", "c2", "c3", "c4", "c5", "c6"};
-                        rnPublish(this, "mes-db", dn, mr.mes_db, 6);
-                        const char *vn[9] = {"sched", "kiq", "bootload", "rlc_srm", "cp_stat", "cp_me_cntl", "mec_cntl", "rlc_sched", "hqd_active"};
-                        uint32_t vv[9] = {mr.fw_ver0, mr.fw_ver1, mr.bootload, mr.rlc_srm, mr.cp_stat0, mr.cp_me_cntl, mr.mec_cntl, mr.rlc_sched, mr.hqd_active};
-                        rnPublish(this, "mes-fw-version", vn, vv, 9);
-                        const char *kn[16] = {"kiq_wptr", "kiq_rptr", "kiq_dbctl", "kiq_active", "t_active", "t_pq_base", "t_pq_ctl", "t_mqd_base", "t_db_ctl", "t_persist", "t_vmid", "t_wptr", "s_kiq_rptr", "s_active", "s_pq_base", "s_mqd_base"};
-                        rnPublish(this, "mes-kiq-end", kn, mr.kiq_end, 16);
-                        const char *mpn[16] = {"pre0", "pre1", "pre2", "pre3", "a0p0", "a0p1", "a0p2", "a0p3", "a1p0", "a1p1", "a1p2", "a1p3", "a2p0", "a2p1", "a2p2", "a2p3"};
-                        rnPublish(this, "mes-mec-pc", mpn, mr.mec_pc, 16);
-                        const char *epn[6] = {"kiq_rptr", "active", "pq_base", "mqd_base", "db_ctl", "kiq_wptr"};
-                        rnPublish(this, "mes-early", epn, mr.early, 6);
-                        {
-                            static const char *pn[32] = {"START","START_HI","INTR_RTN","INTR_RTN_HI","CNTL","MIE","PC","MSCR_HI","MSCR_LO","MSTAT_LO","MSTAT_HI","MEPC","MCAUSE","MBADADDR","MIP","IC_OP","DC_OP","GP0","GP0H","GP1","GP1H","GP2","GP2H","GP3","GP3H","GP4","GP4H","IC_BASE","IC_BASE_HI","IC_CNTL","DC_BASE","DC_BASE_HI"};
-                            rnPublish(this, "mes-pipe0-regs", pn, gMesPipeRegs[0], 32);
-                            rnPublish(this, "mes-pipe1-regs", pn, gMesPipeRegs[1], 32);
-                        }
-                        const char *pon[10] = {"db_before", "target", "db_after", "rptr_after", "active_after", "db_005", "db_05", "db_2", "db_5", "db_10"};
-                        rnPublish(this, "mes-post", pon, mr.post, 10);
-                        {
-                            static char tn[32][6];
-                            static const char *tp[32];
-                            for (int i = 0; i < 32; i++) { snprintf(tn[i], 6, "%c%02d", (i & 1) ? 'n' : 'p', i / 2); tp[i] = tn[i]; }
-                            rnPublish(this, "mes-trace0", tp, gKiqTrace[0], 32);
-                            rnPublish(this, "mes-trace1", tp, gKiqTrace[1], 32);
-                            rnPublish(this, "mes-trace2", tp, gKiqTrace[2], 32);
-                        }
-                        const char *isn[10] = {"cntl", "rlc_sched", "pc0", "pc1", "act0", "act1", "db0", "db1", "mec_active", "bootload"};
-                        rnPublish(this, "mes-init", isn, mr.init_state, 10);
-                        {
-                            static const char *sn[10] = {"db", "rptr", "wptr", "act", "pers", "pqc", "mecpc", "rw", "ww", "dw142"};
-                            rnPublish(this, "mes-snap0", sn, mr.snap[0], 10);
-                            rnPublish(this, "mes-snap1", sn, mr.snap[1], 10);
-                            rnPublish(this, "mes-snap2", sn, mr.snap[2], 10);
-                        }
-                        {
-                            static const char *hn[10] = {"pqb", "pqb_hi", "mqdb", "pqc", "dbc", "rptr", "wptr", "act", "rptr_rep", "wptr_poll"};
-                            rnPublish(this, "mes-sched-hqd", hn, mr.sched_hqd, 10);
-                            static const char *fn[2] = {"lo32", "hi32"};
-                            rnPublish(this, "mes-fault-addr", fn, mr.fault_addr, 2);
-                            static const char *rn[8] = {"d0", "d1", "d2", "d3", "rptr_w", "wptr_w", "fence", "api"};
-                            rnPublish(this, "mes-ring-head", rn, mr.ring_head, 8);
-                        }
-                        const char *p2n[5] = {"t01", "t05", "t2", "t6", "t15"};
-                        rnPublish(this, "mes-post2", p2n, mr.post2, 5);
-                        const char *p3n[5] = {"c01", "c05", "c2", "c6", "c15"};
-                        rnPublish(this, "mes-post3", p3n, mr.post3, 5);
-                        const char *ktn[6] = {"a_scratch", "a_pc", "b_scratch", "b_pc", "c_scratch", "c_pc"};
-                        rnPublish(this, "mes-kiq-test", ktn, mr.ktest, 6);
-                        const char *kpn[6] = {"k0", "k1", "k2", "k3", "idle0", "idle1"};
-                        uint32_t kpv[6] = {mr.kiq_pc_end[0], mr.kiq_pc_end[1], mr.kiq_pc_end[2], mr.kiq_pc_end[3], mr.kiq_pc_pre[0], mr.kiq_pc_pre[1]};
-                        rnPublish(this, "mes-kiq-pc", kpn, kpv, 6);
-                        const char *pn[2] = {"cleaner", "flags"};
-                        rnPublish(this, "mes-parity", pn, mr.parity, 2);
-                        {
-                            static char kn2[96][6];
-                            static const char *kp2[96];
-                            for (int i = 0; i < 96; i++) { snprintf(kn2[i], 6, "r%02x", i); kp2[i] = kn2[i]; }
-                            rnPublish(this, "mes-kiq-ring", kp2, gMesKiqRing, 96);
-                        }
-                        const char *bn[9] = {"gc0", "gc1", "gc2", "gc3", "mmhub0", "mmhub1", "mmhub2", "oss0", "oss1"};
-                        uint32_t bv[9] = {gpu.reg_offset[RN_GC_HWIP][0][0], gpu.reg_offset[RN_GC_HWIP][0][1], gpu.reg_offset[RN_GC_HWIP][0][2], gpu.reg_offset[RN_GC_HWIP][0][3],
-                                          gpu.reg_offset[RN_MMHUB_HWIP][0][0], gpu.reg_offset[RN_MMHUB_HWIP][0][1], gpu.reg_offset[RN_MMHUB_HWIP][0][2],
-                                          gpu.reg_offset[RN_OSSSYS_HWIP][0][0], gpu.reg_offset[RN_OSSSYS_HWIP][0][1]};
-                        rnPublish(this, "mes-bases", bn, bv, 9);   // the register bases SET_HW_RESOURCES gave the MES
-                    }
-                }
+                publishMes(mr);
                 if ((mr.q_active & 1u) || mr.add_ok) computeRingOff = gMesBaseUsed + 0x40000;   // the queue the MES mapped
                 if (mesClean == 1 && ((mr.q_active & 1u) || mr.add_ok)) cr.ok = 1;
                 if (mesClean == 2) {      // the MES is up (step 4): now a hand-programmed queue, to see whether it survives with the MES running
@@ -2493,7 +2381,7 @@ void RedNaviProbe::sdmaTest() {
             // firmware on the next doorbell after the boot-time tests; a queue mapped through the KIQ is the firmware's own.
             uint32_t kiqArg = 0;
             if (cr.ok && PE_parse_boot_argn("rednavi_kiq_test", &kiqArg, sizeof(kiqArg)) && kiqArg == 1) {
-                struct rn_kiq_result kr;
+                static struct rn_kiq_result kr;   // static: sdmaTest runs once, and a 16 KB kernel stack cannot be widened
                 uint32_t kiqStep = 4;
                 PE_parse_boot_argn("rednavi_kiq_step", &kiqStep, sizeof(kiqStep));
                 uint32_t kiqPipe = 3, kiqQueue = 0;
