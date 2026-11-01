@@ -95,6 +95,7 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include "gfx11.h"
 #include "rn_uapi.h"
+#include "splash_1920x1080.h"
 #include "gc_regs.h"
 
 #ifdef RN_HAVE_PSP_FW
@@ -784,11 +785,27 @@ void RedNaviProbe::dpTrain() {
     rnPublish(this, "dp-train", n, v, 9);
 }
 
-// A recognisable 1920x1080 XRGB8888 image: red/green gradient, a checker in blue, a white frame and
+// What the screen shows from the moment the pipe is up until WindowServer draws the desktop: the RedNavi splash (assets/splash_1920x1080.png) in modes it
+// exists for, or with boot-arg rednavi_testpattern=1 the colour test pattern below. A screen that stays on this image is the sign that the boot did not go on.
+//
+// The test pattern is a recognisable XRGB8888 image: red/green gradient, a checker in blue, a white frame and
 // eight colour bars along the bottom, so a wrong pitch, offset or format is obvious on screen.
 void RedNaviProbe::fillScanout() {
     static const uint32_t bars[8] = {0xFFFFFF, 0xFFFF00, 0x00FFFF, 0x00FF00, 0xFF00FF, 0xFF0000, 0x0000FF, 0x000000};
     const uint32_t W = selMode.hactive, H = selMode.vactive;
+    uint32_t testPattern = 0;
+    PE_parse_boot_argn("rednavi_testpattern", &testPattern, sizeof(testPattern));
+    if (testPattern != 1 && W == kSplash1920x1080Width && H == kSplash1920x1080Height) {
+        uint32_t x = 0, y = 0;
+        for (uint32_t r = 0; r < kSplash1920x1080Runs; r++) {
+            const uint32_t v = kSplash1920x1080Colour[r];
+            for (uint32_t n = kSplash1920x1080Length[r]; n; n--) {
+                vramWrite(kRNScanoutVramOff + (static_cast<uint64_t>(y) * selPitch + x) * 4, v);
+                if (++x == W) { x = 0; y++; if ((y & 63) == 0) IOSleep(1); }
+            }
+        }
+        return;
+    }
     for (uint32_t y = 0; y < H; y++) {
         for (uint32_t x = 0; x < W; x++) {
             uint32_t v;
