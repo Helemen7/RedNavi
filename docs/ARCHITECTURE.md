@@ -3,7 +3,7 @@
 ## Target stack
 
 ```
-Metal app -> Metal plugin -> translator (AIR -> SPIR-V) -> RADV (Mesa Vulkan + ACO) -> libdrm_amdgpu shim -> user client -> kext (amdgpu: DC, PSP, SMU, GFX11, MES, GPUVM)
+Metal app -> Metal plugin -> translator (AIR -> SPIR-V) -> RADV (Mesa Vulkan + ACO) -> `ac_drm_*` backend (Mesa's replacement for libdrm_amdgpu, see M5_PLAN.md) -> user client -> kext (amdgpu: DC, PSP, SMU, GFX11, MES, GPUVM)
 ```
 
 ## What we learned from NullMoth (NVIDIA)
