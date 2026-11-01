@@ -252,6 +252,7 @@ static void rnPublish(IOService *svc, const char *property, const char *const *n
     out->release();
 }
 
+static uint64_t gMesBaseUsed = 0x0C400000;   // base of the MES working area of this boot (a VRAM offset, or the logical offset of the host buffer)
 static void rnPublishOne(OSDictionary *d, const char *key, uint64_t v) {
     OSNumber *n = OSNumber::withNumber(v, 64);
     if (n) { d->setObject(key, n); n->release(); }
@@ -273,7 +274,7 @@ class RedNaviProbe : public IOService {
     uint32_t gartNextPage {16};                    // the first pages of the window are used by the boot-time tests
     struct rn_gmc gmcLive {};
     bool gpuLive {false};                          // the memory hub is on and the GART window is set up
-    int createHostBo(uint32_t size);
+    int createHostBo(uint32_t size, bool writeCombine = false);
     friend class RedNaviClient;
 public:
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
@@ -1818,12 +1819,12 @@ IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32
     return kIOReturnSuccess;
 }
 
-int RedNaviProbe::createHostBo(uint32_t size) {
+int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
     if (!gpuLive || boCount >= 64 || size == 0) return -1;
     size = (size + 4095u) & ~4095u;
     const uint32_t pages = size / 4096;
     if (gartNextPage + pages > 16384) return -1;
-    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, size, 4096);
+    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | (writeCombine ? kIOMapWriteCombineCache : 0), size, 4096);
     if (!md) return -1;
     md->prepare();
     memset(md->getBytesNoCopy(), 0, size);
@@ -2042,6 +2043,18 @@ void RedNaviProbe::sdmaTest() {
         for (uint32_t pg = 0; hostBus && pg < 4 && (pg + 1) * 4096u <= hostBusLen; pg++) rn_gart_map_page(&gpu, &gmc, pg, hostBus + pg * 4096ull);
     }
     rn_gfxhub_enable(&gpu, &gmc);
+    {   // Opt-in (rednavi_mmhub=1): mmhub_v3_0_gart_enable after the gfxhub, as gmc_v11_0_gart_enable does; before/after of its main registers go to "mmhub-gart".
+        uint32_t mm = 0;
+        if (PE_parse_boot_argn("rednavi_mmhub", &mm, sizeof(mm)) && mm == 1) {
+            uint32_t before[8], after[8], all[16];
+            rn_mmhub_state(&gpu, before);
+            rn_mmhub_enable(&gpu, &gmc);
+            rn_mmhub_state(&gpu, after);
+            for (int i = 0; i < 8; i++) { all[i] = before[i]; all[8 + i] = after[i]; }
+            static const char *mn[16] = {"b_ctx0", "b_tlb", "b_l2", "b_ptb", "b_start", "b_end", "b_fault", "b_faddr", "a_ctx0", "a_tlb", "a_l2", "a_ptb", "a_start", "a_end", "a_fault", "a_faddr"};
+            rnPublish(this, "mmhub-gart", mn, all, 16);
+        }
+    }
     gmcLive = gmc;
     gpuLive = true;
     trace[4] = rd(0x1295 * 4);
@@ -2334,20 +2347,21 @@ void RedNaviProbe::sdmaTest() {
                 // which one it is varies from boot to boot for reasons not found. A failed map is retried from the pipe reset, a few times.
                 uint32_t attempts = 0;
                 for (; attempts < 1; attempts++) {
-                    uint64_t mesBase = 0x0C0A0000;
+                    uint64_t mesBase = 0x0C400000;   // VRAM mode: above the SMU tables (0x0C300000) and well clear of the GART page table at 0x0C100000
                 gMesHostMem = nullptr; gMesHostSize = 0; gMesHostLogBase = 0;
                 {   // rednavi_mes_host=1: the MES working memory in host memory behind the GART, as Linux has it (see gfx11.cpp)
                     uint32_t mh = 0;
                     if (PE_parse_boot_argn("rednavi_mes_host", &mh, sizeof(mh)) && mh == 1) {
-                        const int hb = createHostBo(0x60000);
+                        const int hb = createHostBo(0xA0000, true);   // write-combined: the CPU's stores go to memory without waiting in a cache line the GPU would have to snoop
                         if (hb >= 0) {
                             gMesHostMem = static_cast<volatile uint8_t *>(bos[hb].md->getBytesNoCopy());
-                            gMesHostSize = 0x60000;
+                            gMesHostSize = 0xA0000;
                             gMesHostLogBase = bos[hb].gpuVa - kRNVramMcBase;
                             mesBase = gMesHostLogBase;
                         }
                     }
                 }
+                gMesBaseUsed = mesBase;
                 rn_mes_start(&gpu, kRNVramMcBase, mesBase, &gmc, start, mesStep,
                                  [](void *ctx, uint32_t step) {
                                      RedNaviProbe *self = static_cast<RedNaviProbe *>(ctx);
@@ -2437,6 +2451,14 @@ void RedNaviProbe::sdmaTest() {
                             rnPublish(this, "mes-snap1", sn, mr.snap[1], 10);
                             rnPublish(this, "mes-snap2", sn, mr.snap[2], 10);
                         }
+                        {
+                            static const char *hn[10] = {"pqb", "pqb_hi", "mqdb", "pqc", "dbc", "rptr", "wptr", "act", "rptr_rep", "wptr_poll"};
+                            rnPublish(this, "mes-sched-hqd", hn, mr.sched_hqd, 10);
+                            static const char *fn[2] = {"lo32", "hi32"};
+                            rnPublish(this, "mes-fault-addr", fn, mr.fault_addr, 2);
+                            static const char *rn[8] = {"d0", "d1", "d2", "d3", "rptr_w", "wptr_w", "fence", "api"};
+                            rnPublish(this, "mes-ring-head", rn, mr.ring_head, 8);
+                        }
                         const char *p2n[5] = {"t01", "t05", "t2", "t6", "t15"};
                         rnPublish(this, "mes-post2", p2n, mr.post2, 5);
                         const char *p3n[5] = {"c01", "c05", "c2", "c6", "c15"};
@@ -2461,7 +2483,7 @@ void RedNaviProbe::sdmaTest() {
                         rnPublish(this, "mes-bases", bn, bv, 9);   // the register bases SET_HW_RESOURCES gave the MES
                     }
                 }
-                if ((mr.q_active & 1u) || mr.add_ok) computeRingOff = 0x0C0A0000 + 0x30000;   // the queue the MES mapped
+                if ((mr.q_active & 1u) || mr.add_ok) computeRingOff = gMesBaseUsed + 0x40000;   // the queue the MES mapped
                 if (mesClean == 1 && ((mr.q_active & 1u) || mr.add_ok)) cr.ok = 1;
                 if (mesClean == 2) {      // the MES is up (step 4): now a hand-programmed queue, to see whether it survives with the MES running
                     rn_compute_ring_test(&gpu, kRNVramMcBase, 0x0C020000, 4096, &cr);
