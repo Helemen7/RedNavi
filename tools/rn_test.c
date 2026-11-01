@@ -12,26 +12,42 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "../RedNavi/rn_uapi.h"
+
 #define GC_BASE 0x1260u
 #define SHREG(reg) (GC_BASE + (reg) - 0x2c00u)
 #define PACKET3(op, n) ((3u << 30) | (((n) & 0x3FFFu) << 16) | (((op) & 0xFFu) << 8))
 
-enum { RN_CREATE = 0, RN_SUBMIT = 1, RN_WAIT = 2, RN_INFO = 3, RN_DIAG = 4, RN_DIAG2 = 5, RN_RING = 6 };
 
 typedef struct { uint32_t handle; uint64_t va; uint64_t size; volatile uint32_t *cpu; } Bo;
 
 static int createBo(io_connect_t c, uint64_t size, Bo *bo) {
-    uint64_t in[1] = {size}, out[3];
-    uint32_t outCnt = 3;
-    kern_return_t kr = IOConnectCallScalarMethod(c, RN_CREATE, in, 1, out, &outCnt);
+    struct rn_uc_bo_create in = {size, 0, 0};
+    struct rn_uc_bo_info out;
+    size_t outSize = sizeof(out);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_BO_CREATE, &in, sizeof(in), &out, &outSize);
     if (kr != KERN_SUCCESS) { printf("create buffer: 0x%x\n", kr); return -1; }
-    bo->handle = (uint32_t)out[0]; bo->va = out[1]; bo->size = out[2];
+    bo->handle = out.handle; bo->va = out.gpu_va; bo->size = out.size;
     mach_vm_address_t addr = 0;
     mach_vm_size_t len = 0;
     kr = IOConnectMapMemory64(c, bo->handle, mach_task_self(), &addr, &len, kIOMapAnywhere);
     if (kr != KERN_SUCCESS) { printf("map buffer %u: 0x%x\n", bo->handle, kr); return -1; }
     bo->cpu = (volatile uint32_t *)(uintptr_t)addr;
     return 0;
+}
+
+static kern_return_t submitIb(io_connect_t c, uint64_t ibVa, uint32_t ibDwords, uint64_t fenceVa, uint32_t fenceValue) {
+    struct rn_uc_submit in = {ibVa, ibDwords, 0, fenceVa, fenceValue, 0};
+    return IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), NULL, NULL);
+}
+
+static kern_return_t waitDword(io_connect_t c, uint32_t handle, uint32_t offset, uint32_t value, uint32_t ms, uint32_t *reached) {
+    struct rn_uc_bo_wait in = {handle, offset, value, ms};
+    struct rn_uc_bo_wait_result out = {0, 0};
+    size_t outSize = sizeof(out);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_BO_WAIT, &in, sizeof(in), &out, &outSize);
+    *reached = out.reached;
+    return kr;
 }
 
 int main(int argc, char **argv) {
@@ -41,10 +57,11 @@ int main(int argc, char **argv) {
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
     if (kr != KERN_SUCCESS) { printf("IOServiceOpen: 0x%x (administrator or boot-arg rednavi_uc_anyone=1)\n", kr); return 1; }
 
-    uint64_t info[3];
-    uint32_t infoCnt = 3;
-    IOConnectCallScalarMethod(c, RN_INFO, NULL, 0, info, &infoCnt);
-    printf("GART base 0x%llx, %llu buffers in use, doorbell %s\n", info[0], info[1], info[2] ? "mapped" : "not mapped");
+    struct rn_uc_info info;
+    size_t infoSize = sizeof(info);
+    kr = IOConnectCallStructMethod(c, RN_UC_INFO, NULL, 0, &info, &infoSize);
+    if (kr != KERN_SUCCESS || info.version != RN_UAPI_VERSION) { printf("info: 0x%x, interface version %u (built for %u)\n", kr, info.version, RN_UAPI_VERSION); return 1; }
+    printf("GART base 0x%llx, %u of %u buffers in use, doorbell %s\n", info.gart_base, info.bo_count, info.bo_limit, info.doorbell_mapped ? "mapped" : "not mapped");
 
     Bo code, data;
     if (createBo(c, 4096, &code) || createBo(c, 4096, &data)) return 1;
@@ -70,57 +87,87 @@ int main(int argc, char **argv) {
 
     data.cpu[0] = 0xDEAD0000u;
     data.cpu[1] = 0;
-    uint64_t sub[4] = {code.va, n, data.va + 4, 0xFEEDFACEu};
-    kr = IOConnectCallScalarMethod(c, RN_SUBMIT, sub, 4, NULL, NULL);
+    kr = submitIb(c, code.va, n, data.va + 4, 0xFEEDFACEu);
     printf("submit: 0x%x\n", kr);
-    uint64_t w[4] = {data.handle, 4, 0xFEEDFACEu, 2000}, reached = 0;
-    uint32_t cnt = 1;
-    kr = IOConnectCallScalarMethod(c, RN_WAIT, w, 4, &reached, &cnt);
-    printf("wait fence: 0x%x, reached %llu\n", kr, reached);
+    uint32_t reached = 0;
+    kr = waitDword(c, data.handle, 4, 0xFEEDFACEu, 2000, &reached);
+    printf("wait fence: 0x%x, reached %u\n", kr, reached);
     printf("result 0x%08x (expected 0x600DC0DE), fence 0x%08x\n", data.cpu[0], data.cpu[1]);
     int ok = reached && data.cpu[0] == 0x600DC0DEu;
     if (!ok) {
-        uint64_t dg[11];
-        uint32_t dgCnt = 11;
-        if (IOConnectCallScalarMethod(c, RN_DIAG, NULL, 0, dg, &dgCnt) == KERN_SUCCESS)
-            printf("queue: rptr 0x%llx wptr 0x%llx active %llu, CP_STAT 0x%llx, VM fault status 0x%llx address 0x%llx%08llx, ring wptr 0x%llx\n"
-                   "       SDMA0_VERSION 0x%llx (0x600 = GC powered), GRBM_STATUS 0x%llx, RLC_GPM_STAT 0x%llx\n",
-                   dg[0], dg[1], dg[2], dg[3], dg[4], dg[6], dg[5], dg[7], dg[8], dg[9], dg[10]);
-    }
-    if (!ok) {
-        uint64_t d2[8];
-        uint32_t d2Cnt = 8;
-        if (IOConnectCallScalarMethod(c, RN_DIAG2, NULL, 0, d2, &d2Cnt) == KERN_SUCCESS)
-            printf("       HQD doorbell control 0x%llx, CP_PQ_STATUS 0x%llx, MEC doorbell range 0x%llx-0x%llx, DOORBELL_APER_EN 0x%llx,\n"
-                   "       PQ base 0x%llx, PQ control 0x%llx, MQD base 0x%llx\n", d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7]);
+        struct rn_uc_diag d;
+        size_t dSize = sizeof(d);
+        if (IOConnectCallStructMethod(c, RN_UC_DIAG, NULL, 0, &d, &dSize) == KERN_SUCCESS)
+            printf("queue: rptr 0x%x wptr 0x%x active %u, CP_STAT 0x%x, VM fault status 0x%x address 0x%x%08x, ring wptr 0x%x\n"
+                   "       SDMA0_VERSION 0x%x (0x600 = GC powered), GRBM_STATUS 0x%x, RLC_GPM_STAT 0x%x\n"
+                   "       HQD doorbell control 0x%x, CP_PQ_STATUS 0x%x, MEC doorbell range 0x%x-0x%x, DOORBELL_APER_EN 0x%x,\n"
+                   "       PQ base 0x%x, PQ control 0x%x, MQD base 0x%x\n",
+                   d.hqd_rptr, d.hqd_wptr, d.hqd_active, d.cp_stat, d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.ring_wptr,
+                   d.sdma0_version, d.grbm_status, d.rlc_gpm_stat, d.hqd_doorbell_control, d.cp_pq_status, d.doorbell_range_lower,
+                   d.doorbell_range_upper, d.doorbell_aper_en, d.pq_base, d.pq_control, d.mqd_base);
     }
     if (ok && argc > 1 && !strcmp(argv[1], "ring")) {          // rptr write-back word against the driver's wptr over many submits (the ring holds 2048 dwords)
         for (uint32_t k = 1; k <= 300; k++) {
-            const uint32_t fv = 0xFEED0000u + k;
-            uint64_t s2[4] = {code.va, n, data.va + 4, fv};
-            if (IOConnectCallScalarMethod(c, RN_SUBMIT, s2, 4, NULL, NULL) != KERN_SUCCESS) { printf("submit %u failed\n", k); ok = 0; break; }
-            uint64_t w2[4] = {data.handle, 4, fv, 2000}, r2 = 0; uint32_t c2 = 1;
-            IOConnectCallScalarMethod(c, RN_WAIT, w2, 4, &r2, &c2);
+            const uint32_t fv = 0xFEED0000u + k, h = 0;
+            uint32_t r2 = 0;
+            if (submitIb(c, code.va, n, data.va + 4, fv) != KERN_SUCCESS) { printf("submit %u failed\n", k); ok = 0; break; }
+            waitDword(c, data.handle, 4, fv, 2000, &r2); (void)h;
             if (!r2) { printf("submit %u: fence not reached\n", k); ok = 0; break; }
             if (k == 1 || k % 50 == 0) {
-                uint64_t rs[4]; uint32_t rc3 = 4;
-                if (IOConnectCallScalarMethod(c, RN_RING, NULL, 0, rs, &rc3) == KERN_SUCCESS)
-                    printf("after %u submits: rptr word %llu, wptr word %llu, driver wptr %llu, full waits %llu\n", k, rs[0], rs[1], rs[2], rs[3]);
+                struct rn_uc_diag d; size_t dSize = sizeof(d);
+                if (IOConnectCallStructMethod(c, RN_UC_DIAG, NULL, 0, &d, &dSize) == KERN_SUCCESS)
+                    printf("after %u submits: rptr word %u, wptr word %u, driver wptr %u, full waits %u\n", k, d.ring_rptr_word, d.ring_wptr_word, d.driver_wptr, d.ring_full_waits);
             }
         }
-    }
-    if (ok && argc > 1 && !strcmp(argv[1], "ring")) {          // a burst without waiting: 1500 submits, about 70 000 dwords through a 2048-dword ring
-        uint32_t last = 0;
+        uint32_t last = 0;                                     // a burst without waiting: 1500 submits through the ring
         for (uint32_t k = 1; k <= 1500 && ok; k++) {
             last = 0xBEEF0000u + k;
-            uint64_t s2[4] = {code.va, n, data.va + 4, last};
-            if (IOConnectCallScalarMethod(c, RN_SUBMIT, s2, 4, NULL, NULL) != KERN_SUCCESS) { printf("burst submit %u failed\n", k); ok = 0; }
+            if (submitIb(c, code.va, n, data.va + 4, last) != KERN_SUCCESS) { printf("burst submit %u failed\n", k); ok = 0; }
         }
-        uint64_t w2[4] = {data.handle, 4, last, 5000}, r2 = 0; uint32_t c2 = 1;
-        if (ok) { IOConnectCallScalarMethod(c, RN_WAIT, w2, 4, &r2, &c2); if (!r2) { printf("burst: last fence not reached\n"); ok = 0; } }
-        uint64_t rs[4]; uint32_t rc3 = 4;
-        if (IOConnectCallScalarMethod(c, RN_RING, NULL, 0, rs, &rc3) == KERN_SUCCESS)
-            printf("after the burst: rptr word %llu, wptr word %llu, driver wptr %llu, full waits %llu, result 0x%08x\n", rs[0], rs[1], rs[2], rs[3], data.cpu[0]);
+        uint32_t r2 = 0;
+        if (ok) { waitDword(c, data.handle, 4, last, 5000, &r2); if (!r2) { printf("burst: last fence not reached\n"); ok = 0; } }
+        struct rn_uc_diag d; size_t dSize = sizeof(d);
+        if (IOConnectCallStructMethod(c, RN_UC_DIAG, NULL, 0, &d, &dSize) == KERN_SUCCESS)
+            printf("after the burst: rptr word %u, wptr word %u, driver wptr %u, full waits %u, result 0x%08x\n", d.ring_rptr_word, d.ring_wptr_word, d.driver_wptr, d.ring_full_waits, data.cpu[0]);
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "bo")) {            // buffer lifetime: handles, ownership, release on close
+        Bo extra;
+        struct rn_uc_bo_free fr = {extra.handle = 0, 0};
+        if (createBo(c, 4096, &extra)) ok = 0;
+        else {
+            fr.handle = extra.handle;
+            kr = IOConnectCallStructMethod(c, RN_UC_BO_FREE, &fr, sizeof(fr), NULL, NULL);
+            printf("free handle %u: 0x%x (expect 0)\n", fr.handle, kr); if (kr != KERN_SUCCESS) ok = 0;
+            kr = IOConnectCallStructMethod(c, RN_UC_BO_FREE, &fr, sizeof(fr), NULL, NULL);
+            printf("free it again: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            kr = submitIb(c, extra.va, n, data.va + 4, 0x1111u);
+            printf("submit from the freed buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            kr = submitIb(c, 0x2000000000ull + 0x1000, n, data.va + 4, 0x1111u);
+            printf("submit from an address of nobody's: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            kr = submitIb(c, code.va + 4096 - 8, n, data.va + 4, 0x1111u);
+            printf("submit running past the end of the buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            Bo again;
+            if (createBo(c, 4096, &again)) ok = 0;
+            else printf("a new buffer after the free: handle %u, address 0x%llx (the address is never reused)\n", again.handle, again.va);
+        }
+        io_connect_t c2;                                       // a second connection must not reach the first one's buffers
+        if (IOServiceOpen(svc, mach_task_self(), 0, &c2) == KERN_SUCCESS) {
+            kr = submitIb(c2, code.va, n, data.va + 4, 0x2222u);
+            printf("second connection submits from the first one's buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            IOServiceClose(c2);
+        }
+        for (int round = 0; round < 5 && ok; round++) {        // 5 x 30 buffers through a table of 64: only works if a closed connection frees its buffers
+            io_connect_t c3;
+            if (IOServiceOpen(svc, mach_task_self(), 0, &c3) != KERN_SUCCESS) { printf("open %d failed\n", round); ok = 0; break; }
+            for (int i = 0; i < 30; i++) { Bo b; if (createBo(c3, 4096, &b)) { printf("round %d: buffer %d failed\n", round, i); ok = 0; break; } }
+            IOServiceClose(c3);
+        }
+        printf("5 connections x 30 buffers: %s\n", ok ? "ok" : "failed");
+        if (ok) {
+            submitIb(c, code.va, n, data.va + 4, 0xFEED0001u);
+            uint32_t r2 = 0; waitDword(c, data.handle, 4, 0xFEED0001u, 2000, &r2);
+            printf("the queue still works afterwards: %s\n", r2 ? "yes" : "no"); if (!r2) ok = 0;
+        }
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     IOServiceClose(c);

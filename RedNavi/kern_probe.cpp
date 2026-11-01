@@ -94,6 +94,7 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include "gfx11.h"
+#include "rn_uapi.h"
 #include "gc_regs.h"
 
 #ifdef RN_HAVE_PSP_FW
@@ -274,7 +275,9 @@ class RedNaviProbe : public IOService {
     uint32_t gartNextPage {16};                    // the first pages of the window are used by the boot-time tests
     struct rn_gmc gmcLive {};
     bool gpuLive {false};                          // the memory hub is on and the GART window is set up
+    IOLock *boLock {nullptr};                      // the buffer table and the window allocator
     int createHostBo(uint32_t size, bool writeCombine = false);
+    void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
     friend class RedNaviClient;
 public:
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
@@ -1682,24 +1685,43 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
     return self->msiCount != 0;
 }
 
-// The door from user space (docs/COMPAT.md, "The user client"): buffers in host memory that the GPU reaches through the GART, a way to
-// hand the compute queue a command buffer, and a fence wait. The caller is trusted with the whole GPU: it needs administrator
-// privilege unless boot-arg rednavi_uc_anyone=1 is set.
+// The door from user space (docs/COMPAT.md, "The user client", interface in rn_uapi.h): buffers in host memory that the GPU reaches
+// through the GART, a way to hand the compute queue a command buffer, and a fence wait. Every buffer belongs to the connection that
+// created it and goes away with it; command buffers and fences must lie inside the connection's own buffers. The caller is still trusted
+// with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
 class RedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(RedNaviClient)
+    static constexpr uint32_t kMaxHandles = 32;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
+    int boIdx[kMaxHandles];                        // handle - 1 -> index in the probe's buffer table, -1 for a free handle
+    uint32_t boUsed {0};
 
-    bool inBo(uint64_t va, uint64_t len) const {
-        for (uint32_t i = 0; i < gpuOwner->boCount; i++)
-            if (va >= gpuOwner->bos[i].gpuVa && va + len <= gpuOwner->bos[i].gpuVa + gpuOwner->bos[i].size) return true;
+    // The buffer behind a handle, or -1.
+    int boOf(uint32_t handle) const {
+        if (handle == 0 || handle > kMaxHandles) return -1;
+        return boIdx[handle - 1];
+    }
+    // Is [va, va + len) inside one buffer of this connection?
+    bool inOwnBo(uint64_t va, uint64_t len) const {
+        for (uint32_t i = 0; i < kMaxHandles; i++) {
+            if (boIdx[i] < 0) continue;
+            const RedNaviProbe::RNBo &b = gpuOwner->bos[boIdx[i]];
+            if (va >= b.gpuVa && len <= b.size && va - b.gpuVa <= b.size - len) return true;
+        }
         return false;
+    }
+    void freeAll() {
+        for (uint32_t i = 0; i < kMaxHandles; i++)
+            if (boIdx[i] >= 0) { gpuOwner->destroyBo(boIdx[i]); boIdx[i] = -1; }
+        boUsed = 0;
     }
 
 public:
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
         gpuOwner = OSDynamicCast(RedNaviProbe, provider);
         lock = IOLockAlloc();
+        for (uint32_t i = 0; i < kMaxHandles; i++) boIdx[i] = -1;
         return gpuOwner && lock && IOUserClient::start(provider);
     }
     void free() APPLE_KEXT_OVERRIDE {
@@ -1707,100 +1729,124 @@ public:
         IOUserClient::free();
     }
     IOReturn clientClose() APPLE_KEXT_OVERRIDE {
+        if (lock && gpuOwner) {
+            IOLockLock(lock);
+            freeAll();                                  // the PTEs go invalid before the pages are released, so a late GPU access faults instead of corrupting memory
+            IOLockUnlock(lock);
+        }
         if (!isInactive()) terminate();
         return kIOReturnSuccess;
     }
 
-    // The buffer `type` as the memory to map into the caller (IOConnectMapMemory64 with that type).
+    // The buffer with handle `type` as the memory to map into the caller (IOConnectMapMemory64 with that type).
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE {
-        if (!gpuOwner || type >= gpuOwner->boCount) return kIOReturnBadArgument;
-        IOBufferMemoryDescriptor *md = gpuOwner->bos[type].md;
-        md->retain();
+        if (!gpuOwner || !lock) return kIOReturnBadArgument;
+        IOLockLock(lock);
+        const int idx = boOf(type);
+        IOBufferMemoryDescriptor *md = idx >= 0 ? gpuOwner->bos[idx].md : nullptr;
+        if (md) md->retain();
+        IOLockUnlock(lock);
+        if (!md) return kIOReturnBadArgument;
         *options = 0;
         *memory = md;
         return kIOReturnSuccess;
     }
 
-    // 0 create buffer: in size                        -> out handle, gpu address, size
-    // 1 submit:        in ib va, ib dwords, fence va, fence value
-    // 2 wait fence:    in handle, byte offset, value, timeout ms -> out 1 if reached
-    // 3 info:                                           -> out gart base, buffers in use, doorbell mapped
-    // 4 diag:                                           -> out hqd rptr, wptr, active, cp stat, fault status, fault address low and high, ring wptr
+    // Exact struct sizes in and out, see rn_uapi.h.
+    static bool sized(const IOExternalMethodArguments *a, size_t in, size_t out) {
+        return a->structureInputSize == in && a->structureOutputSize == out && (!in || a->structureInput) && (!out || a->structureOutput) &&
+               a->scalarInputCount == 0 && a->scalarOutputCount == 0;
+    }
+
     IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *, void *) APPLE_KEXT_OVERRIDE {
-        if (!gpuOwner || !args) return kIOReturnBadArgument;
+        if (!gpuOwner || !args || !lock) return kIOReturnBadArgument;
         IOLockLock(lock);
         IOReturn rc = kIOReturnBadArgument;
         switch (selector) {
-        case 0:
-            if (args->scalarInputCount == 1 && args->scalarOutputCount == 3) {
-                const uint64_t size = args->scalarInput[0];
-                const int h = size <= (1u << 20) ? gpuOwner->createHostBo(static_cast<uint32_t>(size)) : -1;
-                if (h >= 0) {
-                    args->scalarOutput[0] = static_cast<uint64_t>(h);
-                    args->scalarOutput[1] = gpuOwner->bos[h].gpuVa;
-                    args->scalarOutput[2] = gpuOwner->bos[h].size;
-                    rc = kIOReturnSuccess;
-                } else {
-                    rc = kIOReturnNoResources;
-                }
+        case RN_UC_INFO:
+            if (sized(args, 0, sizeof(rn_uc_info))) {
+                rn_uc_info *o = static_cast<rn_uc_info *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->version = RN_UAPI_VERSION;
+                o->doorbell_mapped = gpuOwner->doorbellKeep != nullptr;
+                o->gart_base = 0x2000000000ull;
+                o->gart_bytes = 16384ull * 4096;
+                o->max_bo_bytes = 1u << 20;
+                o->bo_count = boUsed;
+                o->bo_limit = kMaxHandles;
+                rc = kIOReturnSuccess;
             }
             break;
-        case 1:
-            if (args->scalarInputCount == 4) {
-                const uint64_t ibVa = args->scalarInput[0], fenceVa = args->scalarInput[2];
-                const uint32_t ibDw = static_cast<uint32_t>(args->scalarInput[1]), fenceVal = static_cast<uint32_t>(args->scalarInput[3]);
-                if (ibDw == 0 || ibDw > 4096 || !inBo(ibVa, ibDw * 4ull) || !inBo(fenceVa, 4)) {
-                    rc = kIOReturnBadArgument;
-                } else {
-                    rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                    rc = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, ibDw, fenceVa, fenceVal) == 0 ? kIOReturnSuccess : kIOReturnNoSpace;
-                }
+        case RN_UC_BO_CREATE:
+            if (sized(args, sizeof(rn_uc_bo_create), sizeof(rn_uc_bo_info))) {
+                const rn_uc_bo_create *in = static_cast<const rn_uc_bo_create *>(args->structureInput);
+                if (in->flags != 0 || in->size == 0 || in->size > (1u << 20)) break;
+                uint32_t h = 0;
+                while (h < kMaxHandles && boIdx[h] >= 0) h++;
+                if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
+                const int idx = gpuOwner->createHostBo(static_cast<uint32_t>(in->size));
+                if (idx < 0) { rc = kIOReturnNoResources; break; }
+                boIdx[h] = idx;
+                boUsed++;
+                rn_uc_bo_info *o = static_cast<rn_uc_bo_info *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->handle = h + 1;
+                o->gpu_va = gpuOwner->bos[idx].gpuVa;
+                o->size = gpuOwner->bos[idx].size;
+                rc = kIOReturnSuccess;
             }
             break;
-        case 2:
-            if (args->scalarInputCount == 4 && args->scalarOutputCount == 1) {
-                const uint64_t h = args->scalarInput[0], off = args->scalarInput[1];
-                const uint32_t value = static_cast<uint32_t>(args->scalarInput[2]);
-                uint32_t timeout = static_cast<uint32_t>(args->scalarInput[3]);
-                if (h >= gpuOwner->boCount || off + 4 > gpuOwner->bos[h].size || (off & 3)) break;
-                if (timeout > 10000) timeout = 10000;
-                volatile uint32_t *w = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(gpuOwner->bos[h].md->getBytesNoCopy()) + off);
+        case RN_UC_BO_FREE:
+            if (sized(args, sizeof(rn_uc_bo_free), 0)) {
+                const uint32_t handle = static_cast<const rn_uc_bo_free *>(args->structureInput)->handle;
+                const int idx = boOf(handle);
+                if (idx < 0) break;
+                gpuOwner->destroyBo(idx);
+                boIdx[handle - 1] = -1;
+                boUsed--;
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_SUBMIT:
+            if (sized(args, sizeof(rn_uc_submit), 0)) {
+                const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
+                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || (in->fence_va & 3) ||
+                    !inOwnBo(in->ib_va, in->ib_dwords * 4ull) || !inOwnBo(in->fence_va, 4)) break;
+                rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
+                const int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, in->ib_va, in->ib_dwords, in->fence_va, in->fence_value);
+                rc = r == 0 ? kIOReturnSuccess : (r == -EAGAIN ? kIOReturnBusy : kIOReturnNoSpace);
+            }
+            break;
+        case RN_UC_BO_WAIT:
+            if (sized(args, sizeof(rn_uc_bo_wait), sizeof(rn_uc_bo_wait_result))) {
+                const rn_uc_bo_wait *in = static_cast<const rn_uc_bo_wait *>(args->structureInput);
+                const int idx = boOf(in->handle);
+                if (idx < 0 || in->offset > gpuOwner->bos[idx].size - 4 || (in->offset & 3)) break;
+                uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
+                volatile uint32_t *w = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(gpuOwner->bos[idx].md->getBytesNoCopy()) + in->offset);
                 uint32_t ms = 0;
-                while (ms < timeout && *w != value) { IOSleep(1); ms++; }
-                args->scalarOutput[0] = *w == value;
+                while (ms < timeout && *w != in->value) { IOSleep(1); ms++; }
+                rn_uc_bo_wait_result *o = static_cast<rn_uc_bo_wait_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->reached = *w == in->value;
                 rn_gc_safe_mode(&gpuOwner->gpu, 0);
                 rc = kIOReturnSuccess;
             }
             break;
-        case 4:
-            if (args->scalarOutputCount == 11) {
-                uint32_t dg[11];
+        case RN_UC_DIAG:
+            if (sized(args, 0, sizeof(rn_uc_diag))) {
+                rn_uc_diag *o = static_cast<rn_uc_diag *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                u32 dg[11], d2[8], rs[4];
                 rn_compute_diag(&gpuOwner->gpu, dg);
-                for (int i = 0; i < 11; i++) args->scalarOutput[i] = dg[i];
-                rc = kIOReturnSuccess;
-            }
-            break;
-        case 5:
-            if (args->scalarOutputCount == 8) {
-                uint32_t d2[8];
                 rn_compute_diag2(&gpuOwner->gpu, d2);
-                for (int i = 0; i < 8; i++) args->scalarOutput[i] = d2[i];
-                rc = kIOReturnSuccess;
-            }
-            break;
-        case 6:
-            if (args->scalarOutputCount == 4) {
-                uint32_t rs[4];
                 rn_compute_ring_state(&gpuOwner->gpu, rs);
-                for (int i = 0; i < 4; i++) args->scalarOutput[i] = rs[i];
-                rc = kIOReturnSuccess;
-            }
-            break;
-        case 3:
-            if (args->scalarOutputCount == 3) {
-                args->scalarOutput[0] = 0x2000000000ull;
-                args->scalarOutput[1] = gpuOwner->boCount;
-                args->scalarOutput[2] = gpuOwner->doorbellKeep != nullptr;
+                o->hqd_rptr = dg[0]; o->hqd_wptr = dg[1]; o->hqd_active = dg[2]; o->cp_stat = dg[3];
+                o->fault_status = dg[4]; o->fault_addr_lo = dg[5]; o->fault_addr_hi = dg[6]; o->ring_wptr = dg[7];
+                o->sdma0_version = dg[8]; o->grbm_status = dg[9]; o->rlc_gpm_stat = dg[10];
+                o->hqd_doorbell_control = d2[0]; o->cp_pq_status = d2[1]; o->doorbell_range_lower = d2[2]; o->doorbell_range_upper = d2[3];
+                o->doorbell_aper_en = d2[4]; o->pq_base = d2[5]; o->pq_control = d2[6]; o->mqd_base = d2[7];
+                o->ring_rptr_word = rs[0]; o->ring_wptr_word = rs[1]; o->driver_wptr = rs[2]; o->ring_full_waits = rs[3];
                 rc = kIOReturnSuccess;
             }
             break;
@@ -1828,8 +1874,29 @@ IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32
     return kIOReturnSuccess;
 }
 
+struct RNLockGuard {
+    IOLock *l;
+    explicit RNLockGuard(IOLock *lk) : l(lk) { if (l) IOLockLock(l); }
+    ~RNLockGuard() { if (l) IOLockUnlock(l); }
+};
+
+void RedNaviProbe::destroyBo(int idx) {
+    RNLockGuard g(boLock);
+    if (idx < 0 || idx >= 64 || !bos[idx].md) return;
+    const uint32_t firstPage = static_cast<uint32_t>((bos[idx].gpuVa - 0x2000000000ull) / 4096);
+    for (uint32_t p = 0; p < bos[idx].size / 4096; p++) rn_gart_unmap_page(&gpu, &gmcLive, firstPage + p);
+    rn_gart_flush(&gpu);
+    if (bos[idx].dma) { bos[idx].dma->complete(); bos[idx].dma->clearMemoryDescriptor(); bos[idx].dma->release(); }
+    bos[idx].md->release();
+    bos[idx] = {};
+}
+
 int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
-    if (!gpuLive || boCount >= 64 || size == 0) return -1;
+    RNLockGuard g(boLock);
+    int slot = -1;
+    for (uint32_t i = 0; i < boCount; i++) if (!bos[i].md) { slot = static_cast<int>(i); break; }
+    if (slot < 0 && boCount < 64) slot = static_cast<int>(boCount);
+    if (!gpuLive || slot < 0 || size == 0) return -1;
     size = (size + 4095u) & ~4095u;
     const uint32_t pages = size / 4096;
     if (gartNextPage + pages > 16384) return -1;
@@ -1859,7 +1926,8 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
         return -1;
     }
     rn_gart_flush(&gpu);
-    const int idx = static_cast<int>(boCount++);
+    const int idx = slot;
+    if (static_cast<uint32_t>(slot) == boCount) boCount++;
     bos[idx] = {md, dma, 0x2000000000ull + static_cast<uint64_t>(gartNextPage) * 4096, size};
     gartNextPage += pages;
     return idx;
@@ -2674,6 +2742,7 @@ bool RedNaviProbe::start(IOService *provider) {
     if (!pci) return false;
 
     modeLock = IOLockAlloc();
+    boLock = IOLockAlloc();
     rn_compute_lock_init();
     pci->setMemoryEnable(true);
     dumpPci();
@@ -2753,6 +2822,7 @@ void RedNaviProbe::stop(IOService *provider) {
     if (msiSrc) { msiSrc->disable(); if (getWorkLoop()) getWorkLoop()->removeEventSource(msiSrc); msiSrc->release(); msiSrc = nullptr; }
     for (uint32_t i = 0; i < boCount; i++) { if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); } if (bos[i].md) bos[i].md->release(); }
     boCount = 0;
+    if (boLock) { IOLockFree(boLock); boLock = nullptr; }
     if (doorbellKeep) { rn_set_doorbell(nullptr, 0); doorbellKeep->release(); doorbellKeep = nullptr; }
     if (hostDma) { hostDma->complete(); hostDma->clearMemoryDescriptor(); hostDma->release(); hostDma = nullptr; }
     if (hostBuf) { hostBuf->release(); hostBuf = nullptr; }

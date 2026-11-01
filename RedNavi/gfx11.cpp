@@ -98,6 +98,12 @@ void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page
     rn_vram_wr32(adev, slot + 4, upper_32_bits(pte));
 }
 
+void rn_gart_unmap_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page) {
+    const u64 slot = gmc->pt_vram_offset + (u64)page * 8;
+    rn_vram_wr32(adev, slot, 0);
+    rn_vram_wr32(adev, slot + 4, 0);
+}
+
 // A GART page that points at VRAM: VALID | EXECUTABLE | READABLE | WRITEABLE, no SYSTEM bit, the address is the MC address of the VRAM page.
 void rn_gart_map_vram_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 mc) {
     const u64 pte = (mc & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x10ull | 0x20ull | 0x40ull;

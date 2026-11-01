@@ -95,6 +95,7 @@ void rn_mmhub_state(struct rn_device *adev, u32 out[8]);
 // zeroes it; rn_gart_map_page then makes page `page` of the window point at a system memory page (bus address as the IOMMU or the
 // physical address gives it: valid, system, snooped, readable, writeable). Do this before rn_gfxhub_enable, which also flushes the TLBs.
 void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 bus_addr);
+void rn_gart_unmap_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page);   // an invalid PTE; follow with rn_gart_flush
 void rn_gart_clear(struct rn_device *adev, const struct rn_gmc *gmc);
 void rn_gart_map_vram_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 mc_addr);   // a GART page that points at VRAM
 // With the hub already on: change or remove a PTE (bus 0 = unmap), then flush VMID 0's TLBs through invalidation engine 17, the one
