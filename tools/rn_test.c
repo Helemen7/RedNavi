@@ -16,7 +16,7 @@
 #define SHREG(reg) (GC_BASE + (reg) - 0x2c00u)
 #define PACKET3(op, n) ((3u << 30) | (((n) & 0x3FFFu) << 16) | (((op) & 0xFFu) << 8))
 
-enum { RN_CREATE = 0, RN_SUBMIT = 1, RN_WAIT = 2, RN_INFO = 3, RN_DIAG = 4, RN_DIAG2 = 5 };
+enum { RN_CREATE = 0, RN_SUBMIT = 1, RN_WAIT = 2, RN_INFO = 3, RN_DIAG = 4, RN_DIAG2 = 5, RN_RING = 6 };
 
 typedef struct { uint32_t handle; uint64_t va; uint64_t size; volatile uint32_t *cpu; } Bo;
 
@@ -34,7 +34,7 @@ static int createBo(io_connect_t c, uint64_t size, Bo *bo) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviProbe"));
     if (!svc) { printf("no RedNaviProbe service\n"); return 1; }
     io_connect_t c;
@@ -93,6 +93,34 @@ int main(void) {
         if (IOConnectCallScalarMethod(c, RN_DIAG2, NULL, 0, d2, &d2Cnt) == KERN_SUCCESS)
             printf("       HQD doorbell control 0x%llx, CP_PQ_STATUS 0x%llx, MEC doorbell range 0x%llx-0x%llx, DOORBELL_APER_EN 0x%llx,\n"
                    "       PQ base 0x%llx, PQ control 0x%llx, MQD base 0x%llx\n", d2[0], d2[1], d2[2], d2[3], d2[4], d2[5], d2[6], d2[7]);
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "ring")) {          // rptr write-back word against the driver's wptr over many submits (the ring holds 2048 dwords)
+        for (uint32_t k = 1; k <= 300; k++) {
+            const uint32_t fv = 0xFEED0000u + k;
+            uint64_t s2[4] = {code.va, n, data.va + 4, fv};
+            if (IOConnectCallScalarMethod(c, RN_SUBMIT, s2, 4, NULL, NULL) != KERN_SUCCESS) { printf("submit %u failed\n", k); ok = 0; break; }
+            uint64_t w2[4] = {data.handle, 4, fv, 2000}, r2 = 0; uint32_t c2 = 1;
+            IOConnectCallScalarMethod(c, RN_WAIT, w2, 4, &r2, &c2);
+            if (!r2) { printf("submit %u: fence not reached\n", k); ok = 0; break; }
+            if (k == 1 || k % 50 == 0) {
+                uint64_t rs[4]; uint32_t rc3 = 4;
+                if (IOConnectCallScalarMethod(c, RN_RING, NULL, 0, rs, &rc3) == KERN_SUCCESS)
+                    printf("after %u submits: rptr word %llu, wptr word %llu, driver wptr %llu, full waits %llu\n", k, rs[0], rs[1], rs[2], rs[3]);
+            }
+        }
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "ring")) {          // a burst without waiting: 1500 submits, about 70 000 dwords through a 2048-dword ring
+        uint32_t last = 0;
+        for (uint32_t k = 1; k <= 1500 && ok; k++) {
+            last = 0xBEEF0000u + k;
+            uint64_t s2[4] = {code.va, n, data.va + 4, last};
+            if (IOConnectCallScalarMethod(c, RN_SUBMIT, s2, 4, NULL, NULL) != KERN_SUCCESS) { printf("burst submit %u failed\n", k); ok = 0; }
+        }
+        uint64_t w2[4] = {data.handle, 4, last, 5000}, r2 = 0; uint32_t c2 = 1;
+        if (ok) { IOConnectCallScalarMethod(c, RN_WAIT, w2, 4, &r2, &c2); if (!r2) { printf("burst: last fence not reached\n"); ok = 0; } }
+        uint64_t rs[4]; uint32_t rc3 = 4;
+        if (IOConnectCallScalarMethod(c, RN_RING, NULL, 0, rs, &rc3) == KERN_SUCCESS)
+            printf("after the burst: rptr word %llu, wptr word %llu, driver wptr %llu, full waits %llu, result 0x%08x\n", rs[0], rs[1], rs[2], rs[3], data.cpu[0]);
     }
     printf("%s\n", ok ? "PASS" : "FAIL");
     IOServiceClose(c);

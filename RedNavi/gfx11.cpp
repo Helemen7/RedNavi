@@ -549,6 +549,8 @@ void rn_gfx_ring_test(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringB
 
 static bool gMapped;                    // the compute queue in use was mapped through the KIQ (rn_kiq_map_compute)
 static u32 gMappedWptr;
+static u32 gRingFullWaits;           // submits that found the mapped ring without room and had to wait for the command processor
+static u64 gMappedRingOff = 0;       // ringOff of the last mapped submit: the block that holds the rptr and wptr words (+0x1000, +0x1008)
 static u64 gMappedRingAt = 0;        // where the mapped queue's ring data starts inside its block (kRingAt for a queue the MES mapped, 0 for the older KIQ-mapped one)
 static u32 gMappedRingBytes = 0;     // its ring size, 0: the caller's
 static u32 gMappedPipe = 0;
@@ -1134,6 +1136,16 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
         const u32 w = gMappedWptr;
         const u32 mmask = gMappedRingBytes ? gMappedRingBytes / 4 - 1 : mask;
         const u64 data = ringOff + gMappedRingAt;
+        gMappedRingOff = ringOff;
+        // Room in the ring. The rptr write-back word holds the read position modulo the ring size (measured 2026-11-01: it wraps while the
+        // wptr counts on), so "used" is (w - rptr) & mmask. The ring is never filled completely: a full ring would look empty.
+        if (n > mmask) return -EINVAL;
+        u32 spins = 0;
+        while (n > mmask - ((w - rn_vram_rd32(adev, ringOff + 0x1000)) & mmask)) {
+            if (spins++ == 0) gRingFullWaits++;
+            if (spins > 200000) return -EAGAIN;                                 // about 2 s: the queue is not draining; nothing was written
+            udelay(10);
+        }
         for (u32 i = 0; i < n; i++) rn_vram_wr32(adev, data + ((w + i) & mmask) * 4, pk[i]);
         gMappedWptr = w + n;
         rn_vram_wr32(adev, wptrOff, w + n); rn_vram_wr32(adev, wptrOff + 4, 0);          // the write-back word of the wptr, as mesRingSubmit keeps it
@@ -1181,6 +1193,15 @@ void rn_compute_diag(struct rn_device *adev, u32 out[11]) {
     out[8] = rn_rreg32(adev, adev->reg_offset[RN_GC_HWIP][0][0] + 0x35);                  // SDMA0_VERSION
     out[9] = rn_rreg32(adev, adev->reg_offset[RN_GC_HWIP][0][0] + 0xda4);                 // GRBM_STATUS
     out[10] = rn_rreg32(adev, adev->reg_offset[RN_GC_HWIP][0][1] + 0x4e6b);               // RLC_GPM_STAT
+}
+
+void rn_compute_ring_state(struct rn_device *adev, u32 out[4]) {
+    if (gSubmitLock) IOLockLock(gSubmitLock);
+    out[0] = gMapped ? rn_vram_rd32(adev, gMappedRingOff + 0x1000) : 0;       // rptr write-back word of the mapped queue
+    out[1] = gMapped ? rn_vram_rd32(adev, gMappedRingOff + 0x1008) : 0;       // wptr word
+    out[2] = gMappedWptr;
+    out[3] = gRingFullWaits;
+    if (gSubmitLock) IOLockUnlock(gSubmitLock);
 }
 
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]) {

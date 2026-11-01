@@ -1788,6 +1788,14 @@ public:
                 rc = kIOReturnSuccess;
             }
             break;
+        case 6:
+            if (args->scalarOutputCount == 4) {
+                uint32_t rs[4];
+                rn_compute_ring_state(&gpuOwner->gpu, rs);
+                for (int i = 0; i < 4; i++) args->scalarOutput[i] = rs[i];
+                rc = kIOReturnSuccess;
+            }
+            break;
         case 3:
             if (args->scalarOutputCount == 3) {
                 args->scalarOutput[0] = 0x2000000000ull;
