@@ -38,6 +38,11 @@ make test                   # host tests for the compat layer
 - Reading all registers of the DCN list (`tools/dcn32_reglist.txt`) hangs the machine (clock- or power-gated blocks). Read only registers of live blocks.
 - `IODisplay::readFramebufferEDID` calls `getAttributeForConnection` with a NULL value pointer.
 - The verbose boot console lags the kernel: the last visible line can be stale.
+- A kext with an unresolved symbol of its own (a global whose definition was deleted, only an `extern` left) builds and links, and then fails when it is linked into the kernel collection at boot: frozen test screen, no SSH, recovery needs the emergency stick. The Makefile fails the build on any unresolved `_g[A-Z]` symbol; run `nm -u` on the binary after removing code. The kernel stack is 16 KB and cannot be widened: big local structs in `sdmaTest` are `static`.
+- GART pages of system memory need the Linux PTE: `VALID | SYSTEM | SNOOPED | EXECUTABLE | READABLE | WRITEABLE | MTYPE_UC << 48` (`MTYPE_UC` is 3, `navi10_enum.h`). Without the MTYPE the MES scheduler read its ring from host memory but never wrote its answers back.
+- The MES log area is 0x4000 bytes of log plus 0x40000 of scratch (0x44000; read it off the size of `debugfs amdgpu_mes_event_log`). A smaller area is overrun by the firmware, in host memory with a GCVM fault one page past the buffer, in VRAM over whatever follows (it was the GART page table).
+- The MES KIQ ring is filled with the NOP `0xFFFF1000` and each commit is padded to 256 dwords with it (`gfx_v11_0_ring_funcs_kiq`); a zero dword in the PM4 stream parks the KIQ pipe at 0x51ad and the scheduler's `MAP_QUEUES` is dropped. The healthy idle value is 0x518c (Linux, 3000 of 3000 samples).
+- A register that Linux reads without consequence can matter here: the MES firmware uses `GRBM_GFX_CNTL` itself, so poll loops that select ME/pipe while it runs are a suspect. Debug a hang by reading properties on a boot you can reach, not by looping reboots; and a result that depends on the boot is a layout problem until proven otherwise.
 
 ## Safety
 

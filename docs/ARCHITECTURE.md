@@ -19,6 +19,8 @@ Read from their repository (`docs/HOW-IT-WORKS.md`, `plugin/`, `nvk/nvk-macos.pa
 
 Confirmed: RX 7800 XT is Navi 32, gfx1101, PCI `1002:747E`. Linux handles it through the generic IP-discovery path, not a dedicated ID entry.
 
+Where the MES keeps its memory (2026-11-01, verified on the 7800 XT; details in `docs/COMPAT.md`): the scheduler ring (32 KB), the KIQ ring (64 KB), the compute ring (8 KB), the write-back words, fences, scheduler context, event log with its scratch (0x44000 bytes), MQDs and EOP buffers sit in one 0xA0000-byte write-combined host buffer behind the GART, as in Linux; the PTEs of that window are `VALID | SYSTEM | SNOOPED | EXECUTABLE | READABLE | WRITEABLE | MTYPE_UC << 48`. `rednavi_mes_host=0` puts the same area in VRAM at 0x0C400000. The MES takes its register bases (GC, MMHUB, OSSSYS) from `SET_HW_RESOURCES`, filled from the IP discovery table.
+
 IP block families (from `amdgpu_discovery.c`): GC 11.0.x, MES 11, SDMA 6.x, PSP 13.0.x, SMU 13.0.x, DCN 3.2.x, VCN 4.0.x.
 
 **Measured on the card (M1 probe, 2026-10-27, Sapphire RX 7800 XT, macOS 15.8.2).** The IP discovery table is binary version 1.2, 1556 bytes, checksum OK, read from VRAM at `VRAM size - 64 KB`. Raw dump: `docs/logs/ioreg-rednavi-747e.txt`; decode it with `tools/decode_discovery.py`.
