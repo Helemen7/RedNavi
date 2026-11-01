@@ -7,15 +7,16 @@
 
 #include <stdint.h>
 
-#define RN_UAPI_VERSION 1
+#define RN_UAPI_VERSION 2
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
     RN_UC_BO_CREATE = 1,   // in rn_uc_bo_create, out rn_uc_bo_info
     RN_UC_BO_FREE = 2,     // in rn_uc_bo_free
-    RN_UC_SUBMIT = 3,      // in rn_uc_submit
+    RN_UC_SUBMIT = 3,      // in rn_uc_submit, out rn_uc_submit_result
     RN_UC_BO_WAIT = 4,     // in rn_uc_bo_wait, out rn_uc_bo_wait_result
     RN_UC_DIAG = 5,        // out rn_uc_diag
+    RN_UC_WAIT_SEQ = 6,    // in rn_uc_wait_seq, out rn_uc_wait_seq_result
     RN_UC_COUNT
 };
 
@@ -49,13 +50,28 @@ struct rn_uc_bo_free {
     uint32_t pad;
 };
 
+// Every connection has one context with one fence: each submit gets the next sequence number (1, 2, 3, ...) and the GPU writes it to a
+// kernel-owned dword when the IB has finished, so a sequence number is done when the fence has reached it. Sequence numbers are 32 bits and
+// compared modulo 2^32; a submit that is refused (ring full, bad address) does not use one.
 struct rn_uc_submit {
     uint64_t ib_va;            // inside a buffer of this connection
     uint32_t ib_dwords;
     uint32_t flags;            // 0
-    uint64_t fence_va;         // dword inside a buffer of this connection, written with fence_value when the IB is done
-    uint32_t fence_value;
+};
+
+struct rn_uc_submit_result {
+    uint32_t seq;
     uint32_t pad;
+};
+
+struct rn_uc_wait_seq {
+    uint32_t seq;              // a sequence number a submit returned (a later one is refused)
+    uint32_t timeout_ms;       // 0: only look (a fence status query); at most 10000
+};
+
+struct rn_uc_wait_seq_result {
+    uint32_t reached;
+    uint32_t signaled;         // the fence value now: every sequence number up to it is done
 };
 
 struct rn_uc_bo_wait {
@@ -77,7 +93,7 @@ struct rn_uc_diag {
     uint32_t hqd_doorbell_control, cp_pq_status, doorbell_range_lower, doorbell_range_upper, doorbell_aper_en;
     uint32_t pq_base, pq_control, mqd_base;
     uint32_t ring_rptr_word, ring_wptr_word, driver_wptr, ring_full_waits;
-    uint32_t pad;
+    uint32_t seq_submitted, seq_signaled;     // this connection's context
 };
 
 #endif

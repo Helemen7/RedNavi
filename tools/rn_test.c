@@ -36,9 +36,25 @@ static int createBo(io_connect_t c, uint64_t size, Bo *bo) {
     return 0;
 }
 
-static kern_return_t submitIb(io_connect_t c, uint64_t ibVa, uint32_t ibDwords, uint64_t fenceVa, uint32_t fenceValue) {
-    struct rn_uc_submit in = {ibVa, ibDwords, 0, fenceVa, fenceValue, 0};
-    return IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), NULL, NULL);
+static uint32_t gSeq;                                      // the sequence number of the last submit that worked
+
+static kern_return_t submitIb(io_connect_t c, uint64_t ibVa, uint32_t ibDwords) {
+    struct rn_uc_submit in = {ibVa, ibDwords, 0};
+    struct rn_uc_submit_result out = {0, 0};
+    size_t outSize = sizeof(out);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), &out, &outSize);
+    if (kr == KERN_SUCCESS) gSeq = out.seq;
+    return kr;
+}
+
+static kern_return_t waitSeq(io_connect_t c, uint32_t seq, uint32_t ms, uint32_t *reached, uint32_t *signaled) {
+    struct rn_uc_wait_seq in = {seq, ms};
+    struct rn_uc_wait_seq_result out = {0, 0};
+    size_t outSize = sizeof(out);
+    kern_return_t kr = IOConnectCallStructMethod(c, RN_UC_WAIT_SEQ, &in, sizeof(in), &out, &outSize);
+    *reached = out.reached;
+    if (signaled) *signaled = out.signaled;
+    return kr;
 }
 
 static kern_return_t waitDword(io_connect_t c, uint32_t handle, uint32_t offset, uint32_t value, uint32_t ms, uint32_t *reached) {
@@ -87,12 +103,18 @@ int main(int argc, char **argv) {
 
     data.cpu[0] = 0xDEAD0000u;
     data.cpu[1] = 0;
-    kr = submitIb(c, code.va, n, data.va + 4, 0xFEEDFACEu);
+    kr = submitIb(c, code.va, n);
     printf("submit: 0x%x\n", kr);
     uint32_t reached = 0;
-    kr = waitDword(c, data.handle, 4, 0xFEEDFACEu, 2000, &reached);
-    printf("wait fence: 0x%x, reached %u\n", kr, reached);
-    printf("result 0x%08x (expected 0x600DC0DE), fence 0x%08x\n", data.cpu[0], data.cpu[1]);
+    kr = waitSeq(c, gSeq, 2000, &reached, NULL);
+    printf("wait for sequence %u: 0x%x, reached %u\n", gSeq, kr, reached);
+    printf("result 0x%08x (expected 0x600DC0DE)\n", data.cpu[0]);
+    {   // the buffer-dword wait still works for results a shader writes itself
+        uint32_t got = 0;
+        kr = waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &got);
+        printf("wait for the result dword: 0x%x, reached %u\n", kr, got);
+        if (kr || !got) reached = 0;
+    }
     int ok = reached && data.cpu[0] == 0x600DC0DEu;
     if (!ok) {
         struct rn_uc_diag d;
@@ -110,8 +132,8 @@ int main(int argc, char **argv) {
         for (uint32_t k = 1; k <= 300; k++) {
             const uint32_t fv = 0xFEED0000u + k, h = 0;
             uint32_t r2 = 0;
-            if (submitIb(c, code.va, n, data.va + 4, fv) != KERN_SUCCESS) { printf("submit %u failed\n", k); ok = 0; break; }
-            waitDword(c, data.handle, 4, fv, 2000, &r2); (void)h;
+            if (submitIb(c, code.va, n) != KERN_SUCCESS) { printf("submit %u failed\n", k); ok = 0; break; }
+            waitSeq(c, gSeq, 2000, &r2, NULL); (void)h; (void)fv;
             if (!r2) { printf("submit %u: fence not reached\n", k); ok = 0; break; }
             if (k == 1 || k % 50 == 0) {
                 struct rn_uc_diag d; size_t dSize = sizeof(d);
@@ -119,16 +141,45 @@ int main(int argc, char **argv) {
                     printf("after %u submits: rptr word %u, wptr word %u, driver wptr %u, full waits %u\n", k, d.ring_rptr_word, d.ring_wptr_word, d.driver_wptr, d.ring_full_waits);
             }
         }
-        uint32_t last = 0;                                     // a burst without waiting: 1500 submits through the ring
+        // a burst without waiting: 1500 submits through the ring
         for (uint32_t k = 1; k <= 1500 && ok; k++) {
-            last = 0xBEEF0000u + k;
-            if (submitIb(c, code.va, n, data.va + 4, last) != KERN_SUCCESS) { printf("burst submit %u failed\n", k); ok = 0; }
+            if (submitIb(c, code.va, n) != KERN_SUCCESS) { printf("burst submit %u failed\n", k); ok = 0; }
         }
         uint32_t r2 = 0;
-        if (ok) { waitDword(c, data.handle, 4, last, 5000, &r2); if (!r2) { printf("burst: last fence not reached\n"); ok = 0; } }
+        if (ok) { waitSeq(c, gSeq, 5000, &r2, NULL); if (!r2) { printf("burst: last fence not reached\n"); ok = 0; } }
         struct rn_uc_diag d; size_t dSize = sizeof(d);
         if (IOConnectCallStructMethod(c, RN_UC_DIAG, NULL, 0, &d, &dSize) == KERN_SUCCESS)
             printf("after the burst: rptr word %u, wptr word %u, driver wptr %u, full waits %u, result 0x%08x\n", d.ring_rptr_word, d.ring_wptr_word, d.driver_wptr, d.ring_full_waits, data.cpu[0]);
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "seq")) {           // sequence numbers of one context
+        uint32_t first = gSeq, r = 0, sig = 0, prev = gSeq;
+        for (int k = 0; k < 5 && ok; k++) {
+            data.cpu[0] = 0xDEAD0000u;
+            if (submitIb(c, code.va, n) != KERN_SUCCESS) { printf("submit failed\n"); ok = 0; break; }
+            if (gSeq != prev + 1) { printf("sequence %u after %u: not consecutive\n", gSeq, prev); ok = 0; }
+            prev = gSeq;
+        }
+        kr = waitSeq(c, gSeq, 2000, &r, &sig);
+        printf("sequences %u..%u: wait 0x%x reached %u, fence now %u\n", first + 1, gSeq, kr, r, sig); if (kr || !r || sig != gSeq) ok = 0;
+        kr = waitSeq(c, first + 1, 0, &r, &sig);
+        printf("an older one, looked at without waiting: 0x%x reached %u (expect 1)\n", kr, r); if (kr || !r) ok = 0;
+        kr = waitSeq(c, gSeq + 1000, 0, &r, &sig);
+        printf("a sequence never submitted: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+        kr = waitSeq(c, 0, 0, &r, &sig);
+        printf("sequence 0: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+        kr = submitIb(c, 0x2000000000ull + 0x1000, n);
+        uint32_t after = gSeq;
+        printf("a refused submit does not use a number: 0x%x, last number %u (expect %u)\n", kr, after, prev); if (kr == KERN_SUCCESS || after != prev) ok = 0;
+        if (submitIb(c, code.va, n) == KERN_SUCCESS && gSeq == prev + 1) { waitSeq(c, gSeq, 2000, &r, &sig); printf("the next one is %u, reached %u\n", gSeq, r); if (!r) ok = 0; } else ok = 0;
+        io_connect_t c2;                                       // a second connection counts on its own
+        if (IOServiceOpen(svc, mach_task_self(), 0, &c2) == KERN_SUCCESS) {
+            uint32_t keep = gSeq;
+            kr = submitIb(c2, code.va, n);                     // refused: not its buffer
+            kr = waitSeq(c2, 1, 0, &r, &sig);
+            printf("second connection, sequence 1 before any submit of its own: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
+            gSeq = keep;
+            IOServiceClose(c2);
+        }
     }
     if (ok && argc > 1 && !strcmp(argv[1], "bo")) {            // buffer lifetime: handles, ownership, release on close
         Bo extra;
@@ -140,11 +191,11 @@ int main(int argc, char **argv) {
             printf("free handle %u: 0x%x (expect 0)\n", fr.handle, kr); if (kr != KERN_SUCCESS) ok = 0;
             kr = IOConnectCallStructMethod(c, RN_UC_BO_FREE, &fr, sizeof(fr), NULL, NULL);
             printf("free it again: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
-            kr = submitIb(c, extra.va, n, data.va + 4, 0x1111u);
+            kr = submitIb(c, extra.va, n);
             printf("submit from the freed buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
-            kr = submitIb(c, 0x2000000000ull + 0x1000, n, data.va + 4, 0x1111u);
+            kr = submitIb(c, 0x2000000000ull + 0x1000, n);
             printf("submit from an address of nobody's: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
-            kr = submitIb(c, code.va + 4096 - 8, n, data.va + 4, 0x1111u);
+            kr = submitIb(c, code.va + 4096 - 8, n);
             printf("submit running past the end of the buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
             Bo again;
             if (createBo(c, 4096, &again)) ok = 0;
@@ -152,7 +203,7 @@ int main(int argc, char **argv) {
         }
         io_connect_t c2;                                       // a second connection must not reach the first one's buffers
         if (IOServiceOpen(svc, mach_task_self(), 0, &c2) == KERN_SUCCESS) {
-            kr = submitIb(c2, code.va, n, data.va + 4, 0x2222u);
+            kr = submitIb(c2, code.va, n);
             printf("second connection submits from the first one's buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
             IOServiceClose(c2);
         }
@@ -164,8 +215,8 @@ int main(int argc, char **argv) {
         }
         printf("5 connections x 30 buffers: %s\n", ok ? "ok" : "failed");
         if (ok) {
-            submitIb(c, code.va, n, data.va + 4, 0xFEED0001u);
-            uint32_t r2 = 0; waitDword(c, data.handle, 4, 0xFEED0001u, 2000, &r2);
+            submitIb(c, code.va, n);
+            uint32_t r2 = 0; waitSeq(c, gSeq, 2000, &r2, NULL);
             printf("the queue still works afterwards: %s\n", r2 ? "yes" : "no"); if (!r2) ok = 0;
         }
     }

@@ -1696,6 +1696,8 @@ class RedNaviClient : public IOUserClient {
     IOLock *lock {nullptr};
     int boIdx[kMaxHandles];                        // handle - 1 -> index in the probe's buffer table, -1 for a free handle
     uint32_t boUsed {0};
+    int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
+    uint32_t seqSubmitted {0};
 
     // The buffer behind a handle, or -1.
     int boOf(uint32_t handle) const {
@@ -1715,6 +1717,10 @@ class RedNaviClient : public IOUserClient {
         for (uint32_t i = 0; i < kMaxHandles; i++)
             if (boIdx[i] >= 0) { gpuOwner->destroyBo(boIdx[i]); boIdx[i] = -1; }
         boUsed = 0;
+        if (fenceIdx >= 0) { gpuOwner->destroyBo(fenceIdx); fenceIdx = -1; }
+    }
+    uint32_t fenceNow() const {
+        return *reinterpret_cast<volatile uint32_t *>(gpuOwner->bos[fenceIdx].md->getBytesNoCopy());
     }
 
 public:
@@ -1722,9 +1728,12 @@ public:
         gpuOwner = OSDynamicCast(RedNaviProbe, provider);
         lock = IOLockAlloc();
         for (uint32_t i = 0; i < kMaxHandles; i++) boIdx[i] = -1;
-        return gpuOwner && lock && IOUserClient::start(provider);
+        if (!gpuOwner || !lock) return false;
+        fenceIdx = gpuOwner->createHostBo(4096);
+        return fenceIdx >= 0 && IOUserClient::start(provider);
     }
     void free() APPLE_KEXT_OVERRIDE {
+        if (lock && gpuOwner) freeAll();                // normally clientClose did it already
         if (lock) { IOLockFree(lock); lock = nullptr; }
         IOUserClient::free();
     }
@@ -1808,13 +1817,36 @@ public:
             }
             break;
         case RN_UC_SUBMIT:
-            if (sized(args, sizeof(rn_uc_submit), 0)) {
+            if (sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) && fenceIdx >= 0) {
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
-                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || (in->fence_va & 3) ||
-                    !inOwnBo(in->ib_va, in->ib_dwords * 4ull) || !inOwnBo(in->fence_va, 4)) break;
+                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !inOwnBo(in->ib_va, in->ib_dwords * 4ull)) break;
+                const uint32_t seq = seqSubmitted + 1;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                const int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, in->ib_va, in->ib_dwords, in->fence_va, in->fence_value);
-                rc = r == 0 ? kIOReturnSuccess : (r == -EAGAIN ? kIOReturnBusy : kIOReturnNoSpace);
+                const int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, in->ib_va, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq);
+                if (r == 0) {
+                    seqSubmitted = seq;                              // taken under the connection's lock, in the order the packets reach the ring
+                    rn_uc_submit_result *o = static_cast<rn_uc_submit_result *>(args->structureOutput);
+                    memset(o, 0, sizeof(*o));
+                    o->seq = seq;
+                    rc = kIOReturnSuccess;
+                } else {
+                    rc = r == -EAGAIN ? kIOReturnBusy : kIOReturnNoSpace;
+                }
+            }
+            break;
+        case RN_UC_WAIT_SEQ:
+            if (sized(args, sizeof(rn_uc_wait_seq), sizeof(rn_uc_wait_seq_result)) && fenceIdx >= 0) {
+                const rn_uc_wait_seq *in = static_cast<const rn_uc_wait_seq *>(args->structureInput);
+                if (static_cast<int32_t>(seqSubmitted - in->seq) < 0 || in->seq == 0) break;   // never submitted
+                const uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
+                uint32_t ms = 0;
+                while (ms < timeout && static_cast<int32_t>(fenceNow() - in->seq) < 0) { IOSleep(1); ms++; }
+                rn_uc_wait_seq_result *o = static_cast<rn_uc_wait_seq_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->signaled = fenceNow();
+                o->reached = static_cast<int32_t>(o->signaled - in->seq) >= 0;
+                if (timeout) rn_gc_safe_mode(&gpuOwner->gpu, 0);
+                rc = kIOReturnSuccess;
             }
             break;
         case RN_UC_BO_WAIT:
@@ -1847,6 +1879,7 @@ public:
                 o->hqd_doorbell_control = d2[0]; o->cp_pq_status = d2[1]; o->doorbell_range_lower = d2[2]; o->doorbell_range_upper = d2[3];
                 o->doorbell_aper_en = d2[4]; o->pq_base = d2[5]; o->pq_control = d2[6]; o->mqd_base = d2[7];
                 o->ring_rptr_word = rs[0]; o->ring_wptr_word = rs[1]; o->driver_wptr = rs[2]; o->ring_full_waits = rs[3];
+                o->seq_submitted = seqSubmitted; o->seq_signaled = fenceIdx >= 0 ? fenceNow() : 0;
                 rc = kIOReturnSuccess;
             }
             break;
