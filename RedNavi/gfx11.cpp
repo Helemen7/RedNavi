@@ -1,3 +1,4 @@
+#include <IOKit/IOLib.h>      // before the compat headers: their min() macro breaks libkern.h
 #include "gfx11.h"
 
 #include <string.h>
@@ -12,8 +13,6 @@
 // rednavi_mes_host=1: the MES working memory (rings, write-back words, fences, contexts, MQDs, EOP buffers) lives in one host buffer mapped through the GART, as
 // in Linux, where every one of these is a GTT buffer or a write-back slot. Its "offset" is chosen so that vaBase + offset is the GART address; the accessors
 // below send an offset inside that range to the host mapping and everything else to VRAM through MM_INDEX/MM_DATA.
-bool gMesCleaner = false;      // rednavi_mes_cleaner=1: see gfx11.h
-bool gMesHwResLinux = false;   // rednavi_mes_hwres=1: see gfx11.h
 u64 gMesHostLogBase = 0;
 volatile u8 *gMesHostMem = nullptr;
 u64 gMesHostSize = 0;
@@ -556,6 +555,7 @@ static u32 gMappedPipe = 0;
 static u32 gMappedQueue = 3;           // queue index (ME 1, pipe 0) of the mapped queue: 3 through the KIQ, 4 through the MES
 static const u32 kMappedDoorbellDword = 8;
 static u32 gMappedDoorbell = kMappedDoorbellDword;   // doorbell dword of the mapped queue: 8 through the KIQ, in the user queue range (26..276) for a MES process queue
+static IOLock *gSubmitLock;             // one writer at a time on the compute ring, its wptr and the doorbell (user clients, the watch timer)
 static u32 gComputeWptr;                // running write pointer of the compute queue, in dwords
 static volatile u8 *gDoorbellBase;      // mapped doorbell BAR, or null for plain register submission
 static u32 gDoorbellDword;              // the compute queue's doorbell, in dwords
@@ -1096,7 +1096,16 @@ u32 rn_build_dispatch_ib(struct rn_device *adev, u32 *ring, u64 shaderVa) {
     return n;
 }
 
-int rn_compute_submit_ib(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue) {
+int rn_compute_lock_init(void) {
+    if (!gSubmitLock) gSubmitLock = IOLockAlloc();
+    return gSubmitLock ? 0 : -ENOMEM;
+}
+
+void rn_compute_lock_free(void) {
+    if (gSubmitLock) { IOLockFree(gSubmitLock); gSubmitLock = nullptr; }
+}
+
+static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue) {
     (void)vaBase;
     const u32 mask = ringBytes / 4 - 1;
     const u64 wptrOff = ringOff + 0x1008;
@@ -1140,6 +1149,13 @@ int rn_compute_submit_ib(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ri
     computeSubmit(adev, wptrOff, w + n);
     grbmSelect(adev, 0, 0, 0, 0);
     return 0;
+}
+
+int rn_compute_submit_ib(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 ringBytes, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue) {
+    if (gSubmitLock) IOLockLock(gSubmitLock);                                // slot reservation, packet writes, flush and doorbell are one critical section
+    const int rc = computeSubmitLocked(adev, vaBase, ringOff, ringBytes, ibVa, ibDwords, fenceVa, fenceValue);
+    if (gSubmitLock) IOLockUnlock(gSubmitLock);
+    return rc;
 }
 
 void rn_gc_safe_mode(struct rn_device *adev, int enter) {
@@ -1496,10 +1512,8 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     if (progress) progress(ctx, 1);
     const u64 logOff = base + 0x50000, logVa = vaBase + logOff;           // MES event log (amdgpu_mes_log_enable): history in the first half, scratch in the second
     for (u32 o = 0; o < 0x8000; o += 4) rn_vram_wr32(adev, logOff + o, 0);
-    if (!gMesHwResLinux) {                                  // rednavi_mes_hwres=1: as Linux without mes_log_enable, MSCRATCH stays 0 (the firmware enables more interrupts when it is set)
-        WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_LO, lower_32_bits(logVa + 0x4000));
-        WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_HI, upper_32_bits(logVa + 0x4000));
-    }
+    WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_LO, lower_32_bits(logVa + 0x4000));
+    WREG32_SOC15(RN_GC, 0, regCP_MES_MSCRATCH_HI, upper_32_bits(logVa + 0x4000));
     u32 d = RREG32_SOC15(RN_GC, 0, regCP_MES_CNTL);
     d = REG_SET_FIELD(d, CP_MES_CNTL, MES_PIPE0_RESET, 1);
     d = REG_SET_FIELD(d, CP_MES_CNTL, MES_PIPE1_RESET, 1);
@@ -1664,15 +1678,8 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
             p.osssys_base[i] = adev->reg_offset[RN_OSSSYS_HWIP][0][i];
         }
         p.disable_reset = 1;
-        p.disable_mes_log = gMesHwResLinux ? 1 : 0;
-        if (gMesHwResLinux) {                              // the three fields mes_v11_0_set_hw_resources (Linux 7.0) sets and RedNavi left at 0
-            p.gds_size = 0x1000;                           // adev->gds.gds_size for GFX11 (gfx_v11_0_set_gds_init)
-            p.oversubscription_timer = 50;
-        }
-        if (!gMesHwResLinux) {                             // Linux without amdgpu.mes_log_enable (the default) sends neither; they also change the scheduler's CP_MES_MIE (0x31ffe against 0x1ffe)
-            p.enable_mes_event_int_logging = 1;
-            p.event_intr_history_gpu_mc_ptr = logVa;
-        }
+        p.enable_mes_event_int_logging = 1;                // the event log area (see logOff); Linux sends it with amdgpu.mes_log_enable
+        p.event_intr_history_gpu_mc_ptr = logVa;
         p.use_different_vmid_compute = 1;
         p.enable_reg_active_poll = 1;
         p.enable_level_process_quantum_check = 1;
@@ -1723,23 +1730,13 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
     gMappedDoorbell = legDb;
     writeComputeMqd(adev, vaBase, qOff, kKcqRingBytes, qOff + 0x2000, qOff + 0x4000, legDb, false, kRingAt);
     {
-        // amdgpu_gfx_mes_enable_kcq: SET_RESOURCES on the KIQ ring with every queue in the mask comes before the legacy queue is mapped
-        // Dwords 4 and 5 are the cleaner shader's MC address >> 8. Linux 7.0 enables the cleaner shader on GC 11.0.3 with these firmware versions
-        // (gfx_v11_0_sw_init: ME >= 2280, PFP >= 2370, MEC >= 2450, MES >= 99) and sends its address here; RedNavi sent 0. The scheduler does touch
-        // the cleaner path in ADD_QUEUE (with the SET_HW_RESOURCES_1 fence reading 0xffffffff it spun there), so a null shader is a suspect.
-        // Linux's shader binary is not copied: a single s_endpgm (GFX11 encoding 0xbfb00000) is enough to see whether the address matters.
-        u64 cleanerMc = 0;
-        if (gMesCleaner) {
-            const u64 shOff = sharedOff + 0x1800;                          // 256-byte aligned, clear of the fence area (+0x200..+0x1200) and the contexts (+0x2000)
-            for (u32 o = 0; o < 0x100; o += 4) rn_vram_wr32(adev, shOff + o, 0xbfb00000u);
-            cleanerMc = (vaBase + shOff) >> 8;
-        }
-        res->parity[0] = lower_32_bits(cleanerMc);
-        res->parity[1] = (gMesCleaner ? 1u : 0u) | (gMesHwResLinux ? 2u : 0u);
+        // amdgpu_gfx_mes_enable_kcq: SET_RESOURCES on the KIQ ring with every queue in the mask comes before the legacy queue is mapped.
+        // Dwords 4 and 5 are the cleaner shader address; RedNavi sends none (Linux's shader is not copied, and sending a one-instruction shader
+        // changed nothing on the hardware, 2026-11-01).
         u32 pk[8];
         pk[0] = RN_PACKET3(0xA0u, 6);
         pk[1] = (0u << 0) | (0xau << 16) | (0u << 29);
-        pk[2] = 0xffffffffu; pk[3] = 0xffffffffu; pk[4] = lower_32_bits(cleanerMc); pk[5] = upper_32_bits(cleanerMc); pk[6] = 0; pk[7] = 0;
+        pk[2] = 0xffffffffu; pk[3] = 0xffffffffu; pk[4] = 0; pk[5] = 0; pk[6] = 0; pk[7] = 0;
         mesRingSubmit(adev, kiqOff, kKiqRingBytes, 0xff, kKiqNop, kiqOff + 0x1008, kMesKiqDoorbell, &kiqWptr, pk, 8);
         msleep(300);                                                      // no GRBM access while the KIQ handles it (see the step 3 comment)
         mesKiqRingTest(adev, kiqOff, &kiqWptr, &res->ktest[2], &res->ktest[3]);   // and after SET_RESOURCES, as amdgpu_gfx_mes_enable_kcq does

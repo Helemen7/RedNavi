@@ -152,6 +152,8 @@ void rn_set_doorbell(volatile void *base, u32 dword_index);
 // Command submission on the compute queue that rn_compute_ring_test programmed (through its doorbell if one is set): appends an
 // INDIRECT_BUFFER packet for the command buffer at ib_va (ib_dwords PM4 dwords) and a RELEASE_MEM that writes fence_value to fence_va
 // (a GPU address, VRAM aperture or GART) when the buffer has executed. The ring is addressed by the running wptr counter, so it wraps.
+int rn_compute_lock_init(void);   // allocates the lock rn_compute_submit_ib takes; call before the first submit
+void rn_compute_lock_free(void);
 int rn_compute_submit_ib(struct rn_device *adev, u64 va_base, u64 ring_vram_offset, u32 ring_bytes, u64 ib_va, u32 ib_dwords,
                          u64 fence_va, u32 fence_value);
 // Fills ib with the PM4 of a 1x1x1 dispatch of the shader at shader_va (the packets of rn_compute_dispatch_test, without the fence)
@@ -164,8 +166,6 @@ void rn_compute_diag(struct rn_device *adev, u32 out[11]);   // out[8..10]: SDMA
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]);
 void rn_mes_state(struct rn_device *adev, u32 out[15]);
 void rn_gfx_constants_init(struct rn_device *adev);   // gfx_v11_0_hw_init steps between the memory hub and the CP resume (golden TCP_CNTL, read timeout, SH_MEM per VMID, doorbell ranges)
-extern bool gMesCleaner;      // rednavi_mes_cleaner=1: a cleaner shader (one s_endpgm) and its address in the KIQ SET_RESOURCES, as gfx11_kiq_set_resources sends it
-extern bool gMesHwResLinux;   // rednavi_mes_hwres=1: SET_HW_RESOURCES with Linux's gds_size 0x1000, oversubscription_timer 50 and disable_mes_log 1
 extern u64 gMesHostLogBase;       // the MES working area in host memory (the default; rednavi_mes_host=0 for VRAM): logical offset of the host buffer (GART address minus the VRAM MC base), its CPU mapping and size
 extern volatile u8 *gMesHostMem;
 extern u64 gMesHostSize;
@@ -187,7 +187,6 @@ struct rn_mes_result {
     u32 ring_head[8];                              // when SET_HW_RESOURCES got no answer: scheduler ring dwords 0..3, rptr word, wptr word, ring fence, api status
     u32 sched_hqd[10];                             // the scheduler's HQD after the KIQ mapped it: PQ_BASE lo/hi, MQD_BASE, PQ_CONTROL, DOORBELL_CONTROL, RPTR, WPTR_LO, ACTIVE, RPTR_REPORT_ADDR, WPTR_POLL_ADDR
     u32 ktest[6];                                  // KIQ ring test (WRITE_DATA to SCRATCH_REG0, 0xDEADBEEF expected) and the KIQ pc after it: after the scheduler queue map, after SET_RESOURCES, after the stuck map
-    u32 parity[2];                                 // [0] cleaner shader address sent in the KIQ SET_RESOURCES (>> 8, low half), [1] bit 0 rednavi_mes_cleaner, bit 1 rednavi_mes_hwres
     u32 hqd_active;                                // MEC queues with CP_HQD_ACTIVE set before the legacy map, bit pipe * 8 + queue
     u32 cp_me_cntl, mec_cntl, rlc_sched;           // CP_ME_CNTL, CP_MEC_RS64_CNTL, RLC_CP_SCHEDULERS before the MES start
     u32 bootload, rlc_srm, cp_stat0;               // RLC_RLCS_BOOTLOAD_STATUS, RLC_SRM_CNTL and CP_STAT before the MES start

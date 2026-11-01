@@ -1880,7 +1880,6 @@ __attribute__((noinline)) void RedNaviProbe::publishMes(const struct rn_mes_resu
     static const char *const ktn[] = {"a_scratch", "a_pc", "b_scratch", "b_pc", "c_scratch", "c_pc"};
     rnPublish(this, "mes-kiq-test", ktn, mr.ktest, 6);
     static const char *const pn[] = {"cleaner", "flags"};
-    rnPublish(this, "mes-parity", pn, mr.parity, 2);
     static const char *const bn[] = {"gc0", "gc1", "gc2", "gc3", "mmhub0", "mmhub1", "mmhub2", "oss0", "oss1"};
     const uint32_t bv[] = {gpu.reg_offset[RN_GC_HWIP][0][0], gpu.reg_offset[RN_GC_HWIP][0][1], gpu.reg_offset[RN_GC_HWIP][0][2], gpu.reg_offset[RN_GC_HWIP][0][3],
                            gpu.reg_offset[RN_MMHUB_HWIP][0][0], gpu.reg_offset[RN_MMHUB_HWIP][0][1], gpu.reg_offset[RN_MMHUB_HWIP][0][2],
@@ -2248,8 +2247,6 @@ void RedNaviProbe::sdmaTest() {
             if (gcAwake == 1) rn_gc_safe_mode(&gpu, 1);
             uint32_t mesClean = 0;    // rednavi_mes_clean=1: no hand-programmed queue at all, only the MEC running and the doorbells mapped; the MES maps the queue
             PE_parse_boot_argn("rednavi_mes_clean", &mesClean, sizeof(mesClean));
-            { uint32_t v = 0; gMesCleaner = PE_parse_boot_argn("rednavi_mes_cleaner", &v, sizeof(v)) && v == 1; }
-            { uint32_t v = 0; gMesHwResLinux = PE_parse_boot_argn("rednavi_mes_hwres", &v, sizeof(v)) && v == 1; }
             if (mesClean == 1 || mesClean == 2) {
                 memset(&cr, 0, sizeof(cr));
                 rn_mec_enable(&gpu);
@@ -2669,6 +2666,7 @@ bool RedNaviProbe::start(IOService *provider) {
     if (!pci) return false;
 
     modeLock = IOLockAlloc();
+    rn_compute_lock_init();
     pci->setMemoryEnable(true);
     dumpPci();
 
@@ -2740,6 +2738,7 @@ bool RedNaviProbe::start(IOService *provider) {
 
 void RedNaviProbe::stop(IOService *provider) {
     if (modeLock) { IOLockFree(modeLock); modeLock = nullptr; }
+    rn_compute_lock_free();
     if (disc) { disc->release(); disc = nullptr; }
     if (vbiosCopy) { vbiosCopy->release(); vbiosCopy = nullptr; }
     if (watchTimer) { watchTimer->cancelTimeout(); if (getWorkLoop()) getWorkLoop()->removeEventSource(watchTimer); watchTimer->release(); watchTimer = nullptr; }
