@@ -8,6 +8,7 @@
 // Log: /tmp/rednavi-metal.log (append, one line per event).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <dlfcn.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -81,9 +82,16 @@ __attribute__((constructor)) static void rn_load(void) {
     class_addMethod(object_getClass(k), @selector(resolveInstanceMethod:), (IMP)rn_resolve_instance, "c@::");
     class_addMethod(object_getClass(k), @selector(resolveClassMethod:), (IMP)rn_resolve_class, "c@::");
     // The first message Metal sends to the plug-in class, seen in the log of the first stub: +bundleForClass (a class method with no argument); the answer is the bundle.
+    // It must not be [NSBundle bundleForClass:self]: that asks this very method again and recurses until the stack is gone (every Metal process crashed with it, 2026-11-02).
+    // The bundle is found from the address of this code instead.
     class_addMethod(object_getClass(k), sel_registerName("bundleForClass"), imp_implementationWithBlock(^id(id self) {
-        NSBundle *b = [NSBundle bundleForClass:self];
-        rn_log("+bundleForClass answered: %s", b.bundlePath.UTF8String);
+        Dl_info info;
+        NSBundle *b = nil;
+        if (dladdr((const void *)rn_load, &info) && info.dli_fname) {
+            NSString *exe = [NSString stringWithUTF8String:info.dli_fname];                 // .../RedNaviMTLDriver.bundle/Contents/MacOS/RedNaviMTLDriver
+            b = [NSBundle bundleWithPath:[[[exe stringByDeletingLastPathComponent] stringByDeletingLastPathComponent] stringByDeletingLastPathComponent]];
+        }
+        rn_log("+bundleForClass answered: %s", b ? b.bundlePath.UTF8String : "nil");
         return b;
     }), "@@:");
     objc_registerClassPair(k);
