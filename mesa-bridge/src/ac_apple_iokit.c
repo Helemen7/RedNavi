@@ -55,6 +55,7 @@ struct ac_drm_device {
    struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
    uint32_t nbos;
    uint32_t next_ctx;
+   int refs;                                                  /* the device and every clone of its sync provider (vk_device keeps one past the winsys) */
    struct util_sync_provider sync;
 };
 
@@ -287,8 +288,17 @@ static int sp_transfer(struct util_sync_provider *p, uint32_t dst, uint64_t dst_
    return call(PROVIDER_DEV(p), RN_UC_SYNCOBJ_TRANSFER, &in, sizeof(in), NULL, 0);
 }
 
-static void sp_finalize(struct util_sync_provider *p) { (void)p; }
-static struct util_sync_provider *sp_clone(struct util_sync_provider *p) { return p; }
+static void dev_release(struct ac_drm_device *dev);
+
+static void sp_finalize(struct util_sync_provider *p) { dev_release(PROVIDER_DEV(p)); }
+
+/* vk_device owns a clone and finalizes it after the winsys is gone, so a clone is a reference to the same device */
+static struct util_sync_provider *sp_clone(struct util_sync_provider *p)
+{
+   struct ac_drm_device *dev = PROVIDER_DEV(p);
+   __atomic_add_fetch(&dev->refs, 1, __ATOMIC_RELAXED);
+   return &dev->sync;
+}
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- device */
 
@@ -346,6 +356,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
    vamgr_init(&dev->low, dev->dev_info.virtual_address_offset, dev->dev_info.virtual_address_max);
    vamgr_init(&dev->high32, dev->dev_info.high_va_offset, dev->dev_info.high_va_offset + (1ull << 32));
    dev->next_ctx = 1;
+   dev->refs = 1;
    dev->sync = (struct util_sync_provider) {
       .create = sp_create, .destroy = sp_destroy, .handle_to_fd = sp_unsupported_fd, .fd_to_handle = sp_unsupported_fd_to_handle,
       .import_sync_file = sp_unsupported_import, .export_sync_file = sp_unsupported_fd, .wait = sp_wait, .reset = sp_reset, .signal = sp_signal,
@@ -364,7 +375,13 @@ int ac_drm_device_get_fd(ac_drm_device *dev) { (void)dev; return -1; }
 
 void ac_drm_device_deinitialize(ac_drm_device *dev)
 {
-   if (!dev)
+   if (dev)
+      dev_release(dev);
+}
+
+static void dev_release(struct ac_drm_device *dev)
+{
+   if (__atomic_sub_fetch(&dev->refs, 1, __ATOMIC_ACQ_REL) != 0)
       return;
    IOServiceClose(dev->conn);                                 /* the kext frees the buffers, the address space and the syncobjs of a closed connection */
    free(dev->low.free_list);
@@ -422,7 +439,15 @@ int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_insta
    memset(&req, 0, sizeof(req));
    req.query_hw_ip.type = type;
    req.query_hw_ip.ip_instance = ip_instance;
-   return info_query(dev, AMDGPU_INFO_HW_IP_INFO, sizeof(*info), info, &req);
+   int r = info_query(dev, AMDGPU_INFO_HW_IP_INFO, sizeof(*info), info, &req);
+   if (r || type != AMDGPU_HW_IP_GFX || info->ip_discovery_version)
+      return r;
+   /* The kext has no graphics queue and answers all zero. Mesa takes the GFX level from the GFX IP version, so give it that of the compute engine (the same GC block) with no rings:
+    * num_queues stays 0 and RADV offers compute queues only. */
+   req.query_hw_ip.type = AMDGPU_HW_IP_COMPUTE;
+   r = info_query(dev, AMDGPU_INFO_HW_IP_INFO, sizeof(*info), info, &req);
+   info->available_rings = 0;
+   return r;
 }
 
 int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance, unsigned index, uint32_t *version, uint32_t *feature)
@@ -525,6 +550,9 @@ int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *val
    switch (info) {
    case amdgpu_sw_info_address32_hi:
       *(uint32_t *)value = (uint32_t)(dev->dev_info.high_va_offset >> 32);
+      return 0;
+   case amdgpu_sw_info_address_prt_wa_control_bit:
+      *(uint32_t *)value = 47;                                 /* the bit that tells the lower half of the 48-bit space from the upper (the hole is at 2^47) */
       return 0;
    default:
       return -EINVAL;
@@ -714,6 +742,9 @@ int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uin
 int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops)
 {
    (void)flags;
+   /* No buffer: a sparse (PRT) range. The kext has no page-fault-as-zero mapping, so the range is only reserved in the VA manager; touching it faults. Nothing to map or unmap. */
+   if (bo_handle == 0 && (ops == AMDGPU_VA_OP_MAP || ops == AMDGPU_VA_OP_REPLACE || ops == AMDGPU_VA_OP_UNMAP || ops == AMDGPU_VA_OP_CLEAR))
+      return 0;
    struct rn_uc_va_unmap un = {addr, size};
    struct rn_uc_va_map map = {bo_handle, 0, addr, offset, size};
    switch (ops) {

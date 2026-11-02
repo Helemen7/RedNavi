@@ -79,7 +79,7 @@ The first useful measurement is `meson setup` of a full checkout with the patche
 
 ## Build result, 2026-11-02 (Mesa bd830ce, 27.0.0-devel)
 
-`mesa-bridge/patches/0001-radv-darwin-iokit.patch` applies on that commit and builds `libvulkan_radeon.dylib` on macOS 15 (x86_64) with `-Dvulkan-drivers=amd`. Verified on the development Mac only: the loader loads the ICD and RADV starts, then stops with "failed to initialize device" because the kext is not there. Not yet run against the card.
+`mesa-bridge/patches/0001-radv-darwin-iokit.patch` applies on that commit and builds `libvulkan_radeon.dylib` on macOS 15 (x86_64) with `-Dvulkan-drivers=amd`. 
 
 ```
 git apply mesa-bridge/patches/0001-radv-darwin-iokit.patch      # in a Mesa checkout at bd830ce
@@ -90,3 +90,14 @@ ninja -C build
 ```
 
 Needs glslang (BVH shaders) from MacPorts. What the patch does: the `ac_drm_*` layer is `src/amd/common/apple/ac_apple_iokit.c` instead of `ac_linux_drm.c`; `apple/amdgpu.h` and `apple/xf86drm.h` stand in for libdrm; RADV enumerates its one device through `physical_devices.enumerate` with no DRM node (`RADV_DRM_DEVICE_APPLE_IOKIT`, fd -1); syncobjs come from the bridge's sync provider; buffers are mapped by `ac_drm_bo_cpu_map` as on virtio; addrlib is built with `-DHAVE_TSERVER` (the Apple branch wants a private header); weak layer entrypoints need `-Wl,-undefined,dynamic_lookup`. `libzstd` must be bundled next to the dylib (`tools/vk_run.sh` and `tools/rn_icd.json` run `vulkaninfo` with `VK_ICD_FILENAMES` and `DYLD_LIBRARY_PATH` pointing at the bundle).
+
+### First `vulkaninfo`, 2026-11-02 (verified on the desktop, 7800 XT)
+
+`VK_ICD_FILENAMES=rn_icd.json vulkaninfo --summary` with the bundle in `~/rn/vk` (Vulkan loader and vulkaninfo from MacPorts, `libvulkan_radeon.dylib`, `libzstd`) lists the card: `AMD Radeon RX 7800 XT (RADV NAVI32)`, `DRIVER_ID_MESA_RADV`, Vulkan 1.4.366, discrete GPU, `0x1002:0x747e`. Getting there took four changes beyond the build:
+
+- GFX IP version: the kext answers all zero for the graphics engine, and Mesa takes the GFX level from it ("Unknown gfx version: 0.0"). The bridge copies the compute engine's version into the GFX answer with `available_rings` 0, so RADV sees GFX11 with no graphics queue.
+- `amdgpu_sw_info_address_prt_wa_control_bit` answers 47.
+- Sparse (PRT) ranges, `bo_handle` 0 in a VA op: success without a mapping. The range is only reserved; touching it faults. Sparse residency does not work.
+- The sync provider clone is a reference to the device: `vk_device` finalizes its clone after the winsys freed the device (crash in `vk_device_finish`).
+
+Not done: a dispatch through RADV, the PCI location (placeholder 0000:03:00.0, so the device UUID is a placeholder too), memory in VRAM (all buffers are host memory), the graphics queue.
