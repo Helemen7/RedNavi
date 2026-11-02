@@ -6,6 +6,9 @@
  *   clang -O1 -arch x86_64 -mmacosx-version-min=12 -I/opt/local/include test/vk_present.c -L/opt/local/lib -lvulkan -o vk_present
  * Exit status 0 when the pixels read back from the surface are right.
  *   vk_present scene [seconds]: the harder scene below (depth test, texture sampling, 4x multisampling with a resolve into the surface).
+ *   vk_present spin [seconds [fps]]: two rotating cubes from vertex and index buffers, MVP matrices in push constants, a per-frame uniform buffer, 4x MSAA, rendered continuously at
+ *   the given rate (default 20 s, 60 fps) with two frames in flight, every frame copied into the display surface; prints frame-time statistics. Exit status 0 when no frame was late
+ *   by more than 4 frame times and the sampled pixels were always right.
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -17,6 +20,9 @@
 
 #include "vk_draw_spv.h"
 #include "vk_scene_spv.h"
+#include "vk_cube_spv.h"
+#include <math.h>
+#include <time.h>
 
 #define CHECK(x)                                                                                    \
    do {                                                                                             \
@@ -460,8 +466,310 @@ static int scene_main(int argc, char **argv)
    return ok ? 0 : 1;
 }
 
+
+/* ------------------------------------------------------------------------------------------------------------------------------------------ spin
+ * A render loop: two cubes (8 vertices, 36 16-bit indices, device-local buffers filled once through a staging buffer) rotate, one orbiting the other. The model-view-projection matrix of
+ * each is a push constant, a uniform buffer written by the CPU every frame tints them, the frame is rendered with 4 samples and resolved, and copied into the display surface. Two
+ * frames are in flight (two command buffers re-recorded in turn, two uniform buffers and fences). The loop is paced at the requested rate. */
+typedef float mat4[16];                                              /* column-major: m[column * 4 + row] */
+static void m_mul(mat4 r, const mat4 a, const mat4 b)
+{
+   mat4 t;
+   for (int c = 0; c < 4; c++) for (int rw = 0; rw < 4; rw++) { float v = 0; for (int k = 0; k < 4; k++) v += a[k * 4 + rw] * b[c * 4 + k]; t[c * 4 + rw] = v; }
+   memcpy(r, t, sizeof(t));
+}
+static void m_id(mat4 m) { memset(m, 0, sizeof(mat4)); m[0] = m[5] = m[10] = m[15] = 1; }
+static void m_rot_y(mat4 m, float a) { m_id(m); m[0] = cosf(a); m[8] = sinf(a); m[2] = -sinf(a); m[10] = cosf(a); }
+static void m_rot_x(mat4 m, float a) { m_id(m); m[5] = cosf(a); m[9] = -sinf(a); m[6] = sinf(a); m[10] = cosf(a); }
+static void m_trans(mat4 m, float x, float y, float z) { m_id(m); m[12] = x; m[13] = y; m[14] = z; }
+static void m_scale(mat4 m, float s) { m_id(m); m[0] = m[5] = m[10] = s; }
+static void m_persp(mat4 m, float fovy, float aspect, float n, float f)    /* Vulkan clip space: y down, depth 0 to 1 */
+{
+   const float t = 1.0f / tanf(fovy / 2);
+   memset(m, 0, sizeof(mat4));
+   m[0] = t / aspect; m[5] = -t; m[10] = f / (n - f); m[11] = -1; m[14] = n * f / (n - f);
+}
+static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
+
+static int spin_main(int argc, char **argv)
+{
+   const int seconds = argc > 1 ? atoi(argv[1]) : 20;
+   const int fps = argc > 2 ? atoi(argv[2]) : 60;
+   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "rn_vk_spin", .apiVersion = VK_API_VERSION_1_1};
+   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+   VkInstance inst;
+   CHECK(vkCreateInstance(&ici, NULL, &inst));
+   uint32_t n = 1;
+   VkPhysicalDevice pd;
+   VkResult r = vkEnumeratePhysicalDevices(inst, &n, &pd);
+   if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n < 1) { fprintf(stderr, "no device\n"); return 2; }
+   vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+   uint32_t nq = 8;
+   VkQueueFamilyProperties qf[8];
+   vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
+   int fam = -1;
+   for (uint32_t i = 0; i < nq; i++) if (fam < 0 && (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) fam = (int)i;
+   if (fam < 0) { fprintf(stderr, "no graphics queue family\n"); return 2; }
+   float prio = 1.0f;
+   VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = (uint32_t)fam, .queueCount = 1, .pQueuePriorities = &prio};
+   const char *exts[] = {"VK_EXT_external_memory_host"};
+   VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 1, .ppEnabledExtensionNames = exts};
+   VkDevice dev;
+   CHECK(vkCreateDevice(pd, &dci, NULL, &dev));
+   VkQueue q;
+   vkGetDeviceQueue(dev, (uint32_t)fam, 0, &q);
+
+   void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
+   int (*scanout)(uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
+   if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
+   uint32_t W, H, pitch;
+   void *scan;
+   size_t slen;
+   if (scanout(&W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
+   PFN_vkGetMemoryHostPointerPropertiesEXT getHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+   VkMemoryHostPointerPropertiesEXT hpp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+   CHECK(getHostProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, scan, &hpp));
+   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = slen, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   VkBuffer sbuf;
+   CHECK(vkCreateBuffer(dev, &bci, NULL, &sbuf));
+   VkMemoryRequirements mr;
+   vkGetBufferMemoryRequirements(dev, sbuf, &mr);
+   VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = scan};
+   VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = slen, .memoryTypeIndex = memType(hpp.memoryTypeBits & mr.memoryTypeBits, 0, 0)};
+   VkDeviceMemory smem;
+   CHECK(vkAllocateMemory(dev, &mai, NULL, &smem));
+   CHECK(vkBindBufferMemory(dev, sbuf, smem, 0));
+
+   /* images: 4x colour, depth, the resolve target */
+   const VkFormat cfmt = VK_FORMAT_B8G8R8A8_UNORM, dfmt = VK_FORMAT_D32_SFLOAT;
+   struct { VkFormat f; VkImageUsageFlags u; VkSampleCountFlagBits s; VkImageAspectFlags a; VkImage img; VkDeviceMemory mem; VkImageView view; } im[3] = {
+      {cfmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_ASPECT_COLOR_BIT},
+      {dfmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_ASPECT_DEPTH_BIT},
+      {cfmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT},
+   };
+   for (int i = 0; i < 3; i++) {
+      VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im[i].f, .extent = {W, H, 1}, .mipLevels = 1, .arrayLayers = 1,
+                              .samples = im[i].s, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = im[i].u, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+      CHECK(vkCreateImage(dev, &ic, NULL, &im[i].img));
+      vkGetImageMemoryRequirements(dev, im[i].img, &mr);
+      VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
+      CHECK(vkAllocateMemory(dev, &ma, NULL, &im[i].mem));
+      CHECK(vkBindImageMemory(dev, im[i].img, im[i].mem, 0));
+      VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[i].img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = im[i].f, .subresourceRange = {im[i].a, 0, 1, 0, 1}};
+      CHECK(vkCreateImageView(dev, &vc, NULL, &im[i].view));
+   }
+
+   /* the cube: position and colour per corner, indices of 12 triangles */
+   float verts[8 * 6];
+   for (int i = 0; i < 8; i++) {
+      const float x = (i & 1) ? 1.f : -1.f, y = (i & 2) ? 1.f : -1.f, z = (i & 4) ? 1.f : -1.f;
+      float *v = &verts[i * 6];
+      v[0] = x; v[1] = y; v[2] = z; v[3] = (i & 1) ? 1.0f : 0.25f; v[4] = (i & 2) ? 1.0f : 0.25f; v[5] = (i & 4) ? 1.0f : 0.25f;
+   }
+   const uint16_t idx[36] = {0, 1, 3, 0, 3, 2,  4, 6, 7, 4, 7, 5,  0, 2, 6, 0, 6, 4,  1, 5, 7, 1, 7, 3,  0, 4, 5, 0, 5, 1,  2, 3, 7, 2, 7, 6};
+   VkBuffer vbuf, ibuf, stage;
+   VkDeviceMemory vmem, imemb, stmem;
+   VkBufferCreateInfo b1 = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = sizeof(verts), .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   VkBufferCreateInfo b2 = b1; b2.size = sizeof(idx); b2.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+   VkBufferCreateInfo b3 = b1; b3.size = 4096; b3.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+   CHECK(vkCreateBuffer(dev, &b1, NULL, &vbuf)); CHECK(vkCreateBuffer(dev, &b2, NULL, &ibuf)); CHECK(vkCreateBuffer(dev, &b3, NULL, &stage));
+   VkBuffer *bl[3] = {&vbuf, &ibuf, &stage};
+   VkDeviceMemory *ml[3] = {&vmem, &imemb, &stmem};
+   for (int i = 0; i < 3; i++) {
+      vkGetBufferMemoryRequirements(dev, *bl[i], &mr);
+      VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = i < 2 ? memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                                                          : memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+      CHECK(vkAllocateMemory(dev, &ma, NULL, ml[i]));
+      CHECK(vkBindBufferMemory(dev, *bl[i], *ml[i], 0));
+   }
+   uint8_t *sp;
+   CHECK(vkMapMemory(dev, stmem, 0, VK_WHOLE_SIZE, 0, (void **)&sp));
+   memcpy(sp, verts, sizeof(verts));
+   memcpy(sp + 512, idx, sizeof(idx));
+
+   /* two uniform buffers (one per frame in flight), one descriptor set each */
+   enum { FRAMES = 2 };
+   VkBuffer ubuf[FRAMES];
+   VkDeviceMemory umem[FRAMES];
+   float *uptr[FRAMES];
+   VkDescriptorSetLayoutBinding dlb = {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+   VkDescriptorSetLayoutCreateInfo dlci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &dlb};
+   VkDescriptorSetLayout dsl;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl));
+   VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, FRAMES};
+   VkDescriptorPoolCreateInfo dpci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = FRAMES, .poolSizeCount = 1, .pPoolSizes = &dps};
+   VkDescriptorPool dpool;
+   CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool));
+   VkDescriptorSet dset[FRAMES];
+   for (int f = 0; f < FRAMES; f++) {
+      VkBufferCreateInfo ub = b1; ub.size = 256; ub.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT;
+      CHECK(vkCreateBuffer(dev, &ub, NULL, &ubuf[f]));
+      vkGetBufferMemoryRequirements(dev, ubuf[f], &mr);
+      VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+      CHECK(vkAllocateMemory(dev, &ma, NULL, &umem[f]));
+      CHECK(vkBindBufferMemory(dev, ubuf[f], umem[f], 0));
+      CHECK(vkMapMemory(dev, umem[f], 0, VK_WHOLE_SIZE, 0, (void **)&uptr[f]));
+      VkDescriptorSetAllocateInfo dsai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl};
+      CHECK(vkAllocateDescriptorSets(dev, &dsai, &dset[f]));
+      VkDescriptorBufferInfo dbi = {ubuf[f], 0, 16};
+      VkWriteDescriptorSet wds = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset[f], .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, .pBufferInfo = &dbi};
+      vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+   }
+
+   VkAttachmentDescription at[3] = {
+      {.format = cfmt, .samples = VK_SAMPLE_COUNT_4_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+      {.format = dfmt, .samples = VK_SAMPLE_COUNT_4_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL},
+      {.format = cfmt, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}};
+   VkAttachmentReference cref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, dref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}, rref = {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+   VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &cref, .pResolveAttachments = &rref, .pDepthStencilAttachment = &dref};
+   VkRenderPassCreateInfo rpci = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 3, .pAttachments = at, .subpassCount = 1, .pSubpasses = &sub};
+   VkRenderPass rp;
+   CHECK(vkCreateRenderPass(dev, &rpci, NULL, &rp));
+   VkImageView fbv[3] = {im[0].view, im[1].view, im[2].view};
+   VkFramebufferCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = 3, .pAttachments = fbv, .width = W, .height = H, .layers = 1};
+   VkFramebuffer fb;
+   CHECK(vkCreateFramebuffer(dev, &fci, NULL, &fb));
+
+   VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+   VkShaderModule vs, fs;
+   smi.codeSize = cube_vert_spv_len; smi.pCode = (const uint32_t *)cube_vert_spv;
+   CHECK(vkCreateShaderModule(dev, &smi, NULL, &vs));
+   smi.codeSize = cube_frag_spv_len; smi.pCode = (const uint32_t *)cube_frag_spv;
+   CHECK(vkCreateShaderModule(dev, &smi, NULL, &fs));
+   VkPushConstantRange pcr = {VK_SHADER_STAGE_VERTEX_BIT, 0, 64};
+   VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pcr};
+   VkPipelineLayout pl;
+   CHECK(vkCreatePipelineLayout(dev, &plci, NULL, &pl));
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"}};
+   VkVertexInputBindingDescription vib = {0, 24, VK_VERTEX_INPUT_RATE_VERTEX};
+   VkVertexInputAttributeDescription via[2] = {{0, 0, VK_FORMAT_R32G32B32_SFLOAT, 0}, {1, 0, VK_FORMAT_R32G32B32_SFLOAT, 12}};
+   VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, .vertexBindingDescriptionCount = 1, .pVertexBindingDescriptions = &vib,
+                                              .vertexAttributeDescriptionCount = 2, .pVertexAttributeDescriptions = via};
+   VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+   VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
+   VkRect2D sc = {{0, 0}, {W, H}};
+   VkPipelineViewportStateCreateInfo vps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .pViewports = &vp, .scissorCount = 1, .pScissors = &sc};
+   VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+                                                .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
+   VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_4_BIT};
+   VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS};
+   VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xf};
+   VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
+   VkGraphicsPipelineCreateInfo gpi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                       .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .layout = pl,
+                                       .renderPass = rp, .subpass = 0};
+   VkPipeline pipe;
+   CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe));
+
+   VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = (uint32_t)fam};
+   VkCommandPool pool;
+   CHECK(vkCreateCommandPool(dev, &cpci, NULL, &pool));
+   VkCommandBufferAllocateInfo cbai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = FRAMES + 1};
+   VkCommandBuffer cmds[FRAMES + 1];
+   CHECK(vkAllocateCommandBuffers(dev, &cbai, cmds));
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   VkFence fence[FRAMES + 1];
+   for (int i = 0; i < FRAMES + 1; i++) CHECK(vkCreateFence(dev, &fi, NULL, &fence[i]));
+
+   /* the buffers' contents, once */
+   VkCommandBufferBeginInfo cbbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+   CHECK(vkBeginCommandBuffer(cmds[FRAMES], &cbbi));
+   VkBufferCopy c1 = {0, 0, sizeof(verts)}, c2 = {512, 0, sizeof(idx)};
+   vkCmdCopyBuffer(cmds[FRAMES], stage, vbuf, 1, &c1);
+   vkCmdCopyBuffer(cmds[FRAMES], stage, ibuf, 1, &c2);
+   CHECK(vkEndCommandBuffer(cmds[FRAMES]));
+   VkSubmitInfo si0 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmds[FRAMES]};
+   CHECK(vkQueueSubmit(q, 1, &si0, fence[FRAMES]));
+   CHECK(vkWaitForFences(dev, 1, &fence[FRAMES], VK_TRUE, 8000000000ull));
+   printf("spin: %ux%u, 4x MSAA + D32, %d fps for %d s, %d frames in flight\n", W, H, fps, seconds, FRAMES);
+   fflush(stdout);
+
+   mat4 proj, view;
+   m_persp(proj, 0.8f, (float)W / (float)H, 0.5f, 20.0f);
+   m_trans(view, 0, 0, -5.5f);
+   const int total = seconds * fps;
+   const double period = 1000.0 / fps, t0 = now_ms();
+   double waitMin = 1e9, waitMax = 0, waitSum = 0, lateMax = 0;
+   int late = 0, bad = 0, checks = 0, submitted[FRAMES] = {0};
+   for (int fr = 0; fr < total; fr++) {
+      const int slot = fr % FRAMES;
+      const double target = t0 + fr * period;
+      for (double d = target - now_ms(); d > 0.3; d = target - now_ms()) {      /* pace the loop: sleep to this frame's time */
+         struct timespec ts = {0, (long)((d > 1.0 ? d - 0.5 : 0.2) * 1e6)};
+         nanosleep(&ts, NULL);
+      }
+      const double start = now_ms();
+      if (start - target > lateMax) lateMax = start - target;
+      if (start - target > 4 * period) late++;
+      if (submitted[slot]) {                                                   /* this slot's previous frame must be done before its command buffer and uniform buffer are reused */
+         const double w0 = now_ms();
+         r = vkWaitForFences(dev, 1, &fence[slot], VK_TRUE, 10000000000ull);
+         if (r != VK_SUCCESS) { printf("FAIL: frame %d: wait for fence %d\n", fr, (int)r); return 3; }
+         const double w = now_ms() - w0;
+         waitSum += w; if (w < waitMin) waitMin = w; if (w > waitMax) waitMax = w;
+         CHECK(vkResetFences(dev, 1, &fence[slot]));
+         if (fr % 30 == 0 && fr > 0) {                                         /* centre: always a cube; corner: always the clear colour */
+            const uint32_t cpx = ((volatile uint32_t *)((uint8_t *)scan + (size_t)(H / 2) * pitch))[W / 2] & 0xffffffu;
+            const uint32_t kpx = ((volatile uint32_t *)((uint8_t *)scan + (size_t)4 * pitch))[4] & 0xffffffu;
+            checks++;
+            if (cpx == 0x000066u || kpx != 0x000066u) { if (bad < 8) printf("frame %d (%.2f s): centre 0x%06x corner 0x%06x\n", fr, (now_ms() - t0) / 1000.0, cpx, kpx); bad++; }
+         }
+      }
+      const float a = (float)fr / (float)fps;
+      uptr[slot][0] = 0.6f + 0.4f * sinf(a * 2.0f); uptr[slot][1] = 0.6f + 0.4f * sinf(a * 2.0f + 2.1f); uptr[slot][2] = 0.6f + 0.4f * sinf(a * 2.0f + 4.2f); uptr[slot][3] = 1.0f;
+      VkCommandBuffer cmd = cmds[slot];
+      CHECK(vkResetCommandBuffer(cmd, 0));
+      CHECK(vkBeginCommandBuffer(cmd, &cbbi));
+      VkMemoryBarrier all = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT, .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &all, 0, NULL, 0, NULL);   /* the other frame in flight uses the same images */
+      VkClearValue cv[3] = {{.color = {{0.0f, 0.0f, 0.4f, 1.0f}}}, {.depthStencil = {1.0f, 0}}, {0}};
+      VkRenderPassBeginInfo rpbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb, .renderArea = {{0, 0}, {W, H}}, .clearValueCount = 3, .pClearValues = cv};
+      vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dset[slot], 0, NULL);
+      VkDeviceSize off = 0;
+      vkCmdBindVertexBuffers(cmd, 0, 1, &vbuf, &off);
+      vkCmdBindIndexBuffer(cmd, ibuf, 0, VK_INDEX_TYPE_UINT16);
+      for (int c = 0; c < 2; c++) {                                            /* the big cube turns in place, the small one orbits it the other way */
+         mat4 ry, rx, tr, sc2, model, vp2, mvp;
+         m_rot_y(ry, a * (c ? -2.3f : 0.9f)); m_rot_x(rx, a * (c ? 1.1f : 0.6f));
+         m_mul(model, ry, rx);
+         if (c) { m_scale(sc2, 0.35f); m_mul(model, model, sc2); m_rot_y(ry, a * 1.7f); m_trans(tr, 2.6f, 0.0f, 0.0f); m_mul(tr, ry, tr); m_mul(model, tr, model); }
+         m_mul(vp2, proj, view);
+         m_mul(mvp, vp2, model);
+         vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp);
+         vkCmdDrawIndexed(cmd, 36, 1, 0, 0, 0);
+      }
+      vkCmdEndRenderPass(cmd);
+      VkBufferImageCopy cp = {.bufferRowLength = pitch / 4, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {W, H, 1}};
+      vkCmdCopyImageToBuffer(cmd, im[2].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf, 1, &cp);
+      CHECK(vkEndCommandBuffer(cmd));
+      VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+      CHECK(vkQueueSubmit(q, 1, &si, fence[slot]));
+      submitted[slot] = 1;
+      if (fr % (fps * 5) == 0) { printf("frame %d (%.1f s)\n", fr, (now_ms() - t0) / 1000.0); fflush(stdout); }
+   }
+   for (int i = 0; i < FRAMES; i++) if (submitted[i]) CHECK(vkWaitForFences(dev, 1, &fence[i], VK_TRUE, 10000000000ull));
+   const double elapsed = (now_ms() - t0) / 1000.0;
+   printf("%d frames in %.2f s = %.2f fps (asked %d); wait for the previous frame of the same slot: min %.2f, mean %.2f, max %.2f ms\n", total, elapsed, total / elapsed, fps, waitMin, waitSum / total, waitMax);
+   printf("frames started more than 4 frame times late: %d (worst start delay %.1f ms); pixel checks: %d, wrong: %d\n", late, lateMax, checks, bad);
+   const int ok = !bad && !late;
+   puts(ok ? "PASS" : "FAIL");
+   return ok ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
+   if (argc > 1 && !strcmp(argv[1], "spin"))
+      return spin_main(argc - 1, argv + 1);
    if (argc > 1 && !strcmp(argv[1], "scene"))
       return scene_main(argc - 1, argv + 1);
    return triangle_main(argc, argv);

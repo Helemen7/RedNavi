@@ -2332,6 +2332,11 @@ static u32 gfxEmitClearState(struct rn_device *adev) {
     return 5 + 934 + 2 * 7 + sizeof(tail) / sizeof(tail[0]);
 }
 
+void rn_gfx_ring_pointers(struct rn_device *adev, u32 *rptr, u32 *wptr) {
+    *rptr = gGfxBlk ? rn_vram_rd32(adev, gGfxBlk + 0x1000) : 0;
+    *wptr = gGfxBlk ? gGfxWptr : 0;
+}
+
 int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
     if (!gGfxBlk) return -EINVAL;
     u32 pk[24];

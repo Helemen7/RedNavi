@@ -2413,6 +2413,8 @@ public:
                 o->ring_rptr_word = rs[0]; o->ring_wptr_word = rs[1]; o->driver_wptr = rs[2]; o->ring_full_waits = rs[3];
                 o->seq_submitted = seqSubmitted; o->seq_signaled = fenceIdx >= 0 ? fenceNow() : 0;
                 { u32 fs[2]; rn_vm_flush_stats(fs); o->flush_failures = fs[0]; o->flush_last_ack = fs[1]; }
+                o->queue_resets = gpuOwner->queueResets; o->gfx_queue_resets = gpuOwner->gfxQueueResets;
+                rn_gfx_ring_pointers(&gpuOwner->gpu, &o->gfx_rptr, &o->gfx_wptr);
                 if (req->flags & RN_UC_DIAG_CLEAR_FAULT) rn_vm_clear_fault(&gpuOwner->gpu);
                 rc = kIOReturnSuccess;
             }

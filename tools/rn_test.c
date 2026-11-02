@@ -325,10 +325,12 @@ gfxdone:;
         struct rn_uc_diag d;
         if (diag(c, 0, &d) == KERN_SUCCESS)
             printf("rptr 0x%x wptr 0x%x, ring-full waits %u, fault status 0x%x address 0x%x%08x, TLB flush failures %u\n", d.hqd_rptr, d.hqd_wptr, d.ring_full_waits, d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.flush_failures);
+        if (diag(c, 0, &d) == KERN_SUCCESS)
+            printf("queue resets: compute %u, graphics %u; graphics ring rptr 0x%x wptr 0x%x\n", d.queue_resets, d.gfx_queue_resets, d.gfx_rptr, d.gfx_wptr);
         {
             struct rn_uc_info inf; size_t infSize = sizeof(inf);
             if (IOConnectCallStructMethod(c, RN_UC_INFO, NULL, 0, &inf, &infSize) == KERN_SUCCESS)
-                printf("VRAM: device-local %llu MB, %llu MB free; CPU-visible %llu MB, %llu MB free\n", inf.vram_bytes >> 20, inf.vram_free >> 20, inf.vram_vis_bytes >> 20, inf.vram_vis_free >> 20);
+                printf("VRAM: device-local %llu MB, %llu MB free; CPU-visible %llu MB, %llu MB free; this connection %u buffers\n", inf.vram_bytes >> 20, inf.vram_free >> 20, inf.vram_vis_bytes >> 20, inf.vram_vis_free >> 20, inf.bo_count);
         }
         IOServiceClose(c);
         return 0;

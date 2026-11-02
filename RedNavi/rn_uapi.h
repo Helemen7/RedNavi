@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 9
+#define RN_UAPI_VERSION 10
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -233,6 +233,8 @@ struct rn_uc_diag {
     uint32_t ring_rptr_word, ring_wptr_word, driver_wptr, ring_full_waits;
     uint32_t seq_submitted, seq_signaled;     // this connection's context
     uint32_t flush_failures, flush_last_ack;  // TLB flushes (engine 17) whose acknowledge never came, and the last acknowledge register read
+    uint32_t queue_resets, gfx_queue_resets;  // resets of the compute and of the graphics queue since boot (all connections)
+    uint32_t gfx_rptr, gfx_wptr;              // the graphics ring's read pointer word and the dwords written to it (modulo 2^32)
 };
 
 #endif

@@ -1,6 +1,6 @@
 # mesa-bridge: RADV on macOS over the RedNavi user client
 
-Mesa's RADV talks to the kernel through the `ac_drm_*` functions of `src/amd/common/ac_linux_drm.h`, which on Linux issue amdgpu ioctls on a DRM file descriptor. This directory holds a replacement for that layer, `src/ac_apple_iokit.c`, which calls the kext's user client (`RedNavi/rn_uapi.h`, version 9) with `IOConnectCallStructMethod`, plus the patch set that makes RADV build and enumerate its device without a DRM node. Mesa is MIT licensed, so the file is meant to live in a Mesa fork; it sits here to be built, tested and kept in step with the kext. Build recipe, results and what stood in the way: [docs/M5_MESA_BUILD.md](../docs/M5_MESA_BUILD.md).
+Mesa's RADV talks to the kernel through the `ac_drm_*` functions of `src/amd/common/ac_linux_drm.h`, which on Linux issue amdgpu ioctls on a DRM file descriptor. This directory holds a replacement for that layer, `src/ac_apple_iokit.c`, which calls the kext's user client (`RedNavi/rn_uapi.h`, version 10) with `IOConnectCallStructMethod`, plus the patch set that makes RADV build and enumerate its device without a DRM node. Mesa is MIT licensed, so the file is meant to live in a Mesa fork; it sits here to be built, tested and kept in step with the kext. Build recipe, results and what stood in the way: [docs/M5_MESA_BUILD.md](../docs/M5_MESA_BUILD.md).
 
 ## What is here
 

@@ -1445,10 +1445,10 @@ index 0000000..70a4648
 +#include "drm-uapi/amdgpu_drm.h"
 diff --git a/src/amd/common/apple/rn_uapi.h b/src/amd/common/apple/rn_uapi.h
 new file mode 100644
-index 0000000..d0cf580
+index 0000000..b6b02f0
 --- /dev/null
 +++ b/src/amd/common/apple/rn_uapi.h
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,240 @@
 +// The user client interface of RedNaviProbe, shared by the kext and user space programs (tools/rn_test.c, later the Mesa backend).
 +// Every method takes and returns one struct through IOConnectCallStructMethod; the sizes are checked exactly, so a layout change
 +// means a new RN_UAPI_VERSION. Plain C, fixed-width types only. The method set mirrors the DRM_AMDGPU_* commands RADV uses
@@ -1460,7 +1460,7 @@ index 0000000..d0cf580
 +
 +#include "rn_drm_uapi.h"
 +
-+#define RN_UAPI_VERSION 9
++#define RN_UAPI_VERSION 10
 +
 +enum {
 +    RN_UC_INFO = 0,        // out rn_uc_info
@@ -1684,6 +1684,8 @@ index 0000000..d0cf580
 +    uint32_t ring_rptr_word, ring_wptr_word, driver_wptr, ring_full_waits;
 +    uint32_t seq_submitted, seq_signaled;     // this connection's context
 +    uint32_t flush_failures, flush_last_ack;  // TLB flushes (engine 17) whose acknowledge never came, and the last acknowledge register read
++    uint32_t queue_resets, gfx_queue_resets;  // resets of the compute and of the graphics queue since boot (all connections)
++    uint32_t gfx_rptr, gfx_wptr;              // the graphics ring's read pointer word and the dwords written to it (modulo 2^32)
 +};
 +
 +#endif

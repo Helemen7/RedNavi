@@ -183,6 +183,7 @@ struct rn_gfxq_result {
     u32 cp_stat, me_cntl, scratch, write_data, fence, rptr_word, fault_status, fault_lo, fault_hi, csb_dwords;
 };
 void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res);
+void rn_gfx_ring_pointers(struct rn_device *adev, u32 *rptr, u32 *wptr);   // the graphics ring's read pointer word (in memory) and the write counter
 int rn_gfx_queue_reset(struct rn_device *adev, u32 info[4]);   // see gfx11.cpp; info as for rn_compute_queue_reset
 // An indirect buffer on the graphics queue followed by a fence write (the same two packets rn_compute_submit_ib sends); 0, -EAGAIN when the ring stayed full for 2 s without the
 // read position moving (nothing was written), -EINVAL.
