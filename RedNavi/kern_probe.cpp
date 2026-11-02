@@ -96,6 +96,7 @@
 #include "gfx11.h"
 #include "rn_uapi.h"
 #include "splash_1920x1080.h"
+#include "linux_info_navi32.h"
 #include "gc_regs.h"
 
 #ifdef RN_HAVE_PSP_FW
@@ -280,7 +281,7 @@ class RedNaviProbe : public IOService {
     bool gpuLive {false};                          // the memory hub is on and the GART window is set up
     // The user address spaces (rn_vm_*): VMIDs 1 to 7, 48 bits, a root directory (PDB2) and the directories and page tables below it made on demand,
     // 4 KB pages of VRAM from a pool of kVmPoolPages per VMID starting at kVmTables.
-    static constexpr uint64_t kVmMin = 0x200000ull;        // AMDGPU_VA_RESERVED_BOTTOM
+    static constexpr uint64_t kVmMin = 0x10000ull;         // virtual_address_offset of DEV_INFO on Linux 7.0 for this card
     static constexpr uint64_t kVmEnd = 1ull << 47;           // the lower half of the 48-bit space; an IB at an address with bit 47 set hung the compute queue (docs/COMPAT.md), so the upper half is refused
     static constexpr uint64_t kVmTables = 0x0D000000ull;   // VRAM
     static constexpr uint32_t kVmPoolPages = 1024;         // 4 MB per VMID: about 1000 tables, enough to map around 1 GB spread out
@@ -1838,8 +1839,10 @@ class RedNaviClient : public IOUserClient {
         if (point == 0) { s.binSignaled = true; s.binSeq = 0; }
         else if (point > s.tlValue) s.tlValue = point;
     }
-    // INFO queries (DRM_AMDGPU_INFO), answered in the caller's buffer, min(size, what the query returns) bytes as Linux does. What the kext cannot say yet is
-    // refused (kIOReturnUnsupported): the device info (DEV_INFO), the firmware versions, the timestamp and the sensors.
+    // INFO queries (DRM_AMDGPU_INFO), answered in the caller's buffer, min(size, what the query returns) bytes as Linux does. The device info, the IP info and
+    // the firmware versions are what the Linux kernel answered on this card (RedNavi/linux_info_navi32.h, tools/linux_amdgpu_info_raw.py), with the one thing the
+    // kext does differently: it submits to one compute queue only. What it cannot say yet is refused (kIOReturnUnsupported): the timestamp, the sensors, the video
+    // and user-queue queries.
     static void putOut(void *out, uint32_t outSize, const void *v, size_t n) { memcpy(out, v, n < outSize ? n : outSize); }
     IOReturn infoQuery(const drm_amdgpu_info *r, void *out, uint32_t outSize) {
         memset(out, 0, outSize);
@@ -1848,23 +1851,38 @@ class RedNaviClient : public IOUserClient {
         const uint64_t gttTotal = 16384ull * 4096, gttUsed = static_cast<uint64_t>(gpuOwner->gartNextPage) * 4096;
         switch (r->query) {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
-        case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue
+        case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, kRNLinuxDevInfo, sizeof(kRNLinuxDevInfo)); return kIOReturnSuccess;
+        case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue (Linux says 4 compute, 1 graphics, 2 SDMA)
             const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : 0;
             putOut(out, outSize, &v, sizeof(v));
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_HW_IP_INFO: {
-            drm_amdgpu_info_hw_ip ip;
-            memset(&ip, 0, sizeof(ip));
+            uint8_t ip[sizeof(kRNLinuxHwIpInfo[0])];
+            memset(ip, 0, sizeof(ip));
             if (r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE && r->query_hw_ip.ip_instance == 0) {
-                ip.hw_ip_version_major = 11;                                  // gfx_v11_0, the GC 11.0.3 of the discovery table
-                ip.hw_ip_version_minor = 0;
-                ip.ib_start_alignment = 32;                                   // amdgpu_kms.c, AMDGPU_HW_IP_COMPUTE
-                ip.ib_size_alignment = 32;
-                ip.available_rings = 1;
-                ip.ip_discovery_version = (11u << 16) | (0u << 8) | 3u;
+                memcpy(ip, kRNLinuxHwIpInfo[AMDGPU_HW_IP_COMPUTE], sizeof(ip));
+                reinterpret_cast<drm_amdgpu_info_hw_ip *>(ip)->available_rings = 1;       // Linux: 0xf, four compute rings
             }
-            putOut(out, outSize, &ip, sizeof(ip));
+            putOut(out, outSize, ip, sizeof(ip));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_FW_VERSION: {
+            for (uint32_t i = 0; i < kRNLinuxFwCount; i++) {
+                if (kRNLinuxFw[i].type != r->query_fw.fw_type) continue;
+                drm_amdgpu_info_firmware f;
+                f.ver = kRNLinuxFw[i].version;
+                f.feature = kRNLinuxFw[i].feature;
+                putOut(out, outSize, &f, sizeof(f));
+                return kIOReturnSuccess;
+            }
+            return kIOReturnBadArgument;                                     // a firmware this chip does not have: -EINVAL
+        }
+        case AMDGPU_INFO_GPUVM_FAULT: {                                      // struct drm_amdgpu_info_gpuvm_fault: the address (a 4 KB page number in the registers), the status, the hub
+            u32 dg[11];
+            rn_compute_diag(&gpuOwner->gpu, dg);
+            struct { uint64_t addr; uint32_t status; uint32_t vmhub; } f = {(static_cast<uint64_t>(dg[5]) << 12) | (static_cast<uint64_t>(dg[6]) << 44), dg[4], 0};
+            putOut(out, outSize, &f, sizeof(f));
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_MEMORY: {
@@ -1888,9 +1906,9 @@ class RedNaviClient : public IOUserClient {
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_GTT_USAGE: putOut(out, outSize, &gttUsed, sizeof(gttUsed)); return kIOReturnSuccess;
-        case AMDGPU_INFO_MAX_IBS: {                                          // AMDGPU_CS_MAX_IBS_PER_SUBMIT, one value per IP type
-            uint32_t v[9];
-            for (int i = 0; i < 9; i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE) ? 1 : 0;
+        case AMDGPU_INFO_MAX_IBS: {                                          // IBs per submit, one value per IP type: a submit of the kext takes one IB (Linux: 192, 125, 49, ...)
+            uint32_t v[sizeof(kRNLinuxMaxIbs) / sizeof(kRNLinuxMaxIbs[0])];
+            for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE) ? 1 : 0;
             putOut(out, outSize, v, sizeof(v));
             return kIOReturnSuccess;
         }

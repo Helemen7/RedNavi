@@ -44,6 +44,17 @@
 #define AMDGPU_INFO_HW_IP_COUNT			0x03
 #define AMDGPU_INFO_TIMESTAMP			0x05
 #define AMDGPU_INFO_FW_VERSION			0x0e
+/* AMDGPU_INFO_FW_*, the fw_type of a FW_VERSION query (amdgpu_drm.h indents these inside a comment block, so the extraction above missed them; values as in the
+ * header and checked against the types that answered in tools/linux_amdgpu_info_raw.py's run: ME 4, PFP 5, RLC 7, MEC 8, SMC 0xa, SDMA 0xb, ...). */
+#define AMDGPU_INFO_FW_GFX_ME		0x04
+#define AMDGPU_INFO_FW_GFX_PFP		0x05
+#define AMDGPU_INFO_FW_GFX_RLC		0x07
+#define AMDGPU_INFO_FW_GFX_MEC		0x08
+#define AMDGPU_INFO_FW_SMC		0x0a
+#define AMDGPU_INFO_FW_SDMA		0x0b
+#define AMDGPU_INFO_FW_MES_KIQ		0x19
+#define AMDGPU_INFO_FW_MES		0x1a
+#define AMDGPU_INFO_FW_IMU		0x1b
 #define AMDGPU_INFO_NUM_BYTES_MOVED		0x0f
 #define AMDGPU_INFO_VRAM_USAGE			0x10
 #define AMDGPU_INFO_GTT_USAGE			0x11

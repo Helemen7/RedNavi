@@ -9,3 +9,4 @@ RedNavi/smu_*.h
 !RedNavi/smu13.h
 RedNavi/gc_*.h
 !RedNavi/gc_regs.h
+rn_test_x86

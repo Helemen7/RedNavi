@@ -287,8 +287,36 @@ int main(int argc, char **argv) {
         QUERY(AMDGPU_INFO_ACCEL_WORKING, 2);
         printf("a buffer of 2 bytes for a 4-byte answer: 0x%x, bytes %02x %02x then %02x (expect 01 00 then the fill byte aa)\n", kr, buf[0], buf[1], buf[2]);
         if (kr || buf[0] != 1 || buf[1] != 0 || buf[2] != 0xAA) ok = 0;
-        QUERY(AMDGPU_INFO_DEV_INFO, sizeof(struct drm_amdgpu_info_device) < sizeof(buf) ? sizeof(struct drm_amdgpu_info_device) : sizeof(buf));
-        printf("DEV_INFO: 0x%x (not answered yet, needs the values from a Linux run: expect an error)\n", kr); if (!kr) ok = 0;
+        {   // DEV_INFO as Linux answered it on this card (RedNavi/linux_info_navi32.h), whole structure in one call
+            uint8_t dev[sizeof(struct drm_amdgpu_info_device)];
+            struct drm_amdgpu_info rq; size_t devSize = sizeof(dev);
+            memset(&rq, 0, sizeof(rq)); rq.query = AMDGPU_INFO_DEV_INFO; rq.return_size = sizeof(dev);
+            kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &rq, sizeof(rq), dev, &devSize);
+            struct drm_amdgpu_info_device *d = (struct drm_amdgpu_info_device *)dev;
+            printf("DEV_INFO: 0x%x, device 0x%x, family %u, %u SE x %u SA, %u CU, rb mask 0x%x, clock %llu kHz, va 0x%llx-0x%llx, high va 0x%llx-0x%llx, mall %llu MB\n", kr, d->device_id,
+                   d->family, d->num_shader_engines, d->num_shader_arrays_per_engine, d->cu_active_number, d->enabled_rb_pipes_mask, d->max_engine_clock, d->virtual_address_offset,
+                   d->virtual_address_max, d->high_va_offset, d->high_va_max, d->mall_size >> 20);
+            if (kr || d->device_id != 0x747e || d->family != 145 || d->num_shader_engines != 3 || d->cu_active_number != 60 || d->virtual_address_offset != 0x10000) ok = 0;
+        }
+        {   // firmware versions, as the kernel reports the ones it loaded (the kext loads the same set)
+            static const struct { uint32_t type, ver, feat; const char *name; } fw[] = {{AMDGPU_INFO_FW_GFX_ME, 0x9a6, 29, "ME"}, {AMDGPU_INFO_FW_GFX_PFP, 0xa50, 29, "PFP"},
+                                                                                       {AMDGPU_INFO_FW_GFX_MEC, 0xa78, 29, "MEC"}};
+            for (int i = 0; i < 3; i++) {
+                memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_FW_VERSION; req.return_size = 8; req.query_fw.fw_type = fw[i].type; bufSize = 8;
+                kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
+                printf("FW_VERSION %s: 0x%x, version 0x%x feature %u (expect 0x%x and %u)\n", fw[i].name, kr, ((uint32_t *)buf)[0], ((uint32_t *)buf)[1], fw[i].ver, fw[i].feat);
+                if (kr || ((uint32_t *)buf)[0] != fw[i].ver || ((uint32_t *)buf)[1] != fw[i].feat) ok = 0;
+            }
+            memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_FW_VERSION; req.return_size = 8; req.query_fw.fw_type = 0x7f; bufSize = 8;
+            kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
+            printf("a firmware this chip does not have: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+        }
+        QUERY(AMDGPU_INFO_MAX_IBS, 36);
+        printf("MAX_IBS: 0x%x, compute %u (a submit takes one IB: expect 1)\n", kr, ((uint32_t *)buf)[1]); if (kr || ((uint32_t *)buf)[1] != 1) ok = 0;
+        QUERY(AMDGPU_INFO_GPUVM_FAULT, 16);
+        printf("GPUVM_FAULT: 0x%x, status 0x%x\n", kr, ((uint32_t *)buf)[2]); if (kr) ok = 0;
+        QUERY(AMDGPU_INFO_TIMESTAMP, 8);
+        printf("TIMESTAMP: 0x%x (not answered yet: expect an error)\n", kr); if (!kr) ok = 0;
         QUERY(0x7777, 4);
         printf("an unknown query: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
 #undef QUERY

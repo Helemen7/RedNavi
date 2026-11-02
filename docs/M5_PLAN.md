@@ -31,6 +31,10 @@ Lacks, in the order RADV needs it:
 5. **Buffer lifetime and teardown.** Per-client BO tables (today `bos[]` is global and never freed per client), eviction is not needed while everything stays pinned.
 6. **Security boundary.** Every address in an IB is a GPU virtual address in the client's own VM; with per-context page tables that is enforced by the hardware, which the single shared window cannot do. Until then the client needs administrator privilege (`rednavi_uc_anyone`).
 
+## State, 2026-11-02
+
+Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: the upper half of the address space (RADV's 32-bit range is there; an IB at such an address hung the queue once), memory in VRAM and bigger buffers (host memory only, 1 MB each, 64 MB of GART that is never recycled), the Mesa backend `ac_apple_iokit.c` and the patches of docs/M5_MESA_BUILD.md, a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
+
 ## Proposed user client shape
 
 The current `externalMethod` has hand-numbered selectors with positional scalar arguments. M5 replaces them with struct-in/struct-out methods that mirror the ioctl structures, one selector per `DRM_AMDGPU_*` command:
