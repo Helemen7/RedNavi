@@ -111,3 +111,16 @@ Not done: the PCI location (placeholder 0000:03:00.0, so the device UUID is a pl
 - `RN_BRIDGE_DEBUG=1` prints every failing kext call and every submit.
 
 The queue is stuck after a hang until it is reset (`rn_test reset`, or the kext's own watchdog after `rednavi_hang_ms`).
+
+### Compute stress tests, 2026-11-02 (verified on the desktop, 7800 XT)
+
+`mesa-bridge/test/vk_stress.c` (plain Vulkan 1.1, compute only; `tools/vk_stress_watchdog.sh SECONDS mode args` runs it on the desktop with a timeout) checks every value on the CPU. All of these pass:
+
+- `burst 20000`: 20000 separate `vkQueueSubmit` calls of one dispatch each (40000 kext submits, 1.28 M values), about 37000 submits per second; three processes at once, 5000 submits each.
+- `saturate 600`: 600 submits of 64 dependent dispatches over 2 M words, about 30 s of GPU time. The submit thread is held back about 1.5 s per 32 submits while the ring (2048 dwords) is full; 17 ring-full waits per run, no reset, six runs in a row.
+- `barrier 20000`: a writer and 20000 increments with a compute-to-compute barrier between each, in one command buffer (a chained IB of hundreds of thousands of dwords), and the same chain over four submits tied by semaphores (syncobj in and out in the kext).
+- `multi 20`: 24 storage buffers alive at once (36 to 45 MB per round, 4 KB to 8 MB each), one write and one increment dispatch each, then every other buffer freed and replaced by another size; 20 rounds. Run next to three burst processes, a saturate process and a second multi process (five VMIDs at once): all pass.
+
+Two kext faults found by these tests, both fixed: the ring-full wait gave up after 2 s even when the read pointer kept moving (a long GPU backlog), reset the queue and dropped the queued work; it now gives up after 2 s without the read pointer moving. And the kext refused command buffers above 4096 dwords (16 KB), which any real command buffer exceeds; the limit is now the hardware's 20-bit size field.
+
+One failure is unexplained: the first `saturate 600` right after the first boot with the new kext lost all its work (every value wrong, a VM fault status latched, address not recorded). It did not repeat in 12 further runs, including one right after a reboot. If a fault shows up again, `rn_test stats` prints the status and address of the latched fault.

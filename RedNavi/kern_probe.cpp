@@ -2063,7 +2063,7 @@ public:
             if (sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) && fenceIdx >= 0) {
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
                 uint64_t ibVa = 0;
-                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 0xFFFFF || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
                 // A command buffer in the upper half of the address space hangs the compute queue (docs/COMPAT.md): the command processor does not run it and later
                 // dispatches of every connection stay dead until the next boot, a reset does not bring them back. Data and shaders up there work, so only this is refused.
                 if (ibVa >= (1ull << 47)) { rc = kIOReturnUnsupported; break; }

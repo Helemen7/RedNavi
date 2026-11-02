@@ -187,6 +187,13 @@ int main(int argc, char **argv) {
         IOServiceClose(c);
         return kr || rr.status ? 2 : 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "stats")) {                // counters of the queue: sequence numbers, ring-full waits, flush failures
+        struct rn_uc_diag d;
+        if (diag(c, 0, &d) == KERN_SUCCESS)
+            printf("rptr 0x%x wptr 0x%x, ring-full waits %u, fault status 0x%x address 0x%x%08x, TLB flush failures %u\n", d.hqd_rptr, d.hqd_wptr, d.ring_full_waits, d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.flush_failures);
+        IOServiceClose(c);
+        return 0;
+    }
     if (argc > 2 && !strcmp(argv[1], "rawib")) {                // rawib FILE: submit the command buffer in FILE (one hex dword per line, e.g. from RADV_DEBUG=dumpibs) as is, wait, report; a stuck queue is reset
         FILE *f = fopen(argv[2], "r");
         if (!f) { printf("cannot open %s\n", argv[2]); return 1; }

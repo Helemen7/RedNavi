@@ -1241,11 +1241,13 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
         // Room in the ring. The rptr write-back word holds the read position modulo the ring size (measured 2026-11-01: it wraps while the
         // wptr counts on), so "used" is (w - rptr) & mmask. The ring is never filled completely: a full ring would look empty.
         if (n > mmask) return -EINVAL;
-        u32 spins = 0;
-        while (n > mmask - ((w - rn_vram_rd32(adev, ringOff + 0x1000)) & mmask)) {
+        u32 spins = 0, rptr = rn_vram_rd32(adev, ringOff + 0x1000);
+        while (n > mmask - ((w - rptr) & mmask)) {
             if (spins++ == 0) gRingFullWaits++;
-            if (spins > 200000) return -EAGAIN;                                 // about 2 s: the queue is not draining; nothing was written
+            if (spins > 200000) return -EAGAIN;                                 // about 2 s without the read position moving: the queue is not draining; nothing was written
             udelay(10);
+            const u32 now = rn_vram_rd32(adev, ringOff + 0x1000);
+            if (now != rptr) { rptr = now; spins = 1; }                         // the queue is working through a long backlog (a stress test: 2.3 s per 32 submits): not stuck
         }
         for (u32 i = 0; i < n; i++) rn_vram_wr32(adev, data + ((w + i) & mmask) * 4, pk[i]);
         gMappedWptr = w + n;
