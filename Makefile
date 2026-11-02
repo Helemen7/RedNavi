@@ -106,6 +106,21 @@ $(ACCELKEXT): $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o RedNaviAccel/In
 	cp RedNaviAccel/Info.plist.in $(ACCELKEXT)/Contents/Info.plist
 	@echo "built $(ACCELKEXT)"
 
+# The Metal plug-in stub (user space, docs/M6_ACCELERATOR_STUDY.md) and the program that makes Metal load it.
+MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
+$(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
+	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
+	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -framework Foundation RedNaviMTL/plugin.m -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
+	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist
+	codesign -f -s - $(MTLBUNDLE)
+	@echo "built $(MTLBUNDLE)"
+
+$(OUT)/mtl_probe: RedNaviMTL/mtl_probe.m
+	@mkdir -p $(OUT)
+	clang -arch x86_64 -mmacosx-version-min=12.0 -framework Metal -framework Foundation $< -o $@
+
+mtl: $(MTLBUNDLE) $(OUT)/mtl_probe
+
 clean:
 	rm -rf build
 
@@ -120,4 +135,4 @@ test:
 	clang++ -std=c++17 -Wall tests/host/mode_regs_test.cpp RedNavi/mode_regs.cpp RedNavi/edid.cpp -o build/mode_regs_test
 	./build/mode_regs_test
 
-.PHONY: all clean test
+.PHONY: all clean test mtl
