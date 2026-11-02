@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -185,6 +186,71 @@ int main(int argc, char **argv) {
         printf("queue reset: 0x%x, status %u, resets so far %u\n", kr, rr.status, rr.resets);
         IOServiceClose(c);
         return kr || rr.status ? 2 : 0;
+    }
+    if (argc > 2 && !strcmp(argv[1], "rawib")) {                // rawib FILE: submit the command buffer in FILE (one hex dword per line, e.g. from RADV_DEBUG=dumpibs) as is, wait, report; a stuck queue is reset
+        FILE *f = fopen(argv[2], "r");
+        if (!f) { printf("cannot open %s\n", argv[2]); return 1; }
+        Bo code;
+        if (createBo(c, 4096, &code) || vaMap(c, code.handle, 0x10000, 0, 4096)) return 1;
+        uint32_t n = 0, v;
+        char line[128];
+        while (fgets(line, sizeof(line), f) && n < 1000) if (sscanf(line, "%x", &v) == 1) code.cpu[n++] = v;
+        fclose(f);
+        kr = submitIb(c, 0x10000, n);
+        uint32_t r = 0;
+        kern_return_t kw = waitSeq(c, gSeq, 3000, &r, NULL);
+        printf("rawib: %u dwords, submit 0x%x, wait 0x%x, fence %s\n", n, kr, kw, r ? "reached" : "NOT reached");
+        struct rn_uc_diag d;
+        if (diag(c, RN_UC_DIAG_CLEAR_FAULT, &d) == KERN_SUCCESS)
+            printf("       rptr 0x%x wptr 0x%x CP_STAT 0x%x fault status 0x%x addr 0x%x%08x\n", d.hqd_rptr, d.hqd_wptr, d.cp_stat, d.fault_status, d.fault_addr_hi, d.fault_addr_lo);
+        IOServiceClose(c);
+        return r ? 0 : 2;
+    }
+    if (argc > 3 && !strcmp(argv[1], "replay")) {               // replay DIR VA:DWORDS ... [peek=VA]: map every DIR/va_<hex>.bin (from the bridge's RN_BRIDGE_DUMP) at its address, submit the listed command buffers in order
+        DIR *dir = opendir(argv[2]);
+        if (!dir) { printf("cannot open %s\n", argv[2]); return 1; }
+        struct { uint64_t va, size; volatile uint32_t *cpu; } maps[64];
+        int nm = 0;
+        struct dirent *de;
+        while ((de = readdir(dir)) && nm < 64) {
+            unsigned long long va;
+            if (sscanf(de->d_name, "va_%llx.bin", &va) != 1) continue;
+            char path[512];
+            snprintf(path, sizeof(path), "%s/%s", argv[2], de->d_name);
+            FILE *f = fopen(path, "rb");
+            if (!f) continue;
+            fseek(f, 0, SEEK_END);
+            long len = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            Bo b;
+            if (createBo(c, (uint64_t)len, &b)) return 1;
+            if (fread((void *)b.cpu, 1, (size_t)len, f) != (size_t)len) return 1;
+            fclose(f);
+            if (vaMap(c, b.handle, va, 0, b.size)) { printf("map 0x%llx failed\n", va); return 1; }
+            maps[nm].va = va; maps[nm].size = b.size; maps[nm].cpu = b.cpu; nm++;
+            printf("mapped %llu bytes at 0x%llx\n", (unsigned long long)b.size, va);
+        }
+        closedir(dir);
+        unsigned long long peek = 0;
+        int ok = 1;
+        for (int i = 3; i < argc; i++) {
+            unsigned long long va; unsigned dw;
+            if (sscanf(argv[i], "peek=%llx", &peek) == 1) continue;
+            if (sscanf(argv[i], "%llx:%u", &va, &dw) != 2) continue;
+            kr = submitIb(c, va, dw);
+            uint32_t r = 0;
+            kern_return_t kw = waitSeq(c, gSeq, 3000, &r, NULL);
+            printf("submit ib 0x%llx, %u dwords: 0x%x, wait 0x%x, fence %s\n", va, dw, kr, kw, r ? "reached" : "NOT reached");
+            if (!r) ok = 0;
+        }
+        for (int i = 0; peek && i < nm; i++)
+            if (peek >= maps[i].va && peek < maps[i].va + maps[i].size)
+                printf("peek 0x%llx: 0x%08x 0x%08x 0x%08x 0x%08x\n", peek, maps[i].cpu[(peek - maps[i].va) / 4], maps[i].cpu[(peek - maps[i].va) / 4 + 1], maps[i].cpu[(peek - maps[i].va) / 4 + 2], maps[i].cpu[(peek - maps[i].va) / 4 + 3]);
+        struct rn_uc_diag d;
+        if (diag(c, RN_UC_DIAG_CLEAR_FAULT, &d) == KERN_SUCCESS)
+            printf("       rptr 0x%x wptr 0x%x CP_STAT 0x%x fault status 0x%x addr 0x%x%08x\n", d.hqd_rptr, d.hqd_wptr, d.cp_stat, d.fault_status, d.fault_addr_hi, d.fault_addr_lo);
+        IOServiceClose(c);
+        return ok ? 0 : 2;
     }
     struct rn_uc_info info;
     size_t infoSize = sizeof(info);

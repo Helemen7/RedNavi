@@ -100,4 +100,14 @@ Needs glslang (BVH shaders) from MacPorts. What the patch does: the `ac_drm_*` l
 - Sparse (PRT) ranges, `bo_handle` 0 in a VA op: success without a mapping. The range is only reserved; touching it faults. Sparse residency does not work.
 - The sync provider clone is a reference to the device: `vk_device` finalizes its clone after the winsys freed the device (crash in `vk_device_finish`).
 
-Not done: a dispatch through RADV, the PCI location (placeholder 0000:03:00.0, so the device UUID is a placeholder too), memory in VRAM (all buffers are host memory), the graphics queue.
+Not done: the PCI location (placeholder 0000:03:00.0, so the device UUID is a placeholder too), memory in VRAM (all buffers are host memory), the graphics queue.
+
+### First Vulkan compute dispatch, 2026-11-02 (verified on the desktop, 7800 XT)
+
+`mesa-bridge/test/vk_dispatch.c` (plain Vulkan 1.1: one storage buffer, a compute shader that writes `v[i] = i * 3 + push_constant`, `vkQueueSubmit`, fence wait, CPU check) passes with 1, 16, 1024 and 4096 workgroups of 64 (262144 values). The pipeline is compiled by ACO on the Mac. Three things stood in the way:
+
+- RADV's submit loop never ended: the kext says "1 IB per submit" in `MAX_IBS` and a RADV submission has a preamble IB and a command buffer, so it never fits. The bridge answers `-EINVAL` to `AMDGPU_INFO_MAX_IBS` (RADV uses its default of 124 for compute) and sends the IBs of a submission to the kext one after the other.
+- The shader hung the wave without a fault. RADV's NULL-PRT workaround for scalar loads clears bit `address_prt_wa_control_bit` of every SMEM address; with the answer 47 it cleared bit 47 of the `0xffff8000` high dword and the shader read its descriptor from the lower half, where the data buffer is. The bridge now answers `~0` ("ignore", as the query's documentation says) and `radv_sparse_enabled()` is false on macOS (no unbacked mappings in the kext). The replay tools that found it: `RN_BRIDGE_DUMP=dir` dumps every mapped range at each submit, `rn_test replay DIR VA:DWORDS...` maps them in a connection and resubmits the command buffers, `rn_test rawib FILE` submits dwords from a file (`RADV_DEBUG=dumpibs` prints them); the hang was bisected by replacing packets with NOPs.
+- `RN_BRIDGE_DEBUG=1` prints every failing kext call and every submit.
+
+The queue is stuck after a hang until it is reset (`rn_test reset`, or the kext's own watchdog after `rednavi_hang_ms`).

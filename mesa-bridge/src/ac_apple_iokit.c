@@ -17,6 +17,7 @@
 #include <errno.h>
 #include <mach/mach.h>
 #include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -55,6 +56,8 @@ struct ac_drm_device {
    struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
    uint32_t nbos;
    uint32_t next_ctx;
+   struct { uint32_t handle; uint64_t va, offset, size; } maps[4096];   /* what is mapped where, for RN_BRIDGE_DUMP only */
+   uint32_t nmaps;
    int refs;                                                  /* the device and every clone of its sync provider (vk_device keeps one past the winsys) */
    struct util_sync_provider sync;
 };
@@ -87,7 +90,10 @@ static uint64_t now_ns(void)
 static int call(struct ac_drm_device *dev, uint32_t selector, const void *in, size_t in_size, void *out, size_t out_size)
 {
    size_t n = out_size;
-   return errno_of(IOConnectCallStructMethod(dev->conn, selector, in, in_size, out, out ? &n : NULL));
+   kern_return_t kr = IOConnectCallStructMethod(dev->conn, selector, in, in_size, out, out ? &n : NULL);
+   if (kr != KERN_SUCCESS && getenv("RN_BRIDGE_DEBUG"))
+      fprintf(stderr, "rn-bridge: selector %u returned 0x%x (errno %d)\n", selector, kr, errno_of(kr));
+   return errno_of(kr);
 }
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- virtual addresses */
@@ -411,6 +417,10 @@ int ac_apple_pci_bus_info(ac_drm_device *dev, uint16_t *domain, uint8_t *bus, ui
 
 int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
 {
+   /* The kext takes one IB per submit and says so, but this layer sends the IBs of a RADV submission one after the other, so RADV may use its own default (124 for compute).
+    * With the kext's 1, a submission that has a preamble and a command buffer never fits and RADV's submit loop does not end. */
+   if (info_id == AMDGPU_INFO_MAX_IBS)
+      return -EINVAL;
    return info_query(dev, info_id, size, value, NULL);
 }
 
@@ -552,7 +562,7 @@ int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *val
       *(uint32_t *)value = (uint32_t)(dev->dev_info.high_va_offset >> 32);
       return 0;
    case amdgpu_sw_info_address_prt_wa_control_bit:
-      *(uint32_t *)value = 47;                                 /* the bit that tells the lower half of the 48-bit space from the upper (the hole is at 2^47) */
+      *(uint32_t *)value = ~0u;                                /* "ignore", as the docs of this query say: no half of the address space is reserved for sparse residency here */
       return 0;
    default:
       return -EINVAL;
@@ -739,6 +749,63 @@ int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uin
 }
 
 /* DRM_AMDGPU_GEM_VA. The kext maps and unmaps exactly one range at a time: an unmap names the range of a map (RADV does that), and the page flags are always read, write and execute. */
+static void track_map(struct ac_drm_device *dev, uint32_t handle, uint64_t va, uint64_t offset, uint64_t size)
+{
+   pthread_mutex_lock(&dev->lock);
+   if (dev->nmaps < 4096)
+   {
+      dev->maps[dev->nmaps].handle = handle;
+      dev->maps[dev->nmaps].va = va;
+      dev->maps[dev->nmaps].offset = offset;
+      dev->maps[dev->nmaps].size = size;
+      dev->nmaps++;
+   }
+   pthread_mutex_unlock(&dev->lock);
+}
+
+static void track_unmap(struct ac_drm_device *dev, uint64_t va)
+{
+   pthread_mutex_lock(&dev->lock);
+   for (uint32_t i = 0; i < dev->nmaps; i++) {
+      if (dev->maps[i].va == va) {
+         dev->maps[i] = dev->maps[--dev->nmaps];
+         break;
+      }
+   }
+   pthread_mutex_unlock(&dev->lock);
+}
+
+/* RN_BRIDGE_DUMP=dir: write every mapped range (up to 16 MB each) as dir/va_<hex>.bin at each submit, to replay a submission with tools/rn_test.c rawib */
+static void dump_maps(struct ac_drm_device *dev, const char *dir)
+{
+   pthread_mutex_lock(&dev->lock);
+   for (uint32_t i = 0; i < dev->nmaps; i++) {
+      if (dev->maps[i].size > (16u << 20) || dev->maps[i].handle >= dev->nbos || !dev->bos[dev->maps[i].handle])
+         continue;
+      struct amdgpu_bo *b = dev->bos[dev->maps[i].handle];
+      mach_vm_address_t addr = 0;
+      mach_vm_size_t len = 0;
+      int mapped_here = 0;
+      void *cpu = b->cpu;
+      if (!cpu) {
+         if (IOConnectMapMemory64(dev->conn, b->handle, mach_task_self(), &addr, &len, kIOMapAnywhere) != KERN_SUCCESS)
+            continue;
+         cpu = (void *)(uintptr_t)addr;
+         mapped_here = 1;
+      }
+      char path[512];
+      snprintf(path, sizeof(path), "%s/va_%llx.bin", dir, (unsigned long long)dev->maps[i].va);
+      FILE *f = fopen(path, "wb");
+      if (f) {
+         fwrite((char *)cpu + dev->maps[i].offset, 1, dev->maps[i].size, f);
+         fclose(f);
+      }
+      if (mapped_here)
+         IOConnectUnmapMemory64(dev->conn, b->handle, mach_task_self(), addr);
+   }
+   pthread_mutex_unlock(&dev->lock);
+}
+
 int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops)
 {
    (void)flags;
@@ -747,15 +814,23 @@ int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset,
       return 0;
    struct rn_uc_va_unmap un = {addr, size};
    struct rn_uc_va_map map = {bo_handle, 0, addr, offset, size};
+   int r;
    switch (ops) {
    case AMDGPU_VA_OP_MAP:
-      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
+      r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
+      if (!r) track_map(dev, bo_handle, addr, offset, size);
+      return r;
    case AMDGPU_VA_OP_UNMAP:
    case AMDGPU_VA_OP_CLEAR:
-      return call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);
+      r = call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);
+      if (!r) track_unmap(dev, addr);
+      return r;
    case AMDGPU_VA_OP_REPLACE:
       call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);     /* nothing mapped there is not an error for a replace */
-      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
+      track_unmap(dev, addr);
+      r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
+      if (!r) track_map(dev, bo_handle, addr, offset, size);
+      return r;
    default:
       return -EINVAL;
    }
@@ -950,6 +1025,11 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
       return -EINVAL;
 
    uint32_t last_seq = 0;
+   if (getenv("RN_BRIDGE_DUMP")) {
+      dump_maps(dev, getenv("RN_BRIDGE_DUMP"));
+      for (unsigned i = 0; i < n_ibs; i++)
+         fprintf(stderr, "rn-bridge: dumped, ib %u at 0x%llx, %u bytes\n", i, (unsigned long long)ibs[i]->va_start, ibs[i]->ib_bytes);
+   }
    for (unsigned i = 0; i < n_ibs; i++) {
       if (ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
          return -EINVAL;
@@ -971,6 +1051,8 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
          memcpy(sub.out, out, n_out * sizeof(out[0]));
       }
       struct rn_uc_submit_result res;
+      if (getenv("RN_BRIDGE_DEBUG"))
+         fprintf(stderr, "rn-bridge: submit ib_va 0x%llx, %u dwords, %u waits, %u signals (ib %u of %u)\n", (unsigned long long)sub.ib_va, sub.ib_dwords, sub.in_count, sub.out_count, i + 1, n_ibs);
       int r = call(dev, RN_UC_SUBMIT, &sub, sizeof(sub), &res, sizeof(res));
       if (r)
          return r;

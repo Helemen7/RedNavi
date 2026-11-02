@@ -24,10 +24,10 @@ index 356df4d..fff4be6 100644
  
 diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
 new file mode 100644
-index 0000000..2e8b379
+index 0000000..1695651
 --- /dev/null
 +++ b/src/amd/common/apple/ac_apple_iokit.c
-@@ -0,0 +1,989 @@
+@@ -0,0 +1,1071 @@
 +/*
 + * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
 + *
@@ -48,6 +48,7 @@ index 0000000..2e8b379
 +#include <errno.h>
 +#include <mach/mach.h>
 +#include <pthread.h>
++#include <stdio.h>
 +#include <stdlib.h>
 +#include <string.h>
 +#include <time.h>
@@ -86,6 +87,8 @@ index 0000000..2e8b379
 +   struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
 +   uint32_t nbos;
 +   uint32_t next_ctx;
++   struct { uint32_t handle; uint64_t va, offset, size; } maps[4096];   /* what is mapped where, for RN_BRIDGE_DUMP only */
++   uint32_t nmaps;
 +   int refs;                                                  /* the device and every clone of its sync provider (vk_device keeps one past the winsys) */
 +   struct util_sync_provider sync;
 +};
@@ -135,7 +138,10 @@ index 0000000..2e8b379
 +static int call(struct ac_drm_device *dev, uint32_t selector, const void *in, size_t in_size, void *out, size_t out_size)
 +{
 +   size_t n = out_size;
-+   return errno_of(IOConnectCallStructMethod(dev->conn, selector, in, in_size, out, out ? &n : NULL));
++   kern_return_t kr = IOConnectCallStructMethod(dev->conn, selector, in, in_size, out, out ? &n : NULL);
++   if (kr != KERN_SUCCESS && getenv("RN_BRIDGE_DEBUG"))
++      fprintf(stderr, "rn-bridge: selector %u returned 0x%x (errno %d)\n", selector, kr, errno_of(kr));
++   return errno_of(kr);
 +}
 +
 +/* ---------------------------------------------------------------------------------------------------------------------------------------------- virtual addresses */
@@ -449,6 +455,10 @@ index 0000000..2e8b379
 +
 +int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
 +{
++   /* The kext takes one IB per submit and says so, but this layer sends the IBs of a RADV submission one after the other, so RADV may use its own default (124 for compute).
++    * With the kext's 1, a submission that has a preamble and a command buffer never fits and RADV's submit loop does not end. */
++   if (info_id == AMDGPU_INFO_MAX_IBS)
++      return -EINVAL;
 +   return info_query(dev, info_id, size, value, NULL);
 +}
 +
@@ -590,7 +600,7 @@ index 0000000..2e8b379
 +      *(uint32_t *)value = (uint32_t)(dev->dev_info.high_va_offset >> 32);
 +      return 0;
 +   case amdgpu_sw_info_address_prt_wa_control_bit:
-+      *(uint32_t *)value = 47;                                 /* the bit that tells the lower half of the 48-bit space from the upper (the hole is at 2^47) */
++      *(uint32_t *)value = ~0u;                                /* "ignore", as the docs of this query say: no half of the address space is reserved for sparse residency here */
 +      return 0;
 +   default:
 +      return -EINVAL;
@@ -777,6 +787,63 @@ index 0000000..2e8b379
 +}
 +
 +/* DRM_AMDGPU_GEM_VA. The kext maps and unmaps exactly one range at a time: an unmap names the range of a map (RADV does that), and the page flags are always read, write and execute. */
++static void track_map(struct ac_drm_device *dev, uint32_t handle, uint64_t va, uint64_t offset, uint64_t size)
++{
++   pthread_mutex_lock(&dev->lock);
++   if (dev->nmaps < 4096)
++   {
++      dev->maps[dev->nmaps].handle = handle;
++      dev->maps[dev->nmaps].va = va;
++      dev->maps[dev->nmaps].offset = offset;
++      dev->maps[dev->nmaps].size = size;
++      dev->nmaps++;
++   }
++   pthread_mutex_unlock(&dev->lock);
++}
++
++static void track_unmap(struct ac_drm_device *dev, uint64_t va)
++{
++   pthread_mutex_lock(&dev->lock);
++   for (uint32_t i = 0; i < dev->nmaps; i++) {
++      if (dev->maps[i].va == va) {
++         dev->maps[i] = dev->maps[--dev->nmaps];
++         break;
++      }
++   }
++   pthread_mutex_unlock(&dev->lock);
++}
++
++/* RN_BRIDGE_DUMP=dir: write every mapped range (up to 16 MB each) as dir/va_<hex>.bin at each submit, to replay a submission with tools/rn_test.c rawib */
++static void dump_maps(struct ac_drm_device *dev, const char *dir)
++{
++   pthread_mutex_lock(&dev->lock);
++   for (uint32_t i = 0; i < dev->nmaps; i++) {
++      if (dev->maps[i].size > (16u << 20) || dev->maps[i].handle >= dev->nbos || !dev->bos[dev->maps[i].handle])
++         continue;
++      struct amdgpu_bo *b = dev->bos[dev->maps[i].handle];
++      mach_vm_address_t addr = 0;
++      mach_vm_size_t len = 0;
++      int mapped_here = 0;
++      void *cpu = b->cpu;
++      if (!cpu) {
++         if (IOConnectMapMemory64(dev->conn, b->handle, mach_task_self(), &addr, &len, kIOMapAnywhere) != KERN_SUCCESS)
++            continue;
++         cpu = (void *)(uintptr_t)addr;
++         mapped_here = 1;
++      }
++      char path[512];
++      snprintf(path, sizeof(path), "%s/va_%llx.bin", dir, (unsigned long long)dev->maps[i].va);
++      FILE *f = fopen(path, "wb");
++      if (f) {
++         fwrite((char *)cpu + dev->maps[i].offset, 1, dev->maps[i].size, f);
++         fclose(f);
++      }
++      if (mapped_here)
++         IOConnectUnmapMemory64(dev->conn, b->handle, mach_task_self(), addr);
++   }
++   pthread_mutex_unlock(&dev->lock);
++}
++
 +int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops)
 +{
 +   (void)flags;
@@ -785,15 +852,23 @@ index 0000000..2e8b379
 +      return 0;
 +   struct rn_uc_va_unmap un = {addr, size};
 +   struct rn_uc_va_map map = {bo_handle, 0, addr, offset, size};
++   int r;
 +   switch (ops) {
 +   case AMDGPU_VA_OP_MAP:
-+      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++      r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++      if (!r) track_map(dev, bo_handle, addr, offset, size);
++      return r;
 +   case AMDGPU_VA_OP_UNMAP:
 +   case AMDGPU_VA_OP_CLEAR:
-+      return call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);
++      r = call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);
++      if (!r) track_unmap(dev, addr);
++      return r;
 +   case AMDGPU_VA_OP_REPLACE:
 +      call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);     /* nothing mapped there is not an error for a replace */
-+      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++      track_unmap(dev, addr);
++      r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++      if (!r) track_map(dev, bo_handle, addr, offset, size);
++      return r;
 +   default:
 +      return -EINVAL;
 +   }
@@ -988,6 +1063,11 @@ index 0000000..2e8b379
 +      return -EINVAL;
 +
 +   uint32_t last_seq = 0;
++   if (getenv("RN_BRIDGE_DUMP")) {
++      dump_maps(dev, getenv("RN_BRIDGE_DUMP"));
++      for (unsigned i = 0; i < n_ibs; i++)
++         fprintf(stderr, "rn-bridge: dumped, ib %u at 0x%llx, %u bytes\n", i, (unsigned long long)ibs[i]->va_start, ibs[i]->ib_bytes);
++   }
 +   for (unsigned i = 0; i < n_ibs; i++) {
 +      if (ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
 +         return -EINVAL;
@@ -1009,6 +1089,8 @@ index 0000000..2e8b379
 +         memcpy(sub.out, out, n_out * sizeof(out[0]));
 +      }
 +      struct rn_uc_submit_result res;
++      if (getenv("RN_BRIDGE_DEBUG"))
++         fprintf(stderr, "rn-bridge: submit ib_va 0x%llx, %u dwords, %u waits, %u signals (ib %u of %u)\n", (unsigned long long)sub.ib_va, sub.ib_dwords, sub.in_count, sub.out_count, i + 1, n_ibs);
 +      int r = call(dev, RN_UC_SUBMIT, &sub, sizeof(sub), &res, sizeof(res));
 +      if (r)
 +         return r;
@@ -1637,7 +1719,7 @@ index 66190a5..cc0104c 100644
  
     if (RADV_DEBUG(instance, STARTUP))
 diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
-index 415efc9..7a2e420 100644
+index 415efc9..0f8202d 100644
 --- a/src/amd/vulkan/radv_physical_device.c
 +++ b/src/amd/vulkan/radv_physical_device.c
 @@ -34,8 +34,11 @@
@@ -1653,7 +1735,19 @@ index 415efc9..7a2e420 100644
  #else
  #include "drm-uapi/amdgpu_drm.h"
  #include "util/os_drm.h"
-@@ -2612,8 +2615,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -103,6 +106,11 @@ radv_sparse_enabled(const struct radv_physical_device *pdev)
+    if (instance->queue_disable_flags & RADV_QUEUE_DISABLE_SPARSE)
+       return false;
+ 
++#ifdef __APPLE__
++   /* The RedNavi kext has no unbacked (PRT) mappings: sparse residency would fault. */
++   return false;
++#endif
++
+    return pdev->info.has_sparse || (instance->experimental_flags & RADV_EXPERIMENTAL_SPARSE);
+ }
+ 
+@@ -2612,8 +2620,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
  #else
     VkResult result;
     int fd = -1;
@@ -1668,7 +1762,7 @@ index 415efc9..7a2e420 100644
     drmVersionPtr version;
  
     fd = open(path, O_RDWR | O_CLOEXEC);
-@@ -2652,6 +2660,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -2652,6 +2665,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
                         path);
     }
     drmFreeVersion(version);
@@ -1676,7 +1770,7 @@ index 415efc9..7a2e420 100644
  
     if (RADV_DEBUG(instance, STARTUP))
        fprintf(stderr, "radv: info: Found device '%s'.\n", path);
-@@ -2716,6 +2725,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -2716,6 +2730,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
     pdev->sync_types[num_sync_types++] = NULL;
     pdev->vk.supported_sync_types = pdev->sync_types;
  
@@ -1684,7 +1778,7 @@ index 415efc9..7a2e420 100644
     if (instance->vk.enabled_extensions.KHR_display) {
        pdev->wsi_master_fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
        if (pdev->wsi_master_fd >= 0) {
-@@ -2734,6 +2744,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -2734,6 +2749,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
        if (fd != -1)
           pdev->wsi_syncobj_fd = os_dupfd_cloexec(fd);
     }
@@ -1692,7 +1786,7 @@ index 415efc9..7a2e420 100644
  
     /* Allow all devices on a virtual winsys, otherwise do a basic support check. */
     if (!radv_is_gpu_supported(&pdev->info)) {
-@@ -2876,6 +2887,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -2876,6 +2892,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
     radv_physical_device_get_supported_extensions(pdev, &pdev->vk.supported_extensions);
     radv_physical_device_get_features(pdev, &pdev->vk.supported_features);
  
@@ -1706,7 +1800,7 @@ index 415efc9..7a2e420 100644
     struct stat primary_stat = {0}, render_stat = {0};
  
     pdev->available_nodes = drm_device->available_nodes;
-@@ -2896,6 +2914,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+@@ -2896,6 +2919,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
        goto fail;
     }
     pdev->render_devid = render_stat.st_rdev;
@@ -1714,7 +1808,7 @@ index 415efc9..7a2e420 100644
  
     if (radv_device_get_cache_uuid(pdev, pdev->cache_uuid)) {
        result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "cannot generate UUID");
-@@ -2969,7 +2988,7 @@ fail_fd:
+@@ -2969,7 +2993,7 @@ fail_fd:
  VkResult
  create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device, struct vk_physical_device **out)
  {
@@ -1723,7 +1817,7 @@ index 415efc9..7a2e420 100644
     bool supported_device = false;
  
     if (!(device->available_nodes & (1 << DRM_NODE_RENDER)))
-@@ -2992,6 +3011,24 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
+@@ -2992,6 +3016,24 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
  #endif
  }
  
