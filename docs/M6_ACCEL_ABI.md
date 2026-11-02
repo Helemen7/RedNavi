@@ -187,3 +187,72 @@ The pure ones are named by what `IntelAccelerator` puts there (AMD's X6000 accel
 - A subclass of `IOGraphicsAccelerator2` must implement 17 virtuals, all of them factories and hooks (`getStampMemory`, `newEventMachine`, `newSurface`, `new2DContext`, `newGLContext`, `newCLContext`, `newVideoContext`, `newSysMemory`, `newVidMemory`, `newResource`, `newMemoryMap`, `newDisplayMachine`, `createUserGPUTask`, `createKernelGPUTask`, `populateAccelConfig`, `configureDevice`, `teardownDevice`). Each factory returns an object of a family class that the driver subclasses in turn, so the subclasses of `IOAccelSurface` (5 pure), `IOAccel2DContext2` (2), `IOAccelResource2` (7), the memory classes (`IOAccelMemory` 11), the event machine (34, most already given by `IOAccelEventMachineFast2`) and the rest come with it; `IOAccelDevice2`, `IOAccelSharedUserClient2` and `IOAccelCommandQueue` have no pure virtual and can be used as they are.
 - The shipped drivers also override family virtuals that are not pure and add some of their own (Intel's table has 353 slots against the family's 351, AMD's 366), so a first driver can start with the 17 and add overrides as the logger shows what is called.
 - The layout of the data members is not in the tables: it needs the class sizes (run-time probe) and, for the members the family code touches in a subclass, trial. A subclass declared with the right size and the right virtual order, adding its own members after them, works whatever is in between, as long as the base class is only used through its own methods.
+
+## Object sizes (run-time, 2026-11-02)
+
+`OSMetaClass::getClassSize()` of each class, asked by `RedNaviAccel` on the test desktop (macOS 15.8.2, `IOAcceleratorFamily2` loaded as its dependency); raw output in `docs/logs/accel_first_load.txt`. Four classes the study lists are not OSObject classes and have no metaclass: `IOAccelClientSharedMachine`, `IOAccelOrphanedMemoryPool`, `IOAccelOrphanedVidMemoryPool`, `IOAccelResidentMemorySet`.
+
+| class | size (bytes) | parent |
+|---|---|---|
+| `IOAccel2DContext2` | 4352 | `IOAccelContext2` |
+| `IOAccelAllocationInfo` | 1072 | `OSObject` |
+| `IOAccelBlockFence` | 224 | `IOAccelEventFence` |
+| `IOAccelBlockFencePort2` | 80 | `OSObject` |
+| `IOAccelBufferMemoryDescriptorPool2` | 432 | `OSObject` |
+| `IOAccelCLContext2` | 4328 | `IOAccelContext2` |
+| `IOAccelChannel2` | 112 | `OSObject` |
+| `IOAccelCommandBufferPool2` | 6328 | `OSObject` |
+| `IOAccelCommandQueue` | 1704 | `IOAccelSubmitter2` |
+| `IOAccelContext2` | 4264 | `IOAccelSubmitter2` |
+| `IOAccelContextEventFence` | 200 | `IOAccelEventFence` |
+| `IOAccelDevice2` | 392 | `IOUserClient` |
+| `IOAccelDeviceShmem` | 120 | `IOAccelKernelMappedMemory` |
+| `IOAccelDisplayMachine` | 376 | `IOService` |
+| `IOAccelDisplayPipe` | 792 | `IOService` |
+| `IOAccelDisplayPipeGammaTable2` | 32 | `OSObject` |
+| `IOAccelDisplayPipeTransaction2` | 440 | `OSObject` |
+| `IOAccelDisplayPipeUserClient2` | 424 | `IOUserClient` |
+| `IOAccelDrawable2` | 520 | `OSObject` |
+| `IOAccelEventFence` | 200 | `OSObject` |
+| `IOAccelEventMachine2` | 240 | `OSObject` |
+| `IOAccelEventMachineFast2` | 3376 | `IOAccelEventMachine2` |
+| `IOAccelExternalEvent` | 32 | `OSObject` |
+| `IOAccelFIFOChannel2` | 232 | `IOAccelChannel2` |
+| `IOAccelFenceMachine` | 144 | `OSObject` |
+| `IOAccelGLContext2` | 4664 | `IOAccelContext2` |
+| `IOAccelGLDrawableUserClient` | 1648 | `IOUserClient` |
+| `IOAccelGPURestartReport2` | 136 | `IOService` |
+| `IOAccelKernelMappedMemory` | 64 | `OSObject` |
+| `IOAccelLegacyDisplayMachine` | 504 | `IOAccelDisplayMachine` |
+| `IOAccelLegacyDisplayPipe` | 896 | `IOAccelDisplayPipe` |
+| `IOAccelLegacySurface` | 5040 | `IOAccelSurface` |
+| `IOAccelMTLEvent2` | 656 | `OSObject` |
+| `IOAccelMemory` | 176 | `OSObject` |
+| `IOAccelMemoryAllocator2` | 120 | `OSObject` |
+| `IOAccelMemoryInfoUserClient` | 232 | `IOUserClient` |
+| `IOAccelMemoryMap` | 280 | `OSObject` |
+| `IOAccelNamespace` | 48 | `OSObject` |
+| `IOAccelRangeAllocator` | 112 | `OSObject` |
+| `IOAccelRemoteMemory` | 208 | `IOAccelMemory` |
+| `IOAccelResource2` | 384 | `OSObject` |
+| `IOAccelShared2` | 312 | `OSObject` |
+| `IOAccelSharedEventFence` | 216 | `IOAccelEventFence` |
+| `IOAccelSharedNamespace2` | 216 | `IOAccelNamespace` |
+| `IOAccelSharedUserClient2` | 360 | `IOUserClient` |
+| `IOAccelStatistics2` | 104 | `OSObject` |
+| `IOAccelSubmitter2` | 1384 | `IOUserClient` |
+| `IOAccelSurface` | 4920 | `IOUserClient` |
+| `IOAccelSurfaceMTL` | 832 | `IOUserClient` |
+| `IOAccelSysMemory` | 408 | `IOAccelMemory` |
+| `IOAccelTask` | 600 | `OSObject` |
+| `IOAccelTraceStream2` | 96 | `OSObject` |
+| `IOAccelVidMemory` | 272 | `IOAccelMemory` |
+| `IOAccelVideoContext2` | 4328 | `IOAccelContext2` |
+| `IOAccelerator` | 136 | `IOService` |
+| `IOFramebuffer` | 464 | `IOGraphicsDevice` |
+| `IOGraphicsAccelerator2` | 3544 | `IOAccelerator` |
+| `IOPCIDevice` | 184 | `IOService` |
+| `IORegistryEntry` | 40 | `OSObject` |
+| `IOService` | 136 | `IORegistryEntry` |
+| `IOUserClient` | 216 | `IOService` |
+| `OSObject` | 16 | `-` |

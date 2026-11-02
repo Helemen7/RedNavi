@@ -1,0 +1,113 @@
+# RedNaviAccel first load, test desktop, macOS 15.8.2; class sizes in bytes (OSMetaClass::getClassSize) and parent
+size IOAccel2DContext2 4352 IOAccelContext2
+size IOAccelAllocationInfo 1072 OSObject
+size IOAccelBlockFence 224 IOAccelEventFence
+size IOAccelBlockFencePort2 80 OSObject
+size IOAccelBufferMemoryDescriptorPool2 432 OSObject
+size IOAccelCLContext2 4328 IOAccelContext2
+size IOAccelChannel2 112 OSObject
+size IOAccelCommandBufferPool2 6328 OSObject
+size IOAccelCommandQueue 1704 IOAccelSubmitter2
+size IOAccelContext2 4264 IOAccelSubmitter2
+size IOAccelContextEventFence 200 IOAccelEventFence
+size IOAccelDevice2 392 IOUserClient
+size IOAccelDeviceShmem 120 IOAccelKernelMappedMemory
+size IOAccelDisplayMachine 376 IOService
+size IOAccelDisplayPipe 792 IOService
+size IOAccelDisplayPipeGammaTable2 32 OSObject
+size IOAccelDisplayPipeTransaction2 440 OSObject
+size IOAccelDisplayPipeUserClient2 424 IOUserClient
+size IOAccelDrawable2 520 OSObject
+size IOAccelEventFence 200 OSObject
+size IOAccelEventMachine2 240 OSObject
+size IOAccelEventMachineFast2 3376 IOAccelEventMachine2
+size IOAccelExternalEvent 32 OSObject
+size IOAccelFIFOChannel2 232 IOAccelChannel2
+size IOAccelFenceMachine 144 OSObject
+size IOAccelGLContext2 4664 IOAccelContext2
+size IOAccelGLDrawableUserClient 1648 IOUserClient
+size IOAccelGPURestartReport2 136 IOService
+size IOAccelKernelMappedMemory 64 OSObject
+size IOAccelLegacyDisplayMachine 504 IOAccelDisplayMachine
+size IOAccelLegacyDisplayPipe 896 IOAccelDisplayPipe
+size IOAccelLegacySurface 5040 IOAccelSurface
+size IOAccelMTLEvent2 656 OSObject
+size IOAccelMemory 176 OSObject
+size IOAccelMemoryAllocator2 120 OSObject
+size IOAccelMemoryInfoUserClient 232 IOUserClient
+size IOAccelMemoryMap 280 OSObject
+size IOAccelNamespace 48 OSObject
+size IOAccelRangeAllocator 112 OSObject
+size IOAccelRemoteMemory 208 IOAccelMemory
+size IOAccelResource2 384 OSObject
+size IOAccelShared2 312 OSObject
+size IOAccelSharedEventFence 216 IOAccelEventFence
+size IOAccelSharedNamespace2 216 IOAccelNamespace
+size IOAccelSharedUserClient2 360 IOUserClient
+size IOAccelStatistics2 104 OSObject
+size IOAccelSubmitter2 1384 IOUserClient
+size IOAccelSurface 4920 IOUserClient
+size IOAccelSurfaceMTL 832 IOUserClient
+size IOAccelSysMemory 408 IOAccelMemory
+size IOAccelTask 600 OSObject
+size IOAccelTraceStream2 96 OSObject
+size IOAccelVidMemory 272 IOAccelMemory
+size IOAccelVideoContext2 4328 IOAccelContext2
+size IOAccelerator 136 IOService
+size IOFramebuffer 464 IOGraphicsDevice
+size IOGraphicsAccelerator2 3544 IOAccelerator
+size IOPCIDevice 184 IOService
+size IORegistryEntry 40 OSObject
+size IOService 136 IORegistryEntry
+size IOUserClient 216 IOService
+size OSObject 16 -
+missing IOAccelClientSharedMachine IOAccelOrphanedMemoryPool IOAccelOrphanedVidMemoryPool IOAccelResidentMemorySet
+counters open 22 call 22 probe 3
+log start on RedNaviAccel, provider GFX0
+log requestProbe(options 0x1)
+log requestProbe(options 0x1)
+log requestProbe(options 0x1)
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1000), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1001), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1002), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1003), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1004), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1005), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1006), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1007), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1008), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1009), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x100a), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x100b), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 4: externalMethod 0, scalar in 1 (first 0xffffffff), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 1, struct out 0
+log WindowServer[159] open type 4: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
+log WindowServer[159] open type 0: externalMethod 7, scalar in 2 (first 0x1), struct in 0 (words 00000000 00000000 00000000 00000000), scalar out 0, struct out 0
+log WindowServer[159] open type 0: closed
