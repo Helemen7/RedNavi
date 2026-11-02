@@ -247,6 +247,70 @@ gfxdone:;
         IOServiceClose(c);
         return fails ? 2 : 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "gfxreset")) {             // gfxreset: hang the graphics queue three ways (CP wait, shader loop, and left to the kernel watchdog), recover each time, check both queues still run
+        Bo code, data;
+        if (createBo(c, 4096, &code) || createBo(c, 4096, &data) || vaMap(c, code.handle, 0x10000, 0, 4096) || vaMap(c, data.handle, 0x20000, 0, 4096)) return 1;
+        int ok = 1;
+        for (int step = 0; step < 6 && ok; step++) {
+            // 0: good dispatch on gfx; 1: CP hang, reset on request; 2: good; 3: shader loop, reset on request; 4: CP hang, the watchdog resets; 5: good on both queues
+            const int hang = step == 1 || step == 3 || step == 4;
+            uint32_t n = buildDispatch(code.cpu, 0x10000, 0x20000);
+            for (uint32_t i = 0; i < n; i++)
+                if ((code.cpu[i] & 0xFFFF00FFu) == (PACKET3(0x15, 3) & 0xFFFF00FFu) && ((code.cpu[i] >> 8) & 0xFF) == 0x15) code.cpu[i] |= 2u;
+            if (step == 3) code.cpu[0x100 / 4] = 0xBFA0FFFFu;                // s_branch -1: the wave never ends
+            if (step == 1 || step == 4) {                                    // WAIT_REG_MEM on a dword in the data buffer that never holds the reference
+                n = 0;
+                code.cpu[n++] = PACKET3(0x3C, 5); code.cpu[n++] = 3u | (1u << 4); code.cpu[n++] = 0x20010; code.cpu[n++] = 0;
+                code.cpu[n++] = 0xDEADBEEFu; code.cpu[n++] = 0xFFFFFFFFu; code.cpu[n++] = 4;
+            }
+            data.cpu[0] = 0xDEAD0000u; data.cpu[4] = 0;
+            struct rn_uc_submit in; memset(&in, 0, sizeof(in));
+            in.ib_va = 0x10000; in.ib_dwords = n; in.flags = RN_SUBMIT_GFX;
+            struct rn_uc_submit_result out; size_t outSize = sizeof(out);
+            kr = IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), &out, &outSize);
+            uint32_t reached = 0;
+            struct timespec t0, t1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            if (kr) { printf("step %d: submit 0x%x\n", step, kr); ok = 0; break; }
+            waitSeq(c, out.seq, hang && step != 4 ? 1500 : 10000, &reached, NULL);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            const long ms = (long)((t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000);
+            printf("step %d (%s): seq 0x%08x, reached %u status %u after %ld ms, data 0x%08x\n", step, !hang ? "good dispatch" : step == 3 ? "shader loop" : "CP wait", out.seq, reached, gStatus, ms, data.cpu[0]);
+            if (!hang) { if (!reached || data.cpu[0] != 0x600DC0DEu) ok = 0; continue; }
+            if (step == 4) { if (!reached || gStatus != RN_UC_SEQ_LOST || ms < 7000) ok = 0; continue; }   // the kernel did it
+            if (reached) { ok = 0; break; }                                  // it must still be stuck here
+            uint32_t one = 1;
+            struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+            kr = IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, &one, sizeof(one), &rr, &rrSize);
+            printf("  graphics queue reset: 0x%x, status %u, resets %u, lost 0x%x..0x%x\n", kr, rr.status, rr.resets, rr.lost_from, rr.lost_to);
+            if (kr || rr.status) { ok = 0; break; }
+            waitSeq(c, out.seq, 1000, &reached, NULL);
+            printf("  waiting for the lost sequence: reached %u, status %u (expect 1 and %u = lost)\n", reached, gStatus, RN_UC_SEQ_LOST);
+            if (!reached || gStatus != RN_UC_SEQ_LOST) ok = 0;
+        }
+        {   // both queues after all that
+            const uint32_t n = buildDispatch(code.cpu, 0x10000, 0x20000);
+            for (int q = 1; q >= 0; q--) {
+                uint32_t nn = n;
+                for (uint32_t i = 0; q && i < nn; i++)
+                    if ((code.cpu[i] & 0xFFFF00FFu) == (PACKET3(0x15, 3) & 0xFFFF00FFu) && ((code.cpu[i] >> 8) & 0xFF) == 0x15) code.cpu[i] |= 2u;
+                data.cpu[0] = 0xDEAD0000u;
+                struct rn_uc_submit in; memset(&in, 0, sizeof(in));
+                in.ib_va = 0x10000; in.ib_dwords = nn; in.flags = q ? RN_SUBMIT_GFX : 0;
+                struct rn_uc_submit_result out; size_t outSize = sizeof(out);
+                kr = IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), &out, &outSize);
+                uint32_t reached = 0;
+                if (!kr) waitSeq(c, out.seq, 3000, &reached, NULL);
+                printf("final %s dispatch: submit 0x%x, reached %u, result 0x%08x\n", q ? "graphics" : "compute", kr, reached, data.cpu[0]);
+                if (kr || !reached || data.cpu[0] != 0x600DC0DEu) ok = 0;
+            }
+        }
+        struct rn_uc_diag d;
+        if (diag(c, 0, &d) == KERN_SUCCESS) printf("fault status 0x%x, address 0x%x%08x\n", d.fault_status, d.fault_addr_hi, d.fault_addr_lo);
+        printf("%s\n", ok ? "PASS" : "FAIL");
+        IOServiceClose(c);
+        return ok ? 0 : 2;
+    }
     if (argc > 3 && !strcmp(argv[1], "peekv")) {                // peekv OFFSET COUNT: dwords of VRAM at a byte offset (hex), by the index/data registers
         struct rn_uc_vram_peek in = {strtoull(argv[2], NULL, 16), (uint32_t)atoi(argv[3]), 0};
         struct rn_uc_vram_peek_result out;

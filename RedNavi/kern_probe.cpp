@@ -343,9 +343,11 @@ class RedNaviProbe : public IOService {
     void vmUnmap(int vmid, uint64_t vaPage, uint32_t pages);
     IOLock *queueLock {nullptr};                   // sequence numbers, submits and resets of the compute queue, in that order
     uint32_t queueResets {0};
+    uint32_t gfxQueueResets {0};
     uint32_t hangMs {8000};                        // a wait this long without the fence moving resets the queue (rednavi_hang_ms)
     RedNaviClient *vmClient[8] {};                 // the connection of each VMID
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
+    int resetGfxQueue(uint32_t info[4]);           // the same for the graphics queue
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
     int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true);
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
@@ -1792,6 +1794,7 @@ class RedNaviClient : public IOUserClient {
     uint32_t seqSubmitted {0};                     // the compute queue's counter (bit 31 clear)
     uint32_t gfxSeqSubmitted {0};                  // the graphics queue's: bit 31 set once something was submitted
     uint32_t lostFrom {1}, lostTo {0};             // sequence numbers dropped by the last queue reset (none when lostFrom > lostTo)
+    uint32_t gfxLostFrom {1}, gfxLostTo {0};       // the same for the graphics queue (numbers with bit 31 set)
     friend class RedNaviProbe;
 
     // Synchronisation objects (rn_uapi.h): the binary state and a timeline per object. Work that signals one is attached as a number of this connection's
@@ -2152,6 +2155,12 @@ public:
                     IOLog("RedNavi: ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
                     if (rr == 0) r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
                 }
+                if (r == -EAGAIN && gfx) {
+                    uint32_t info[4];
+                    const int rr = gpuOwner->resetGfxQueue(info);
+                    IOLog("RedNavi: graphics ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
+                    if (rr == 0) r = rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(vmid));
+                }
                 if (r == 0) { if (gfx) gfxSeqSubmitted = seq; else seqSubmitted = seq; }   // taken under the queue lock, in the order the packets reach the ring
                 IOLockUnlock(gpuOwner->queueLock);
                 if (r == 0) {
@@ -2177,10 +2186,10 @@ public:
                 while (ms < timeout && !seqDone(fenceWord(ring), in->seq)) {
                     IOSleep(1);
                     ms++;
-                    if (ms == gpuOwner->hangMs && fenceWord(ring) == fence0 && ring == 0) {   // (the graphics queue has no reset yet)          // no progress for the whole hang time: the queue is stuck
+                    if (ms == gpuOwner->hangMs && fenceWord(ring) == fence0) {            // no progress for the whole hang time: the queue is stuck
                         uint32_t info[4];
                         IOLockLock(gpuOwner->queueLock);
-                        const int rr = gpuOwner->resetQueue(info);
+                        const int rr = ring ? gpuOwner->resetGfxQueue(info) : gpuOwner->resetQueue(info);
                         IOLockUnlock(gpuOwner->queueLock);
                         IOLog("RedNavi: queue hung while waiting for sequence %u, reset: %d (step %u)\n", in->seq, rr, info[0]);
                     }
@@ -2190,7 +2199,10 @@ public:
                 IOLockLock(gpuOwner->queueLock);
                 o->signaled = fenceWord(ring);
                 o->reached = seqDone(o->signaled, in->seq);
-                if (ring == 0 && o->reached && static_cast<int32_t>(in->seq - lostFrom) >= 0 && static_cast<int32_t>(lostTo - in->seq) >= 0) o->status = RN_UC_SEQ_LOST;
+                {
+                    const uint32_t from = ring ? gfxLostFrom : lostFrom, to = ring ? gfxLostTo : lostTo;
+                    if (o->reached && static_cast<int32_t>(in->seq - from) >= 0 && static_cast<int32_t>(to - in->seq) >= 0) o->status = RN_UC_SEQ_LOST;
+                }
                 IOLockUnlock(gpuOwner->queueLock);
                 if (timeout) rn_gc_safe_mode(&gpuOwner->gpu, 0);
                 rc = kIOReturnSuccess;
@@ -2362,16 +2374,18 @@ public:
             }
             break;
         case RN_UC_QUEUE_RESET:
-            if (sized(args, 0, sizeof(rn_uc_reset_result)) && fenceIdx >= 0) {
+            if ((sized(args, 0, sizeof(rn_uc_reset_result)) || sized(args, sizeof(uint32_t), sizeof(rn_uc_reset_result))) && fenceIdx >= 0) {
+                const bool gfx = args->structureInputSize != 0 && *static_cast<const uint32_t *>(args->structureInput) == 1;   // the optional input names the queue: 1 graphics, otherwise compute
+                if (gfx && !gpuOwner->gfxQueueOk) break;
                 uint32_t info[4];
                 IOLockLock(gpuOwner->queueLock);
-                const int rr = gpuOwner->resetQueue(info);
+                const int rr = gfx ? gpuOwner->resetGfxQueue(info) : gpuOwner->resetQueue(info);
                 rn_uc_reset_result *o = static_cast<rn_uc_reset_result *>(args->structureOutput);
                 memset(o, 0, sizeof(*o));
                 o->status = rr == 0 ? 0 : (info[0] ? info[0] : 0xff);
-                o->resets = gpuOwner->queueResets;
-                o->lost_from = lostFrom;
-                o->lost_to = lostTo;
+                o->resets = gfx ? gpuOwner->gfxQueueResets : gpuOwner->queueResets;
+                o->lost_from = gfx ? gfxLostFrom : lostFrom;
+                o->lost_to = gfx ? gfxLostTo : lostTo;
                 IOLockUnlock(gpuOwner->queueLock);
                 rc = kIOReturnSuccess;
             }
@@ -2418,6 +2432,23 @@ int RedNaviProbe::resetQueue(uint32_t info[4]) {
         c->lostFrom = before[v] + 1;
         c->lostTo = c->seqSubmitted;
         *reinterpret_cast<volatile uint32_t *>(bos[c->fenceIdx].md->getBytesNoCopy()) = c->seqSubmitted;
+    }
+    return 0;
+}
+
+// The graphics queue's reset: same bookkeeping, with the fence in dword 2 and sequence numbers that carry bit 31.
+int RedNaviProbe::resetGfxQueue(uint32_t info[4]) {
+    uint32_t before[8];
+    for (int v = 1; v <= 7; v++) before[v] = vmClient[v] ? vmClient[v]->fenceWord(1) : 0;
+    const int rr = rn_gfx_queue_reset(&gpu, info);
+    gfxQueueResets++;
+    if (rr != 0) return rr;
+    for (int v = 1; v <= 7; v++) {
+        RedNaviClient *c = vmClient[v];
+        if (!c) continue;
+        c->gfxLostFrom = (before[v] + 1) | 0x80000000u;
+        c->gfxLostTo = c->gfxSeqSubmitted;
+        *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(bos[c->fenceIdx].md->getBytesNoCopy()) + 8) = c->gfxSeqSubmitted;
     }
     return 0;
 }

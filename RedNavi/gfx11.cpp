@@ -2282,6 +2282,24 @@ static void writeGfxMqd(struct rn_device *adev, u64 vaBase, u64 blk, u32 ringByt
     __sync_synchronize();
 }
 
+// The MES maps the graphics queue (amdgpu_gfx_enable_kgq: MAP_LEGACY_QUEUE of type GFX) from the MQD that writeGfxMqd built.
+static bool gfxMesAdd(struct rn_device *adev, u64 vaBase, u64 blk, u32 *status) {
+    union MESAPI__ADD_QUEUE p;
+    memset(&p, 0, sizeof(p));
+    p.header.type = MES_API_TYPE_SCHEDULER;
+    p.header.opcode = MES_SCH_API_ADD_QUEUE;
+    p.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+    p.pipe_id = 0;
+    p.queue_id = 0;
+    p.doorbell_offset = kGfxDoorbell;
+    p.mqd_addr = vaBase + blk + 0x2000;
+    p.wptr_addr = vaBase + blk + 0x1008;
+    p.queue_type = MES_QUEUE_TYPE_GFX;
+    p.map_legacy_kq = 1;
+    *status = 0;
+    return mesSendLate(adev, &p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4, status);
+}
+
 // Dwords to the graphics ring, the write pointer shadow, and the doorbell (a 64-bit write of the running dword count).
 static void gfxRingEmit(struct rn_device *adev, const u32 *pk, u32 n) {
     const u32 mask = kGfxRingBytes / 4 - 1;
@@ -2294,6 +2312,24 @@ static void gfxRingEmit(struct rn_device *adev, const u32 *pk, u32 n) {
     __sync_synchronize();
     rn_hdp_flush(adev);
     *reinterpret_cast<volatile u64 *>(gDoorbellBase + kGfxDoorbell * 4) = w + n;
+}
+
+static u32 gfxEmitClearState(struct rn_device *adev) {
+    // gfx_v11_0_cp_gfx_start: the clear state, the default values of all context registers (gfx11_csb.h), between the preamble packets, then CLEAR_STATE, which makes the
+    // command processor load them into every context it creates. Without the defaults a new context starts with every register 0 and a draw produces nothing.
+    const u32 head[] = {RN_PACKET3(0x4Au, 0), 2u << 28,                     // PREAMBLE_CNTL: begin clear state
+                        RN_PACKET3(0x28u, 1), 0x80000000u, 0x80000000u};    // CONTEXT_CONTROL
+    gfxRingEmit(adev, head, sizeof(head) / sizeof(head[0]));
+    for (u32 e = 0; e < sizeof(kGfx11CsbExtents) / sizeof(kGfx11CsbExtents[0]); e++) {
+        const u32 hdr[] = {RN_PACKET3(0x69u, kGfx11CsbExtents[e].count), kGfx11CsbExtents[e].first_reg - 0xA000u};   // SET_CONTEXT_REG
+        gfxRingEmit(adev, hdr, 2);
+        gfxRingEmit(adev, kGfx11CsbExtents[e].values, kGfx11CsbExtents[e].count);
+    }
+    const u32 tail[] = {RN_PACKET3(0x69u, 1), 0xA1ECu - 0xA000u, 0,           // SET_CONTEXT_REG PA_SC_TILE_STEERING_OVERRIDE = 0 (gfx.config.pa_sc_tile_steering_override)
+                        RN_PACKET3(0x4Au, 0), 3u << 28,                       // PREAMBLE_CNTL: end clear state
+                        RN_PACKET3(0x12u, 0), 0};                             // CLEAR_STATE
+    gfxRingEmit(adev, tail, sizeof(tail) / sizeof(tail[0]));
+    return 5 + 934 + 2 * 7 + sizeof(tail) / sizeof(tail[0]);
 }
 
 int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
@@ -2338,6 +2374,86 @@ int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa
     return rc;
 }
 
+// Does the graphics queue run what it is given? The scratch register ring test of Linux.
+static bool gfxQueueAlive(struct rn_device *adev) {
+    const u32 scratchDw = 0xc000u + 0x40u;
+    WREG32_SOC15(RN_GC, 0, regSCRATCH_REG0, 0xCAFEDEADu);
+    const u32 pk[] = {RN_PACKET3(RN_PACKET3_SET_UCONFIG_REG, 1), scratchDw - RN_PACKET3_SET_UCONFIG_REG_START, 0xDEADBEEFu};
+    gfxRingEmit(adev, pk, 3);
+    for (int i = 0; i < 2000; i++) { if (RREG32_SOC15(RN_GC, 0, regSCRATCH_REG0) == 0xDEADBEEFu) return true; udelay(10); }
+    return false;
+}
+
+#ifndef regCP_VMID_RESET
+#define regCP_VMID_RESET 0x1e53          // gc_11_0_3_offset.h; RESET_REQUEST is bits 15:0 (one per VMID), PIPE0_QUEUES bits 23:16
+#define regCP_VMID_RESET_BASE_IDX 0
+#endif
+
+// A hung graphics queue: ask the CP to reset every VMID's work on queue 0 of pipe 0 (mes_v11_0_reset_queue_mmio, the path Linux takes with use_mmio), take the queue out of the
+// MES, and map it again from a fresh MQD with the clear state resent. If the HQD does not leave, the ME and PFP of pipe 0 are reset as well (mes_v11_0_reset_pipe_mmio).
+// info: [0] failed step (0 none), [1] HQD_ACTIVE after the VMID reset, [2] api status of the failing frame, [3] HQD_ACTIVE after the re-map.
+int rn_gfx_queue_reset(struct rn_device *adev, u32 info[4]) {
+    memset(info, 0, 4 * sizeof(u32));
+    if (!gGfxBlk) return -ENODEV;
+    if (gSubmitLock) IOLockLock(gSubmitLock);
+    int rc = -EIO;
+    rn_gc_safe_mode(adev, 1);
+    grbmSelect(adev, 0, 0, 0, 0);
+    WREG32_SOC15(RN_GC, 0, regCP_VMID_RESET, 0xFFFFu | (1u << 16));
+    bool inactive = false;
+    for (int i = 0; i < 100000; i++) {
+        if (!(RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE) & 1u)) { inactive = true; break; }
+        udelay(1);
+    }
+    if (!inactive) {                                                         // the front end is wedged: reset pfp and me of pipe 0, then the queue is released by the firmware's restart
+        const u32 hold = RREG32_SOC15(RN_GC, 0, regCP_ME_CNTL);
+        u32 reset = REG_SET_FIELD(hold, CP_ME_CNTL, PFP_PIPE0_RESET, 1);
+        reset = REG_SET_FIELD(reset, CP_ME_CNTL, ME_PIPE0_RESET, 1);
+        u32 clean = REG_SET_FIELD(hold, CP_ME_CNTL, PFP_PIPE0_RESET, 0);
+        clean = REG_SET_FIELD(clean, CP_ME_CNTL, ME_PIPE0_RESET, 0);
+        WREG32_SOC15(RN_GC, 0, regCP_ME_CNTL, reset);
+        WREG32_SOC15(RN_GC, 0, regCP_ME_CNTL, clean);
+        for (int i = 0; i < 100000; i++) {
+            if (!(RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE) & 1u) && !(RREG32_SOC15(RN_GC, 0, regCP_VMID_RESET) & (1u << 16))) { inactive = true; break; }
+            udelay(1);
+        }
+    }
+    info[1] = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE);
+    if (!inactive) { info[0] = 1; goto out; }
+    {
+        union MESAPI__REMOVE_QUEUE r;
+        memset(&r, 0, sizeof(r));
+        r.header.type = MES_API_TYPE_SCHEDULER;
+        r.header.opcode = MES_SCH_API_REMOVE_QUEUE;
+        r.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+        r.doorbell_offset = kGfxDoorbell;
+        r.gang_context_addr = 0;
+        r.pipe_id = 0;
+        r.queue_id = 0;
+        r.unmap_legacy_queue = 1;
+        r.queue_type = MES_QUEUE_TYPE_GFX;
+        u32 st = 0;
+        if (!mesSendLate(adev, &r, offsetof(union MESAPI__REMOVE_QUEUE, api_status) / 4, &st)) { info[0] = 2; info[2] = st; goto out; }
+    }
+    writeGfxMqd(adev, gMesCtx.vaBase, gGfxBlk, kGfxRingBytes, kGfxDoorbell);
+    gGfxWptr = 0;
+    gGfxLastVmid = 0xffffffffu;
+    {
+        u32 st = 0;
+        if (!gfxMesAdd(adev, gMesCtx.vaBase, gGfxBlk, &st)) { info[0] = 3; info[2] = st; goto out; }
+    }
+    grbmSelect(adev, 0, 0, 0, 0);
+    info[3] = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE);
+    if (!(info[3] & 1u)) { info[0] = 4; goto out; }
+    gfxEmitClearState(adev);
+    if (!gfxQueueAlive(adev)) { info[0] = 5; goto out; }
+    rc = 0;
+out:
+    rn_gc_safe_mode(adev, 0);
+    if (gSubmitLock) IOLockUnlock(gSubmitLock);
+    return rc;
+}
+
 void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res) {
     memset(res, 0, sizeof(*res));
     if (!gMesCtx.valid || !gDoorbellBase) return;
@@ -2356,23 +2472,7 @@ void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res) {
     for (int i = 0; i < 1000 && (RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE) & 1u); i++) udelay(1);
     writeGfxMqd(adev, vaBase, blk, kGfxRingBytes, kGfxDoorbell);
     res->step = 2;
-    {
-        union MESAPI__ADD_QUEUE p;
-        memset(&p, 0, sizeof(p));
-        p.header.type = MES_API_TYPE_SCHEDULER;
-        p.header.opcode = MES_SCH_API_ADD_QUEUE;
-        p.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
-        p.pipe_id = 0;
-        p.queue_id = 0;
-        p.doorbell_offset = kGfxDoorbell;
-        p.mqd_addr = vaBase + blk + 0x2000;
-        p.wptr_addr = vaBase + blk + 0x1008;
-        p.queue_type = MES_QUEUE_TYPE_GFX;
-        p.map_legacy_kq = 1;
-        u32 st = 0;
-        res->add_ok = mesSendLate(adev, &p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4, &st);
-        res->add_status = st;
-    }
+    res->add_ok = gfxMesAdd(adev, gMesCtx.vaBase, gGfxBlk, &res->add_status);
     res->step = 3;
     grbmSelect(adev, 0, 0, 0, 0);
     res->hqd_active = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE);
@@ -2384,22 +2484,7 @@ void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res) {
     res->me_cntl = RREG32_SOC15(RN_GC, 0, regCP_ME_CNTL);
     if (!(res->hqd_active & 1u)) goto out;
     res->step = 4;
-    {   // gfx_v11_0_cp_gfx_start: the clear state, the default values of all context registers (gfx11_csb.h), between the preamble packets, then CLEAR_STATE, which makes the
-        // command processor load them into every context it creates. Without the defaults a new context starts with every register 0 and a draw produces nothing.
-        const u32 head[] = {RN_PACKET3(0x4Au, 0), 2u << 28,                     // PREAMBLE_CNTL: begin clear state
-                            RN_PACKET3(0x28u, 1), 0x80000000u, 0x80000000u};    // CONTEXT_CONTROL
-        gfxRingEmit(adev, head, sizeof(head) / sizeof(head[0]));
-        for (u32 e = 0; e < sizeof(kGfx11CsbExtents) / sizeof(kGfx11CsbExtents[0]); e++) {
-            const u32 hdr[] = {RN_PACKET3(0x69u, kGfx11CsbExtents[e].count), kGfx11CsbExtents[e].first_reg - 0xA000u};   // SET_CONTEXT_REG
-            gfxRingEmit(adev, hdr, 2);
-            gfxRingEmit(adev, kGfx11CsbExtents[e].values, kGfx11CsbExtents[e].count);
-        }
-        const u32 tail[] = {RN_PACKET3(0x69u, 1), 0xA1ECu - 0xA000u, 0,           // SET_CONTEXT_REG PA_SC_TILE_STEERING_OVERRIDE = 0 (gfx.config.pa_sc_tile_steering_override)
-                            RN_PACKET3(0x4Au, 0), 3u << 28,                       // PREAMBLE_CNTL: end clear state
-                            RN_PACKET3(0x12u, 0), 0};                             // CLEAR_STATE
-        gfxRingEmit(adev, tail, sizeof(tail) / sizeof(tail[0]));
-        res->csb_dwords = 5 + 934 + 2 * 7 + sizeof(tail) / sizeof(tail[0]);
-    }
+    res->csb_dwords = gfxEmitClearState(adev);
     {   // the ring test of Linux: SET_UCONFIG_REG SCRATCH_REG0
         const u32 scratchDw = 0xc000u + 0x40u;
         WREG32_SOC15(RN_GC, 0, regSCRATCH_REG0, 0xCAFEDEADu);
