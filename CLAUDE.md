@@ -6,6 +6,7 @@ Native macOS display driver for the AMD Radeon RX 7800 XT (Navi 32, RDNA 3, PCI 
 
 - `RedNavi/`: the probe kext (`kern_probe.cpp`, matches the GPU; every stage that writes to the card is opt-in through a `rednavi_*` boot-arg), `smu13.cpp`, the generated `dcn_reglist.h` and `dcn_replay.h`.
 - `RedNaviFB/`: the `IOFramebuffer` kext. It is separate because IOGraphicsFamily is in the system kernel collection, which OpenCore cannot link against; see `docs/DP_BRINGUP.md` for installing it.
+- `mesa-bridge/`: Mesa's `ac_drm_*` layer over the kext's user client, the RADV patch set and the Vulkan test programs (`mesa-bridge/README.md`, `docs/M5_MESA_BUILD.md`). `RedNavi/rn_uapi.h` is the kext's user interface and must stay in step with the bridge's copy.
 - `compat/`: LinuxKPI-style compatibility layer (`docs/COMPAT.md`). `tests/host/`: host tests, run with `make test`.
 - `tools/`: Python helpers (IP discovery decoder, VBIOS and EDID parsers, firmware header generators, Linux register-dump scripts).
 - `docs/logs/`: raw dumps from real runs, with vendor firmware and monitor serial numbers left out.

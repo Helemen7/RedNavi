@@ -1,6 +1,6 @@
 # M5: what RADV needs from the kernel
 
-Status: read from the Mesa sources (2026-11-01), nothing here is run on hardware. The goal of M5 is a Vulkan driver (RADV) that runs on the 7800 XT through our kext.
+Status: the first sections below are the plan as read from the Mesa sources on 2026-11-01; the dated sections at the end record what was built and verified (as of 2026-11-02 RADV runs compute, 3D and multisampled rendering on the 7800 XT in test programs, see docs/M5_MESA_BUILD.md and docs/COMPAT.md). The goal of M5 is a Vulkan driver (RADV) that runs on the 7800 XT through our kext.
 
 ## Where the shim goes
 
@@ -69,3 +69,7 @@ VRAM buffers work (docs/COMPAT.md): device-local and CPU-visible pools, RADV rep
 ## State, 2026-11-02 (graphics)
 
 The graphics queue works (docs/COMPAT.md): a triangle is drawn by RADV into VRAM. Open: reset of the graphics queue, display of a rendered image, MSI, the PCI location, 2 MB leaf entries, clearing device-local buffers, buffers above 1 GB, Metal (M6).
+
+## State, 2026-11-02 (presentation and 3D)
+
+The graphics queue resets and has a watchdog like the compute queue. A program can write the display surface (`RN_BO_SCANOUT`, imported into Vulkan as a host pointer): a triangle, and a scene with a D32 depth buffer, a sampled texture and 4x MSAA with a resolve are shown on the monitor, read back and confirmed. M5's goal ("offscreen Vulkan compute and triangle") is met. Open: window system integration, Vulkan feature coverage, MSI, the PCI location, 2 MB leaf entries, clearing device-local buffers, buffers above 1 GB, Metal (M6).

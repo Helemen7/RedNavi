@@ -1,6 +1,6 @@
 # RADV on macOS: what the Mesa build and code need
 
-Read-only analysis, 2026-11-01, of Mesa `main` at commit `01bab93` (sparse checkout of `src/amd`, `src/util`, `src/vulkan`, `include/`; the scan is reproducible with `tools/mesa_linux_scan.sh`). Nothing here was built: `meson` and `glslang` are not installed on the Mac the analysis ran on, and a `meson setup` needs the whole tree. Everything below is read from the sources, none of it verified by a build.
+The first sections are a read-only analysis of 2026-11-01 of Mesa `main` at commit `01bab93` (sparse checkout; the scan is reproducible with `tools/mesa_linux_scan.sh`), written before anything was built. The sections from "Build result" on (2026-11-02, Mesa `bd830ce`) record the real build and what ran on the 7800 XT; where the two differ, the later ones are right (for example the open questions under "Not known yet" are answered there).
 
 ## Short answer
 
@@ -75,7 +75,7 @@ The expected size is of the order of 1500 lines of C. The structs on the wire ar
 - The BVH shader build and `glslang` on macOS.
 - How much memory model RADV insists on: it expects CPU-visible device-local memory and a GTT heap. The kext has host memory only for now (docs/M5_PLAN.md).
 
-The first useful measurement is `meson setup` of a full checkout with the patches of this page applied, with `-Dvulkan-drivers=amd -Dllvm=disabled -Dgallium-drivers= -Dglx=disabled -Degl=disabled`. It was not done.
+That measurement was done on 2026-11-02, see "Build result" below.
 
 ## Build result, 2026-11-02 (Mesa bd830ce, 27.0.0-devel)
 
@@ -132,3 +132,7 @@ Buffers in device-local VRAM (about 13.5 GB) and CPU-visible VRAM (78 MB) from t
 ### Graphics, 2026-11-02
 
 RADV now reports a queue family with GRAPHICS (flags 0xf) next to the compute-only one; a triangle renders correctly into a tiled image in VRAM. Details and what is missing in docs/COMPAT.md, "Graphics queue". Tools: `test/vk_draw.c` (`vk_draw [size] [linear|clear]`), `test/vk_stress.c` (`VK_QUEUE_COMPUTE_ONLY=1` picks the compute-only family).
+
+### Presentation and 3D, 2026-11-02
+
+`vk_present` (`mesa-bridge/test/vk_present.c`) writes into the display surface: the bridge's `rn_bridge_scanout()` maps it and RADV imports the pointer with `VK_EXT_external_memory_host`; the kext hands the same VRAM out as an `RN_BO_SCANOUT` buffer. `vk_present` draws the triangle at 1920 x 1080; `vk_present scene` renders two crossing quads (a checkerboard texture and a gradient, with a D32_SFLOAT depth buffer) and a slanted triangle with 4x MSAA and a resolve, and checks the surface pixel by pixel (depth rejection, texture sampling, the 1/4, 2/4 and 3/4 coverage levels on the edge). Both confirmed on the monitor. The graphics queue is reset and watched like the compute queue (`rn_test gfxreset`). Details in docs/COMPAT.md.

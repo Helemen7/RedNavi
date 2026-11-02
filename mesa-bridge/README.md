@@ -1,21 +1,26 @@
-# mesa-bridge: Mesa's `ac_drm_*` layer over the RedNavi user client
+# mesa-bridge: RADV on macOS over the RedNavi user client
 
-`src/ac_apple_iokit.c` implements the functions of Mesa's `src/amd/common/ac_linux_drm.h` (the layer RADV's amdgpu winsys calls instead of libdrm) on top of `IOConnectCallStructMethod` to the kext (`RedNavi/rn_uapi.h`, version 6). It is the file `docs/M5_MESA_BUILD.md` calls `ac_apple_iokit.c`. Mesa is MIT licensed, so the file is meant to live in a Mesa fork; it sits here to be built, tested and kept in step with the kext.
+Mesa's RADV talks to the kernel through the `ac_drm_*` functions of `src/amd/common/ac_linux_drm.h`, which on Linux issue amdgpu ioctls on a DRM file descriptor. This directory holds a replacement for that layer, `src/ac_apple_iokit.c`, which calls the kext's user client (`RedNavi/rn_uapi.h`, version 9) with `IOConnectCallStructMethod`, plus the patch set that makes RADV build and enumerate its device without a DRM node. Mesa is MIT licensed, so the file is meant to live in a Mesa fork; it sits here to be built, tested and kept in step with the kext. Build recipe, results and what stood in the way: [docs/M5_MESA_BUILD.md](../docs/M5_MESA_BUILD.md).
 
 ## What is here
 
-- `src/ac_apple_iokit.c`: device open and interface check, the queries (`DEV_INFO` cached at open, hw ip, firmware versions, heaps, gpu info as libdrm derives it), buffers (create, CPU map, free), the user-space virtual address allocator (two ranges), mappings (`bo_va_op*`), contexts, `cs_submit_raw2` with its chunks (IB, syncobj in and out, timeline wait and signal, dependencies), fence status, and a `struct util_sync_provider` over the kext's syncobjs (create, destroy, wait with DRM's absolute deadline, reset, signal, timeline signal and wait, query, transfer).
-- `include/ac_apple_iokit.h`: the prototypes (those of Mesa at commit `01bab93`) and the types, so that the bridge builds without a Mesa tree.
-- `include/amdgpu_compat.h`: libdrm's `amdgpu.h` types and the `amdgpu_drm.h` structures it needs, copied unchanged (MIT).
-- `test/bridge_test.c`: what `tools/rn_test.c` does, through the `ac_drm_*` functions only, in the way the winsys calls them. `make -C mesa-bridge test`, run `./bridge_test` on the machine with the card. Verified on the 7800 XT: gpu info, heaps, a 32-bit buffer in the upper half and a code buffer in the lower half, a dispatch submitted with an IB chunk and a syncobj chunk, the syncobj and the fence status, a timeline point, a command buffer in the upper half refused, a range handed out again after it was freed.
+- `patches/0001-radv-darwin-iokit.patch`: the whole change to Mesa at commit `bd830ce` (27.0.0-devel), generated from the working tree: the meson conditions, the in-tree copy of the bridge in `src/amd/common/apple/` (`ac_apple_iokit.c`, headers, a libdrm subset in `amdgpu.h` and `xf86drm.h`), and the RADV changes (device enumeration through the instance's `enumerate` hook, syncobjs from the bridge's sync provider, no external handles, sparse off). It builds `libvulkan_radeon.dylib` on macOS 15 (x86_64).
+- `src/ac_apple_iokit.c` and `include/`: the same bridge as a standalone file that builds without a Mesa tree, for `test/bridge_test.c` (what `tools/rn_test.c` does, through the `ac_drm_*` functions only; `make -C mesa-bridge test`, run `./bridge_test` on the machine with the card). The copy inside the patch is the one RADV uses; keep the two in step.
+- `test/`: Vulkan programs, plain Vulkan 1.1 (`clang -I/opt/local/include test/X.c -lvulkan`): `vk_dispatch` (one compute dispatch), `vk_stress` (modes `burst`, `saturate`, `barrier`, `multi`, `vram`, `all`; `VK_QUEUE_COMPUTE_ONLY=1` uses the compute-only queue family), `vk_draw` (a triangle, checked pixel by pixel), `vk_present` (the same triangle written to the display surface; `vk_present scene` renders depth, a sampled texture and 4x MSAA with a resolve into it). SPIR-V headers are generated with glslangValidator from the `.comp`/`.vert`/`.frag` files next to them.
+- `tools/`: `rn_icd.json` (the Vulkan loader manifest), `vk_run.sh` / `vk_run_tool.sh` (run `vulkaninfo` or a test with the ICD and library path set), `vk_rebuild_and_run.sh` (rebuild, copy to the test machine, run), `vk_stress_watchdog.sh`.
 
-## What it does differently from Linux, on purpose
+## What the bridge does
 
-- **Address ranges**: a buffer goes to the upper half only with `AMDGPU_VA_RANGE_32_BIT`; everything else, `AMDGPU_VA_RANGE_HIGH` included, goes to the lower half, because a command buffer in the upper half hangs the compute queue (`docs/COMPAT.md`).
-- **Memory**: every domain is wired host memory (a VRAM request is served from it), up to 1 GB per buffer, 2 GB in all (the kext's boot-arg `rednavi_bo_budget_mb`), 1024 buffers per connection; a 3 GB request is refused. Verified: 100 buffers, a 64 MB buffer written at its far end by a shader.
-- **Queues**: one compute queue; all contexts share it and its sequence numbers. Graphics and SDMA submits are refused (`-EINVAL`).
-- **Not supported**: dma-buf and sync-file export and import, user memory buffers, user queues, sensors, video caps, the timestamp. They return `-EOPNOTSUPP` or `-ENOSYS`.
+Device open and interface check, the queries (`DEV_INFO` as the Linux kernel answered it on this card, firmware versions, heaps, GPU info as libdrm derives it), buffers (create in host memory, device-local VRAM or CPU-visible VRAM; CPU map; free), the user-space virtual address allocator, mappings (`bo_va_op*`), contexts, `cs_submit_raw2` with its chunks (IB, syncobj in and out, timeline wait and signal, dependencies; IBs go to the graphics or the compute queue by `ip_type`), fence status, a `struct util_sync_provider` over the kext's syncobjs, and, for the display surface, `rn_bridge_scanout()` plus a host-pointer import of that range (`ac_drm_create_bo_from_user_mem`).
 
-## Putting it into Mesa
+## Differences from Linux, on purpose
 
-The patches around it are listed in `docs/M5_MESA_BUILD.md`: the meson conditions for libdrm_amdgpu and the winsys, a Darwin branch in `ac_linux_drm.h` and `ac_linux_drm.c` that routes to this file (as the virtio branch routes to `amdvgpu_*`), the physical-device creation in RADV that finds the IOService instead of opening a render node, the sync type from `vk_drm_syncobj_get_type_from_provider`, and the external-memory extensions switched off. None of that has been built: no full Mesa tree has been configured yet.
+- **Address ranges**: a buffer goes to the upper half only with `AMDGPU_VA_RANGE_32_BIT`; everything else goes to the lower half, because a command buffer in the upper half hangs the queue (`docs/COMPAT.md`).
+- **Memory placement**: buffers the CPU never maps go to device-local VRAM; VRAM-only requests to the CPU-visible part; mappable VRAM|GTT buffers (command buffers, shaders, descriptors) to host memory unless `RN_BRIDGE_VRAM_FIRST=1`. `RN_BRIDGE_NO_VRAM=1` serves everything from host memory.
+- **Queues**: one compute queue and one graphics queue, shared by all contexts of a connection; no SDMA.
+- **Sparse resources** are off (`radv_sparse_enabled` is false on macOS).
+- **Not supported**: dma-buf and sync-file export and import, user queues, sensors, video caps, the timestamp. They return `-EOPNOTSUPP` or `-ENOSYS`.
+
+## Debugging
+
+`RN_BRIDGE_DEBUG=1` prints every failing kext call, every submit and every buffer placement. `RN_BRIDGE_DUMP=dir` dumps all mapped ranges at each submit; `rn_test replay DIR VA:DWORDS...` and `rn_test rawib FILE` resubmit them. `RADV_DEBUG=dumpibs,shaders,info` works as on Linux.
