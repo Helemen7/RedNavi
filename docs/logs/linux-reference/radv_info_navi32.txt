@@ -1,0 +1,464 @@
+== kernel
+7.0.0-30-generic
+== card
+/sys/class/drm/card1 vendor 0x8086 device 0x9bc5 revision 0x05 subsys 0x1043/0x8694
+/sys/class/drm/card2 vendor 0x1002 device 0x747e revision 0xc8 subsys 0x1da2/0xd475
+== RADV's own dump of what the kernel told it (ac_print_gpu_info)
+error: XDG_RUNTIME_DIR is invalid or not set in the environment.
+Device info:
+    name = NAVI32
+    marketing_name = AMD Radeon RX 7800 XT
+    dev_filename = /dev/dri/renderD129
+    num_se = 3
+    num_rb = 12
+    num_cu = 60
+    max_gpu_freq = 2124 MHz
+    max_gflops = 32624 GFLOPS
+    sqc_inst_cache_size = 32 KB (1 per WGP)
+    sqc_scalar_cache_size = 16 KB (1 per WGP)
+    tcp_cache_size = 32 KB
+    l1_cache_size = 256 KB
+    l2_cache_size = 4096 KB
+    l3_cache_size = 64 MB
+    memory_channels = 16 (TCC blocks)
+    memory_size = 16 GB (16384 MB)
+    memory_freq = 20 GHz
+    memory_bus_width = 256 bits
+    memory_bandwidth = 624 GB/s
+    pcie_gen = 3
+    pcie_num_lanes = 16
+    pcie_bandwidth = 15.8 GB/s
+    clock_crystal_freq = 100000 KHz
+    IP GFX     11.0 	queues:1 	align:256 	pad_dw:0x7
+    IP COMPUTE 11.0 	queues:4 	align:256 	pad_dw:0x7
+    IP SDMA     6.0 	queues:2 	align:256 	pad_dw:0xf
+    IP VCN      4.0 	queues:1 	align:256 	pad_dw:0x3f
+    IP VCN_JPEG  4.0 	queues:1 	align:256 	pad_dw:0xf
+Identification:
+    pci (domain:bus:dev.func): 0000:03:00.0
+    pci_id = 0x747e
+    pci_rev_id = 0xc8
+    family = 88
+    gfx_level = 14
+    family_id = 145
+    chip_external_rev = 32
+    chip_rev = 0
+Flags:
+    family_overridden = 0
+    has_graphics = 1
+    has_clear_state = 0
+    has_distributed_tess = 1
+    has_dcc_constant_encode = 1
+    has_rbplus = 1
+    rbplus_allowed = 1
+    has_load_ctx_reg_pkt = 1
+    has_out_of_order_rast = 0
+    cpdma_prefetch_writes_memory = 0
+    has_gfx9_scissor_bug = 0
+    has_htile_stencil_mipmap_bug = 0
+    has_htile_tc_z_clear_bug_without_stencil = 0
+    has_htile_tc_z_clear_bug_with_stencil = 0
+    has_small_prim_filter_sample_loc_bug = 0
+    has_ls_vgpr_init_bug = 0
+    has_pops_missed_overlap_bug = 0
+    has_32bit_predication = 1
+    has_3d_cube_border_color_mipmap = 1
+    has_image_opcodes = 1
+    never_stop_sq_perf_counters = 0
+    has_sqtt_rb_harvest_bug = 0
+    has_sqtt_auto_flush_mode_bug = 0
+    never_send_perfcounter_stop = 1
+    discardable_allows_big_page = 1
+    has_taskmesh_indirect0_bug = 0
+    has_set_context_pairs = 0
+    has_set_context_pairs_packed = 1
+    has_set_sh_pairs = 0
+    has_set_sh_pairs_packed = 0
+    has_set_uconfig_pairs = 0
+    conformant_trunc_coord = 1
+    mesh_fast_launch_2 = 1
+Display features:
+    use_display_dcc_unaligned = 0
+    use_display_dcc_with_retile_blit = 1
+Memory info:
+    pte_fragment_size = 2097152
+    gart_page_size = 4096
+    gart_size = 7871 MB
+    vram_size = 16384 MB
+    vram_vis_size = 16368 MB
+    vram_type = 9
+    max_heap_size_kb = 16384 MB
+    min_alloc_size = 0
+    address32_hi = 0xffff8000
+    has_dedicated_vram = 1
+    all_vram_visible = 1
+    virtual_address_max = 800000000000
+    max_tcc_blocks = 16
+    tcc_cache_line_size = 128
+    tcc_rb_non_coherent = 0
+    cp_sdma_ge_use_system_memory_scope = 0
+    pc_lines = 1024
+    lds_size_per_workgroup = 65536
+    lds_alloc_granularity = 1024
+    max_memory_clock = 1218 MHz
+CP info:
+    gfx_ib_pad_with_type2 = 0
+    can_chain_ib2 = 1
+    has_cp_dma = 1
+    me_fw_version = 2470
+    me_fw_feature = 29
+    mec_fw_version = 2680
+    mec_fw_feature = 29
+    pfp_fw_version = 2640
+    pfp_fw_feature = 29
+Userqueue info:
+    userq_ip_mask = 0
+Multimedia info:
+    vcn_unified = 2
+    vcn_enc_major_version = 1
+    vcn_enc_minor_version = 24
+    vcn_dec_version = 9
+    jpeg_decode = 1
+    codec    dec  max_resolution   enc  max_resolution  
+    mpeg2    -    -                -    -               
+    mpeg4    -    -                -    -               
+    vc1      -    -                -    -               
+    h264     *    4096x4096        *    4096x4096       
+    hevc     *    8192x4352        *    8192x4352       
+    jpeg     *    16384x16384      -    -               
+    vp9      *    8192x4352        -    -               
+    av1      *    8192x4352        *    8192x4352       
+Kernel & winsys capabilities:
+    drm = 3.64.0
+    has_userptr = 1
+    has_timeline_syncobj = 1
+    has_vm_always_valid = 1
+    has_bo_metadata = 1
+    has_eqaa_surface_allocator = 0
+    has_sparse = 1
+    has_stable_pstate = 1
+    has_gang_submit = 1
+    has_gpuvm_fault_query = 1
+    has_kernelq_reg_shadowing = 0
+    has_default_zerovram_support = 1
+    has_tmz_support = 0
+    has_trap_handler_support = 0
+    IP GFX     max_submitted_ibs = 192
+    IP COMPUTE max_submitted_ibs = 125
+    IP SDMA    max_submitted_ibs = 49
+    IP UVD     max_submitted_ibs = 1
+    IP VCE     max_submitted_ibs = 1
+    IP UVD_ENC max_submitted_ibs = 1
+    IP VCN_DEC max_submitted_ibs = 1
+    IP VCN     max_submitted_ibs = 1
+    IP VCN_JPEG max_submitted_ibs = 16
+    IP VPE     max_submitted_ibs = 49
+    kernel_has_modifiers = 1
+    uses_kernel_cu_mask = 0
+Shader core info:
+    cu_mask[SE0][SA0] = 0x3ff 	(10)	CU_EN = 0x3ff
+    cu_mask[SE0][SA1] = 0x3ff 	(10)	CU_EN = 0x3ff
+    cu_mask[SE1][SA0] = 0x3ff 	(10)	CU_EN = 0x3ff
+    cu_mask[SE1][SA1] = 0x3ff 	(10)	CU_EN = 0x3ff
+    cu_mask[SE2][SA0] = 0x3ff 	(10)	CU_EN = 0x3ff
+    cu_mask[SE2][SA1] = 0x3ff 	(10)	CU_EN = 0x3ff
+    spi_cu_en_has_effect = 0
+    max_good_cu_per_sa = 10
+    min_good_cu_per_sa = 10
+    max_se = 3
+    max_sa_per_se = 2
+    num_cu_per_sh = 10
+    max_waves_per_simd = 16
+    num_physical_sgprs_per_simd = 1728
+    num_physical_wave64_vgprs_per_simd = 768
+    num_simd_per_compute_unit = 2
+    min_sgpr_alloc = 108
+    max_sgpr_alloc = 108
+    sgpr_alloc_granularity = 108
+    min_wave64_vgpr_alloc = 12
+    max_vgpr_alloc = 256
+    wave64_vgpr_alloc_granularity = 12
+    max_scratch_waves = 1920
+    has_scratch_base_registers = 1
+Ring info:
+    attribute_ring_size_per_se = 1408 KB
+    total_attribute_pos_prim_ring_size = 4224 KB
+    hs_offchip_workgroup_size = 32768 B
+    tess_factor_ring_size = 180 KB
+    tess_offchip_ring_size = 7680 KB
+Render backend info:
+    pa_sc_tile_steering_override = 0x0
+    max_render_backends = 12
+    num_tile_pipes = 16
+    enabled_rb_mask = 0xfff
+    max_alignment = 262144
+    pbb_max_alloc_count = 16
+GB_ADDR_CONFIG: 0x00000444
+    num_pipes = 16
+    pipe_interleave_size = 256
+    max_compressed_frags = 2
+    num_pkrs = 16
+Modifiers (32bpp):
+    GFX11,64KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=128B,DCC_INDEPENDENT_128B,DCC_PIPE_ALIGN
+    GFX11,64KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=128B,DCC_INDEPENDENT_128B,DCC_RETILE
+    GFX11,64KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=64B,DCC_INDEPENDENT_64B,DCC_INDEPENDENT_128B,DCC_RETILE
+    GFX11,64KB_R_X,PIPE_XOR_BITS=4,PACKERS=4
+    GFX11,256KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=128B,DCC_INDEPENDENT_128B,DCC_PIPE_ALIGN
+    GFX11,256KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=128B,DCC_INDEPENDENT_128B,DCC_RETILE
+    GFX11,256KB_R_X,PIPE_XOR_BITS=4,PACKERS=4,DCC,DCC_MAX_COMPRESSED_BLOCK=64B,DCC_INDEPENDENT_64B,DCC_INDEPENDENT_128B,DCC_RETILE
+    GFX11,256KB_R_X,PIPE_XOR_BITS=4,PACKERS=4
+    GFX11,4KB_D_X,PIPE_XOR_BITS=4,PACKERS=4
+    GFX11,64KB_D
+    LINEAR
+WARNING: [Loader Message] Code 0 : ICD for selected physical device does not export vkGetPhysicalDeviceDisplayPlanePropertiesKHR!
+WARNING: [Loader Message] Code 0 : ICD for selected physical device does not export vkGetPhysicalDeviceDisplayPropertiesKHR!
+==========
+VULKANINFO
+==========
+
+Vulkan Instance Version: 1.4.341
+
+
+Instance Extensions: count = 26
+-------------------------------
+VK_EXT_acquire_drm_display             : extension revision 1
+VK_EXT_acquire_xlib_display            : extension revision 1
+VK_EXT_debug_report                    : extension revision 10
+VK_EXT_debug_utils                     : extension revision 2
+VK_EXT_direct_mode_display             : extension revision 1
+VK_EXT_display_surface_counter         : extension revision 1
+VK_EXT_headless_surface                : extension revision 1
+VK_EXT_layer_settings                  : extension revision 2
+VK_EXT_surface_maintenance1            : extension revision 1
+VK_EXT_swapchain_colorspace            : extension revision 5
+VK_KHR_device_group_creation           : extension revision 1
+VK_KHR_display                         : extension revision 23
+VK_KHR_external_fence_capabilities     : extension revision 1
+VK_KHR_external_memory_capabilities    : extension revision 1
+VK_KHR_external_semaphore_capabilities : extension revision 1
+VK_KHR_get_display_properties2         : extension revision 1
+VK_KHR_get_physical_device_properties2 : extension revision 2
+VK_KHR_get_surface_capabilities2       : extension revision 1
+VK_KHR_portability_enumeration         : extension revision 1
+VK_KHR_surface                         : extension revision 25
+VK_KHR_surface_maintenance1            : extension revision 1
+VK_KHR_surface_protected_capabilities  : extension revision 1
+VK_KHR_wayland_surface                 : extension revision 6
+VK_KHR_xcb_surface                     : extension revision 6
+VK_KHR_xlib_surface                    : extension revision 6
+VK_LUNARG_direct_driver_loading        : extension revision 1
+
+Instance Layers: count = 5
+--------------------------
+VK_LAYER_INTEL_nullhw       INTEL NULL HW                                                1.1.73   version 1
+VK_LAYER_MESA_anti_lag      Open-source implementation of the VK_AMD_anti_lag extension. 1.4.303  version 1
+VK_LAYER_MESA_device_select Linux device selection layer                                 1.4.303  version 1
+VK_LAYER_MESA_overlay       Mesa Overlay layer                                           1.4.303  version 1
+VK_LAYER_MESA_screenshot    Mesa Screenshot layer                                        1.4.303  version 1
+
+Devices:
+========
+GPU0:
+	apiVersion         = 1.4.335
+	driverVersion      = 26.0.8
+	vendorID           = 0x1002
+	deviceID           = 0x747e
+	deviceType         = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+	deviceName         = AMD Radeon RX 7800 XT (RADV NAVI32)
+	driverID           = DRIVER_ID_MESA_RADV
+	driverName         = radv
+	driverInfo         = Mesa 26.0.8-1ubuntu0.3
+	conformanceVersion = 1.4.0.0
+	deviceUUID         = 00000000-0300-0000-0000-000000000000
+	driverUUID         = 414d442d-4d45-5341-2d44-525600000000
+GPU1:
+	apiVersion         = 1.4.335
+	driverVersion      = 26.0.8
+	vendorID           = 0x8086
+	deviceID           = 0x9bc5
+	deviceType         = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+	deviceName         = Intel(R) UHD Graphics 630 (CML GT2)
+	driverID           = DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+	driverName         = Intel open-source Mesa driver
+	driverInfo         = Mesa 26.0.8-1ubuntu0.3
+	conformanceVersion = 1.4.0.0
+	deviceUUID         = 8680c59b-0500-0000-0002-000000000000
+	driverUUID         = d813f844-3e23-d162-63e1-632a14fbedd2
+GPU2:
+	apiVersion         = 1.4.335
+	driverVersion      = 26.0.8
+	vendorID           = 0x10005
+	deviceID           = 0x0000
+	deviceType         = PHYSICAL_DEVICE_TYPE_CPU
+	deviceName         = llvmpipe (LLVM 21.1.8, 256 bits)
+	driverID           = DRIVER_ID_MESA_LLVMPIPE
+	driverName         = llvmpipe
+	driverInfo         = Mesa 26.0.8-1ubuntu0.3 (LLVM 21.1.8)
+	conformanceVersion = 1.3.1.1
+	deviceUUID         = 6d657361-3236-2e30-2e38-2d3175627500
+	driverUUID         = 6c6c766d-7069-7065-5555-494400000000
+== firmware versions as the kernel reports them (the FW_VERSION query)
+/sys/kernel/debug/dri/0000:03:00.0
+VCE feature version: 0, firmware version: 0x00000000
+UVD feature version: 0, firmware version: 0x00000000
+MC feature version: 0, firmware version: 0x00000000
+ME feature version: 29, firmware version: 0x000009a6
+PFP feature version: 29, firmware version: 0x00000a50
+CE feature version: 0, firmware version: 0x00000000
+RLC feature version: 1, firmware version: 0x00000064
+RLC SRLC feature version: 0, firmware version: 0x00000000
+RLC SRLG feature version: 0, firmware version: 0x00000000
+RLC SRLS feature version: 0, firmware version: 0x00000000
+RLCP feature version: 1, firmware version: 0x00000017
+RLCV feature version: 1, firmware version: 0x00000032
+MEC feature version: 29, firmware version: 0x00000a78
+IMU feature version: 0, firmware version: 0x0b204700
+SOS feature version: 3282711, firmware version: 0x00321717
+ASD feature version: 553648393, firmware version: 0x21000109
+TA XGMI feature version: 0x00000000, firmware version: 0x00000000
+TA RAS feature version: 0x00000000, firmware version: 0x1b32000c
+TA HDCP feature version: 0x00000000, firmware version: 0x1700004d
+TA DTM feature version: 0x00000000, firmware version: 0x1200001d
+TA RAP feature version: 0x00000000, firmware version: 0x00000000
+TA SECUREDISPLAY feature version: 0x00000000, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00505600 (80.86.0)
+SDMA0 feature version: 60, firmware version: 0x0000001d
+SDMA1 feature version: 60, firmware version: 0x0000001d
+VCN feature version: 0, firmware version: 0x09118010
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x07002f00
+TOC feature version: 16, firmware version: 0x00000010
+MES_KIQ feature version: 6, firmware version: 0x00000108
+MES feature version: 1, firmware version: 0x00000086
+VPE feature version: 0, firmware version: 0x00000000
+VBIOS version: 113-D7120200-S02
+/sys/kernel/debug/dri/129
+VCE feature version: 0, firmware version: 0x00000000
+UVD feature version: 0, firmware version: 0x00000000
+MC feature version: 0, firmware version: 0x00000000
+ME feature version: 29, firmware version: 0x000009a6
+PFP feature version: 29, firmware version: 0x00000a50
+CE feature version: 0, firmware version: 0x00000000
+RLC feature version: 1, firmware version: 0x00000064
+RLC SRLC feature version: 0, firmware version: 0x00000000
+RLC SRLG feature version: 0, firmware version: 0x00000000
+RLC SRLS feature version: 0, firmware version: 0x00000000
+RLCP feature version: 1, firmware version: 0x00000017
+RLCV feature version: 1, firmware version: 0x00000032
+MEC feature version: 29, firmware version: 0x00000a78
+IMU feature version: 0, firmware version: 0x0b204700
+SOS feature version: 3282711, firmware version: 0x00321717
+ASD feature version: 553648393, firmware version: 0x21000109
+TA XGMI feature version: 0x00000000, firmware version: 0x00000000
+TA RAS feature version: 0x00000000, firmware version: 0x1b32000c
+TA HDCP feature version: 0x00000000, firmware version: 0x1700004d
+TA DTM feature version: 0x00000000, firmware version: 0x1200001d
+TA RAP feature version: 0x00000000, firmware version: 0x00000000
+TA SECUREDISPLAY feature version: 0x00000000, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00505600 (80.86.0)
+SDMA0 feature version: 60, firmware version: 0x0000001d
+SDMA1 feature version: 60, firmware version: 0x0000001d
+VCN feature version: 0, firmware version: 0x09118010
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x07002f00
+TOC feature version: 16, firmware version: 0x00000010
+MES_KIQ feature version: 6, firmware version: 0x00000108
+MES feature version: 1, firmware version: 0x00000086
+VPE feature version: 0, firmware version: 0x00000000
+VBIOS version: 113-D7120200-S02
+/sys/kernel/debug/dri/2
+VCE feature version: 0, firmware version: 0x00000000
+UVD feature version: 0, firmware version: 0x00000000
+MC feature version: 0, firmware version: 0x00000000
+ME feature version: 29, firmware version: 0x000009a6
+PFP feature version: 29, firmware version: 0x00000a50
+CE feature version: 0, firmware version: 0x00000000
+RLC feature version: 1, firmware version: 0x00000064
+RLC SRLC feature version: 0, firmware version: 0x00000000
+RLC SRLG feature version: 0, firmware version: 0x00000000
+RLC SRLS feature version: 0, firmware version: 0x00000000
+RLCP feature version: 1, firmware version: 0x00000017
+RLCV feature version: 1, firmware version: 0x00000032
+MEC feature version: 29, firmware version: 0x00000a78
+IMU feature version: 0, firmware version: 0x0b204700
+SOS feature version: 3282711, firmware version: 0x00321717
+ASD feature version: 553648393, firmware version: 0x21000109
+TA XGMI feature version: 0x00000000, firmware version: 0x00000000
+TA RAS feature version: 0x00000000, firmware version: 0x1b32000c
+TA HDCP feature version: 0x00000000, firmware version: 0x1700004d
+TA DTM feature version: 0x00000000, firmware version: 0x1200001d
+TA RAP feature version: 0x00000000, firmware version: 0x00000000
+TA SECUREDISPLAY feature version: 0x00000000, firmware version: 0x00000000
+SMC feature version: 0, program: 0, firmware version: 0x00505600 (80.86.0)
+SDMA0 feature version: 60, firmware version: 0x0000001d
+SDMA1 feature version: 60, firmware version: 0x0000001d
+VCN feature version: 0, firmware version: 0x09118010
+DMCU feature version: 0, firmware version: 0x00000000
+DMCUB feature version: 0, firmware version: 0x07002f00
+TOC feature version: 16, firmware version: 0x00000010
+MES_KIQ feature version: 6, firmware version: 0x00000108
+MES feature version: 1, firmware version: 0x00000086
+VPE feature version: 0, firmware version: 0x00000000
+VBIOS version: 113-D7120200-S02
+== gfx configuration the kernel read from the hardware (amdgpu_gca_config: struct of u32, version first)
+/sys/kernel/debug/dri/0000:03:00.0
+ 00000005 00000003 00000010 0000000a
+ 00000002 00000004 00000010 00000600
+ 00000020 00000008 00000020 00000100
+ 00000000 000004c0 00000000 00000fff
+ 00000000 00000000 00000000 00000000
+ 00000000 00000000 00000444 0000000c
+ 00000000 0002c000 7500000d 00000091
+ 00000020 0000747e 000000c8 0000d475
+ 00001da2 00000000 00000000 00000001
+/sys/kernel/debug/dri/129
+ 00000005 00000003 00000010 0000000a
+ 00000002 00000004 00000010 00000600
+ 00000020 00000008 00000020 00000100
+ 00000000 000004c0 00000000 00000fff
+ 00000000 00000000 00000000 00000000
+ 00000000 00000000 00000444 0000000c
+ 00000000 0002c000 7500000d 00000091
+ 00000020 0000747e 000000c8 0000d475
+ 00001da2 00000000 00000000 00000001
+/sys/kernel/debug/dri/2
+ 00000005 00000003 00000010 0000000a
+ 00000002 00000004 00000010 00000600
+ 00000020 00000008 00000020 00000100
+ 00000000 000004c0 00000000 00000fff
+ 00000000 00000000 00000000 00000000
+ 00000000 00000000 00000444 0000000c
+ 00000000 0002c000 7500000d 00000091
+ 00000020 0000747e 000000c8 0000d475
+ 00001da2 00000000 00000000 00000001
+== vm and memory lines of the kernel log
+[   22.286446] amdgpu 0000:03:00.0: detected ip block number 0 <common_v1_0_0> (soc21_common)
+[   22.286451] amdgpu 0000:03:00.0: detected ip block number 1 <gmc_v11_0_0> (gmc_v11_0)
+[   22.286453] amdgpu 0000:03:00.0: detected ip block number 2 <ih_v6_0_0> (ih_v6_0)
+[   22.286456] amdgpu 0000:03:00.0: detected ip block number 3 <psp_v13_0_0> (psp)
+[   22.286458] amdgpu 0000:03:00.0: detected ip block number 4 <smu_v13_0_0> (smu)
+[   22.286460] amdgpu 0000:03:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+[   22.286462] amdgpu 0000:03:00.0: detected ip block number 6 <gfx_v11_0_0> (gfx_v11_0)
+[   22.286465] amdgpu 0000:03:00.0: detected ip block number 7 <sdma_v6_0_0> (sdma_v6_0)
+[   22.286467] amdgpu 0000:03:00.0: detected ip block number 8 <vcn_v4_0_0> (vcn_v4_0)
+[   22.286469] amdgpu 0000:03:00.0: detected ip block number 9 <jpeg_v4_0_0> (jpeg_v4_0)
+[   22.286471] amdgpu 0000:03:00.0: detected ip block number 10 <mes_v11_0_0> (mes_v11_0)
+[   22.601856] amdgpu 0000:03:00.0: vm size is 262144 GB, 4 levels, block size is 9-bit, fragment size is 9-bit
+[   22.601861] amdgpu 0000:03:00.0: VRAM: 16368M 0x0000008000000000 - 0x00000083FEFFFFFF (16368M used)
+[   22.601862] amdgpu 0000:03:00.0: GART: 512M 0x00007FFF00000000 - 0x00007FFF1FFFFFFF
+[   22.601938] amdgpu 0000:03:00.0:  7870M of GTT memory ready.
+[   22.601956] amdgpu 0000:03:00.0: [drm] GART: num cpu pages 131072, num gpu pages 131072
+[   22.603184] amdgpu 0000:03:00.0: MES: vmid_mask_mmhub 0x0000ff00, vmid_mask_gfxhub 0x0000ff00
+[   22.603187] amdgpu 0000:03:00.0: MES: gfx_hqd_mask 0x00000002, compute_hqd_mask 0x0000000c, sdma_hqd_mask 0x000000fc
+[   23.279442] amdgpu 0000:03:00.0: ring gfx_0.0.0 uses VM inv eng 0 on hub 0
+[   23.279460] amdgpu 0000:03:00.0: ring mes_kiq_3.1.0 uses VM inv eng 14 on hub 0
+== clocks
+/sys/class/drm/card2/device sclk
+S: 20Mhz *
+1: 500Mhz 
+2: 2124Mhz 
+mclk
+0: 96Mhz *
+1: 456Mhz 
+2: 772Mhz 
+3: 1218Mhz 
