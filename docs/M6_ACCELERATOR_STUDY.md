@@ -120,6 +120,10 @@ nm -gU -arch x86_64 /System/Library/KernelCollections/SystemKernelExtensions.kc 
 
 Checked offline: it builds; `nm -u` shows no private symbol of its own; `kmutil libraries` resolves every symbol (`IOAccelerator` from IOGraphicsFamily 599, the rest from the iokit/libkern/bsd kpis). Not run: loading it needs the AuxKC route on the test desktop and the user's sudo.
 
+### First load on the test desktop (2026-11-02): a panic, and what it showed
+
+The first version panicked the desktop during boot (`Trying to change a collection in the registry`, `OSCollection::haveUpdated`, called from `OSArray::setObject` in `RedNaviAccel::note`). Cause, ours: the log array was published as a property and then modified on the next line; a collection that has become a registry property is frozen. Fixed by publishing a copy of the private array each time. The backtrace also **confirmed the handshake on the real machine** (V, panic log): `AppleGPUWrangler` (its work loop) -> `IOFramebuffer::message` -> `IOFramebuffer::probeAccelerator` -> `RedNaviAccel::requestProbe`, about 17.5 s after boot. So the wrangler's probe message does reach an `IOAccelerator` that is a sibling of the framebuffer's PCI parent, and does so as soon as the PCI node's children have started, without any change to `RedNaviFB`.
+
 ### Run-time class sizes
 
-(filled in after the first load on the test desktop)
+(filled in after a successful load on the test desktop)

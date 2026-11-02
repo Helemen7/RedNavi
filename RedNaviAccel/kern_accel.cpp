@@ -34,8 +34,13 @@ class RedNaviAccel : public IOAccelerator {
     uint32_t openCount {0}, callCount {0}, probeCount {0};
     bool link {false};
 
+    // A collection that was made a property of a registry entry is frozen ("Trying to change a collection in the registry" panics in OSCollection::haveUpdated, which
+    // is what the first version of this did on its second log line): the working array stays private and a copy is published.
     void publishLog() {
-        setProperty("call-log", log);
+        if (OSArray *snapshot = OSArray::withArray(log)) {
+            setProperty("call-log", snapshot);
+            snapshot->release();
+        }
         setProperty("open-count", openCount, 32);
         setProperty("call-count", callCount, 32);
         setProperty("probe-count", probeCount, 32);
