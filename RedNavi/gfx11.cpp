@@ -96,6 +96,10 @@ int rn_gart_update_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 pa
     return rn_gart_flush(adev);
 }
 
+u64 rn_vram_pte(u64 vram_offset) {            // a page of local VRAM at that offset (not the MC address: the PTE of a user address space takes the offset): valid, readable, writeable, executable, not system, not snooped, MTYPE_NC (0, Linux's default for local memory on GC 11)
+    return (vram_offset & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x10ull | 0x20ull | 0x40ull;
+}
+
 u64 rn_system_pte(u64 bus) {
     const u64 kMtypeUc = 3ull;
     return (bus & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x2ull | 0x4ull | 0x10ull | 0x20ull | 0x40ull | (kMtypeUc << 48);

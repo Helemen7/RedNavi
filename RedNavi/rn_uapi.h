@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 6
+#define RN_UAPI_VERSION 7
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -30,6 +30,7 @@ enum {
     RN_UC_SYNCOBJ_SIGNAL = 15,   // in rn_uc_syncobj_array (points: 0 signals the binary state, a point signals the timeline up to it)
     RN_UC_SYNCOBJ_QUERY = 16,    // in rn_uc_syncobj_array, out rn_uc_syncobj_array (points filled)
     RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
+    RN_UC_VRAM_PEEK = 18,        // in rn_uc_vram_peek, out rn_uc_vram_peek_result (debugging: reads VRAM through the index/data registers, any offset)
     RN_UC_COUNT
 };
 
@@ -55,20 +56,35 @@ struct rn_uc_info {
     uint64_t vm_va_bytes;
     uint32_t vmid;
     uint32_t va_map_limit;     // mappings one connection can hold
+    uint64_t vram_bytes;       // device-local VRAM the allocator hands out (the pool the GPU alone reaches), and what is left of it
+    uint64_t vram_free;
+    uint64_t vram_vis_bytes;   // VRAM the CPU reaches through the PCI aperture (RN_BO_VRAM_VISIBLE), and what is left of it
+    uint64_t vram_vis_free;
 };
+
+// Where a buffer lives. 0: wired host memory (the GTT domain), CPU cached, mapped by the GPU as system memory. RN_BO_VRAM: device-local VRAM, only the GPU reaches it
+// (no CPU mapping, RN_UC_BO_WAIT is refused, the contents are not cleared). RN_BO_VRAM_VISIBLE: VRAM inside the PCI aperture, mapped write-combined into the caller,
+// cleared on allocation; that pool is small (see vram_vis_bytes). A VRAM buffer is physically contiguous.
+#define RN_BO_VRAM 1u
+#define RN_BO_VRAM_VISIBLE 2u
 
 struct rn_uc_bo_create {
     uint64_t size;             // bytes, rounded up to 4 KB
-    uint32_t flags;            // 0
+    uint32_t flags;            // 0, RN_BO_VRAM or RN_BO_VRAM_VISIBLE
     uint32_t pad;
 };
 
 struct rn_uc_bo_info {
     uint32_t handle;           // 1 and up, local to the connection
-    uint32_t pad;
+    uint32_t flags;            // the placement the buffer got (0, RN_BO_VRAM or RN_BO_VRAM_VISIBLE)
     uint64_t gpu_va;
     uint64_t size;
 };
+
+// Reads up to 64 dwords of VRAM at a byte offset, by the register index/data pair (slow, for checking what a GPU write left in a device-local buffer). A VRAM buffer's gpu_va
+// (rn_uc_bo_info) is its offset in VRAM.
+struct rn_uc_vram_peek { uint64_t offset; uint32_t count; uint32_t pad; };
+struct rn_uc_vram_peek_result { uint32_t v[64]; };
 
 struct rn_uc_bo_free {
     uint32_t handle;

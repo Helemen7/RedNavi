@@ -26,6 +26,7 @@
 
 struct amdgpu_bo {
    uint32_t handle;
+   uint32_t placement;                                        /* what the kext gave: 0 host memory, RN_BO_VRAM device-local, RN_BO_VRAM_VISIBLE CPU-visible VRAM */
    uint64_t size;
    void *cpu;
    mach_vm_size_t cpu_len;
@@ -573,12 +574,30 @@ int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *val
 
 int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *bo)
 {
-   /* Every domain is host memory behind the GART for now; GDS, GWS and OA do not exist. */
+   /* GDS, GWS and OA do not exist. VRAM requests come from the kext's VRAM allocator: a request that says NO_CPU_ACCESS gets the device-local pool the CPU cannot touch, any other the small
+    * CPU-visible part of the aperture; a request for VRAM|GTT falls back to host memory when VRAM has no room.
+    * RN_BRIDGE_NO_VRAM=1 serves everything from host memory, for comparison. */
    if (req->alloc_size == 0 || (req->preferred_heap & ~(uint32_t)(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)))
       return -EINVAL;
-   struct rn_uc_bo_create in = {req->alloc_size, 0, 0};
+   /* A VRAM|GTT buffer the CPU may map (command buffers, shader code, descriptors, uploads) goes to host memory: the CPU-visible VRAM is small and a write-combined mapping is slow
+    * to read. The device-local pool is for NO_CPU_ACCESS buffers, the visible part for what asks for VRAM alone. */
+   const int cpu_may_map = !(req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) || (req->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
+   const int want_vram = (req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) && !getenv("RN_BRIDGE_NO_VRAM") &&
+                         !(cpu_may_map && (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) && !getenv("RN_BRIDGE_VRAM_FIRST"));
+   const int allow_gtt = (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) || !(req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) || !want_vram;
    struct rn_uc_bo_info out;
-   int r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
+   int r = -ENOMEM;
+   if (want_vram) {
+      /* Linux may place a VRAM buffer anywhere and moves it to the visible part when the CPU maps it; this kext cannot move buffers, so only a buffer that says NO_CPU_ACCESS goes
+       * to the device-local pool (the CPU never maps it); every other VRAM buffer gets the CPU-visible part of the aperture. */
+      const uint32_t kind = (req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(req->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) ? RN_BO_VRAM : RN_BO_VRAM_VISIBLE;
+      struct rn_uc_bo_create in = {req->alloc_size, kind, 0};
+      r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
+   }
+   if (r && allow_gtt) {
+      struct rn_uc_bo_create in = {req->alloc_size, 0, 0};
+      r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
+   }
    if (r)
       return r;
    struct amdgpu_bo *b = calloc(1, sizeof(*b));
@@ -590,6 +609,9 @@ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_
    }
    b->handle = out.handle;
    b->size = out.size;
+   b->placement = out.flags;
+   if (getenv("RN_BRIDGE_DEBUG"))
+      fprintf(stderr, "rn-bridge: bo %u, %llu bytes, domain 0x%x flags 0x%llx -> placement %u\n", b->handle, (unsigned long long)out.size, req->preferred_heap, (unsigned long long)req->flags, b->placement);
    pthread_mutex_lock(&dev->lock);
    dev->bos[b->handle] = b;
    pthread_mutex_unlock(&dev->lock);
@@ -616,6 +638,8 @@ int ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
 int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
 {
    struct amdgpu_bo *b = bo.abo;
+   if (b->placement == RN_BO_VRAM)
+      return -EINVAL;                                          /* device-local VRAM: only the GPU reaches it */
    if (!b->cpu) {
       mach_vm_address_t addr = 0;
       mach_vm_size_t len = 0;

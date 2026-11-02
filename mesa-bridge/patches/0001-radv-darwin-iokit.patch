@@ -24,10 +24,10 @@ index 356df4d..fff4be6 100644
  
 diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
 new file mode 100644
-index 0000000..1695651
+index 0000000..05b0dcd
 --- /dev/null
 +++ b/src/amd/common/apple/ac_apple_iokit.c
-@@ -0,0 +1,1071 @@
+@@ -0,0 +1,1095 @@
 +/*
 + * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
 + *
@@ -57,6 +57,7 @@ index 0000000..1695651
 +
 +struct amdgpu_bo {
 +   uint32_t handle;
++   uint32_t placement;                                        /* what the kext gave: 0 host memory, RN_BO_VRAM device-local, RN_BO_VRAM_VISIBLE CPU-visible VRAM */
 +   uint64_t size;
 +   void *cpu;
 +   mach_vm_size_t cpu_len;
@@ -611,12 +612,30 @@ index 0000000..1695651
 +
 +int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *bo)
 +{
-+   /* Every domain is host memory behind the GART for now; GDS, GWS and OA do not exist. */
++   /* GDS, GWS and OA do not exist. VRAM requests come from the kext's VRAM allocator: a request that says NO_CPU_ACCESS gets the device-local pool the CPU cannot touch, any other the small
++    * CPU-visible part of the aperture; a request for VRAM|GTT falls back to host memory when VRAM has no room.
++    * RN_BRIDGE_NO_VRAM=1 serves everything from host memory, for comparison. */
 +   if (req->alloc_size == 0 || (req->preferred_heap & ~(uint32_t)(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)))
 +      return -EINVAL;
-+   struct rn_uc_bo_create in = {req->alloc_size, 0, 0};
++   /* A VRAM|GTT buffer the CPU may map (command buffers, shader code, descriptors, uploads) goes to host memory: the CPU-visible VRAM is small and a write-combined mapping is slow
++    * to read. The device-local pool is for NO_CPU_ACCESS buffers, the visible part for what asks for VRAM alone. */
++   const int cpu_may_map = !(req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) || (req->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
++   const int want_vram = (req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) && !getenv("RN_BRIDGE_NO_VRAM") &&
++                         !(cpu_may_map && (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) && !getenv("RN_BRIDGE_VRAM_FIRST"));
++   const int allow_gtt = (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) || !(req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) || !want_vram;
 +   struct rn_uc_bo_info out;
-+   int r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
++   int r = -ENOMEM;
++   if (want_vram) {
++      /* Linux may place a VRAM buffer anywhere and moves it to the visible part when the CPU maps it; this kext cannot move buffers, so only a buffer that says NO_CPU_ACCESS goes
++       * to the device-local pool (the CPU never maps it); every other VRAM buffer gets the CPU-visible part of the aperture. */
++      const uint32_t kind = (req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) && !(req->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) ? RN_BO_VRAM : RN_BO_VRAM_VISIBLE;
++      struct rn_uc_bo_create in = {req->alloc_size, kind, 0};
++      r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
++   }
++   if (r && allow_gtt) {
++      struct rn_uc_bo_create in = {req->alloc_size, 0, 0};
++      r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
++   }
 +   if (r)
 +      return r;
 +   struct amdgpu_bo *b = calloc(1, sizeof(*b));
@@ -628,6 +647,9 @@ index 0000000..1695651
 +   }
 +   b->handle = out.handle;
 +   b->size = out.size;
++   b->placement = out.flags;
++   if (getenv("RN_BRIDGE_DEBUG"))
++      fprintf(stderr, "rn-bridge: bo %u, %llu bytes, domain 0x%x flags 0x%llx -> placement %u\n", b->handle, (unsigned long long)out.size, req->preferred_heap, (unsigned long long)req->flags, b->placement);
 +   pthread_mutex_lock(&dev->lock);
 +   dev->bos[b->handle] = b;
 +   pthread_mutex_unlock(&dev->lock);
@@ -654,6 +676,8 @@ index 0000000..1695651
 +int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
 +{
 +   struct amdgpu_bo *b = bo.abo;
++   if (b->placement == RN_BO_VRAM)
++      return -EINVAL;                                          /* device-local VRAM: only the GPU reaches it */
 +   if (!b->cpu) {
 +      mach_vm_address_t addr = 0;
 +      mach_vm_size_t len = 0;
@@ -1343,10 +1367,10 @@ index 0000000..70a4648
 +#include "drm-uapi/amdgpu_drm.h"
 diff --git a/src/amd/common/apple/rn_uapi.h b/src/amd/common/apple/rn_uapi.h
 new file mode 100644
-index 0000000..32b4405
+index 0000000..5eea896
 --- /dev/null
 +++ b/src/amd/common/apple/rn_uapi.h
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,224 @@
 +// The user client interface of RedNaviProbe, shared by the kext and user space programs (tools/rn_test.c, later the Mesa backend).
 +// Every method takes and returns one struct through IOConnectCallStructMethod; the sizes are checked exactly, so a layout change
 +// means a new RN_UAPI_VERSION. Plain C, fixed-width types only. The method set mirrors the DRM_AMDGPU_* commands RADV uses
@@ -1358,7 +1382,7 @@ index 0000000..32b4405
 +
 +#include "rn_drm_uapi.h"
 +
-+#define RN_UAPI_VERSION 6
++#define RN_UAPI_VERSION 7
 +
 +enum {
 +    RN_UC_INFO = 0,        // out rn_uc_info
@@ -1379,6 +1403,7 @@ index 0000000..32b4405
 +    RN_UC_SYNCOBJ_SIGNAL = 15,   // in rn_uc_syncobj_array (points: 0 signals the binary state, a point signals the timeline up to it)
 +    RN_UC_SYNCOBJ_QUERY = 16,    // in rn_uc_syncobj_array, out rn_uc_syncobj_array (points filled)
 +    RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
++    RN_UC_VRAM_PEEK = 18,        // in rn_uc_vram_peek, out rn_uc_vram_peek_result (debugging: reads VRAM through the index/data registers, any offset)
 +    RN_UC_COUNT
 +};
 +
@@ -1404,20 +1429,35 @@ index 0000000..32b4405
 +    uint64_t vm_va_bytes;
 +    uint32_t vmid;
 +    uint32_t va_map_limit;     // mappings one connection can hold
++    uint64_t vram_bytes;       // device-local VRAM the allocator hands out (the pool the GPU alone reaches), and what is left of it
++    uint64_t vram_free;
++    uint64_t vram_vis_bytes;   // VRAM the CPU reaches through the PCI aperture (RN_BO_VRAM_VISIBLE), and what is left of it
++    uint64_t vram_vis_free;
 +};
++
++// Where a buffer lives. 0: wired host memory (the GTT domain), CPU cached, mapped by the GPU as system memory. RN_BO_VRAM: device-local VRAM, only the GPU reaches it
++// (no CPU mapping, RN_UC_BO_WAIT is refused, the contents are not cleared). RN_BO_VRAM_VISIBLE: VRAM inside the PCI aperture, mapped write-combined into the caller,
++// cleared on allocation; that pool is small (see vram_vis_bytes). A VRAM buffer is physically contiguous.
++#define RN_BO_VRAM 1u
++#define RN_BO_VRAM_VISIBLE 2u
 +
 +struct rn_uc_bo_create {
 +    uint64_t size;             // bytes, rounded up to 4 KB
-+    uint32_t flags;            // 0
++    uint32_t flags;            // 0, RN_BO_VRAM or RN_BO_VRAM_VISIBLE
 +    uint32_t pad;
 +};
 +
 +struct rn_uc_bo_info {
 +    uint32_t handle;           // 1 and up, local to the connection
-+    uint32_t pad;
++    uint32_t flags;            // the placement the buffer got (0, RN_BO_VRAM or RN_BO_VRAM_VISIBLE)
 +    uint64_t gpu_va;
 +    uint64_t size;
 +};
++
++// Reads up to 64 dwords of VRAM at a byte offset, by the register index/data pair (slow, for checking what a GPU write left in a device-local buffer). A VRAM buffer's gpu_va
++// (rn_uc_bo_info) is its offset in VRAM.
++struct rn_uc_vram_peek { uint64_t offset; uint32_t count; uint32_t pad; };
++struct rn_uc_vram_peek_result { uint32_t v[64]; };
 +
 +struct rn_uc_bo_free {
 +    uint32_t handle;

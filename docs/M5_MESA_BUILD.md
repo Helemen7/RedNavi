@@ -124,3 +124,7 @@ The queue is stuck after a hang until it is reset (`rn_test reset`, or the kext'
 Two kext faults found by these tests, both fixed: the ring-full wait gave up after 2 s even when the read pointer kept moving (a long GPU backlog), reset the queue and dropped the queued work; it now gives up after 2 s without the read pointer moving. And the kext refused command buffers above 4096 dwords (16 KB), which any real command buffer exceeds; the limit is now the hardware's 20-bit size field.
 
 One failure is unexplained: the first `saturate 600` right after the first boot with the new kext lost all its work (every value wrong, a VM fault status latched, address not recorded). It did not repeat in 12 further runs, including one right after a reboot. If a fault shows up again, `rn_test stats` prints the status and address of the latched fault.
+
+### VRAM, 2026-11-02
+
+Buffers in device-local VRAM (about 13.5 GB) and CPU-visible VRAM (78 MB) from the kext's allocator; design, the PTE finding (offset, not MC address) and the results are in docs/COMPAT.md, "VRAM buffers". Memory types RADV now reports: host (heap of 2 GB), device-local VRAM, CPU-visible VRAM (78 MB heap).

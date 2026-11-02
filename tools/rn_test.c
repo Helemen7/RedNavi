@@ -187,10 +187,55 @@ int main(int argc, char **argv) {
         IOServiceClose(c);
         return kr || rr.status ? 2 : 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "vram")) {                 // vram [visible]: the plain dispatch, its result dword in a VRAM buffer (device-local, or CPU-visible); the result is read back by peek (and by the mapping)
+        const int visible = argc > 2 && !strcmp(argv[2], "visible");
+        Bo code;
+        if (createBo(c, 4096, &code) || vaMap(c, code.handle, 0x10000, 0, 4096)) return 1;
+        struct rn_uc_bo_create in = {1u << 20, visible ? RN_BO_VRAM_VISIBLE : RN_BO_VRAM, 0};
+        struct rn_uc_bo_info out;
+        size_t outSize = sizeof(out);
+        kr = IOConnectCallStructMethod(c, RN_UC_BO_CREATE, &in, sizeof(in), &out, &outSize);
+        printf("create %s VRAM buffer: 0x%x, handle %u, placement %u, VRAM offset 0x%llx\n", visible ? "visible" : "device-local", kr, out.handle, out.flags, out.gpu_va);
+        if (kr) return 1;
+        const uint64_t vramOff = out.gpu_va;
+        if (vaMap(c, out.handle, 0x20000, 0, 1u << 20)) { printf("va map failed\n"); return 1; }
+        const uint32_t n = buildDispatch(code.cpu, 0x10000, 0x20000);
+        kr = submitIb(c, 0x10000, n);
+        uint32_t r = 0;
+        kern_return_t kw = waitSeq(c, gSeq, 3000, &r, NULL);
+        printf("submit 0x%x, wait 0x%x, fence %s\n", kr, kw, r ? "reached" : "NOT reached");
+        struct rn_uc_vram_peek pk = {vramOff, 4, 0};
+        struct rn_uc_vram_peek_result pr;
+        size_t prSize = sizeof(pr);
+        kr = IOConnectCallStructMethod(c, RN_UC_VRAM_PEEK, &pk, sizeof(pk), &pr, &prSize);
+        printf("VRAM at 0x%llx: %08x %08x %08x %08x (want 600dc0de first)\n", vramOff, pr.v[0], pr.v[1], pr.v[2], pr.v[3]);
+        if (visible) {
+            mach_vm_address_t addr = 0; mach_vm_size_t len = 0;
+            kr = IOConnectMapMemory64(c, out.handle, mach_task_self(), &addr, &len, kIOMapAnywhere);
+            printf("CPU mapping: 0x%x, first dword through it 0x%08x\n", kr, kr ? 0 : *(volatile uint32_t *)(uintptr_t)addr);
+        }
+        IOServiceClose(c);
+        return pr.v[0] == 0x600DC0DEu ? 0 : 2;
+    }
+    if (argc > 3 && !strcmp(argv[1], "peekv")) {                // peekv OFFSET COUNT: dwords of VRAM at a byte offset (hex), by the index/data registers
+        struct rn_uc_vram_peek in = {strtoull(argv[2], NULL, 16), (uint32_t)atoi(argv[3]), 0};
+        struct rn_uc_vram_peek_result out;
+        size_t outSize = sizeof(out);
+        kr = IOConnectCallStructMethod(c, RN_UC_VRAM_PEEK, &in, sizeof(in), &out, &outSize);
+        printf("peekv: 0x%x\n", kr);
+        for (uint32_t i = 0; kr == KERN_SUCCESS && i < in.count; i++) printf("%08x%s", out.v[i], (i & 7) == 7 || i + 1 == in.count ? "\n" : " ");
+        IOServiceClose(c);
+        return kr != KERN_SUCCESS;
+    }
     if (argc > 1 && !strcmp(argv[1], "stats")) {                // counters of the queue: sequence numbers, ring-full waits, flush failures
         struct rn_uc_diag d;
         if (diag(c, 0, &d) == KERN_SUCCESS)
             printf("rptr 0x%x wptr 0x%x, ring-full waits %u, fault status 0x%x address 0x%x%08x, TLB flush failures %u\n", d.hqd_rptr, d.hqd_wptr, d.ring_full_waits, d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.flush_failures);
+        {
+            struct rn_uc_info inf; size_t infSize = sizeof(inf);
+            if (IOConnectCallStructMethod(c, RN_UC_INFO, NULL, 0, &inf, &infSize) == KERN_SUCCESS)
+                printf("VRAM: device-local %llu MB, %llu MB free; CPU-visible %llu MB, %llu MB free\n", inf.vram_bytes >> 20, inf.vram_free >> 20, inf.vram_vis_bytes >> 20, inf.vram_vis_free >> 20);
+        }
         IOServiceClose(c);
         return 0;
     }

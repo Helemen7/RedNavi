@@ -33,7 +33,7 @@ Lacks, in the order RADV needs it:
 
 ## State, 2026-11-02
 
-Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: command buffers in the upper half of the address space hang the queue (data and shaders there work; the kext refuses such an IB and the bridge keeps IBs low, docs/COMPAT.md; the cause is unknown), memory in VRAM (all buffers are wired host memory, up to 1 GB each and 2 GB in all; the BAR shows 256 MB of VRAM), the patches of docs/M5_MESA_BUILD.md applied to a full Mesa tree (the bridge `mesa-bridge/` exists), a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
+Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: command buffers in the upper half of the address space hang the queue (data and shaders there work; the kext refuses such an IB and the bridge keeps IBs low, docs/COMPAT.md; the cause is unknown), the patches of docs/M5_MESA_BUILD.md applied to a full Mesa tree (the bridge `mesa-bridge/` exists), a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
 
 The Mesa side has started: `mesa-bridge/` holds `ac_apple_iokit.c`, the `ac_drm_*` layer over the user client, and a test that drives it the way the winsys does (passes on the 7800 XT, 2026-11-02). What remains for a first `vulkaninfo`: the meson and RADV patches of docs/M5_MESA_BUILD.md applied to a full Mesa tree. The kext's buffer limits were lifted on 2026-11-02 (docs/COMPAT.md); VRAM allocation is still not there.
 
@@ -61,3 +61,7 @@ CPU mapping of a BO uses `IOConnectMapMemory` with the BO handle as memory type.
 5. Patched `ac_linux_drm.c` backend plus the minimal queries; run `vulkaninfo`, then a compute-only Vulkan test, then graphics.
 
 Step 2 decides the schedule; steps 1 and 5 are mostly software.
+
+## State, 2026-11-02 (later)
+
+VRAM buffers work (docs/COMPAT.md): device-local and CPU-visible pools, RADV reports memory types for both. Open: the graphics queue, MSI, the PCI location, 2 MB leaf entries, clearing of device-local buffers, buffers above 1 GB.

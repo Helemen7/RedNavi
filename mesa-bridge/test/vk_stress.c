@@ -6,7 +6,8 @@
  *   barrier [K]  K dependent dispatches in one command buffer (a writer, then K increments, a compute-to-compute barrier between each), then the same chain
  *                over several submits tied by semaphores (syncobj in/out in the kext).
  *   multi [R]    R rounds (default 20) of several storage buffers alive at once, one dispatch each, verified, then half of them freed and replaced.
- *   all          the three above.
+ *   vram [MB]    buffers in device-local VRAM (written and checked by the GPU, read back by vkCmdCopyBuffer), CPU-visible VRAM, and as many 256 MB device-local buffers as fit (at most MB).
+ *   all          all of the above.
  *
  * Exit status 0 when every check passed. Shaders: vk_stress.comp.write (v[base+i] = (base+i)*3 + add) and vk_stress.comp.inc (v[base+i] += add).
  *   clang -O1 -arch x86_64 -mmacosx-version-min=12 -I/opt/local/include test/vk_stress.c -L/opt/local/lib -lvulkan -o vk_stress
@@ -70,33 +71,47 @@ static VkPipeline makePipeline(const unsigned char *spv, size_t len)
    return p;
 }
 
-static void bufCreate(Buf *b, uint32_t words)
+/* A buffer in a memory type that has the properties `want` and none of `avoid`; returns the VkResult of the allocation (VK_SUCCESS, or an error when that memory is full), the buffer
+ * is not usable otherwise. A buffer in host-visible memory is mapped (b->cpu), one in device-local memory is not. */
+static VkResult bufCreateEx(Buf *b, uint32_t words, VkBufferUsageFlags usage, VkMemoryPropertyFlags want, VkMemoryPropertyFlags avoid)
 {
-   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)words * 4, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   memset(b, 0, sizeof(*b));
+   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = (VkDeviceSize)words * 4, .usage = usage | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
    CHECK(vkCreateBuffer(dev, &bci, NULL, &b->buf));
    VkMemoryRequirements mr;
    vkGetBufferMemoryRequirements(dev, b->buf, &mr);
    int mt = -1;
-   const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
    for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
-      if ((mr.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want) { mt = (int)i; break; }
-   if (mt < 0) { fprintf(stderr, "no host visible memory type\n"); exit(2); }
+      if ((mr.memoryTypeBits & (1u << i)) && (memProps.memoryTypes[i].propertyFlags & want) == want && !(memProps.memoryTypes[i].propertyFlags & avoid)) { mt = (int)i; break; }
+   if (mt < 0) { fprintf(stderr, "no memory type with 0x%x and without 0x%x\n", want, avoid); exit(2); }
    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
-   CHECK(vkAllocateMemory(dev, &mai, NULL, &b->mem));
+   VkResult ar = vkAllocateMemory(dev, &mai, NULL, &b->mem);
+   if (ar != VK_SUCCESS) {
+      vkDestroyBuffer(dev, b->buf, NULL);
+      memset(b, 0, sizeof(*b));
+      return ar;
+   }
    CHECK(vkBindBufferMemory(dev, b->buf, b->mem, 0));
-   CHECK(vkMapMemory(dev, b->mem, 0, VK_WHOLE_SIZE, 0, (void **)&b->cpu));
+   if (memProps.memoryTypes[mt].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+      CHECK(vkMapMemory(dev, b->mem, 0, VK_WHOLE_SIZE, 0, (void **)&b->cpu));
    b->words = words;
    VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = descPool, .descriptorSetCount = 1, .pSetLayouts = &setLayout};
    CHECK(vkAllocateDescriptorSets(dev, &dsa, &b->set));
    VkDescriptorBufferInfo dbi = {.buffer = b->buf, .offset = 0, .range = VK_WHOLE_SIZE};
    VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = b->set, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &dbi};
    vkUpdateDescriptorSets(dev, 1, &w, 0, NULL);
+   return VK_SUCCESS;
+}
+
+static void bufCreate(Buf *b, uint32_t words)
+{
+   CHECK(bufCreateEx(b, words, 0, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0));
 }
 
 static void bufDestroy(Buf *b)
 {
    vkFreeDescriptorSets(dev, descPool, 1, &b->set);
-   vkUnmapMemory(dev, b->mem);
+   if (b->cpu) vkUnmapMemory(dev, b->mem);
    vkDestroyBuffer(dev, b->buf, NULL);
    vkFreeMemory(dev, b->mem, NULL);
    memset(b, 0, sizeof(*b));
@@ -303,6 +318,164 @@ static void testBarrier(uint32_t k)
 }
 
 /* --------------------------------------------------------------------------------------------------------------------------------- multi */
+/* --------------------------------------------------------------------------------------------------------------------------------- vram */
+static void dispatchAll(VkCommandBuffer cb, VkPipeline p, const Buf *b, uint32_t add, int write)
+{
+   const uint32_t chunk = 65535u * 64u;                                   /* words per dispatch: the workgroup count limit */
+   for (uint32_t base = 0; base < b->words; base += chunk) {
+      cmdDispatch(cb, p, b, (PC){base, add, b->words - base < chunk ? b->words - base : chunk});
+      (void)write;
+   }
+}
+
+/* Copies [from, from + words) of a device-local buffer into a host-visible one with vkCmdCopyBuffer and waits. */
+static void copyOut(const Buf *src, const Buf *dst, uint32_t from, uint32_t words)
+{
+   VkCommandBuffer cb = cbAlloc();
+   cbBegin(cb, 1);
+   cmdBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+   VkBufferCopy rg = {.srcOffset = (VkDeviceSize)from * 4, .dstOffset = 0, .size = (VkDeviceSize)words * 4};
+   vkCmdCopyBuffer(cb, src->buf, dst->buf, 1, &rg);
+   VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+   vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+   CHECK(vkEndCommandBuffer(cb));
+   VkFence f = fenceCreate();
+   VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+   CHECK(vkQueueSubmit(queue, 1, &si, f));
+   if (fenceWait(f, 30.0)) { fail("copy fence timeout"); exit(3); }
+   vkDestroyFence(dev, f, NULL);
+   vkFreeCommandBuffers(dev, cmdPool, 1, &cb);
+}
+
+/* One device-local buffer of `mb` MB: written by a dispatch, incremented by a second, read back through a staging buffer in 16 MB pieces and checked. */
+static int vramOne(uint32_t mb, uint32_t tag)
+{
+   const uint32_t words = mb << 18;
+   Buf d, h;
+   double t0 = now();
+   VkResult r = bufCreateEx(&d, words, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+   if (r != VK_SUCCESS) { printf("%u MB device-local: allocation failed (%d)\n", mb, (int)r); return -1; }
+   const uint32_t pieceWords = words < (4u << 20) ? words : (4u << 20);
+   CHECK(bufCreateEx(&h, pieceWords, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0));
+   double tAlloc = now() - t0;
+   VkCommandBuffer cb = cbAlloc();
+   cbBegin(cb, 1);
+   dispatchAll(cb, pipeWrite, &d, tag, 1);
+   cmdBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+   dispatchAll(cb, pipeInc, &d, 1, 0);
+   cmdBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+   CHECK(vkEndCommandBuffer(cb));
+   VkFence f = fenceCreate();
+   VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+   double t1 = now();
+   CHECK(vkQueueSubmit(queue, 1, &si, f));
+   if (fenceWait(f, 60.0)) { fail("vram fence timeout"); exit(3); }
+   double tGpu = now() - t1;
+   uint64_t bad = 0;
+   for (uint32_t from = 0; from < words; from += pieceWords) {
+      const uint32_t n = words - from < pieceWords ? words - from : pieceWords;
+      memset(h.cpu, 0xAB, (size_t)n * 4);
+      copyOut(&d, &h, from, n);
+      for (uint32_t i = 0; i < n; i++)
+         if (h.cpu[i] != (from + i) * 3u + tag + 1u) bad++;
+   }
+   printf("%5u MB device-local: allocate and map %.2f s, write+increment %.3f s (%.1f GB/s), %llu of %u values wrong\n", mb, tAlloc, tGpu, (double)mb / 1024.0 / (tGpu > 0 ? tGpu : 1e-9) * 2,
+          (unsigned long long)bad, words);
+   if (bad) {
+      memset(h.cpu, 0xAB, 64);
+      copyOut(&d, &h, 0, 16);
+      printf("first words read back: %08x %08x %08x %08x (want %08x %08x %08x %08x)\n", h.cpu[0], h.cpu[1], h.cpu[2], h.cpu[3], tag + 1u, 3u + tag + 1u, 6u + tag + 1u, 9u + tag + 1u);
+      fail("device-local values");
+   }
+   vkDestroyFence(dev, f, NULL);
+   vkFreeCommandBuffers(dev, cmdPool, 1, &cb);
+   bufDestroy(&h);
+   bufDestroy(&d);
+   return bad ? 1 : 0;
+}
+
+static void testVram(uint32_t maxMb)
+{
+   printf("== vram\n");
+   for (uint32_t i = 0; i < memProps.memoryTypeCount; i++)
+      printf("memory type %u: flags 0x%x heap %u\n", i, memProps.memoryTypes[i].propertyFlags, memProps.memoryTypes[i].heapIndex);
+   for (uint32_t i = 0; i < memProps.memoryHeapCount; i++)
+      printf("heap %u: %llu MB, flags 0x%x\n", i, (unsigned long long)(memProps.memoryHeaps[i].size >> 20), memProps.memoryHeaps[i].flags);
+   static const uint32_t sizes[] = {1, 16, 128, 512};
+   for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++)
+      if (sizes[i] <= maxMb) vramOne(sizes[i], 100 + i);
+
+   /* CPU-visible VRAM: written through the aperture by the CPU, incremented by the GPU, read back through the aperture */
+   {
+      Buf v;
+      VkResult r = bufCreateEx(&v, 1u << 18, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, 0);
+      if (r != VK_SUCCESS || !v.cpu) {
+         printf("CPU-visible VRAM: not available (%d)\n", (int)r);
+      } else {
+         for (uint32_t i = 0; i < v.words; i++) v.cpu[i] = i * 7u;
+         VkCommandBuffer cb = cbAlloc();
+         cbBegin(cb, 1);
+         dispatchAll(cb, pipeInc, &v, 5, 0);
+         cmdBarrier(cb, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+         CHECK(vkEndCommandBuffer(cb));
+         VkFence f = fenceCreate();
+         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+         CHECK(vkQueueSubmit(queue, 1, &si, f));
+         if (fenceWait(f, 20.0)) { fail("visible vram fence timeout"); return; }
+         uint32_t bad = 0;
+         for (uint32_t i = 0; i < v.words; i++) if (v.cpu[i] != i * 7u + 5u) bad++;
+         printf("CPU-visible VRAM, 1 MB: CPU writes, GPU increments, CPU reads: %u of %u values wrong\n", bad, v.words);
+         if (bad) fail("visible vram values");
+         vkDestroyFence(dev, f, NULL);
+         bufDestroy(&v);
+      }
+   }
+
+   /* How much device-local memory can be had: 256 MB buffers until the allocator says no, each written by the GPU, then every one checked at its ends, then freed */
+   {
+      Buf big[64];
+      int n = 0;
+      double t0 = now();
+      while (n < 64 && (uint64_t)n * 256 < maxMb * 64ull) {
+         if (bufCreateEx(&big[n], 64u << 20, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != VK_SUCCESS) break;
+         n++;
+      }
+      printf("%d buffers of 256 MB device-local (%d MB) allocated in %.2f s\n", n, n * 256, now() - t0);
+      Buf h;
+      CHECK(bufCreateEx(&h, 4096, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0));
+      VkCommandBuffer cb = cbAlloc();
+      cbBegin(cb, 1);
+      for (int i = 0; i < n; i++) {
+         cmdDispatch(cb, pipeWrite, &big[i], (PC){0, 1000u + (uint32_t)i, 4096});                        /* the first 4096 words */
+         cmdDispatch(cb, pipeWrite, &big[i], (PC){big[i].words - 4096, 1000u + (uint32_t)i, 4096});      /* and the last 4096 */
+      }
+      cmdBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+      CHECK(vkEndCommandBuffer(cb));
+      VkFence f = fenceCreate();
+      VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+      CHECK(vkQueueSubmit(queue, 1, &si, f));
+      if (fenceWait(f, 60.0)) { fail("fill fence timeout"); return; }
+      uint32_t bad = 0;
+      for (int i = 0; i < n; i++) {
+         for (int end = 0; end < 2; end++) {
+            const uint32_t from = end ? big[i].words - 4096 : 0;
+            memset(h.cpu, 0xAB, 4096 * 4);
+            copyOut(&big[i], &h, from, 4096);
+            for (uint32_t w = 0; w < 4096; w++) if (h.cpu[w] != (from + w) * 3u + 1000u + (uint32_t)i) bad++;
+         }
+      }
+      printf("%u of %d values wrong at the ends of the %d buffers\n", bad, n * 8192, n);
+      if (bad) fail("device-local ends");
+      vkDestroyFence(dev, f, NULL);
+      for (int i = 0; i < n; i++) bufDestroy(&big[i]);
+      bufDestroy(&h);
+      Buf again;
+      VkResult r2 = bufCreateEx(&again, 64u << 20, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+      printf("after freeing them all, a 256 MB buffer again: %s\n", r2 == VK_SUCCESS ? "ok" : "FAILED");
+      if (r2 != VK_SUCCESS) fail("realloc after free"); else bufDestroy(&again);
+   }
+}
+
 #define NBUF 24
 static uint32_t sizeFor(uint32_t i, uint32_t round)
 {
@@ -399,6 +572,7 @@ int main(int argc, char **argv)
    if (all || !strcmp(mode, "saturate")) testSaturate(arg ? arg : 200);
    if (all || !strcmp(mode, "barrier")) testBarrier(arg ? arg : 100);
    if (all || !strcmp(mode, "multi")) testMulti(arg ? arg : 20);
+   if (!strcmp(mode, "vram") || all) testVram(arg ? arg : 16384);
    printf(failures ? "RESULT: %d FAILED\n" : "RESULT: PASS\n", failures);
    return failures ? 1 : 0;
 }

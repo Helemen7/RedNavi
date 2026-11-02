@@ -274,7 +274,47 @@ class RedNaviProbe : public IOService {
     uint32_t hostBusLen {0};
     // Buffer objects: pages of host memory with an address in the GART window that is never reused (see docs/COMPAT.md on remapping).
     // gpuVa: the buffer's address in the GART window (0 for a buffer that is not mapped there); bus: the bus address of each of its 4 KB pages, from which the user address spaces get their PTEs.
-    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; };
+    // A VRAM buffer has no md/dma/bus: vramOff is its offset in VRAM (physically contiguous, 4 KB aligned), dom is RN_BO_VRAM or RN_BO_VRAM_VISIBLE, and a visible one has vmd, the
+    // sub-range of the PCI aperture it occupies, which is what the caller maps. A slot is free when size is 0.
+    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; IOMemoryDescriptor *vmd; uint64_t vramOff; uint32_t dom; };
+    // VRAM that no one else in the kext uses, handed out in 4 KB pages by first fit from a sorted list of free ranges that merge when they touch. A range allocator, not a buddy
+    // system: buffers come in any size up to 1 GB, a buddy system would round a 640 MB buffer up to 1 GB, and the list stays short because a buffer's neighbours are merged on free.
+    struct VramPool {
+        struct Seg { uint64_t first, pages; };
+        static constexpr uint32_t kMax = 256;
+        Seg seg[kMax];
+        uint32_t n {0};
+        uint64_t totalPages {0}, freePages {0};
+        void init(uint64_t base, uint64_t bytes) { n = 1; seg[0] = {base / 4096, bytes / 4096}; totalPages = freePages = bytes / 4096; }
+        void add(uint64_t base, uint64_t bytes) { if (n < kMax) { seg[n++] = {base / 4096, bytes / 4096}; totalPages += bytes / 4096; freePages += bytes / 4096; } }
+        bool alloc(uint64_t bytes, uint64_t *off) {
+            const uint64_t pages = bytes / 4096;
+            for (uint32_t i = 0; i < n; i++) {
+                if (seg[i].pages < pages) continue;
+                *off = seg[i].first * 4096;
+                seg[i].first += pages; seg[i].pages -= pages;
+                if (seg[i].pages == 0) { for (uint32_t k = i + 1; k < n; k++) seg[k - 1] = seg[k]; n--; }
+                freePages -= pages;
+                return true;
+            }
+            return false;
+        }
+        void release(uint64_t off, uint64_t bytes) {
+            const uint64_t first = off / 4096, pages = bytes / 4096;
+            uint32_t i = 0;
+            while (i < n && seg[i].first < first) i++;
+            const bool joinPrev = i > 0 && seg[i - 1].first + seg[i - 1].pages == first;
+            const bool joinNext = i < n && first + pages == seg[i].first;
+            if (joinPrev && joinNext) { seg[i - 1].pages += pages + seg[i].pages; for (uint32_t k = i + 1; k < n; k++) seg[k - 1] = seg[k]; n--; }
+            else if (joinPrev) seg[i - 1].pages += pages;
+            else if (joinNext) { seg[i].first = first; seg[i].pages += pages; }
+            else if (n < kMax) { for (uint32_t k = n; k > i; k--) seg[k] = seg[k - 1]; seg[i] = {first, pages}; n++; }
+            freePages += pages;                               // (a full list loses the range's address space, never its accounting)
+        }
+    };
+    VramPool devPool, visPool;
+    IODeviceMemory *bar0Mem {nullptr};                    // the PCI aperture of VRAM (BAR0), whose first visPool.. bytes the CPU reaches
+    int createVramBo(uint32_t size, bool visible);
     static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
@@ -288,8 +328,8 @@ class RedNaviProbe : public IOService {
     // 4 KB pages of VRAM from a pool of kVmPoolPages per VMID starting at kVmTables.
     static constexpr uint64_t kVmMin = 0x10000ull;         // virtual_address_offset of DEV_INFO on Linux 7.0 for this card
     static constexpr uint64_t kVmEnd = 1ull << 48;           // the 48-bit space: the lower half 0 to 2^47 and the upper half, which a program sees sign-extended (0xffff800000000000 and up)
-    static constexpr uint64_t kVmTables = 0x0D000000ull;   // VRAM
-    static constexpr uint32_t kVmPoolPages = 4096;         // 16 MB per VMID: about 4000 tables (a table maps 2 MB), enough for several GB of buffers; 7 VMIDs take 112 MB of VRAM from kVmTables
+    static constexpr uint64_t kVmTables = 0x60000000ull;   // VRAM, 1.5 GB in: outside the PCI aperture, so that the aperture's free space can hold CPU-visible buffers
+    static constexpr uint32_t kVmPoolPages = 8192;         // 32 MB per VMID: about 8000 tables (a table maps 2 MB), 16 GB of mapped buffers; 7 VMIDs take 224 MB of VRAM from kVmTables (the 4096 of before ran out at 31 buffers of 256 MB); the device-local pool starts above them
     uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
     bool vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff);
     uint64_t vmPageAlloc(int vmid);                  // a zeroed pool page (VRAM offset), 0 when the pool is empty
@@ -1857,8 +1897,6 @@ class RedNaviClient : public IOUserClient {
     static void putOut(void *out, uint32_t outSize, const void *v, size_t n) { memcpy(out, v, n < outSize ? n : outSize); }
     IOReturn infoQuery(const drm_amdgpu_info *r, void *out, uint32_t outSize) {
         memset(out, 0, outSize);
-        const uint64_t visible = 256ull << 20;                                // what BAR0 maps
-        const uint64_t vram = static_cast<uint64_t>(gpuOwner->vramMbytes) << 20;
         const uint64_t gttTotal = gpuOwner->boBudget, gttUsed = gpuOwner->boBytes;      // the host memory that can be wired for buffers, and what is
         switch (r->query) {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
@@ -1905,19 +1943,28 @@ class RedNaviClient : public IOUserClient {
         case AMDGPU_INFO_MEMORY: {
             drm_amdgpu_memory_info m;
             memset(&m, 0, sizeof(m));
-            m.vram.total_heap_size = vram; m.vram.usable_heap_size = vram; m.vram.max_allocation = 0;            // nothing is allocated in VRAM yet (docs/M5_PLAN.md)
-            m.cpu_accessible_vram.total_heap_size = visible; m.cpu_accessible_vram.usable_heap_size = visible;
+            const uint64_t devTotal = gpuOwner->devPool.totalPages * 4096, visTotal = gpuOwner->visPool.totalPages * 4096;
+            const uint64_t devUsed = devTotal - gpuOwner->devPool.freePages * 4096, visUsed = visTotal - gpuOwner->visPool.freePages * 4096;
+            m.vram.total_heap_size = devTotal + visTotal; m.vram.usable_heap_size = devTotal + visTotal; m.vram.heap_usage = devUsed + visUsed; m.vram.max_allocation = RedNaviProbe::kBoMaxBytes;
+            m.cpu_accessible_vram.total_heap_size = visTotal; m.cpu_accessible_vram.usable_heap_size = visTotal; m.cpu_accessible_vram.heap_usage = visUsed; m.cpu_accessible_vram.max_allocation = RedNaviProbe::kBoMaxBytes;
             m.gtt.total_heap_size = gttTotal; m.gtt.usable_heap_size = gttTotal; m.gtt.heap_usage = gttUsed; m.gtt.max_allocation = RedNaviProbe::kBoMaxBytes;
             putOut(out, outSize, &m, sizeof(m));
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_VRAM_GTT: {
             drm_amdgpu_info_vram_gtt g;
-            g.vram_size = vram; g.vram_cpu_accessible_size = visible; g.gtt_size = gttTotal;
+            g.vram_size = gpuOwner->devPool.totalPages * 4096 + gpuOwner->visPool.totalPages * 4096; g.vram_cpu_accessible_size = gpuOwner->visPool.totalPages * 4096; g.gtt_size = gttTotal;
             putOut(out, outSize, &g, sizeof(g));
             return kIOReturnSuccess;
         }
-        case AMDGPU_INFO_VRAM_USAGE: case AMDGPU_INFO_VIS_VRAM_USAGE: case AMDGPU_INFO_NUM_BYTES_MOVED: case AMDGPU_INFO_NUM_EVICTIONS: case AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS: {
+        case AMDGPU_INFO_VRAM_USAGE: case AMDGPU_INFO_VIS_VRAM_USAGE: {
+            const RedNaviProbe::VramPool &p = r->query == AMDGPU_INFO_VIS_VRAM_USAGE ? gpuOwner->visPool : gpuOwner->devPool;
+            const uint64_t v = r->query == AMDGPU_INFO_VIS_VRAM_USAGE ? (p.totalPages - p.freePages) * 4096
+                                                                      : (gpuOwner->devPool.totalPages - gpuOwner->devPool.freePages + gpuOwner->visPool.totalPages - gpuOwner->visPool.freePages) * 4096;
+            putOut(out, outSize, &v, sizeof(v));
+            return kIOReturnSuccess;
+        }
+        case AMDGPU_INFO_NUM_BYTES_MOVED: case AMDGPU_INFO_NUM_EVICTIONS: case AMDGPU_INFO_NUM_VRAM_CPU_PAGE_FAULTS: {
             const uint64_t v = 0;
             putOut(out, outSize, &v, sizeof(v));
             return kIOReturnSuccess;
@@ -1990,11 +2037,12 @@ public:
         if (!gpuOwner || !lock) return kIOReturnBadArgument;
         IOLockLock(lock);
         const int idx = boOf(type);
-        IOBufferMemoryDescriptor *md = idx >= 0 ? gpuOwner->bos[idx].md : nullptr;
+        IOMemoryDescriptor *md = idx < 0 ? nullptr : gpuOwner->bos[idx].dom ? gpuOwner->bos[idx].vmd : static_cast<IOMemoryDescriptor *>(gpuOwner->bos[idx].md);
+        const bool vis = idx >= 0 && gpuOwner->bos[idx].dom == RN_BO_VRAM_VISIBLE;
         if (md) md->retain();
         IOLockUnlock(lock);
-        if (!md) return kIOReturnBadArgument;
-        *options = 0;
+        if (!md) return kIOReturnBadArgument;                     // not a buffer, or a device-local one: no CPU mapping
+        *options = vis ? kIOMapWriteCombineCache : 0;
         *memory = md;
         return kIOReturnSuccess;
     }
@@ -2025,17 +2073,20 @@ public:
                 o->vm_va_bytes = (1ull << 47) - RedNaviProbe::kVmMin;                // the lower half; the upper half is 0xffff800000000000 up to 2^64 - 4 MB
                 o->vmid = static_cast<uint32_t>(vmid);
                 o->va_map_limit = kMaxMaps;
+                o->vram_bytes = gpuOwner->devPool.totalPages * 4096; o->vram_free = gpuOwner->devPool.freePages * 4096;
+                o->vram_vis_bytes = gpuOwner->visPool.totalPages * 4096; o->vram_vis_free = gpuOwner->visPool.freePages * 4096;
                 rc = kIOReturnSuccess;
             }
             break;
         case RN_UC_BO_CREATE:
             if (sized(args, sizeof(rn_uc_bo_create), sizeof(rn_uc_bo_info))) {
                 const rn_uc_bo_create *in = static_cast<const rn_uc_bo_create *>(args->structureInput);
-                if (in->flags != 0 || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes) break;
+                if ((in->flags & ~(RN_BO_VRAM | RN_BO_VRAM_VISIBLE)) != 0 || in->flags == (RN_BO_VRAM | RN_BO_VRAM_VISIBLE) || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes) break;
                 uint32_t h = 0;
                 while (h < kMaxHandles && boIdx[h] >= 0) h++;
                 if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
-                const int idx = gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false);   // not in the GART window: the address spaces map it from its page list
+                const int idx = in->flags ? gpuOwner->createVramBo(static_cast<uint32_t>(in->size), in->flags == RN_BO_VRAM_VISIBLE)
+                                          : gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false);   // not in the GART window: the address spaces map it from its page list
                 if (idx < 0) { rc = kIOReturnNoResources; break; }
                 boIdx[h] = idx;
                 boUsed++;
@@ -2044,6 +2095,8 @@ public:
                 o->handle = h + 1;
                 o->gpu_va = gpuOwner->bos[idx].gpuVa;
                 o->size = gpuOwner->bos[idx].size;
+                o->flags = gpuOwner->bos[idx].dom;
+                if (gpuOwner->bos[idx].dom) o->gpu_va = gpuOwner->bos[idx].vramOff;           // a VRAM buffer: its offset in VRAM
                 rc = kIOReturnSuccess;
             }
             break;
@@ -2127,11 +2180,21 @@ public:
                 rc = kIOReturnSuccess;
             }
             break;
+        case RN_UC_VRAM_PEEK:
+            if (sized(args, sizeof(rn_uc_vram_peek), sizeof(rn_uc_vram_peek_result))) {
+                const rn_uc_vram_peek *in = static_cast<const rn_uc_vram_peek *>(args->structureInput);
+                if (in->count == 0 || in->count > 64 || (in->offset & 3) || in->offset >= (static_cast<uint64_t>(gpuOwner->vramMbytes) << 20) - 256) break;
+                rn_uc_vram_peek_result *o = static_cast<rn_uc_vram_peek_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                for (uint32_t i = 0; i < in->count; i++) o->v[i] = gpuOwner->vramRead(in->offset + i * 4ull);
+                rc = kIOReturnSuccess;
+            }
+            break;
         case RN_UC_BO_WAIT:
             if (sized(args, sizeof(rn_uc_bo_wait), sizeof(rn_uc_bo_wait_result))) {
                 const rn_uc_bo_wait *in = static_cast<const rn_uc_bo_wait *>(args->structureInput);
                 const int idx = boOf(in->handle);
-                if (idx < 0 || in->offset > gpuOwner->bos[idx].size - 4 || (in->offset & 3)) break;
+                if (idx < 0 || gpuOwner->bos[idx].dom || in->offset > gpuOwner->bos[idx].size - 4 || (in->offset & 3)) break;   // host buffers only
                 uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
                 volatile uint32_t *w = reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(gpuOwner->bos[idx].md->getBytesNoCopy()) + in->offset);
                 uint32_t ms = 0;
@@ -2368,11 +2431,17 @@ struct RNLockGuard {
 
 void RedNaviProbe::destroyBo(int idx) {
     RNLockGuard g(boLock);
-    if (idx < 0 || idx >= static_cast<int>(kBoCap) || !bos[idx].md) return;
+    if (idx < 0 || idx >= static_cast<int>(kBoCap) || !bos[idx].size) return;
     if (bos[idx].gart) {
         const uint32_t firstPage = static_cast<uint32_t>((bos[idx].gpuVa - 0x2000000000ull) / 4096);
         for (uint32_t p = 0; p < bos[idx].size / 4096; p++) rn_gart_unmap_page(&gpu, &gmcLive, firstPage + p);
         rn_gart_flush(&gpu);
+    }
+    if (bos[idx].dom) {
+        (bos[idx].dom == RN_BO_VRAM_VISIBLE ? visPool : devPool).release(bos[idx].vramOff, bos[idx].size);
+        if (bos[idx].vmd) bos[idx].vmd->release();
+        bos[idx] = {};
+        return;
     }
     if (bos[idx].bus) IOFree(bos[idx].bus, sizeof(uint64_t) * (bos[idx].size / 4096));
     boBytes -= bos[idx].size;
@@ -2448,13 +2517,15 @@ void RedNaviProbe::vmFree(int vmid) {
 bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages) {
     RNLockGuard g(boLock);
     const uint64_t *bus = bos[boIdx].bus;
+    const bool vram = bos[boIdx].dom != 0;                 // a VRAM buffer is contiguous: page i is at kRNVramMcBase + vramOff + i * 4096
+    const uint64_t vramPa = bos[boIdx].vramOff;           // the PTE of a local page holds the offset in VRAM, not the MC address (measured 2026-11-02: with 0x80_0000_0000 added the GPU's writes vanish)
     uint64_t ptb = 0;
     bool ok = true;
     uint32_t done = 0;
     for (; done < pages; done++) {
         const uint64_t vp = vaPage + done;
         if (done == 0 || (vp & 0x1ff) == 0) { if (!vmPtb(vmid, vp, true, &ptb)) { ok = false; break; } }
-        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), rn_system_pte(bus[boPage + done]));
+        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), vram ? rn_vram_pte(vramPa + static_cast<uint64_t>(boPage + done) * 4096) : rn_system_pte(bus[boPage + done]));
     }
     if (!ok) {                                       // leave nothing half mapped
         for (uint32_t p = 0; p < done; p++) {
@@ -2482,7 +2553,7 @@ void RedNaviProbe::vmUnmap(int vmid, uint64_t vaPage, uint32_t pages) {
 int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
     RNLockGuard g(boLock);
     int slot = -1;
-    for (uint32_t i = 0; i < boCount; i++) if (!bos[i].md) { slot = static_cast<int>(i); break; }
+    for (uint32_t i = 0; i < boCount; i++) if (!bos[i].size) { slot = static_cast<int>(i); break; }
     if (slot < 0 && boCount < kBoCap) slot = static_cast<int>(boCount);
     if (!gpuLive || !bos || slot < 0 || size == 0 || size > kBoMaxBytes) return -1;
     size = (size + 4095u) & ~4095u;
@@ -2531,6 +2602,31 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
     if (gart) gartNextPage += pages;
     boBytes += size;
     return idx;
+}
+
+// A buffer in VRAM, from the device-local pool or, for `visible`, from the part of the aperture the CPU can reach. A visible buffer is cleared through the aperture; a device-local
+// one is not (nothing but the GPU can write it: rn_uapi.h).
+int RedNaviProbe::createVramBo(uint32_t size, bool visible) {
+    RNLockGuard g(boLock);
+    int slot = -1;
+    for (uint32_t i = 0; i < boCount; i++) if (!bos[i].size) { slot = static_cast<int>(i); break; }
+    if (slot < 0 && boCount < kBoCap) slot = static_cast<int>(boCount);
+    if (!gpuLive || !bos || slot < 0 || size == 0 || size > kBoMaxBytes) return -1;
+    size = (size + 4095u) & ~4095u;
+    VramPool &pool = visible ? visPool : devPool;
+    uint64_t off = 0;
+    if (!pool.alloc(size, &off)) return -1;
+    IOMemoryDescriptor *vmd = nullptr;
+    if (visible) {
+        vmd = bar0Mem ? IODeviceMemory::withSubRange(bar0Mem, off, size) : nullptr;
+        IOMemoryMap *km = vmd ? vmd->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+        if (!km) { if (vmd) vmd->release(); pool.release(off, size); return -1; }
+        memset(reinterpret_cast<void *>(km->getVirtualAddress()), 0, size);
+        km->release();
+    }
+    if (static_cast<uint32_t>(slot) == boCount) boCount++;
+    bos[slot] = {nullptr, nullptr, 0, size, nullptr, false, vmd, off, visible ? RN_BO_VRAM_VISIBLE : RN_BO_VRAM};
+    return slot;
 }
 
 // The MES bring-up result as ioreg properties (ioreg -rn RedNaviProbe -l -x). Out of line so that its name tables do not sit in sdmaTest's frame.
@@ -2763,6 +2859,18 @@ void RedNaviProbe::sdmaTest() {
         }
     }
     gmcLive = gmc;
+    {   // the VRAM the allocator hands out (docs/COMPAT.md, "VRAM buffers"). Device-local: above the user page-table pools (kVmTables + 7 x 16 MB) to 15.25 GB, below the PSP
+        // TMR at 15.5 GB and the discovery table at the end. CPU-visible: the free parts of the PCI aperture, between the scanout (4K fits in 34 MB from 0x08000000) and the
+        // kernel tables at 0x0C000000, and above those (the MES area and the GART table end well before 0x0D000000) up to the aperture's end.
+        bar0Mem = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
+        const uint64_t apLen = bar0Mem ? static_cast<uint64_t>(bar0Mem->getLength()) : 0;
+        devPool.init(kVmTables + 7ull * kVmPoolPages * 4096, 0x3D0000000ull - (kVmTables + 7ull * kVmPoolPages * 4096));
+        if (apLen >= 0x10000000ull) {
+            visPool.init(kRNScanoutVramOff + 0x02200000ull, 0x0C000000ull - (kRNScanoutVramOff + 0x02200000ull));
+            visPool.add(0x0D000000ull, 0x10000000ull - 0x0D000000ull);
+        }
+        IOLog("RedNavi: VRAM allocator: %llu MB device-local, %llu MB CPU-visible\n", (uint64_t)(devPool.totalPages >> 8), (uint64_t)(visPool.totalPages >> 8));
+    }
     gpuLive = true;
     trace[4] = rd(0x1295 * 4);
     {   // do the GCVM writes stick? (they read 0 on a healthy Linux system too, so this may tell nothing)
@@ -3429,6 +3537,7 @@ void RedNaviProbe::stop(IOService *provider) {
     for (uint32_t i = 0; bos && i < boCount; i++) {
         if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); }
         if (bos[i].md) bos[i].md->release();
+        if (bos[i].vmd) bos[i].vmd->release();
         if (bos[i].bus) IOFree(bos[i].bus, sizeof(uint64_t) * (bos[i].size / 4096));
     }
     boCount = 0;
