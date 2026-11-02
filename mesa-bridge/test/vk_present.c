@@ -74,10 +74,11 @@ static int triangle_main(int argc, char **argv)
    void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
    int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
    if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
+   int (*present_fn)(uint32_t, int) = dlsym(lib, "rn_bridge_present");
    uint32_t W, H, pitch;
    void *scan;
    size_t slen;
-   int sr = scanout(0, &W, &H, &pitch, &scan, &slen);
+   int sr = scanout(1, &W, &H, &pitch, &scan, &slen);
    if (sr) { fprintf(stderr, "no display surface (rn_bridge_scanout %d): needs rednavi_fb=1\n", sr); return 2; }
    printf("display surface %ux%u, pitch %u bytes, %zu bytes mapped at %p\n", W, H, pitch, slen, scan);
 
@@ -202,7 +203,11 @@ static int triangle_main(int argc, char **argv)
          printf("row %4u: x=100 0x%08x x=1800 0x%08x\n", y, ((volatile uint32_t *)((uint8_t *)scan + (size_t)y * pitch))[100], ((volatile uint32_t *)((uint8_t *)scan + (size_t)y * pitch))[1800]);
    if (bad) printf("FAIL: %u of %u pixels wrong, first at (%u,%u): 0x%06x\n", bad, checked, firstX, firstY, firstGot);
    else printf("PASS: %u pixels read back from the display surface: red upper-left half, blue the rest\n", checked);
-   if (seconds > 0) { printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds); }
+   if (seconds > 0) {
+      present_fn(1, 1);                                     /* surface 1 on the display; the desktop's surface 0 is WindowServer's and would be drawn over */
+      printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds);
+      present_fn(0, 1);
+   }
    return bad ? 1 : 0;
 }
 
@@ -245,10 +250,11 @@ static int scene_main(int argc, char **argv)
    void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
    int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
    if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
+   int (*present_fn)(uint32_t, int) = dlsym(lib, "rn_bridge_present");
    uint32_t W, H, pitch;
    void *scan;
    size_t slen;
-   if (scanout(0, &W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
+   if (scanout(1, &W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
    printf("display surface %ux%u, pitch %u\n", W, H, pitch);
    PFN_vkGetMemoryHostPointerPropertiesEXT getHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
    VkMemoryHostPointerPropertiesEXT hpp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -462,7 +468,11 @@ static int scene_main(int argc, char **argv)
    printf("edge of the triangle: %u partly covered pixels, %u not a 4-sample level; levels 1/4: %d, 2/4: %d, 3/4: %d\n", partial, badPartial, levels[1], levels[2], levels[3]);
    const int ok = !badTex && !badGrad && !badBg && nTex > 1000 && nGrad > 1000 && partial > 100 && !badPartial && levels[1] && levels[2] && levels[3];
    puts(ok ? "PASS: depth test, texture sampling and 4x MSAA resolve are right" : "FAIL");
-   if (seconds > 0) { printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds); }
+   if (seconds > 0) {
+      present_fn(1, 1);                                     /* surface 1 on the display; the desktop's surface 0 is WindowServer's and would be drawn over */
+      printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds);
+      present_fn(0, 1);
+   }
    return ok ? 0 : 1;
 }
 
@@ -471,25 +481,7 @@ static int scene_main(int argc, char **argv)
  * A render loop: two cubes (8 vertices, 36 16-bit indices, device-local buffers filled once through a staging buffer) rotate, one orbiting the other. The model-view-projection matrix of
  * each is a push constant, a uniform buffer written by the CPU every frame tints them, the frame is rendered with 4 samples and resolved, and copied into the display surface. Two
  * frames are in flight (two command buffers re-recorded in turn, two uniform buffers and fences). The loop is paced at the requested rate. */
-typedef float mat4[16];                                              /* column-major: m[column * 4 + row] */
-static void m_mul(mat4 r, const mat4 a, const mat4 b)
-{
-   mat4 t;
-   for (int c = 0; c < 4; c++) for (int rw = 0; rw < 4; rw++) { float v = 0; for (int k = 0; k < 4; k++) v += a[k * 4 + rw] * b[c * 4 + k]; t[c * 4 + rw] = v; }
-   memcpy(r, t, sizeof(t));
-}
-static void m_id(mat4 m) { memset(m, 0, sizeof(mat4)); m[0] = m[5] = m[10] = m[15] = 1; }
-static void m_rot_y(mat4 m, float a) { m_id(m); m[0] = cosf(a); m[8] = sinf(a); m[2] = -sinf(a); m[10] = cosf(a); }
-static void m_rot_x(mat4 m, float a) { m_id(m); m[5] = cosf(a); m[9] = -sinf(a); m[6] = sinf(a); m[10] = cosf(a); }
-static void m_trans(mat4 m, float x, float y, float z) { m_id(m); m[12] = x; m[13] = y; m[14] = z; }
-static void m_scale(mat4 m, float s) { m_id(m); m[0] = m[5] = m[10] = s; }
-static void m_persp(mat4 m, float fovy, float aspect, float n, float f)    /* Vulkan clip space: y down, depth 0 to 1 */
-{
-   const float t = 1.0f / tanf(fovy / 2);
-   memset(m, 0, sizeof(mat4));
-   m[0] = t / aspect; m[5] = -t; m[10] = f / (n - f); m[11] = -1; m[14] = n * f / (n - f);
-}
-static double now_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6; }
+#include "vk_mat.h"
 
 static int spin_main(int argc, char **argv)
 {

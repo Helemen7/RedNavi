@@ -136,3 +136,7 @@ RADV now reports a queue family with GRAPHICS (flags 0xf) next to the compute-on
 ### Presentation and 3D, 2026-11-02
 
 `vk_present` (`mesa-bridge/test/vk_present.c`) writes into the display surface: the bridge's `rn_bridge_scanout()` maps it and RADV imports the pointer with `VK_EXT_external_memory_host`; the kext hands the same VRAM out as an `RN_BO_SCANOUT` buffer. `vk_present` draws the triangle at 1920 x 1080; `vk_present scene` renders two crossing quads (a checkerboard texture and a gradient, with a D32_SFLOAT depth buffer) and a slanted triangle with 4x MSAA and a resolve, and checks the surface pixel by pixel (depth rejection, texture sampling, the 1/4, 2/4 and 3/4 coverage levels on the edge). Both confirmed on the monitor. The graphics queue is reset and watched like the compute queue (`rn_test gfxreset`). Details in docs/COMPAT.md.
+
+### Swapchain, 2026-11-02
+
+`VK_KHR_swapchain` works on the headless surface, which is the display (docs/M6_PLAN.md, step 1b): `__APPLE__` branches in `wsi_common_headless.c`, `radv_wsi.[ch]`, a `stride_align` for CPU images in the common WSI code. `mesa-bridge/test/vk_swapchain.c` is the test.

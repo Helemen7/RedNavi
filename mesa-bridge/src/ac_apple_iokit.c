@@ -66,6 +66,9 @@ struct ac_drm_device {
    struct util_sync_provider sync;
 };
 
+/* The display geometry as the last opened device saw it. RADV opens a device to probe the physical device and closes it again before the logical device exists, but the surface
+ * queries of a swapchain come in between. */
+static struct { uint32_t width, height, pitch, surfaces; } display_info;
 static struct ac_drm_device *last_dev;                        /* the device the scanout helper below works on: the process has one Vulkan device */
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- errors, time */
@@ -370,6 +373,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
    dev->next_ctx = 1;
    dev->refs = 1;
    last_dev = dev;
+   display_info.width = dev->info.fb_width; display_info.height = dev->info.fb_height; display_info.pitch = dev->info.fb_pitch; display_info.surfaces = dev->info.fb_surfaces;
    dev->sync = (struct util_sync_provider) {
       .create = sp_create, .destroy = sp_destroy, .handle_to_fd = sp_unsupported_fd, .fd_to_handle = sp_unsupported_fd_to_handle,
       .import_sync_file = sp_unsupported_import, .export_sync_file = sp_unsupported_fd, .wait = sp_wait, .reset = sp_reset, .signal = sp_signal,
@@ -745,6 +749,21 @@ int rn_bridge_scanout(uint32_t surface, uint32_t *width, uint32_t *height, uint3
    *pitch_bytes = dev->info.fb_pitch;
    *cpu = dev->scan_cpu[surface];
    *len = dev->scan_len[surface];
+   return 0;
+}
+
+/* The display's geometry and how many display surfaces exist (0 is the desktop's), without mapping any: what the swapchain's surface capabilities are made of. */
+__attribute__((visibility("default")))
+int rn_bridge_scanout_info(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, uint32_t *surfaces);
+__attribute__((visibility("default")))
+int rn_bridge_scanout_info(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, uint32_t *surfaces)
+{
+   if (!display_info.pitch)
+      return -ENODEV;
+   *width = display_info.width;
+   *height = display_info.height;
+   *pitch_bytes = display_info.pitch;
+   *surfaces = display_info.surfaces;
    return 0;
 }
 

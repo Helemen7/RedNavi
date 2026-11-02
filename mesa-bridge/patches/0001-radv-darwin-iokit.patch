@@ -24,10 +24,10 @@ index 356df4d..fff4be6 100644
  
 diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
 new file mode 100644
-index 0000000..a77f256
+index 0000000..7b08e38
 --- /dev/null
 +++ b/src/amd/common/apple/ac_apple_iokit.c
-@@ -0,0 +1,1194 @@
+@@ -0,0 +1,1213 @@
 +/*
 + * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
 + *
@@ -97,6 +97,9 @@ index 0000000..a77f256
 +   struct util_sync_provider sync;
 +};
 +
++/* The display geometry as the last opened device saw it. RADV opens a device to probe the physical device and closes it again before the logical device exists, but the surface
++ * queries of a swapchain come in between. */
++static struct { uint32_t width, height, pitch, surfaces; } display_info;
 +static struct ac_drm_device *last_dev;                        /* the device the scanout helper below works on: the process has one Vulkan device */
 +
 +int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
@@ -418,6 +421,7 @@ index 0000000..a77f256
 +   dev->next_ctx = 1;
 +   dev->refs = 1;
 +   last_dev = dev;
++   display_info.width = dev->info.fb_width; display_info.height = dev->info.fb_height; display_info.pitch = dev->info.fb_pitch; display_info.surfaces = dev->info.fb_surfaces;
 +   dev->sync = (struct util_sync_provider) {
 +      .create = sp_create, .destroy = sp_destroy, .handle_to_fd = sp_unsupported_fd, .fd_to_handle = sp_unsupported_fd_to_handle,
 +      .import_sync_file = sp_unsupported_import, .export_sync_file = sp_unsupported_fd, .wait = sp_wait, .reset = sp_reset, .signal = sp_signal,
@@ -783,6 +787,21 @@ index 0000000..a77f256
 +   *pitch_bytes = dev->info.fb_pitch;
 +   *cpu = dev->scan_cpu[surface];
 +   *len = dev->scan_len[surface];
++   return 0;
++}
++
++/* The display's geometry and how many display surfaces exist (0 is the desktop's), without mapping any: what the swapchain's surface capabilities are made of. */
++__attribute__((visibility("default")))
++int rn_bridge_scanout_info(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, uint32_t *surfaces);
++__attribute__((visibility("default")))
++int rn_bridge_scanout_info(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, uint32_t *surfaces)
++{
++   if (!display_info.pitch)
++      return -ENODEV;
++   *width = display_info.width;
++   *height = display_info.height;
++   *pitch_bytes = display_info.pitch;
++   *surfaces = display_info.surfaces;
 +   return 0;
 +}
 +
@@ -2047,6 +2066,59 @@ index 7d6823a..015e00f 100644
  VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device,
                                      struct vk_physical_device **out);
  
+diff --git a/src/amd/vulkan/radv_wsi.c b/src/amd/vulkan/radv_wsi.c
+index d862dad..8f5fb28 100644
+--- a/src/amd/vulkan/radv_wsi.c
++++ b/src/amd/vulkan/radv_wsi.c
+@@ -41,6 +41,11 @@ radv_wsi_set_memory_ownership(VkDevice _device, VkDeviceMemory _mem, VkBool32 ow
+ static struct vk_queue *
+ radv_wsi_get_prime_blit_queue(VkDevice _device)
+ {
++#ifdef __APPLE__
++   /* The kext has no SDMA queue: the swapchain blits on the application's queue. */
++   (void)_device;
++   return NULL;
++#else
+    VK_FROM_HANDLE(radv_device, device, _device);
+    struct radv_physical_device *pdev = radv_device_physical(device);
+    const struct radv_instance *instance = radv_physical_device_instance(pdev);
+@@ -88,6 +93,7 @@ radv_wsi_get_prime_blit_queue(VkDevice _device)
+ 
+    simple_mtx_unlock(&device->blit_queue_mtx);
+    return NULL;
++#endif
+ }
+ 
+ VkResult
+@@ -97,7 +103,14 @@ radv_init_wsi(struct radv_physical_device *pdev)
+ 
+    VkResult result =
+       wsi_device_init(&pdev->wsi_device, radv_physical_device_to_handle(pdev), radv_wsi_proc_addr, &instance->vk.alloc,
+-                      pdev->wsi_master_fd, &pdev->drirc.options, &(struct wsi_device_options){.sw_device = false});
++                      pdev->wsi_master_fd, &pdev->drirc.options, &(struct wsi_device_options){
++#ifdef __APPLE__
++                         /* no dma-buf: the swapchain images are blitted into buffers the bridge imports (the display's surfaces), the way software rasterizers present */
++                         .sw_device = true
++#else
++                         .sw_device = false
++#endif
++                      });
+    if (result != VK_SUCCESS)
+       return result;
+ 
+diff --git a/src/amd/vulkan/radv_wsi.h b/src/amd/vulkan/radv_wsi.h
+index 2ab3107..0352772 100644
+--- a/src/amd/vulkan/radv_wsi.h
++++ b/src/amd/vulkan/radv_wsi.h
+@@ -14,7 +14,7 @@
+ #include "radv_physical_device.h"
+ 
+ #if defined(VK_USE_PLATFORM_WAYLAND_KHR) || defined(VK_USE_PLATFORM_XCB_KHR) || defined(VK_USE_PLATFORM_XLIB_KHR) ||   \
+-   defined(VK_USE_PLATFORM_DISPLAY_KHR)
++   defined(VK_USE_PLATFORM_DISPLAY_KHR) || defined(__APPLE__)   /* macOS: the headless surface is the display (wsi_common_headless.c) */
+ #define RADV_USE_WSI_PLATFORM
+ #endif
+ 
 diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
 index 59348f1..2dffc46 100644
 --- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
@@ -2158,3 +2230,240 @@ index 57de98e..4e387bd 100644
  
  #include "drm-uapi/drm.h"
  
+diff --git a/src/vulkan/wsi/wsi_common.c b/src/vulkan/wsi/wsi_common.c
+index e7e077f..d66abb1 100644
+--- a/src/vulkan/wsi/wsi_common.c
++++ b/src/vulkan/wsi/wsi_common.c
+@@ -3654,7 +3654,7 @@ wsi_configure_cpu_image(const struct wsi_swapchain *chain,
+ 
+    if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
+       wsi_configure_buffer_image(chain, pCreateInfo,
+-                                 1 /* stride_align */,
++                                 params->stride_align ? params->stride_align : 1,
+                                  1 /* size_align */,
+                                  info);
+ 
+diff --git a/src/vulkan/wsi/wsi_common_headless.c b/src/vulkan/wsi/wsi_common_headless.c
+index 05906d4..3e5fce2 100644
+--- a/src/vulkan/wsi/wsi_common_headless.c
++++ b/src/vulkan/wsi/wsi_common_headless.c
+@@ -23,6 +23,8 @@
+ 
+ /** VK_EXT_headless_surface */
+ 
++#include <stdio.h>
++#include <stdlib.h>
+ #include "util/macros.h"
+ #include "util/timespec.h"
+ #include "vk_util.h"
+@@ -33,6 +35,37 @@
+ 
+ #include "drm-uapi/drm_fourcc.h"
+ 
++#ifdef __APPLE__
++/* On macOS with the RedNavi kext the "headless" surface is the display: the swapchain images are blitted into display surfaces 1 and 2 (surface 0 is the desktop's) and presenting is
++ * a page flip at the vertical blank. The functions live in the RedNavi bridge, src/amd/common/apple/ac_apple_iokit.c. */
++extern int rn_bridge_scanout_info(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, uint32_t *surfaces);
++extern int rn_bridge_scanout(uint32_t surface, uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, void **cpu, size_t *len);
++extern int rn_bridge_present(uint32_t surface, int wait);
++
++static bool
++rn_display(const struct wsi_device *wsi_device, uint32_t *w, uint32_t *h, uint32_t *pitch, uint32_t *surfaces)
++{
++   const int r = wsi_device->sw ? rn_bridge_scanout_info(w, h, pitch, surfaces) : -1000;
++   if (getenv("RN_BRIDGE_DEBUG"))
++      fprintf(stderr, "rn-bridge: wsi display: sw %d, scanout_info %d, %ux%u, %u surfaces\n", wsi_device->sw, r, r == 0 ? *w : 0, r == 0 ? *h : 0, r == 0 ? *surfaces : 0);
++   return r == 0 && *surfaces >= 2;
++}
++
++static _Thread_local uint32_t rn_alloc_surface;
++static int rn_display_chains;           /* swapchains that own the display now; the desktop's surface comes back when the last one goes (a replacement is made before the old one is destroyed) */
++
++static uint8_t *
++rn_alloc_shm(struct wsi_image *image, unsigned size)
++{
++   uint32_t w, h, pitch;
++   void *cpu;
++   size_t len;
++   if (rn_bridge_scanout(rn_alloc_surface, &w, &h, &pitch, &cpu, &len) != 0 || size > len)
++      return NULL;
++   return cpu;
++}
++#endif
++
+ struct wsi_headless {
+    struct wsi_interface base;
+ };
+@@ -74,6 +107,17 @@ wsi_headless_surface_get_capabilities(VkIcdSurfaceBase *surface,
+       wsi_device->maxImageDimension2D,
+       wsi_device->maxImageDimension2D,
+    };
++#ifdef __APPLE__
++   uint32_t dw, dh, dpitch, dsurfaces;
++   if (rn_display(wsi_device, &dw, &dh, &dpitch, &dsurfaces)) {
++      /* one image per display surface but the desktop's */
++      caps->surfaceCapabilities.minImageCount = dsurfaces - 1;
++      caps->surfaceCapabilities.maxImageCount = dsurfaces - 1;
++      caps->surfaceCapabilities.currentExtent = (VkExtent2D) { dw, dh };
++      caps->surfaceCapabilities.minImageExtent = (VkExtent2D) { dw, dh };
++      caps->surfaceCapabilities.maxImageExtent = (VkExtent2D) { dw, dh };
++   }
++#endif
+ 
+    caps->surfaceCapabilities.supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    caps->surfaceCapabilities.currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+@@ -213,6 +257,22 @@ wsi_headless_surface_get_formats(VkIcdSurfaceBase *icd_surface,
+ {
+    VK_OUTARRAY_MAKE_TYPED(VkSurfaceFormatKHR, out, pSurfaceFormats, pSurfaceFormatCount);
+ 
++#ifdef __APPLE__
++   uint32_t dw, dh, dpitch, dsurfaces;
++   if (rn_display(wsi_device, &dw, &dh, &dpitch, &dsurfaces)) {
++      /* the display scans out XRGB8888: bytes B, G, R, X */
++      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
++         out_fmt->format = VK_FORMAT_B8G8R8A8_UNORM;
++         out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++      vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
++         out_fmt->format = VK_FORMAT_B8G8R8A8_SRGB;
++         out_fmt->colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
++      }
++      return vk_outarray_status(&out);
++   }
++#endif
++
+    if (wsi_device->force_bgra8_unorm_first) {
+       vk_outarray_append_typed(VkSurfaceFormatKHR, &out, out_fmt) {
+          out_fmt->format = VK_FORMAT_B8G8R8A8_UNORM;
+@@ -306,6 +366,21 @@ wsi_headless_surface_get_present_modes(VkIcdSurfaceBase *surface,
+                                        uint32_t* pPresentModeCount,
+                                        VkPresentModeKHR* pPresentModes)
+ {
++#ifdef __APPLE__
++   uint32_t dw, dh, dpitch, dsurfaces;
++   if (rn_display(wsi_device, &dw, &dh, &dpitch, &dsurfaces)) {
++      /* a page flip at the vertical blank, and present blocks until it is done: FIFO */
++      if (pPresentModes == NULL) {
++         *pPresentModeCount = 1;
++         return VK_SUCCESS;
++      }
++      if (*pPresentModeCount == 0)
++         return VK_INCOMPLETE;
++      pPresentModes[0] = VK_PRESENT_MODE_FIFO_KHR;
++      *pPresentModeCount = 1;
++      return VK_SUCCESS;
++   }
++#endif
+    if (pPresentModes == NULL) {
+       *pPresentModeCount = ARRAY_SIZE(present_modes);
+       return VK_SUCCESS;
+@@ -357,6 +432,8 @@ struct wsi_headless_image {
+ 
+ struct wsi_headless_swapchain {
+    struct wsi_swapchain base;
++   bool display;        /* the images are blitted into display surfaces (RedNavi, macOS) */
++   int displayed;       /* image on the display now, -1 before the first present */
+    struct wsi_headless_image images[0];
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(wsi_headless_swapchain, base.base, VkSwapchainKHR,
+@@ -400,6 +477,27 @@ wsi_headless_swapchain_acquire_next_image(struct wsi_swapchain *wsi_chain,
+ 
+    timespec_from_nsec(&rel_timeout, info->timeout);
+ 
++#ifdef __APPLE__
++   if (chain->display) {
++      /* any image that is not on the display and not held by the application; present blocks until its flip is done, so no image is pending */
++      struct timespec t0, now;
++      clock_gettime(CLOCK_MONOTONIC, &t0);
++      timespec_add(&end_time, &rel_timeout, &t0);
++      for (;;) {
++         for (uint32_t i = 0; i < chain->base.image_count; i++) {
++            if (!chain->images[i].busy_on_host && ((int)i != chain->displayed || chain->base.image_count == 1)) {
++               chain->images[i].busy_on_host = true;
++               *image_index = i;
++               return VK_SUCCESS;
++            }
++         }
++         clock_gettime(CLOCK_MONOTONIC, &now);
++         if (timespec_after(&now, &end_time))
++            return VK_NOT_READY;
++      }
++   }
++#endif
++
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    timespec_add(&end_time, &rel_timeout, &start_time);
+ 
+@@ -440,6 +538,15 @@ wsi_headless_swapchain_queue_present(struct wsi_swapchain *wsi_chain,
+ 
+    assert(image_index < chain->base.image_count);
+ 
++#ifdef __APPLE__
++   if (chain->display) {
++      /* the blit into the display surface is done (the common code waited for it): flip to it and wait for the vertical blank */
++      int r = rn_bridge_present(1 + image_index, 1);
++      chain->displayed = (int)image_index;
++      chain->images[image_index].busy_on_host = false;
++      return r < 0 ? VK_ERROR_SURFACE_LOST_KHR : VK_SUCCESS;
++   }
++#endif
+    chain->images[image_index].busy_on_host = false;
+ 
+    return VK_SUCCESS;
+@@ -461,6 +568,10 @@ wsi_headless_swapchain_destroy(struct wsi_swapchain *wsi_chain,
+    struct wsi_headless_swapchain *chain =
+       (struct wsi_headless_swapchain *)wsi_chain;
+ 
++#ifdef __APPLE__
++   if (chain->display && __atomic_sub_fetch(&rn_display_chains, 1, __ATOMIC_SEQ_CST) == 0)
++      rn_bridge_present(0, 1);                       /* the screen goes back to the desktop's surface */
++#endif
+    for (uint32_t i = 0; i < chain->base.image_count; i++) {
+       if (chain->images[i].base.image != VK_NULL_HANDLE)
+          wsi_destroy_image(&chain->base, &chain->images[i].base);
+@@ -526,6 +637,21 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+       cpu_params = (struct wsi_cpu_image_params) {
+          .base.image_type = WSI_IMAGE_TYPE_CPU,
+       };
++#ifdef __APPLE__
++      uint32_t dw, dh, dpitch, dsurfaces;
++      if (rn_display(wsi_device, &dw, &dh, &dpitch, &dsurfaces)) {
++         if (pCreateInfo->imageExtent.width != dw || pCreateInfo->imageExtent.height != dh ||
++             num_images > (int)dsurfaces - 1) {
++            vk_free(pAllocator, chain);
++            return VK_ERROR_INITIALIZATION_FAILED;
++         }
++         cpu_params.alloc_shm = rn_alloc_shm;
++         cpu_params.stride_align = 256;               /* the display's pitch: the width rounded up to 64 pixels */
++         chain->display = true;
++         chain->displayed = -1;
++         __atomic_add_fetch(&rn_display_chains, 1, __ATOMIC_SEQ_CST);
++      }
++#endif
+       image_params = &cpu_params.base;
+    } else {
+       drm_params = (struct wsi_drm_image_params) {
+@@ -559,6 +685,9 @@ wsi_headless_surface_create_swapchain(VkIcdSurfaceBase *icd_surface,
+ 
+    uint32_t image = 0;
+    for (; image < chain->base.image_count; image++) {
++#ifdef __APPLE__
++      rn_alloc_surface = 1 + image;                   /* surface 0 is the desktop's */
++#endif
+       result = wsi_create_image(&chain->base, &chain->base.image_info,
+                                 &chain->images[image].base);
+       if (result != VK_SUCCESS)
+diff --git a/src/vulkan/wsi/wsi_common_private.h b/src/vulkan/wsi/wsi_common_private.h
+index 58b592a..6805723 100644
+--- a/src/vulkan/wsi/wsi_common_private.h
++++ b/src/vulkan/wsi/wsi_common_private.h
+@@ -59,6 +59,9 @@ struct wsi_cpu_image_params {
+    struct wsi_base_image_params base;
+ 
+    uint8_t *(*alloc_shm)(struct wsi_image *image, unsigned size);
++
++   /* Row pitch alignment of the buffer images in bytes (0: 1) */
++   uint32_t stride_align;
+ };
+ 
+ struct wsi_drm_image_params {
