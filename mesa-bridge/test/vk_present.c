@@ -5,6 +5,7 @@
  * pixels back through the same memory. Needs rednavi_fb=1 (and a display). Usage: vk_present [seconds to leave the picture up, default 20]
  *   clang -O1 -arch x86_64 -mmacosx-version-min=12 -I/opt/local/include test/vk_present.c -L/opt/local/lib -lvulkan -o vk_present
  * Exit status 0 when the pixels read back from the surface are right.
+ *   vk_present scene [seconds]: the harder scene below (depth test, texture sampling, 4x multisampling with a resolve into the surface).
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@
 #include <vulkan/vulkan.h>
 
 #include "vk_draw_spv.h"
+#include "vk_scene_spv.h"
 
 #define CHECK(x)                                                                                    \
    do {                                                                                             \
@@ -35,7 +37,7 @@ static uint32_t memType(uint32_t bits, VkMemoryPropertyFlags want, VkMemoryPrope
    exit(2);
 }
 
-int main(int argc, char **argv)
+static int triangle_main(int argc, char **argv)
 {
    const int seconds = argc > 1 ? atoi(argv[1]) : 20;
    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "rn_vk_present", .apiVersion = VK_API_VERSION_1_1};
@@ -196,4 +198,271 @@ int main(int argc, char **argv)
    else printf("PASS: %u pixels read back from the display surface: red upper-left half, blue the rest\n", checked);
    if (seconds > 0) { printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds); }
    return bad ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------------------------------------------------------------------------------ scene
+ * Two quads that cross each other and a thin slanted triangle, drawn with a D32_SFLOAT depth buffer, a sampled checkerboard texture and 4 samples per pixel. Quad A (texture) is
+ * nearer than quad B (a gradient computed in the shader) for x < 0 and farther for x > 0, and B is drawn after A: only the depth test keeps A visible on the left. The multisampled
+ * colour image is resolved by the render pass into a single-sample image, which is copied into the display surface. Checked against the picture computed here. */
+static int scene_main(int argc, char **argv)
+{
+   const int seconds = argc > 1 ? atoi(argv[1]) : 20;
+   VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "rn_vk_scene", .apiVersion = VK_API_VERSION_1_1};
+   VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
+   VkInstance inst;
+   CHECK(vkCreateInstance(&ici, NULL, &inst));
+   uint32_t n = 1;
+   VkPhysicalDevice pd;
+   VkResult r = vkEnumeratePhysicalDevices(inst, &n, &pd);
+   if ((r != VK_SUCCESS && r != VK_INCOMPLETE) || n < 1) { fprintf(stderr, "no device\n"); return 2; }
+   vkGetPhysicalDeviceMemoryProperties(pd, &mp);
+   uint32_t nq = 8;
+   VkQueueFamilyProperties qf[8];
+   vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
+   int fam = -1;
+   for (uint32_t i = 0; i < nq; i++) if (fam < 0 && (qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)) fam = (int)i;
+   if (fam < 0) { fprintf(stderr, "no graphics queue family\n"); return 2; }
+   VkImageFormatProperties ifp;
+   r = vkGetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_B8G8R8A8_UNORM, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, 0, &ifp);
+   printf("B8G8R8A8 colour attachment: %d, sample counts 0x%x\n", (int)r, ifp.sampleCounts);
+   r = vkGetPhysicalDeviceImageFormatProperties(pd, VK_FORMAT_D32_SFLOAT, VK_IMAGE_TYPE_2D, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, 0, &ifp);
+   printf("D32_SFLOAT depth attachment: %d, sample counts 0x%x\n", (int)r, ifp.sampleCounts);
+   float prio = 1.0f;
+   VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = (uint32_t)fam, .queueCount = 1, .pQueuePriorities = &prio};
+   const char *exts[] = {"VK_EXT_external_memory_host"};
+   VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .enabledExtensionCount = 1, .ppEnabledExtensionNames = exts};
+   VkDevice dev;
+   CHECK(vkCreateDevice(pd, &dci, NULL, &dev));
+   VkQueue q;
+   vkGetDeviceQueue(dev, (uint32_t)fam, 0, &q);
+
+   void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
+   int (*scanout)(uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
+   if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
+   uint32_t W, H, pitch;
+   void *scan;
+   size_t slen;
+   if (scanout(&W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
+   printf("display surface %ux%u, pitch %u\n", W, H, pitch);
+   PFN_vkGetMemoryHostPointerPropertiesEXT getHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
+   VkMemoryHostPointerPropertiesEXT hpp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+   CHECK(getHostProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, scan, &hpp));
+   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = slen, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   VkBuffer sbuf;
+   CHECK(vkCreateBuffer(dev, &bci, NULL, &sbuf));
+   VkMemoryRequirements mr;
+   vkGetBufferMemoryRequirements(dev, sbuf, &mr);
+   VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = scan};
+   VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = slen, .memoryTypeIndex = memType(hpp.memoryTypeBits & mr.memoryTypeBits, 0, 0)};
+   VkDeviceMemory smem;
+   CHECK(vkAllocateMemory(dev, &mai, NULL, &smem));
+   CHECK(vkBindBufferMemory(dev, sbuf, smem, 0));
+
+   /* images: 4x colour, depth, resolve target, and the texture */
+   const VkFormat cfmt = VK_FORMAT_B8G8R8A8_UNORM, dfmt = VK_FORMAT_D32_SFLOAT;
+   struct { VkFormat f; VkImageUsageFlags u; VkSampleCountFlagBits s; VkImageAspectFlags a; uint32_t w, h; VkImage img; VkDeviceMemory mem; VkImageView view; } im[4] = {
+      {cfmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_ASPECT_COLOR_BIT, W, H},
+      {dfmt, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_SAMPLE_COUNT_4_BIT, VK_IMAGE_ASPECT_DEPTH_BIT, W, H},
+      {cfmt, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, W, H},
+      {VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_ASPECT_COLOR_BIT, 64, 64},
+   };
+   for (int i = 0; i < 4; i++) {
+      VkImageCreateInfo ic = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im[i].f, .extent = {im[i].w, im[i].h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                              .samples = im[i].s, .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = im[i].u, .sharingMode = VK_SHARING_MODE_EXCLUSIVE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED};
+      if (i == 0) ic.usage &= ~VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+      CHECK(vkCreateImage(dev, &ic, NULL, &im[i].img));
+      vkGetImageMemoryRequirements(dev, im[i].img, &mr);
+      VkMemoryAllocateInfo ma = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                                 .memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)};
+      CHECK(vkAllocateMemory(dev, &ma, NULL, &im[i].mem));
+      CHECK(vkBindImageMemory(dev, im[i].img, im[i].mem, 0));
+      VkImageViewCreateInfo vc = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im[i].img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = im[i].f,
+                                  .subresourceRange = {im[i].a, 0, 1, 0, 1}};
+      CHECK(vkCreateImageView(dev, &vc, NULL, &im[i].view));
+   }
+
+   /* the texture: 64 x 64, 8 x 8 texel cells, yellow and dark grey, through a host staging buffer */
+   VkBufferCreateInfo tbi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64 * 64 * 4, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+   VkBuffer stage;
+   CHECK(vkCreateBuffer(dev, &tbi, NULL, &stage));
+   vkGetBufferMemoryRequirements(dev, stage, &mr);
+   VkMemoryAllocateInfo sm = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size,
+                              .memoryTypeIndex = memType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, 0)};
+   VkDeviceMemory stmem;
+   CHECK(vkAllocateMemory(dev, &sm, NULL, &stmem));
+   CHECK(vkBindBufferMemory(dev, stage, stmem, 0));
+   uint32_t *tx;
+   CHECK(vkMapMemory(dev, stmem, 0, VK_WHOLE_SIZE, 0, (void **)&tx));
+   for (int y = 0; y < 64; y++) for (int x = 0; x < 64; x++) tx[y * 64 + x] = (((x / 8) + (y / 8)) & 1) ? 0xff00dcffu : 0xff282828u;   /* RGBA bytes: yellow (255,220,0), grey (40,40,40) */
+   VkSamplerCreateInfo sci = {.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_NEAREST, .minFilter = VK_FILTER_NEAREST, .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+                              .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT, .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT, .maxLod = 0.25f};
+   VkSampler samp;
+   CHECK(vkCreateSampler(dev, &sci, NULL, &samp));
+   VkDescriptorSetLayoutBinding dlb = {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+   VkDescriptorSetLayoutCreateInfo dlci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &dlb};
+   VkDescriptorSetLayout dsl;
+   CHECK(vkCreateDescriptorSetLayout(dev, &dlci, NULL, &dsl));
+   VkDescriptorPoolSize dps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1};
+   VkDescriptorPoolCreateInfo dpci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &dps};
+   VkDescriptorPool dpool;
+   CHECK(vkCreateDescriptorPool(dev, &dpci, NULL, &dpool));
+   VkDescriptorSetAllocateInfo dsai = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = dpool, .descriptorSetCount = 1, .pSetLayouts = &dsl};
+   VkDescriptorSet dset;
+   CHECK(vkAllocateDescriptorSets(dev, &dsai, &dset));
+   VkDescriptorImageInfo dii = {samp, im[3].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+   VkWriteDescriptorSet wds = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = dset, .dstBinding = 0, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &dii};
+   vkUpdateDescriptorSets(dev, 1, &wds, 0, NULL);
+
+   /* render pass: 4x colour (not stored), depth (not stored), resolve (stored, left as a transfer source) */
+   VkAttachmentDescription at[3] = {
+      {.format = cfmt, .samples = VK_SAMPLE_COUNT_4_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL},
+      {.format = dfmt, .samples = VK_SAMPLE_COUNT_4_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL},
+      {.format = cfmt, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+       .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .finalLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL}};
+   VkAttachmentReference cref = {0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL}, dref = {1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL}, rref = {2, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+   VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = 1, .pColorAttachments = &cref, .pResolveAttachments = &rref, .pDepthStencilAttachment = &dref};
+   VkRenderPassCreateInfo rpci = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = 3, .pAttachments = at, .subpassCount = 1, .pSubpasses = &sub};
+   VkRenderPass rp;
+   CHECK(vkCreateRenderPass(dev, &rpci, NULL, &rp));
+   VkImageView fbv[3] = {im[0].view, im[1].view, im[2].view};
+   VkFramebufferCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = rp, .attachmentCount = 3, .pAttachments = fbv, .width = W, .height = H, .layers = 1};
+   VkFramebuffer fb;
+   CHECK(vkCreateFramebuffer(dev, &fci, NULL, &fb));
+
+   VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+   VkShaderModule vs, fs;
+   smi.codeSize = scene_vert_spv_len; smi.pCode = (const uint32_t *)scene_vert_spv;
+   CHECK(vkCreateShaderModule(dev, &smi, NULL, &vs));
+   smi.codeSize = scene_frag_spv_len; smi.pCode = (const uint32_t *)scene_frag_spv;
+   CHECK(vkCreateShaderModule(dev, &smi, NULL, &fs));
+   VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &dsl};
+   VkPipelineLayout pl;
+   CHECK(vkCreatePipelineLayout(dev, &plci, NULL, &pl));
+   VkPipelineShaderStageCreateInfo stages[2] = {
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vs, .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs, .pName = "main"}};
+   VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+   VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+   VkViewport vp = {0, 0, (float)W, (float)H, 0, 1};
+   VkRect2D sc = {{0, 0}, {W, H}};
+   VkPipelineViewportStateCreateInfo vps = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .pViewports = &vp, .scissorCount = 1, .pScissors = &sc};
+   VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+                                                .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
+   VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_4_BIT};
+   VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthTestEnable = VK_TRUE, .depthWriteEnable = VK_TRUE, .depthCompareOp = VK_COMPARE_OP_LESS};
+   VkPipelineColorBlendAttachmentState cba = {.colorWriteMask = 0xf};
+   VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = 1, .pAttachments = &cba};
+   VkGraphicsPipelineCreateInfo gpi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                       .pViewportState = &vps, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .layout = pl,
+                                       .renderPass = rp, .subpass = 0};
+   VkPipeline pipe;
+   CHECK(vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpi, NULL, &pipe));
+   puts("pipeline compiled");
+
+   VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .queueFamilyIndex = (uint32_t)fam};
+   VkCommandPool pool;
+   CHECK(vkCreateCommandPool(dev, &cpci, NULL, &pool));
+   VkCommandBufferAllocateInfo cbai = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+   VkCommandBuffer cmd;
+   CHECK(vkAllocateCommandBuffers(dev, &cbai, &cmd));
+   VkCommandBufferBeginInfo cbbi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+   CHECK(vkBeginCommandBuffer(cmd, &cbbi));
+   /* texture upload and the layout change that makes it readable by the fragment shader */
+   VkImageMemoryBarrier b1 = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                              .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                              .image = im[3].img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b1);
+   VkBufferImageCopy tcp = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {64, 64, 1}};
+   vkCmdCopyBufferToImage(cmd, stage, im[3].img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &tcp);
+   VkImageMemoryBarrier b2 = b1;
+   b2.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT; b2.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+   b2.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL; b2.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, NULL, 0, NULL, 1, &b2);
+   VkClearValue cv[3] = {{.color = {{0.0f, 0.0f, 0.4f, 1.0f}}}, {.depthStencil = {1.0f, 0}}, {0}};
+   VkRenderPassBeginInfo rpbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = rp, .framebuffer = fb, .renderArea = {{0, 0}, {W, H}}, .clearValueCount = 3, .pClearValues = cv};
+   vkCmdBeginRenderPass(cmd, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+   vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+   vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pl, 0, 1, &dset, 0, NULL);
+   vkCmdDraw(cmd, 6, 1, 0, 0);     /* A: the textured quad */
+   vkCmdDraw(cmd, 6, 1, 0, 1);     /* B: the gradient quad, drawn later, hidden by A where A is nearer */
+   vkCmdDraw(cmd, 6, 1, 0, 2);     /* C: the slanted triangle */
+   vkCmdEndRenderPass(cmd);
+   VkBufferImageCopy cp = {.bufferRowLength = pitch / 4, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {W, H, 1}};
+   vkCmdCopyImageToBuffer(cmd, im[2].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf, 1, &cp);
+   VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
+   CHECK(vkEndCommandBuffer(cmd));
+   VkFenceCreateInfo fi = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+   VkFence fence;
+   CHECK(vkCreateFence(dev, &fi, NULL, &fence));
+   VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
+   puts("submitting");
+   fflush(stdout);
+   CHECK(vkQueueSubmit(q, 1, &si, fence));
+   r = vkWaitForFences(dev, 1, &fence, VK_TRUE, 8000000000ull);
+   printf("wait for fence: %d\n", (int)r);
+   if (r != VK_SUCCESS) return 3;
+
+   /* the picture, pixel by pixel, from the surface */
+   #define PX(x, y) (((volatile uint32_t *)((uint8_t *)scan + (size_t)(y) * pitch))[x] & 0x00ffffffu)
+   #define CH(p, sh) ((int)(((p) >> (sh)) & 0xff))
+   uint32_t badTex = 0, nTex = 0, badGrad = 0, nGrad = 0, badBg = 0, nBg = 0, partial = 0, badPartial = 0;
+   int levels[5] = {0};
+   uint32_t first[3] = {0, 0, 0};
+   for (uint32_t y = 0; y < H; y++) {
+      for (uint32_t x = 0; x < W; x++) {
+         const float xn = ((float)x + 0.5f) / (float)W * 2.0f - 1.0f, yn = ((float)y + 0.5f) / (float)H * 2.0f - 1.0f;
+         const int inQuad = xn > -0.9f && xn < 0.9f && yn > -0.9f && yn < 0.9f;
+         if (inQuad && xn < -0.01f && ((x % 5) == 0) && ((y % 5) == 0)) {              /* A, the textured quad, visible on the left only if the depth test works */
+            const float u = xn / 0.9f * 0.5f + 0.5f, v = yn / 0.9f * 0.5f + 0.5f;
+            const float fu = u * 64.0f, fv = v * 64.0f;
+            if (fu - (int)fu < 0.2f || fu - (int)fu > 0.8f || fv - (int)fv < 0.2f || fv - (int)fv > 0.8f || xn < -0.895f || yn < -0.895f || yn > 0.895f) continue;
+            const uint32_t want = (((int)fu + (int)fv) & 1) ? 0x00ffdc00u : 0x00282828u;
+            nTex++;
+            if (PX(x, y) != want) { if (!badTex) { first[0] = x; first[1] = y; first[2] = PX(x, y); } badTex++; }
+         } else if (inQuad && xn > 0.01f && ((x % 5) == 0) && ((y % 5) == 0) && xn < 0.895f && yn > -0.895f && yn < 0.895f) {   /* B, the gradient */
+            const float u = xn / 0.9f * 0.5f + 0.5f, v = yn / 0.9f * 0.5f + 0.5f;
+            const uint32_t p = PX(x, y);
+            nGrad++;
+            if (abs(CH(p, 16) - (int)(u * 255.0f + 0.5f)) > 3 || abs(CH(p, 8) - (int)(v * 255.0f + 0.5f)) > 3 || abs(CH(p, 0) - 64) > 3) badGrad++;
+         } else if (!inQuad && xn < 0.9f && ((x % 7) == 0) && ((y % 7) == 0)) {      /* the clear colour (0, 0, 0.4) around the quads */
+            nBg++;
+            if (PX(x, y) != 0x00000066u) badBg++;
+         }
+      }
+   }
+   /* the triangle's slanted edge: along each row the red channel steps 0 -> 255 through the 4-sample coverage levels (0, 64, 128, 191, 255, within 3) */
+   for (uint32_t y = 120; y < H - 120; y += 3) {
+      const float yn = ((float)y + 0.5f) / (float)H * 2.0f - 1.0f;
+      const float edgeX = 0.92f + 0.06f * (yn + 0.9f) / 1.8f;             /* from (0.92, -0.9) to (0.98, 0.9): the left edge of the triangle's body is vertical at 0.92, the slanted one is its right side */
+      const int xe = (int)((edgeX + 1.0f) * 0.5f * (float)W);
+      for (int dx = -3; dx <= 3; dx++) {
+         const uint32_t p = PX(xe + dx, y);
+         const int rch = CH(p, 16);
+         if (rch != 0 && rch != 255) {
+            partial++;
+            int k = -1;
+            for (int l = 1; l <= 3; l++) if (abs(rch - l * 255 / 4) <= 3) k = l;
+            if (k < 0 || CH(p, 8) != rch || abs(CH(p, 0) - (102 + (255 - 102) * rch / 255)) > 3) badPartial++; else levels[k]++;
+         }
+      }
+   }
+   printf("texture: %u of %u sampled pixels wrong%s\n", badTex, nTex, badTex ? "" : " (checkerboard right where the depth test must keep it)");
+   if (badTex) printf("  first at (%u,%u): 0x%06x\n", first[0], first[1], first[2]);
+   printf("gradient (right half, drawn later and nearer): %u of %u wrong\n", badGrad, nGrad);
+   printf("clear colour: %u of %u wrong\n", badBg, nBg);
+   printf("edge of the triangle: %u partly covered pixels, %u not a 4-sample level; levels 1/4: %d, 2/4: %d, 3/4: %d\n", partial, badPartial, levels[1], levels[2], levels[3]);
+   const int ok = !badTex && !badGrad && !badBg && nTex > 1000 && nGrad > 1000 && partial > 100 && !badPartial && levels[1] && levels[2] && levels[3];
+   puts(ok ? "PASS: depth test, texture sampling and 4x MSAA resolve are right" : "FAIL");
+   if (seconds > 0) { printf("leaving the picture up for %d s\n", seconds); fflush(stdout); sleep((unsigned)seconds); }
+   return ok ? 0 : 1;
+}
+
+int main(int argc, char **argv)
+{
+   if (argc > 1 && !strcmp(argv[1], "scene"))
+      return scene_main(argc - 1, argv + 1);
+   return triangle_main(argc, argv);
 }
