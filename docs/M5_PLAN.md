@@ -35,6 +35,8 @@ Lacks, in the order RADV needs it:
 
 Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: command buffers in the upper half of the address space hang the queue (data and shaders there work; the kext refuses such an IB and the bridge keeps IBs low, docs/COMPAT.md; the cause is unknown), memory in VRAM and bigger buffers (host memory only, 1 MB each, 64 MB of GART that is never recycled), the Mesa backend `ac_apple_iokit.c` and the patches of docs/M5_MESA_BUILD.md, a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
 
+The Mesa side has started: `mesa-bridge/` holds `ac_apple_iokit.c`, the `ac_drm_*` layer over the user client, and a test that drives it the way the winsys does (passes on the 7800 XT, 2026-11-02). What remains for a first `vulkaninfo`: the meson and RADV patches of docs/M5_MESA_BUILD.md applied to a full Mesa tree, and the kext's limits lifted (1 MB and 32 buffers per connection, 64 MB of GART, no VRAM).
+
 ## Proposed user client shape
 
 The current `externalMethod` has hand-numbered selectors with positional scalar arguments. M5 replaces them with struct-in/struct-out methods that mirror the ioctl structures, one selector per `DRM_AMDGPU_*` command:

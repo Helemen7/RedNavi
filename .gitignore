@@ -10,3 +10,4 @@ RedNavi/smu_*.h
 RedNavi/gc_*.h
 !RedNavi/gc_regs.h
 rn_test_x86
+mesa-bridge/bridge_test

@@ -1884,6 +1884,12 @@ class RedNaviClient : public IOUserClient {
             }
             return kIOReturnBadArgument;                                     // a firmware this chip does not have: -EINVAL
         }
+        case AMDGPU_INFO_READ_MMR_REG: {                                     // what RADV reads for the gpu info: GB_ADDR_CONFIG, offset 0x263e as the DRM interface numbers it (Linux answered 0x444 on this card)
+            if (r->read_mmr_reg.dword_offset != 0x263e || r->read_mmr_reg.count != 1) return kIOReturnUnsupported;
+            const uint32_t v = 0x00000444;
+            putOut(out, outSize, &v, sizeof(v));
+            return kIOReturnSuccess;
+        }
         case AMDGPU_INFO_GPUVM_FAULT: {                                      // struct drm_amdgpu_info_gpuvm_fault: the address (a 4 KB page number in the registers), the status, the hub
             u32 dg[11];
             rn_compute_diag(&gpuOwner->gpu, dg);
