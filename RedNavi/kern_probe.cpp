@@ -316,7 +316,12 @@ class RedNaviProbe : public IOService {
     IODeviceMemory *bar0Mem {nullptr};                    // the PCI aperture of VRAM (BAR0), whose first visPool.. bytes the CPU reaches
     int createVramBo(uint32_t size, bool visible);
     bool fbReady {false};                          // the display surface exists (rednavi_fb=1)
-    int createScanoutBo();                         // an alias of the display surface (fixed VRAM offset, never given back)
+    int createScanoutBo(uint32_t surface);
+    uint32_t scanoutSurfaces() const;              // 1 to 3: how many surfaces of the current mode fit
+    uint64_t scanoutStride() const;
+    uint64_t scanoutOff(uint32_t surface) const { return kRNScanoutVramOff + static_cast<uint64_t>(surface) * scanoutStride(); }
+    uint32_t frontSurface {0};                     // the one the display was last told to scan out
+    int present(uint32_t surface, bool wait);      // HUBP0 page flip at the next vertical blank; 0 ok, 1 still pending, <0 error                         // an alias of the display surface (fixed VRAM offset, never given back)
     static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
@@ -1303,6 +1308,7 @@ void RedNaviProbe::applyMode(const rn_mode &m) {
     bool isBase = selMode.pclk_khz == base->pclk_khz && selMode.hactive == base->hactive && selMode.vactive == base->vactive && selMode.htotal == base->htotal;
     selRate = isBase ? 0x06 : static_cast<uint32_t>(rate < 0x06 ? 0x06 : rate);    // the base state was captured at RBR
     selPitch = rn_pitch_pixels(selMode.hactive);
+    frontSurface = 0;                                                         // the replay points the plane at surface 0
     IOLog("RedNavi: mode %ux%u@%u pclk %u kHz, link rate 0x%02x, pitch %u pixels\n", selMode.hactive, selMode.vactive, selMode.refresh_hz, selMode.pclk_khz, selRate, selPitch);
     uint32_t vals[6] = {selMode.hactive, selMode.vactive, selMode.refresh_hz, selMode.pclk_khz, selRate, selPitch};
     const char *names[6] = {"width", "height", "refresh", "pclk_khz", "link_rate", "pitch_pixels"};
@@ -2043,6 +2049,7 @@ public:
             IOLockLock(lock);
             freeAll();                                  // the PTEs go invalid before the pages are released, so a late GPU access faults instead of corrupting memory
             IOLockUnlock(lock);
+            if (gpuOwner->frontSurface != 0) gpuOwner->present(0, false);   // a program that flipped to its own surface and went away: the desktop's surface is shown again
         }
         if (!isInactive()) terminate();
         return kIOReturnSuccess;
@@ -2090,7 +2097,7 @@ public:
                 o->vmid = static_cast<uint32_t>(vmid);
                 o->va_map_limit = kMaxMaps;
                 o->gfx_queue = gpuOwner->gfxQueueOk ? 1 : 0;
-                if (gpuOwner->fbReady) { o->fb_width = gpuOwner->selMode.hactive; o->fb_height = gpuOwner->selMode.vactive; o->fb_pitch = gpuOwner->selPitch * 4; }
+                if (gpuOwner->fbReady) { o->fb_width = gpuOwner->selMode.hactive; o->fb_height = gpuOwner->selMode.vactive; o->fb_pitch = gpuOwner->selPitch * 4; o->fb_surfaces = gpuOwner->scanoutSurfaces(); }
                 o->vram_bytes = gpuOwner->devPool.totalPages * 4096; o->vram_free = gpuOwner->devPool.freePages * 4096;
                 o->vram_vis_bytes = gpuOwner->visPool.totalPages * 4096; o->vram_vis_free = gpuOwner->visPool.freePages * 4096;
                 rc = kIOReturnSuccess;
@@ -2104,7 +2111,7 @@ public:
                 uint32_t h = 0;
                 while (h < kMaxHandles && boIdx[h] >= 0) h++;
                 if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
-                const int idx = scan ? gpuOwner->createScanoutBo()
+                const int idx = scan ? gpuOwner->createScanoutBo(in->pad)
                                 : in->flags ? gpuOwner->createVramBo(static_cast<uint32_t>(in->size), in->flags == RN_BO_VRAM_VISIBLE)
                                           : gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false);   // not in the GART window: the address spaces map it from its page list
                 if (idx < 0) { rc = kIOReturnNoResources; break; }
@@ -2211,6 +2218,18 @@ public:
                 }
                 IOLockUnlock(gpuOwner->queueLock);
                 if (timeout) rn_gc_safe_mode(&gpuOwner->gpu, 0);
+                rc = kIOReturnSuccess;
+            }
+            break;
+        case RN_UC_PRESENT:
+            if (sized(args, sizeof(rn_uc_present), sizeof(rn_uc_present_result))) {
+                const rn_uc_present *in = static_cast<const rn_uc_present *>(args->structureInput);
+                if ((in->flags & ~RN_PRESENT_WAIT) != 0) break;
+                const int pr = gpuOwner->present(in->surface, (in->flags & RN_PRESENT_WAIT) != 0);
+                if (pr < 0) break;
+                rn_uc_present_result *o = static_cast<rn_uc_present_result *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->status = static_cast<uint32_t>(pr);
                 rc = kIOReturnSuccess;
             }
             break;
@@ -2684,17 +2703,47 @@ int RedNaviProbe::createVramBo(uint32_t size, bool visible) {
     return slot;
 }
 
-int RedNaviProbe::createScanoutBo() {
+// Surface 0 is the desktop's: RedNaviFB hands it to WindowServer, which keeps drawing into it. A program that presents uses the others (so that the desktop does not flash into its
+// frames) and the display goes back to surface 0 when it leaves. They are packed, one MB-aligned surface after the other, in the 34 MB between the scanout and the CPU-visible pool.
+uint64_t RedNaviProbe::scanoutStride() const {
+    return ((static_cast<uint64_t>(selPitch) * 4 * selMode.vactive) + 0xFFFFFull) & ~0xFFFFFull;
+}
+uint32_t RedNaviProbe::scanoutSurfaces() const {
+    const uint64_t n = 0x02200000ull / scanoutStride();
+    return n > 3 ? 3 : static_cast<uint32_t>(n);
+}
+
+// A page flip, as hubp1_program_surface_flip_and_addr does it: vsync flip type (SURFACE_FLIP_TYPE 0, the value the pipe has), the high half of the address first and then the low
+// half, which latches the pair for the next vertical update. Done when SURFACE_FLIP_PENDING is clear and the earliest address in use is the new one
+// (hubp1_is_flip_pending). The pitch, size and format of the surface are those of the mode, which is why only surfaces of the current mode exist.
+int RedNaviProbe::present(uint32_t surface, bool wait) {
+    uint32_t b2 = 0;
+    if (!fbReady || liveSwitch || surface >= scanoutSurfaces() || !ipBase(kRNHwIdDmu, &b2, 2)) return -EINVAL;
+    const uint64_t mc = kRNVramMcBase + scanoutOff(surface);
+    const uint32_t flipCtl = (b2 + 0x61b) * 4, addr = (b2 + 0x60a) * 4, addrHi = (b2 + 0x60b) * 4, earliest = (b2 + 0x624) * 4, earliestHi = (b2 + 0x625) * 4;
+    wr(flipCtl, rd(flipCtl) & ~(1u << 1));
+    wr(addrHi, static_cast<uint32_t>(mc >> 32));
+    wr(addr, static_cast<uint32_t>(mc));
+    frontSurface = surface;
+    if (!wait) return 0;
+    for (int i = 0; i < 5000; i++) {                                         // up to 50 ms: three frames at 60 Hz
+        if (!(rd(flipCtl) & (1u << 8)) && rd(earliest) == static_cast<uint32_t>(mc) && rd(earliestHi) == static_cast<uint32_t>(mc >> 32)) return 0;
+        IODelay(10);
+    }
+    return 1;
+}
+
+int RedNaviProbe::createScanoutBo(uint32_t surface) {
     RNLockGuard g(boLock);
     int slot = -1;
     for (uint32_t i = 0; i < boCount; i++) if (!bos[i].size) { slot = static_cast<int>(i); break; }
     if (slot < 0 && boCount < kBoCap) slot = static_cast<int>(boCount);
     const uint64_t bytes = (static_cast<uint64_t>(selPitch) * 4 * selMode.vactive + 4095) & ~4095ull;
-    if (!gpuLive || !bos || slot < 0 || !bar0Mem || !fbReady || bytes == 0 || kRNScanoutVramOff + bytes > bar0Mem->getLength()) return -1;
-    IOMemoryDescriptor *vmd = IODeviceMemory::withSubRange(bar0Mem, kRNScanoutVramOff, bytes);
+    if (!gpuLive || !bos || slot < 0 || !bar0Mem || !fbReady || bytes == 0 || surface >= scanoutSurfaces() || scanoutOff(surface) + bytes > bar0Mem->getLength()) return -1;
+    IOMemoryDescriptor *vmd = IODeviceMemory::withSubRange(bar0Mem, scanoutOff(surface), bytes);
     if (!vmd) return -1;
     if (static_cast<uint32_t>(slot) == boCount) boCount++;
-    bos[slot] = {nullptr, nullptr, 0, static_cast<uint32_t>(bytes), nullptr, false, vmd, kRNScanoutVramOff, RN_BO_VRAM_VISIBLE, true};
+    bos[slot] = {nullptr, nullptr, 0, static_cast<uint32_t>(bytes), nullptr, false, vmd, scanoutOff(surface), RN_BO_VRAM_VISIBLE, true};
     return slot;
 }
 

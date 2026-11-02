@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 10
+#define RN_UAPI_VERSION 11
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -30,6 +30,7 @@ enum {
     RN_UC_SYNCOBJ_SIGNAL = 15,   // in rn_uc_syncobj_array (points: 0 signals the binary state, a point signals the timeline up to it)
     RN_UC_SYNCOBJ_QUERY = 16,    // in rn_uc_syncobj_array, out rn_uc_syncobj_array (points filled)
     RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
+    RN_UC_PRESENT = 19,          // in rn_uc_present, out rn_uc_present_result: show a display surface (page flip)
     RN_UC_VRAM_PEEK = 18,        // in rn_uc_vram_peek, out rn_uc_vram_peek_result (debugging: reads VRAM through the index/data registers, any offset)
     RN_UC_COUNT
 };
@@ -64,7 +65,7 @@ struct rn_uc_info {
     uint32_t fb_width;         // the display scanout (RN_BO_SCANOUT): size in pixels, row pitch in bytes; 0 when RedNaviFB has no surface
     uint32_t fb_height;
     uint32_t fb_pitch;
-    uint32_t pad;
+    uint32_t fb_surfaces;      // display surfaces that fit in the current mode (1 to 3)
 };
 
 // Where a buffer lives. 0: wired host memory (the GTT domain), CPU cached, mapped by the GPU as system memory. RN_BO_VRAM: device-local VRAM, only the GPU reaches it
@@ -75,6 +76,21 @@ struct rn_uc_info {
 // RN_BO_SCANOUT: not an allocation but the surface the display scans out (XRGB8888, linear, fb_pitch bytes per row, fb_height rows; docs/COMPAT.md). Any number of connections may
 // hold one; the size asked for is ignored and the buffer is as large as the surface. The GPU writes it like any VRAM buffer and the CPU maps it write-combined. Freeing it frees nothing.
 #define RN_BO_SCANOUT 3u
+// With RN_BO_SCANOUT, rn_uc_bo_create.pad is the surface number: 0 is the desktop's surface, the one the display scans out after a mode change and that WindowServer draws into;
+// 1 and 2 are further surfaces of the same size, for a program that presents on its own (rn_uc_info.fb_surfaces says how many exist in the current mode, 1 to 3). RN_UC_PRESENT
+// makes the display scan out one of them; when the connection that did so closes, the display goes back to surface 0.
+
+#define RN_PRESENT_WAIT 1u     // return when the display uses the new surface (the next vertical blank), not before
+
+struct rn_uc_present {
+    uint32_t surface;          // display surface number (rn_uc_bo_create.pad of the RN_BO_SCANOUT buffer)
+    uint32_t flags;            // RN_PRESENT_*
+};
+
+struct rn_uc_present_result {
+    uint32_t status;           // 0 ok; 1 the flip was still pending when the wait gave up (50 ms)
+    uint32_t pad;
+};
 
 struct rn_uc_bo_create {
     uint64_t size;             // bytes, rounded up to 4 KB

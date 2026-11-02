@@ -6,7 +6,7 @@
  *   clang -O1 -arch x86_64 -mmacosx-version-min=12 -I/opt/local/include test/vk_present.c -L/opt/local/lib -lvulkan -o vk_present
  * Exit status 0 when the pixels read back from the surface are right.
  *   vk_present scene [seconds]: the harder scene below (depth test, texture sampling, 4x multisampling with a resolve into the surface).
- *   vk_present spin [seconds [fps]]: two rotating cubes from vertex and index buffers, MVP matrices in push constants, a per-frame uniform buffer, 4x MSAA, rendered continuously at
+ *   vk_present spin [seconds [fps [flip]]]: two rotating cubes from vertex and index buffers, MVP matrices in push constants, a per-frame uniform buffer, 4x MSAA, rendered continuously at
  *   the given rate (default 20 s, 60 fps) with two frames in flight, every frame copied into the display surface; prints frame-time statistics. Exit status 0 when no frame was late
  *   by more than 4 frame times and the sampled pixels were always right.
  */
@@ -72,12 +72,12 @@ static int triangle_main(int argc, char **argv)
 
    /* the display surface, from the bridge in the driver library the loader opened */
    void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
-   int (*scanout)(uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
+   int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
    if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
    uint32_t W, H, pitch;
    void *scan;
    size_t slen;
-   int sr = scanout(&W, &H, &pitch, &scan, &slen);
+   int sr = scanout(0, &W, &H, &pitch, &scan, &slen);
    if (sr) { fprintf(stderr, "no display surface (rn_bridge_scanout %d): needs rednavi_fb=1\n", sr); return 2; }
    printf("display surface %ux%u, pitch %u bytes, %zu bytes mapped at %p\n", W, H, pitch, slen, scan);
 
@@ -243,12 +243,12 @@ static int scene_main(int argc, char **argv)
    vkGetDeviceQueue(dev, (uint32_t)fam, 0, &q);
 
    void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
-   int (*scanout)(uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
+   int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
    if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
    uint32_t W, H, pitch;
    void *scan;
    size_t slen;
-   if (scanout(&W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
+   if (scanout(0, &W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
    printf("display surface %ux%u, pitch %u\n", W, H, pitch);
    PFN_vkGetMemoryHostPointerPropertiesEXT getHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
    VkMemoryHostPointerPropertiesEXT hpp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
@@ -495,6 +495,7 @@ static int spin_main(int argc, char **argv)
 {
    const int seconds = argc > 1 ? atoi(argv[1]) : 20;
    const int fps = argc > 2 ? atoi(argv[2]) : 60;
+   const int flip = argc > 3 && !strcmp(argv[3], "flip");      /* two display surfaces and a page flip per frame, one frame in flight */
    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .pApplicationName = "rn_vk_spin", .apiVersion = VK_API_VERSION_1_1};
    VkInstanceCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app};
    VkInstance inst;
@@ -520,25 +521,32 @@ static int spin_main(int argc, char **argv)
    vkGetDeviceQueue(dev, (uint32_t)fam, 0, &q);
 
    void *lib = dlopen("libvulkan_radeon.dylib", RTLD_LAZY | RTLD_NOLOAD);
-   int (*scanout)(uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
+   int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib ? dlsym(lib, "rn_bridge_scanout") : NULL;
    if (!scanout) { fprintf(stderr, "rn_bridge_scanout not found\n"); return 2; }
    uint32_t W, H, pitch;
-   void *scan;
-   size_t slen;
-   if (scanout(&W, &H, &pitch, &scan, &slen)) { fprintf(stderr, "no display surface: needs rednavi_fb=1\n"); return 2; }
+   void *scans[3] = {NULL, NULL, NULL};
+   size_t slens[3] = {0, 0, 0};
+   const int first = flip ? 1 : 0, nsurf = flip ? 3 : 1;           /* surface 0 is the desktop's: WindowServer keeps drawing into it, so the flipping loop uses 1 and 2 */
+   for (int i = first; i < nsurf; i++)
+      if (scanout(i, &W, &H, &pitch, &scans[i], &slens[i])) { fprintf(stderr, "no display surface %d: needs rednavi_fb=1 (and a mode that leaves room for two)\n", i); return 2; }
+   void *scan = scans[first];
+   int (*present)(uint32_t, int) = dlsym(lib, "rn_bridge_present");
+   if (flip && !present) { fprintf(stderr, "rn_bridge_present not found\n"); return 2; }
    PFN_vkGetMemoryHostPointerPropertiesEXT getHostProps = (PFN_vkGetMemoryHostPointerPropertiesEXT)vkGetDeviceProcAddr(dev, "vkGetMemoryHostPointerPropertiesEXT");
    VkMemoryHostPointerPropertiesEXT hpp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
    CHECK(getHostProps(dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, scan, &hpp));
-   VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = slen, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
-   VkBuffer sbuf;
-   CHECK(vkCreateBuffer(dev, &bci, NULL, &sbuf));
+   VkBuffer sbufs[3];
    VkMemoryRequirements mr;
-   vkGetBufferMemoryRequirements(dev, sbuf, &mr);
-   VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = scan};
-   VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = slen, .memoryTypeIndex = memType(hpp.memoryTypeBits & mr.memoryTypeBits, 0, 0)};
-   VkDeviceMemory smem;
-   CHECK(vkAllocateMemory(dev, &mai, NULL, &smem));
-   CHECK(vkBindBufferMemory(dev, sbuf, smem, 0));
+   for (int i = first; i < nsurf; i++) {
+      VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = slens[i], .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT, .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+      CHECK(vkCreateBuffer(dev, &bci, NULL, &sbufs[i]));
+      vkGetBufferMemoryRequirements(dev, sbufs[i], &mr);
+      VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = scans[i]};
+      VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = slens[i], .memoryTypeIndex = memType(hpp.memoryTypeBits & mr.memoryTypeBits, 0, 0)};
+      VkDeviceMemory smem;
+      CHECK(vkAllocateMemory(dev, &mai, NULL, &smem));
+      CHECK(vkBindBufferMemory(dev, sbufs[i], smem, 0));
+   }
 
    /* images: 4x colour, depth, the resolve target */
    const VkFormat cfmt = VK_FORMAT_B8G8R8A8_UNORM, dfmt = VK_FORMAT_D32_SFLOAT;
@@ -689,7 +697,7 @@ static int spin_main(int argc, char **argv)
    VkSubmitInfo si0 = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmds[FRAMES]};
    CHECK(vkQueueSubmit(q, 1, &si0, fence[FRAMES]));
    CHECK(vkWaitForFences(dev, 1, &fence[FRAMES], VK_TRUE, 8000000000ull));
-   printf("spin: %ux%u, 4x MSAA + D32, %d fps for %d s, %d frames in flight\n", W, H, fps, seconds, FRAMES);
+   printf("spin: %ux%u, 4x MSAA + D32, %d fps for %d s, %d frames in flight%s\n", W, H, fps, seconds, flip ? 1 : FRAMES, flip ? ", two display surfaces, vsync page flip per frame" : "");
    fflush(stdout);
 
    mat4 proj, view;
@@ -698,9 +706,11 @@ static int spin_main(int argc, char **argv)
    const int total = seconds * fps;
    const double period = 1000.0 / fps, t0 = now_ms();
    double waitMin = 1e9, waitMax = 0, waitSum = 0, lateMax = 0;
-   int late = 0, bad = 0, checks = 0, submitted[FRAMES] = {0};
+   int late = 0, bad = 0, checks = 0, submitted[FRAMES] = {0}, flipBad = 0;
+   double flipSum = 0, flipMax = 0;
    for (int fr = 0; fr < total; fr++) {
-      const int slot = fr % FRAMES;
+      const int slot = flip ? 0 : fr % FRAMES;
+      const int surf = flip ? 1 + (fr & 1) : 0;                                      /* the surface that is not on the display */
       const double target = t0 + fr * period;
       for (double d = target - now_ms(); d > 0.3; d = target - now_ms()) {      /* pace the loop: sleep to this frame's time */
          struct timespec ts = {0, (long)((d > 1.0 ? d - 0.5 : 0.2) * 1e6)};
@@ -717,8 +727,9 @@ static int spin_main(int argc, char **argv)
          waitSum += w; if (w < waitMin) waitMin = w; if (w > waitMax) waitMax = w;
          CHECK(vkResetFences(dev, 1, &fence[slot]));
          if (fr % 30 == 0 && fr > 0) {                                         /* centre: always a cube; corner: always the clear colour */
-            const uint32_t cpx = ((volatile uint32_t *)((uint8_t *)scan + (size_t)(H / 2) * pitch))[W / 2] & 0xffffffu;
-            const uint32_t kpx = ((volatile uint32_t *)((uint8_t *)scan + (size_t)4 * pitch))[4] & 0xffffffu;
+            void *sc = scans[flip ? 1 + ((fr - 1) & 1) : 0];                          /* the frame that was just shown */
+            const uint32_t cpx = ((volatile uint32_t *)((uint8_t *)sc + (size_t)(H / 2) * pitch))[W / 2] & 0xffffffu;
+            const uint32_t kpx = ((volatile uint32_t *)((uint8_t *)sc + (size_t)4 * pitch))[4] & 0xffffffu;
             checks++;
             if (cpx == 0x000066u || kpx != 0x000066u) { if (bad < 8) printf("frame %d (%.2f s): centre 0x%06x corner 0x%06x\n", fr, (now_ms() - t0) / 1000.0, cpx, kpx); bad++; }
          }
@@ -750,18 +761,36 @@ static int spin_main(int argc, char **argv)
       }
       vkCmdEndRenderPass(cmd);
       VkBufferImageCopy cp = {.bufferRowLength = pitch / 4, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {W, H, 1}};
-      vkCmdCopyImageToBuffer(cmd, im[2].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbuf, 1, &cp);
+      vkCmdCopyImageToBuffer(cmd, im[2].img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, sbufs[surf], 1, &cp);
       CHECK(vkEndCommandBuffer(cmd));
       VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cmd};
       CHECK(vkQueueSubmit(q, 1, &si, fence[slot]));
       submitted[slot] = 1;
+      if (flip) {                                                              /* done rendering: show it, and wait until the display has it before the other surface is drawn into */
+         CHECK(vkWaitForFences(dev, 1, &fence[slot], VK_TRUE, 10000000000ull));
+         CHECK(vkResetFences(dev, 1, &fence[slot]));
+         submitted[slot] = 0;
+         const double p0 = now_ms();
+         const int pr = present(surf, 1);
+         const double pw = now_ms() - p0;
+         flipSum += pw; if (pw > flipMax) flipMax = pw;
+         if (fr % 30 == 0) {                                                   /* centre: always a cube; corner: always the clear colour */
+            const uint32_t cpx = ((volatile uint32_t *)((uint8_t *)scans[surf] + (size_t)(H / 2) * pitch))[W / 2] & 0xffffffu;
+            const uint32_t kpx = ((volatile uint32_t *)((uint8_t *)scans[surf] + (size_t)4 * pitch))[4] & 0xffffffu;
+            checks++;
+            if (cpx == 0x000066u || kpx != 0x000066u) { if (bad < 8) printf("frame %d: centre 0x%06x corner 0x%06x\n", fr, cpx, kpx); bad++; }
+         }
+         if (pr) { if (flipBad < 5) printf("frame %d: present returned %d after %.1f ms\n", fr, pr, pw); flipBad++; }
+      }
       if (fr % (fps * 5) == 0) { printf("frame %d (%.1f s)\n", fr, (now_ms() - t0) / 1000.0); fflush(stdout); }
    }
    for (int i = 0; i < FRAMES; i++) if (submitted[i]) CHECK(vkWaitForFences(dev, 1, &fence[i], VK_TRUE, 10000000000ull));
    const double elapsed = (now_ms() - t0) / 1000.0;
-   printf("%d frames in %.2f s = %.2f fps (asked %d); wait for the previous frame of the same slot: min %.2f, mean %.2f, max %.2f ms\n", total, elapsed, total / elapsed, fps, waitMin, waitSum / total, waitMax);
+   printf("%d frames in %.2f s = %.2f fps (asked %d); wait for the previous frame of the same slot: min %.2f, mean %.2f, max %.2f ms\n", total, elapsed, total / elapsed, fps, waitMin > 1e8 ? 0.0 : waitMin, waitSum / total, waitMax);
+   if (flip) printf("page flips: %d, present wait mean %.2f ms, max %.2f ms, flips not done within 50 ms: %d\n", total, flipSum / total, flipMax, flipBad);
    printf("frames started more than 4 frame times late: %d (worst start delay %.1f ms); pixel checks: %d, wrong: %d\n", late, lateMax, checks, bad);
-   const int ok = !bad && !late;
+   if (flip) present(0, 1);                                                  /* give the screen back to the desktop */
+   const int ok = !bad && !late && !flipBad;
    puts(ok ? "PASS" : "FAIL");
    return ok ? 0 : 1;
 }
