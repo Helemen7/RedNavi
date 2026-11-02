@@ -276,7 +276,7 @@ class RedNaviProbe : public IOService {
     // gpuVa: the buffer's address in the GART window (0 for a buffer that is not mapped there); bus: the bus address of each of its 4 KB pages, from which the user address spaces get their PTEs.
     // A VRAM buffer has no md/dma/bus: vramOff is its offset in VRAM (physically contiguous, 4 KB aligned), dom is RN_BO_VRAM or RN_BO_VRAM_VISIBLE, and a visible one has vmd, the
     // sub-range of the PCI aperture it occupies, which is what the caller maps. A slot is free when size is 0.
-    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; IOMemoryDescriptor *vmd; uint64_t vramOff; uint32_t dom; };
+    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; IOMemoryDescriptor *vmd; uint64_t vramOff; uint32_t dom; bool fixed; };
     // VRAM that no one else in the kext uses, handed out in 4 KB pages by first fit from a sorted list of free ranges that merge when they touch. A range allocator, not a buddy
     // system: buffers come in any size up to 1 GB, a buddy system would round a 640 MB buffer up to 1 GB, and the list stays short because a buffer's neighbours are merged on free.
     struct VramPool {
@@ -315,6 +315,8 @@ class RedNaviProbe : public IOService {
     VramPool devPool, visPool;
     IODeviceMemory *bar0Mem {nullptr};                    // the PCI aperture of VRAM (BAR0), whose first visPool.. bytes the CPU reaches
     int createVramBo(uint32_t size, bool visible);
+    bool fbReady {false};                          // the display surface exists (rednavi_fb=1)
+    int createScanoutBo();                         // an alias of the display surface (fixed VRAM offset, never given back)
     static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
@@ -1065,6 +1067,7 @@ void RedNaviProbe::publishFramebuffer() {
     setProperty("fb-pitch", selPitch * 4, 32);
     setProperty("fb-refresh", selMode.refresh_hz, 32);
     setProperty("fb-scanout-phys", phys + kRNScanoutVramOff, 64);
+    fbReady = true;
     setProperty("rednavi-fb-ready", kOSBooleanTrue);
 }
 
@@ -2087,6 +2090,7 @@ public:
                 o->vmid = static_cast<uint32_t>(vmid);
                 o->va_map_limit = kMaxMaps;
                 o->gfx_queue = gpuOwner->gfxQueueOk ? 1 : 0;
+                if (gpuOwner->fbReady) { o->fb_width = gpuOwner->selMode.hactive; o->fb_height = gpuOwner->selMode.vactive; o->fb_pitch = gpuOwner->selPitch * 4; }
                 o->vram_bytes = gpuOwner->devPool.totalPages * 4096; o->vram_free = gpuOwner->devPool.freePages * 4096;
                 o->vram_vis_bytes = gpuOwner->visPool.totalPages * 4096; o->vram_vis_free = gpuOwner->visPool.freePages * 4096;
                 rc = kIOReturnSuccess;
@@ -2095,11 +2099,13 @@ public:
         case RN_UC_BO_CREATE:
             if (sized(args, sizeof(rn_uc_bo_create), sizeof(rn_uc_bo_info))) {
                 const rn_uc_bo_create *in = static_cast<const rn_uc_bo_create *>(args->structureInput);
-                if ((in->flags & ~(RN_BO_VRAM | RN_BO_VRAM_VISIBLE)) != 0 || in->flags == (RN_BO_VRAM | RN_BO_VRAM_VISIBLE) || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes) break;
+                const bool scan = in->flags == RN_BO_SCANOUT;
+                if (!scan && ((in->flags & ~(RN_BO_VRAM | RN_BO_VRAM_VISIBLE)) != 0 || in->flags == (RN_BO_VRAM | RN_BO_VRAM_VISIBLE) || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes)) break;
                 uint32_t h = 0;
                 while (h < kMaxHandles && boIdx[h] >= 0) h++;
                 if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
-                const int idx = in->flags ? gpuOwner->createVramBo(static_cast<uint32_t>(in->size), in->flags == RN_BO_VRAM_VISIBLE)
+                const int idx = scan ? gpuOwner->createScanoutBo()
+                                : in->flags ? gpuOwner->createVramBo(static_cast<uint32_t>(in->size), in->flags == RN_BO_VRAM_VISIBLE)
                                           : gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false);   // not in the GART window: the address spaces map it from its page list
                 if (idx < 0) { rc = kIOReturnNoResources; break; }
                 boIdx[h] = idx;
@@ -2485,7 +2491,7 @@ void RedNaviProbe::destroyBo(int idx) {
         rn_gart_flush(&gpu);
     }
     if (bos[idx].dom) {
-        (bos[idx].dom == RN_BO_VRAM_VISIBLE ? visPool : devPool).release(bos[idx].vramOff, bos[idx].size);
+        if (!bos[idx].fixed) (bos[idx].dom == RN_BO_VRAM_VISIBLE ? visPool : devPool).release(bos[idx].vramOff, bos[idx].size);
         if (bos[idx].vmd) bos[idx].vmd->release();
         bos[idx] = {};
         return;
@@ -2673,6 +2679,20 @@ int RedNaviProbe::createVramBo(uint32_t size, bool visible) {
     }
     if (static_cast<uint32_t>(slot) == boCount) boCount++;
     bos[slot] = {nullptr, nullptr, 0, size, nullptr, false, vmd, off, visible ? RN_BO_VRAM_VISIBLE : RN_BO_VRAM};
+    return slot;
+}
+
+int RedNaviProbe::createScanoutBo() {
+    RNLockGuard g(boLock);
+    int slot = -1;
+    for (uint32_t i = 0; i < boCount; i++) if (!bos[i].size) { slot = static_cast<int>(i); break; }
+    if (slot < 0 && boCount < kBoCap) slot = static_cast<int>(boCount);
+    const uint64_t bytes = (static_cast<uint64_t>(selPitch) * 4 * selMode.vactive + 4095) & ~4095ull;
+    if (!gpuLive || !bos || slot < 0 || !bar0Mem || !fbReady || bytes == 0 || kRNScanoutVramOff + bytes > bar0Mem->getLength()) return -1;
+    IOMemoryDescriptor *vmd = IODeviceMemory::withSubRange(bar0Mem, kRNScanoutVramOff, bytes);
+    if (!vmd) return -1;
+    if (static_cast<uint32_t>(slot) == boCount) boCount++;
+    bos[slot] = {nullptr, nullptr, 0, static_cast<uint32_t>(bytes), nullptr, false, vmd, kRNScanoutVramOff, RN_BO_VRAM_VISIBLE, true};
     return slot;
 }
 

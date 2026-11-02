@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 8
+#define RN_UAPI_VERSION 9
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -61,6 +61,9 @@ struct rn_uc_info {
     uint64_t vram_vis_bytes;   // VRAM the CPU reaches through the PCI aperture (RN_BO_VRAM_VISIBLE), and what is left of it
     uint64_t vram_vis_free;
     uint32_t gfx_queue;        // 1 when the graphics queue is mapped and RN_SUBMIT_GFX works
+    uint32_t fb_width;         // the display scanout (RN_BO_SCANOUT): size in pixels, row pitch in bytes; 0 when RedNaviFB has no surface
+    uint32_t fb_height;
+    uint32_t fb_pitch;
     uint32_t pad;
 };
 
@@ -69,6 +72,9 @@ struct rn_uc_info {
 // cleared on allocation; that pool is small (see vram_vis_bytes). A VRAM buffer is physically contiguous.
 #define RN_BO_VRAM 1u
 #define RN_BO_VRAM_VISIBLE 2u
+// RN_BO_SCANOUT: not an allocation but the surface the display scans out (XRGB8888, linear, fb_pitch bytes per row, fb_height rows; docs/COMPAT.md). Any number of connections may
+// hold one; the size asked for is ignored and the buffer is as large as the surface. The GPU writes it like any VRAM buffer and the CPU maps it write-combined. Freeing it frees nothing.
+#define RN_BO_SCANOUT 3u
 
 struct rn_uc_bo_create {
     uint64_t size;             // bytes, rounded up to 4 KB

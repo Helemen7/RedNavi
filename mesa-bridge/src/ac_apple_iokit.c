@@ -60,8 +60,12 @@ struct ac_drm_device {
    struct { uint32_t handle; uint64_t va, offset, size; } maps[4096];   /* what is mapped where, for RN_BRIDGE_DUMP only */
    uint32_t nmaps;
    int refs;                                                  /* the device and every clone of its sync provider (vk_device keeps one past the winsys) */
+   void *scan_cpu;                                            /* the display surface, once rn_bridge_scanout mapped it: a host-pointer import of this range gets the surface itself */
+   size_t scan_len;
    struct util_sync_provider sync;
 };
+
+static struct ac_drm_device *last_dev;                        /* the device the scanout helper below works on: the process has one Vulkan device */
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- errors, time */
 
@@ -364,6 +368,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
    vamgr_init(&dev->high32, dev->dev_info.high_va_offset, dev->dev_info.high_va_offset + (1ull << 32));
    dev->next_ctx = 1;
    dev->refs = 1;
+   last_dev = dev;
    dev->sync = (struct util_sync_provider) {
       .create = sp_create, .destroy = sp_destroy, .handle_to_fd = sp_unsupported_fd, .fd_to_handle = sp_unsupported_fd_to_handle,
       .import_sync_file = sp_unsupported_import, .export_sync_file = sp_unsupported_fd, .wait = sp_wait, .reset = sp_reset, .signal = sp_signal,
@@ -390,6 +395,8 @@ static void dev_release(struct ac_drm_device *dev)
 {
    if (__atomic_sub_fetch(&dev->refs, 1, __ATOMIC_ACQ_REL) != 0)
       return;
+   if (last_dev == dev)
+      last_dev = NULL;
    IOServiceClose(dev->conn);                                 /* the kext frees the buffers, the address space and the syncobjs of a closed connection */
    free(dev->low.free_list);
    free(dev->high32.free_list);
@@ -681,10 +688,74 @@ int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type, uint32
    return 0;
 }
 
+/* A buffer that is the display surface: VRAM at a fixed place, the same memory whichever connection holds it. */
+static int scanout_bo_new(struct ac_drm_device *dev, struct amdgpu_bo **out)
+{
+   struct rn_uc_bo_create in = {0, RN_BO_SCANOUT, 0};
+   struct rn_uc_bo_info info;
+   int r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &info, sizeof(info));
+   if (r)
+      return r;
+   struct amdgpu_bo *b = calloc(1, sizeof(*b));
+   if (!b || info.handle >= dev->nbos) {
+      struct rn_uc_bo_free f = {info.handle, 0};
+      call(dev, RN_UC_BO_FREE, &f, sizeof(f), NULL, 0);
+      free(b);
+      return -ENOMEM;
+   }
+   b->handle = info.handle;
+   b->size = info.size;
+   b->placement = info.flags;
+   pthread_mutex_lock(&dev->lock);
+   dev->bos[b->handle] = b;
+   pthread_mutex_unlock(&dev->lock);
+   *out = b;
+   return 0;
+}
+
+
+/* For a program that shows what it renders: maps the display surface (XRGB8888, linear) and returns the pointer, its size and the geometry. A Vulkan program imports the pointer with
+ * VK_EXT_external_memory_host and the GPU then writes the surface itself (ac_drm_create_bo_from_user_mem below); the pointer is also good for the CPU (write-combined). */
+__attribute__((visibility("default")))
+int rn_bridge_scanout(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, void **cpu, size_t *len);
+__attribute__((visibility("default")))
+int rn_bridge_scanout(uint32_t *width, uint32_t *height, uint32_t *pitch_bytes, void **cpu, size_t *len)
+{
+   struct ac_drm_device *dev = last_dev;
+   if (!dev || !dev->info.fb_pitch)
+      return -ENODEV;
+   if (!dev->scan_cpu) {
+      struct amdgpu_bo *b;
+      int r = scanout_bo_new(dev, &b);
+      if (r)
+         return r;
+      ac_drm_bo bo = {.abo = b};
+      void *p;
+      r = ac_drm_bo_cpu_map(dev, bo, &p);
+      if (r)
+         return r;
+      dev->scan_cpu = p;
+      dev->scan_len = b->size;
+   }
+   *width = dev->info.fb_width;
+   *height = dev->info.fb_height;
+   *pitch_bytes = dev->info.fb_pitch;
+   *cpu = dev->scan_cpu;
+   *len = dev->scan_len;
+   return 0;
+}
+
 int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
 {
-   (void)dev; (void)cpu; (void)size; (void)bo;
-   return -EOPNOTSUPP;
+   /* Host memory cannot be imported (no userptr in the kext); the one range that can is the display surface the program got from rn_bridge_scanout. */
+   if (!dev->scan_cpu || cpu != dev->scan_cpu || size == 0 || size > dev->scan_len)
+      return -EOPNOTSUPP;
+   struct amdgpu_bo *b;
+   int r = scanout_bo_new(dev, &b);
+   if (r)
+      return r;
+   bo->abo = b;
+   return 0;
 }
 
 int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_bo_metadata *info)
