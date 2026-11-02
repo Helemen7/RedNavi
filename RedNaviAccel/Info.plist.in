@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>RedNaviAccel</string>
+	<key>CFBundleIdentifier</key>
+	<string>org.rednavi.RedNaviAccel</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>RedNaviAccel</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.0.1</string>
+	<key>CFBundleVersion</key>
+	<string>0.0.1</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>RedNaviAccel</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>org.rednavi.RedNaviAccel</string>
+			<key>IOClass</key>
+			<string>RedNaviAccel</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x747E1002</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProbeScore</key>
+			<integer>100</integer>
+			<key>MetalPluginName</key>
+			<string>../../../Library/GPUBundles/RedNaviMTLDriver</string>
+			<key>MetalPluginClassName</key>
+			<string>RedNaviMTLDevice</string>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.iokit.IOSurface</key>
+		<string>1.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0.0</string>
+	</dict>
+</dict>
+</plist>

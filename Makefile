@@ -12,6 +12,7 @@ SDK := MacKernelSDK
 OUT := build/$(CONFIG)
 KEXT := $(OUT)/RedNavi.kext
 FBKEXT := $(OUT)/RedNaviFB.kext
+ACCELKEXT := $(OUT)/RedNaviAccel.kext
 CXX := clang++
 ARCH := -arch x86_64
 CXXFLAGS := $(ARCH) $(OPT) -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -mkernel \
@@ -33,7 +34,7 @@ endif
 LDFLAGS := $(ARCH) -Xlinker -kext -nostdlib -lkmod -L$(SDK)/Library -lkmodc++ -lcc_kext \
 	-Xlinker -object_path_lto -Xlinker /dev/null -mmacosx-version-min=12.0
 
-all: $(KEXT) $(FBKEXT)
+all: $(KEXT) $(FBKEXT) $(ACCELKEXT)
 
 # Every header of the kext: gfx11.h, rn_uapi.h, the generated splash and register headers changed behind a stale object once (a new splash that never reached the build).
 $(OUT)/kern_probe.o: RedNavi/kern_probe.cpp $(wildcard RedNavi/*.h compat/include/*/*.h)
@@ -89,6 +90,21 @@ $(FBKEXT): $(OUT)/fb_kern_fb.o $(OUT)/fb_kern_info.o RedNaviFB/Info.plist.in
 	$(CXX) $(LDFLAGS) $(OUT)/fb_kern_fb.o $(OUT)/fb_kern_info.o -o $(FBKEXT)/Contents/MacOS/RedNaviFB
 	cp RedNaviFB/Info.plist.in $(FBKEXT)/Contents/Info.plist
 	@echo "built $(FBKEXT)"
+
+# The accelerator skeleton (M6): also an AuxKC kext, it depends on IOAcceleratorFamily2 (docs/M6_ACCELERATOR_STUDY.md).
+$(OUT)/accel_kern_accel.o: RedNaviAccel/kern_accel.cpp
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(OUT)/accel_kern_info.o: RedNaviAccel/kern_info.c
+	@mkdir -p $(OUT)
+	clang $(ARCH) $(OPT) -mkernel -nostdinc -isystem $(SDK)/Headers -DKERNEL -mmacosx-version-min=12.0 -c $< -o $@
+
+$(ACCELKEXT): $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o RedNaviAccel/Info.plist.in
+	@mkdir -p $(ACCELKEXT)/Contents/MacOS
+	$(CXX) $(LDFLAGS) $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o -o $(ACCELKEXT)/Contents/MacOS/RedNaviAccel
+	cp RedNaviAccel/Info.plist.in $(ACCELKEXT)/Contents/Info.plist
+	@echo "built $(ACCELKEXT)"
 
 clean:
 	rm -rf build
