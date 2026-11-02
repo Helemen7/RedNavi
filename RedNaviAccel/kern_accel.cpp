@@ -14,6 +14,7 @@
 #include <IOKit/IORegistryEntry.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/graphics/IOAccelerator.h>
+#include "IOGraphicsAccelerator2.h"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSArray.h>
@@ -26,7 +27,12 @@
 
 class RedNaviAccelClient;
 
-class RedNaviAccel : public IOAccelerator {
+static_assert(sizeof(IOGraphicsAccelerator2) == 3544, "the family class is 3544 bytes in the registry (docs/M6_ACCEL_ABI.md)");
+
+// A subclass of the family's IOGraphicsAccelerator2 (declared in the generated header, 351 virtual slots, 3544 bytes) that implements its 17 pure virtuals as stubs
+// which log and fail. It does NOT run the family's own start(): the base members are zero padding here, and the family code behind the hooks (configureDevice, the
+// factories) is not available. start(), stop() and free() go to IOService directly. What it tests is whether WindowServer treats an accelerator of that class differently.
+class RedNaviAccel : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel)
 
     IOLock *logLock {nullptr};
@@ -55,6 +61,9 @@ public:
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
     IOReturn requestProbe(IOOptionBits options) APPLE_KEXT_OVERRIDE;
     IOReturn message(UInt32 type, IOService *provider, void *argument) APPLE_KEXT_OVERRIDE;
+#define RN_PURE(R, N, A, Q) R N A Q override;
+#include "IOGraphicsAccelerator2_pure.inc"
+#undef RN_PURE
 
     // One line in the log; printf-style, kernel formatting.
     void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
@@ -62,7 +71,12 @@ public:
     void noteCall() { IOLockLock(logLock); callCount++; IOLockUnlock(logLock); }
 };
 
-OSDefineMetaClassAndStructors(RedNaviAccel, IOAccelerator)
+OSDefineMetaClassAndStructors(RedNaviAccel, IOGraphicsAccelerator2)
+
+// The pure virtuals: the family calls these on a real accelerator; here a call is logged and refused.
+#define RN_PURE(R, N, A, Q) R RedNaviAccel::N A Q { note("family hook called: %s", #N); return sizeof(R) == sizeof(IOReturn) ? (R)(intptr_t)kIOReturnUnsupported : (R)0; }
+#include "IOGraphicsAccelerator2_pure.inc"
+#undef RN_PURE
 
 class RedNaviAccelClient : public IOUserClient {
     OSDeclareDefaultStructors(RedNaviAccelClient)
@@ -145,7 +159,7 @@ void RedNaviAccel::probeClasses() {
 }
 
 bool RedNaviAccel::start(IOService *provider) {
-    if (!IOAccelerator::start(provider)) return false;
+    if (!IOService::start(provider)) return false;
     uint32_t arg = 0;
     link = PE_parse_boot_argn("rednavi_accel_link", &arg, sizeof(arg)) && arg == 1;
     logLock = IOLockAlloc();
@@ -153,24 +167,37 @@ bool RedNaviAccel::start(IOService *provider) {
     if (!logLock || !log) return false;
     note("start on %s, provider %s", getName(), provider ? provider->getName() : "?");
     probeClasses();
+    // Boot-arg rednavi_accel_caps=1: the capability properties the Intel accelerator has on its node (docs/M6_ACCELERATOR_STUDY.md, section 3), to see whether WindowServer
+    // then opens the display-pipe clients.
+    if (PE_parse_boot_argn("rednavi_accel_caps", &arg, sizeof(arg)) && arg == 1) {
+        setProperty("IOAccelRevision", static_cast<uint32_t>(2), 32);
+        setProperty("AccelCaps", static_cast<uint32_t>(15), 32);
+        if (OSDictionary *pipe = OSDictionary::withCapacity(2)) {
+            pipe->setObject("DisplayPipeSupported", kOSBooleanTrue);
+            pipe->setObject("TransactionsSupported", kOSBooleanTrue);
+            setProperty("IOAccelDisplayPipeCapabilities", pipe);
+            pipe->release();
+        }
+        note("capability properties published");
+    }
     publishLog();
     registerService();
     return true;
 }
 
 void RedNaviAccel::stop(IOService *provider) {
-    IOAccelerator::stop(provider);
+    IOService::stop(provider);
 }
 
 void RedNaviAccel::free() {
     if (log) { log->release(); log = nullptr; }
     if (logLock) { IOLockFree(logLock); logLock = nullptr; }
-    IOAccelerator::free();
+    IOService::free();
 }
 
 IOReturn RedNaviAccel::message(UInt32 type, IOService *provider, void *argument) {
     note("message(type 0x%x, provider %s)", type, provider ? provider->getName() : "?");
-    return IOAccelerator::message(type, provider, argument);
+    return IOService::message(type, provider, argument);
 }
 
 IOReturn RedNaviAccel::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
