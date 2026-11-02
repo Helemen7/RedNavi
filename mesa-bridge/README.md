@@ -12,7 +12,7 @@
 ## What it does differently from Linux, on purpose
 
 - **Address ranges**: a buffer goes to the upper half only with `AMDGPU_VA_RANGE_32_BIT`; everything else, `AMDGPU_VA_RANGE_HIGH` included, goes to the lower half, because a command buffer in the upper half hangs the compute queue (`docs/COMPAT.md`).
-- **Memory**: every domain is host memory behind the GART, 1 MB per buffer, 32 per connection (the kext's limits): a 64 MB request is refused.
+- **Memory**: every domain is wired host memory (a VRAM request is served from it), up to 1 GB per buffer, 2 GB in all (the kext's boot-arg `rednavi_bo_budget_mb`), 1024 buffers per connection; a 3 GB request is refused. Verified: 100 buffers, a 64 MB buffer written at its far end by a shader.
 - **Queues**: one compute queue; all contexts share it and its sequence numbers. Graphics and SDMA submits are refused (`-EINVAL`).
 - **Not supported**: dma-buf and sync-file export and import, user memory buffers, user queues, sensors, video caps, the timestamp. They return `-EOPNOTSUPP` or `-ENOSYS`.
 

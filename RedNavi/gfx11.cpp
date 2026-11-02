@@ -96,13 +96,17 @@ int rn_gart_update_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 pa
     return rn_gart_flush(adev);
 }
 
+u64 rn_system_pte(u64 bus) {
+    const u64 kMtypeUc = 3ull;
+    return (bus & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x2ull | 0x4ull | 0x10ull | 0x20ull | 0x40ull | (kMtypeUc << 48);
+}
+
 void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 bus) {
     // The PTE Linux writes for a GTT page: amdgpu_ttm_tt_pte_flags = amdgpu_ttm_tt_pde_flags (VALID | SYSTEM, plus SNOOPED for cached memory) | gart_pte_flags
     // (gmc_v11_0_gart_init: AMDGPU_PTE_MTYPE_NV10(MTYPE_UC) | AMDGPU_PTE_EXECUTABLE) | READABLE | WRITEABLE. Address in bits 47:12. EXECUTABLE matters: the command
     // processor fetching an indirect buffer, or the shader array fetching instructions, from a page without it takes a permission fault. MTYPE_UC is 3 (navi10_enum.h,
     // the enum that holds MTYPE_UC next to MTYPE_C_RW_US and the other cache-policy values; MTYPE_NC/WC/CC 0/1/2 are the TCC_MTYPE enum): bits 50:48 of the PTE.
-    const u64 kMtypeUc = 3ull;
-    const u64 pte = (bus & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x2ull | 0x4ull | 0x10ull | 0x20ull | 0x40ull | (kMtypeUc << 48);
+    const u64 pte = rn_system_pte(bus);
     const u64 slot = gmc->pt_vram_offset + (u64)page * 8;
     rn_vram_wr32(adev, slot, lower_32_bits(pte));
     rn_vram_wr32(adev, slot + 4, upper_32_bits(pte));

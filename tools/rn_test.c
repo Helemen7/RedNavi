@@ -517,7 +517,7 @@ int main(int argc, char **argv) {
             printf("submit running past the end of the buffer: 0x%x (expect an error)\n", kr); if (kr == KERN_SUCCESS) ok = 0;
             Bo again;
             if (createBo(c, 4096, &again)) ok = 0;
-            else printf("a new buffer after the free: handle %u, address 0x%llx (the address is never reused)\n", again.handle, again.va);
+            else printf("a new buffer after the free: handle %u\n", again.handle);
         }
         io_connect_t c2;                                       // a second connection must not reach the first one's buffers
         if (IOServiceOpen(svc, mach_task_self(), 0, &c2) == KERN_SUCCESS) {

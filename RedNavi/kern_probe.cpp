@@ -273,8 +273,13 @@ class RedNaviProbe : public IOService {
     uint64_t hostBus {0};                          // its bus address as the device must use it
     uint32_t hostBusLen {0};
     // Buffer objects: pages of host memory with an address in the GART window that is never reused (see docs/COMPAT.md on remapping).
-    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; };
-    RNBo bos[64] {};
+    // gpuVa: the buffer's address in the GART window (0 for a buffer that is not mapped there); bus: the bus address of each of its 4 KB pages, from which the user address spaces get their PTEs.
+    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; };
+    static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
+    static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
+    RNBo *bos {nullptr};
+    uint64_t boBytes {0};                                 // host memory wired for buffers now
+    uint64_t boBudget {2048ull << 20};                    // and the most it may be: wired memory is not swappable (boot-arg rednavi_bo_budget_mb)
     uint32_t boCount {0};
     uint32_t gartNextPage {16};                    // the first pages of the window are used by the boot-time tests
     struct rn_gmc gmcLive {};
@@ -284,7 +289,7 @@ class RedNaviProbe : public IOService {
     static constexpr uint64_t kVmMin = 0x10000ull;         // virtual_address_offset of DEV_INFO on Linux 7.0 for this card
     static constexpr uint64_t kVmEnd = 1ull << 48;           // the 48-bit space: the lower half 0 to 2^47 and the upper half, which a program sees sign-extended (0xffff800000000000 and up)
     static constexpr uint64_t kVmTables = 0x0D000000ull;   // VRAM
-    static constexpr uint32_t kVmPoolPages = 1024;         // 4 MB per VMID: about 1000 tables, enough to map around 1 GB spread out
+    static constexpr uint32_t kVmPoolPages = 4096;         // 16 MB per VMID: about 4000 tables (a table maps 2 MB), enough for several GB of buffers; 7 VMIDs take 112 MB of VRAM from kVmTables
     uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
     bool vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff);
     uint64_t vmPageAlloc(int vmid);                  // a zeroed pool page (VRAM offset), 0 when the pool is empty
@@ -301,7 +306,7 @@ class RedNaviProbe : public IOService {
     RedNaviClient *vmClient[8] {};                 // the connection of each VMID
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
-    int createHostBo(uint32_t size, bool writeCombine = false);
+    int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true);
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
     friend class RedNaviClient;
 public:
@@ -1733,14 +1738,14 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
 class RedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(RedNaviClient)
-    static constexpr uint32_t kMaxHandles = 32;
+    static constexpr uint32_t kMaxHandles = 1024;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
-    int boIdx[kMaxHandles];                        // handle - 1 -> index in the probe's buffer table, -1 for a free handle
+    int *boIdx {nullptr};                          // handle - 1 -> index in the probe's buffer table, -1 for a free handle
     uint32_t boUsed {0};
     struct Map { uint64_t va; uint64_t size; uint32_t handle; bool used; };
-    static constexpr uint32_t kMaxMaps = 64;
-    Map maps[kMaxMaps];                            // what is mapped in this connection's address space
+    static constexpr uint32_t kMaxMaps = 2048;
+    Map *maps {nullptr};                           // what is mapped in this connection's address space
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
     uint32_t seqSubmitted {0};
@@ -1756,8 +1761,8 @@ class RedNaviClient : public IOUserClient {
         struct { uint64_t point; uint32_t seq; } pend[8];   // work attached to timeline points
         uint32_t npend;
     };
-    static constexpr uint32_t kMaxSync = 32;
-    Syncobj sync[kMaxSync];
+    static constexpr uint32_t kMaxSync = 512;
+    Syncobj *sync {nullptr};
 
     // The buffer behind a handle, or -1.
     int boOf(uint32_t handle) const {
@@ -1854,7 +1859,7 @@ class RedNaviClient : public IOUserClient {
         memset(out, 0, outSize);
         const uint64_t visible = 256ull << 20;                                // what BAR0 maps
         const uint64_t vram = static_cast<uint64_t>(gpuOwner->vramMbytes) << 20;
-        const uint64_t gttTotal = 16384ull * 4096, gttUsed = static_cast<uint64_t>(gpuOwner->gartNextPage) * 4096;
+        const uint64_t gttTotal = gpuOwner->boBudget, gttUsed = gpuOwner->boBytes;      // the host memory that can be wired for buffers, and what is
         switch (r->query) {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
         case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, kRNLinuxDevInfo, sizeof(kRNLinuxDevInfo)); return kIOReturnSuccess;
@@ -1902,7 +1907,7 @@ class RedNaviClient : public IOUserClient {
             memset(&m, 0, sizeof(m));
             m.vram.total_heap_size = vram; m.vram.usable_heap_size = vram; m.vram.max_allocation = 0;            // nothing is allocated in VRAM yet (docs/M5_PLAN.md)
             m.cpu_accessible_vram.total_heap_size = visible; m.cpu_accessible_vram.usable_heap_size = visible;
-            m.gtt.total_heap_size = gttTotal; m.gtt.usable_heap_size = gttTotal; m.gtt.heap_usage = gttUsed; m.gtt.max_allocation = 1u << 20;
+            m.gtt.total_heap_size = gttTotal; m.gtt.usable_heap_size = gttTotal; m.gtt.heap_usage = gttUsed; m.gtt.max_allocation = RedNaviProbe::kBoMaxBytes;
             putOut(out, outSize, &m, sizeof(m));
             return kIOReturnSuccess;
         }
@@ -1945,10 +1950,14 @@ public:
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE {
         gpuOwner = OSDynamicCast(RedNaviProbe, provider);
         lock = IOLockAlloc();
+        boIdx = static_cast<int *>(IOMalloc(sizeof(int) * kMaxHandles));
+        maps = static_cast<Map *>(IOMalloc(sizeof(Map) * kMaxMaps));
+        sync = static_cast<Syncobj *>(IOMalloc(sizeof(Syncobj) * kMaxSync));
+        if (!boIdx || !maps || !sync) return false;
         for (uint32_t i = 0; i < kMaxHandles; i++) boIdx[i] = -1;
         if (!gpuOwner || !lock) return false;
-        memset(maps, 0, sizeof(maps));
-        memset(sync, 0, sizeof(sync));
+        memset(maps, 0, sizeof(Map) * kMaxMaps);
+        memset(sync, 0, sizeof(Syncobj) * kMaxSync);
         vmid = gpuOwner->vmAlloc();
         if (vmid < 0) { vmid = 0; return false; }      // all seven address spaces are in use
         fenceIdx = gpuOwner->createHostBo(4096);
@@ -1959,8 +1968,11 @@ public:
         return IOUserClient::start(provider);
     }
     void free() APPLE_KEXT_OVERRIDE {
-        if (lock && gpuOwner) freeAll();                // normally clientClose did it already
+        if (lock && gpuOwner && boIdx && maps) freeAll();                // normally clientClose did it already
         if (lock) { IOLockFree(lock); lock = nullptr; }
+        if (boIdx) { IOFree(boIdx, sizeof(int) * kMaxHandles); boIdx = nullptr; }
+        if (maps) { IOFree(maps, sizeof(Map) * kMaxMaps); maps = nullptr; }
+        if (sync) { IOFree(sync, sizeof(Syncobj) * kMaxSync); sync = nullptr; }
         IOUserClient::free();
     }
     IOReturn clientClose() APPLE_KEXT_OVERRIDE {
@@ -2005,8 +2017,8 @@ public:
                 o->version = RN_UAPI_VERSION;
                 o->doorbell_mapped = gpuOwner->doorbellKeep != nullptr;
                 o->gart_base = 0x2000000000ull;
-                o->gart_bytes = 16384ull * 4096;
-                o->max_bo_bytes = 1u << 20;
+                o->gart_bytes = gpuOwner->boBudget;                // no longer a window: the host memory the kext may wire for buffers
+                o->max_bo_bytes = RedNaviProbe::kBoMaxBytes;
                 o->bo_count = boUsed;
                 o->bo_limit = kMaxHandles;
                 o->vm_va_start = RedNaviProbe::kVmMin;
@@ -2019,11 +2031,11 @@ public:
         case RN_UC_BO_CREATE:
             if (sized(args, sizeof(rn_uc_bo_create), sizeof(rn_uc_bo_info))) {
                 const rn_uc_bo_create *in = static_cast<const rn_uc_bo_create *>(args->structureInput);
-                if (in->flags != 0 || in->size == 0 || in->size > (1u << 20)) break;
+                if (in->flags != 0 || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes) break;
                 uint32_t h = 0;
                 while (h < kMaxHandles && boIdx[h] >= 0) h++;
                 if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
-                const int idx = gpuOwner->createHostBo(static_cast<uint32_t>(in->size));
+                const int idx = gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false);   // not in the GART window: the address spaces map it from its page list
                 if (idx < 0) { rc = kIOReturnNoResources; break; }
                 boIdx[h] = idx;
                 boUsed++;
@@ -2356,10 +2368,14 @@ struct RNLockGuard {
 
 void RedNaviProbe::destroyBo(int idx) {
     RNLockGuard g(boLock);
-    if (idx < 0 || idx >= 64 || !bos[idx].md) return;
-    const uint32_t firstPage = static_cast<uint32_t>((bos[idx].gpuVa - 0x2000000000ull) / 4096);
-    for (uint32_t p = 0; p < bos[idx].size / 4096; p++) rn_gart_unmap_page(&gpu, &gmcLive, firstPage + p);
-    rn_gart_flush(&gpu);
+    if (idx < 0 || idx >= static_cast<int>(kBoCap) || !bos[idx].md) return;
+    if (bos[idx].gart) {
+        const uint32_t firstPage = static_cast<uint32_t>((bos[idx].gpuVa - 0x2000000000ull) / 4096);
+        for (uint32_t p = 0; p < bos[idx].size / 4096; p++) rn_gart_unmap_page(&gpu, &gmcLive, firstPage + p);
+        rn_gart_flush(&gpu);
+    }
+    if (bos[idx].bus) IOFree(bos[idx].bus, sizeof(uint64_t) * (bos[idx].size / 4096));
+    boBytes -= bos[idx].size;
     if (bos[idx].dma) { bos[idx].dma->complete(); bos[idx].dma->clearMemoryDescriptor(); bos[idx].dma->release(); }
     bos[idx].md->release();
     bos[idx] = {};
@@ -2431,14 +2447,14 @@ void RedNaviProbe::vmFree(int vmid) {
 
 bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages) {
     RNLockGuard g(boLock);
-    const uint32_t first = static_cast<uint32_t>((bos[boIdx].gpuVa - 0x2000000000ull) / 4096) + boPage;
+    const uint64_t *bus = bos[boIdx].bus;
     uint64_t ptb = 0;
     bool ok = true;
     uint32_t done = 0;
     for (; done < pages; done++) {
         const uint64_t vp = vaPage + done;
         if (done == 0 || (vp & 0x1ff) == 0) { if (!vmPtb(vmid, vp, true, &ptb)) { ok = false; break; } }
-        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), rn_gart_read_pte(&gpu, &gmcLive, first + done));
+        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), rn_system_pte(bus[boPage + done]));
     }
     if (!ok) {                                       // leave nothing half mapped
         for (uint32_t p = 0; p < done; p++) {
@@ -2463,15 +2479,16 @@ void RedNaviProbe::vmUnmap(int vmid, uint64_t vaPage, uint32_t pages) {
     rn_vm_flush(&gpu, vmid);
 }
 
-int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
+int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
     RNLockGuard g(boLock);
     int slot = -1;
     for (uint32_t i = 0; i < boCount; i++) if (!bos[i].md) { slot = static_cast<int>(i); break; }
-    if (slot < 0 && boCount < 64) slot = static_cast<int>(boCount);
-    if (!gpuLive || slot < 0 || size == 0) return -1;
+    if (slot < 0 && boCount < kBoCap) slot = static_cast<int>(boCount);
+    if (!gpuLive || !bos || slot < 0 || size == 0 || size > kBoMaxBytes) return -1;
     size = (size + 4095u) & ~4095u;
     const uint32_t pages = size / 4096;
-    if (gartNextPage + pages > 16384) return -1;
+    if (gart && gartNextPage + pages > 16384) return -1;
+    if (boBytes + size > boBudget) return -1;
     IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | (writeCombine ? kIOMapWriteCombineCache : 0), size, 4096);
     if (!md) return -1;
     md->prepare();
@@ -2482,26 +2499,37 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine) {
         md->release();
         return -1;
     }
-    uint32_t page = gartNextPage;
+    uint64_t *bus = static_cast<uint64_t *>(IOMalloc(sizeof(uint64_t) * pages));
+    if (!bus) {
+        dma->complete(); dma->clearMemoryDescriptor(); dma->release();
+        md->release();
+        return -1;
+    }
+    uint32_t page = gartNextPage, n = 0;
     UInt64 off = 0;
     while (off < size) {
         IODMACommand::Segment64 segs[8] = {};
         UInt32 nseg = 8;
         if (dma->genIOVMSegments(&off, segs, &nseg) != kIOReturnSuccess || nseg == 0) break;
         for (UInt32 i = 0; i < nseg; i++)
-            for (uint64_t p = 0; p < segs[i].fLength / 4096; p++) rn_gart_map_page(&gpu, &gmcLive, page++, segs[i].fIOVMAddr + p * 4096);
+            for (uint64_t p = 0; p < segs[i].fLength / 4096 && n < pages; p++) {
+                bus[n++] = segs[i].fIOVMAddr + p * 4096;
+                if (gart) rn_gart_map_page(&gpu, &gmcLive, page++, bus[n - 1]);
+            }
     }
-    if (page != gartNextPage + pages) {                      // a short mapping: give up on this buffer (its pages stay unused in the window)
-        gartNextPage = page;
+    if (n != pages) {                                        // a short mapping: give up on this buffer (the window pages it took stay unused)
+        if (gart) gartNextPage = page;
+        IOFree(bus, sizeof(uint64_t) * pages);
         dma->complete(); dma->clearMemoryDescriptor(); dma->release();
         md->release();
         return -1;
     }
-    rn_gart_flush(&gpu);
+    if (gart) rn_gart_flush(&gpu);
     const int idx = slot;
     if (static_cast<uint32_t>(slot) == boCount) boCount++;
-    bos[idx] = {md, dma, 0x2000000000ull + static_cast<uint64_t>(gartNextPage) * 4096, size};
-    gartNextPage += pages;
+    bos[idx] = {md, dma, gart ? 0x2000000000ull + static_cast<uint64_t>(gartNextPage) * 4096 : 0, size, bus, gart};
+    if (gart) gartNextPage += pages;
+    boBytes += size;
     return idx;
 }
 
@@ -3315,6 +3343,10 @@ bool RedNaviProbe::start(IOService *provider) {
 
     modeLock = IOLockAlloc();
     boLock = IOLockAlloc();
+    bos = static_cast<RNBo *>(IOMalloc(sizeof(RNBo) * kBoCap));
+    if (!bos) return false;
+    memset(bos, 0, sizeof(RNBo) * kBoCap);
+    { uint32_t mb = 0; if (PE_parse_boot_argn("rednavi_bo_budget_mb", &mb, sizeof(mb)) && mb >= 16 && mb <= 8192) boBudget = static_cast<uint64_t>(mb) << 20; }
     queueLock = IOLockAlloc();
     { uint32_t v = 0; if (PE_parse_boot_argn("rednavi_hang_ms", &v, sizeof(v)) && v >= 100 && v <= 9000) hangMs = v; }
     rn_compute_lock_init();
@@ -3394,8 +3426,13 @@ void RedNaviProbe::stop(IOService *provider) {
     if (vbiosCopy) { vbiosCopy->release(); vbiosCopy = nullptr; }
     if (watchTimer) { watchTimer->cancelTimeout(); if (getWorkLoop()) getWorkLoop()->removeEventSource(watchTimer); watchTimer->release(); watchTimer = nullptr; }
     if (msiSrc) { msiSrc->disable(); if (getWorkLoop()) getWorkLoop()->removeEventSource(msiSrc); msiSrc->release(); msiSrc = nullptr; }
-    for (uint32_t i = 0; i < boCount; i++) { if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); } if (bos[i].md) bos[i].md->release(); }
+    for (uint32_t i = 0; bos && i < boCount; i++) {
+        if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); }
+        if (bos[i].md) bos[i].md->release();
+        if (bos[i].bus) IOFree(bos[i].bus, sizeof(uint64_t) * (bos[i].size / 4096));
+    }
     boCount = 0;
+    if (bos) { IOFree(bos, sizeof(RNBo) * kBoCap); bos = nullptr; }
     if (boLock) { IOLockFree(boLock); boLock = nullptr; }
     if (queueLock) { IOLockFree(queueLock); queueLock = nullptr; }
     if (doorbellKeep) { rn_set_doorbell(nullptr, 0); doorbellKeep->release(); doorbellKeep = nullptr; }

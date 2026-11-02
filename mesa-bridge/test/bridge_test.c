@@ -139,9 +139,50 @@ int main(void)
    CHECK(r == 0, "map code %d", r);
    r = ac_drm_bo_va_op_raw(dev, data_h, 0, 4096, data_va, AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE, AMDGPU_VA_OP_MAP);
    CHECK(r == 0, "map data %d", r);
-   struct amdgpu_bo_alloc_request big = {.alloc_size = 64ull << 20, .phys_alignment = 4096, .preferred_heap = AMDGPU_GEM_DOMAIN_GTT};
-   ac_drm_bo nobo;
-   CHECK(ac_drm_bo_alloc(dev, &big, &nobo) != 0, "a 64 MB buffer is refused (the kext takes 1 MB per buffer)");
+   /* more than the old 32 buffers, and a big one: 64 MB mapped at a 32-bit address, written through at its far end by a shader, read by the CPU */
+   {
+      ac_drm_bo many[100];
+      uint32_t h;
+      volatile uint32_t *c;
+      int made = 0;
+      for (; made < 100; made++)
+         if (make_bo(dev, 4096, &many[made], &h, &c))
+            break;
+      CHECK(made == 100, "100 buffers: %d made", made);
+      for (int i = 0; i < made; i++)
+         ac_drm_bo_free(dev, many[i]);
+      ac_drm_bo bigbo;
+      uint32_t big_h;
+      volatile uint32_t *big_cpu;
+      r = make_bo(dev, 64ull << 20, &bigbo, &big_h, &big_cpu);
+      CHECK(r == 0, "a 64 MB buffer: %d", r);
+      if (r == 0) {
+         uint64_t big_va;
+         amdgpu_va_handle big_vah;
+         r = ac_drm_va_range_alloc(dev, amdgpu_gpu_va_range_general, 64ull << 20, 2ull << 20, 0, &big_va, &big_vah, AMDGPU_VA_RANGE_32_BIT);
+         CHECK(r == 0, "va for 64 MB: %d", r);
+         r = ac_drm_bo_va_op_raw(dev, big_h, 0, 64ull << 20, big_va, AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE, AMDGPU_VA_OP_MAP);
+         CHECK(r == 0, "map 64 MB: %d", r);
+         const uint64_t far_off = (64ull << 20) - 4096;
+         uint32_t cz;
+         r = ac_drm_cs_ctx_create2(dev, 0, &cz);
+         uint32_t nn = build_dispatch(code_cpu, code_va, big_va + far_off);
+         big_cpu[far_off / 4] = 0xDEAD0000u;
+         uint64_t bseq = 0;
+         r = submit(dev, cz, code_va, nn, 0, 0, &bseq);
+         uint32_t ex = 0;
+         if (r == 0)
+            r = ac_drm_cs_query_fence_status(dev, cz, AMDGPU_HW_IP_COMPUTE, 0, 0, bseq, 2000000000ull, 0, &ex);
+         CHECK(r == 0 && ex && big_cpu[far_off / 4] == 0x600DC0DEu, "dispatch storing into the last page of a 64 MB buffer: %d expired %u value 0x%08x", r, ex, big_cpu[far_off / 4]);
+         printf("64 MB buffer at 0x%llx: last page written by the shader, value 0x%08x\n", (unsigned long long)big_va, big_cpu[far_off / 4]);
+         ac_drm_bo_va_op_raw(dev, big_h, 0, 64ull << 20, big_va, 0, AMDGPU_VA_OP_UNMAP);
+         ac_drm_va_range_free(big_vah);
+         ac_drm_bo_free(dev, bigbo);
+      }
+      struct amdgpu_bo_alloc_request huge = {.alloc_size = 3ull << 30, .phys_alignment = 4096, .preferred_heap = AMDGPU_GEM_DOMAIN_GTT};
+      ac_drm_bo nobo;
+      CHECK(ac_drm_bo_alloc(dev, &huge, &nobo) != 0, "a 3 GB buffer is refused");
+   }
 
    /* a context, a syncobj, a submit with chunks, the fence */
    uint32_t ctx, so;

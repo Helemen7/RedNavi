@@ -6,7 +6,7 @@
  * Mesa is MIT licensed and so is this file when it lives in that tree; in the RedNavi repository it is under the licence of the project.
  *
  * What the kext does not have yet, and what that means here:
- *   - memory is host memory behind the GART for every domain (VRAM requests are served from it), 1 MB per buffer, 32 buffers per connection;
+ *   - memory is wired host memory for every domain (VRAM requests are served from it): up to 1 GB per buffer, 2 GB in all (the kext's boot-arg rednavi_bo_budget_mb), 1024 buffers per connection;
  *   - one compute queue: every context shares it and its sequence numbers; graphics and SDMA submits are refused;
  *   - a command buffer must lie in the lower half of the address space (a command buffer in the upper half hangs the queue); only 32-bit buffers get upper-half addresses;
  *   - no external handles (dma-buf, sync files, opaque fds), no user queues, no sensors, no timestamp.
@@ -21,7 +21,6 @@
 #include <string.h>
 #include <time.h>
 
-#define RN_MAX_HANDLES 33                                     /* bo_limit of the kext is 32, handles start at 1 */
 #define RN_WAIT_SLICE_MS 5000u                                /* the kext waits at most 10 s per call; longer waits are made of slices */
 
 struct amdgpu_bo {
@@ -53,7 +52,8 @@ struct ac_drm_device {
    struct drm_amdgpu_info_device dev_info;
    pthread_mutex_t lock;
    struct vamgr low, high32;
-   struct amdgpu_bo *bos[RN_MAX_HANDLES];
+   struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
+   uint32_t nbos;
    uint32_t next_ctx;
    struct util_sync_provider sync;
 };
@@ -331,6 +331,12 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
       r = -EPROTO;                                            /* the kext and the bridge were built for different interfaces */
    if (r == 0)
       r = info_query(dev, AMDGPU_INFO_DEV_INFO, sizeof(dev->dev_info), &dev->dev_info, NULL);
+   if (r == 0) {
+      dev->nbos = dev->info.bo_limit + 1;
+      dev->bos = calloc(dev->nbos, sizeof(*dev->bos));
+      if (!dev->bos)
+         r = -ENOMEM;
+   }
    if (r) {
       IOServiceClose(dev->conn);
       free(dev);
@@ -363,6 +369,7 @@ void ac_drm_device_deinitialize(ac_drm_device *dev)
    IOServiceClose(dev->conn);                                 /* the kext frees the buffers, the address space and the syncobjs of a closed connection */
    free(dev->low.free_list);
    free(dev->high32.free_list);
+   free(dev->bos);
    pthread_mutex_destroy(&dev->lock);
    free(dev);
 }
@@ -537,7 +544,7 @@ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_
    if (r)
       return r;
    struct amdgpu_bo *b = calloc(1, sizeof(*b));
-   if (!b || out.handle >= RN_MAX_HANDLES) {
+   if (!b || out.handle >= dev->nbos) {
       struct rn_uc_bo_free f = {out.handle, 0};
       call(dev, RN_UC_BO_FREE, &f, sizeof(f), NULL, 0);
       free(b);
@@ -605,7 +612,7 @@ int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo, enum amdgpu_bo_handle_typ
 
 int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type, uint32_t shared_handle, struct ac_drm_bo_import_result *output)
 {
-   if (type != amdgpu_bo_handle_type_kms || shared_handle >= RN_MAX_HANDLES || !dev->bos[shared_handle])
+   if (type != amdgpu_bo_handle_type_kms || shared_handle >= dev->nbos || !dev->bos[shared_handle])
       return -EOPNOTSUPP;
    output->bo.abo = dev->bos[shared_handle];
    output->alloc_size = dev->bos[shared_handle]->size;
@@ -626,7 +633,7 @@ int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu
 
 int ac_drm_bo_query_info(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_bo_info *info)
 {
-   if (bo_handle >= RN_MAX_HANDLES || !dev->bos[bo_handle])
+   if (bo_handle >= dev->nbos || !dev->bos[bo_handle])
       return -EINVAL;
    memset(info, 0, sizeof(*info));
    info->alloc_size = dev->bos[bo_handle]->size;
