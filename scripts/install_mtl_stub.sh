@@ -10,6 +10,7 @@ rm -rf /Library/GPUBundles/RedNaviMTLDriver.bundle
 cp -R "$SRC" /Library/GPUBundles/RedNaviMTLDriver.bundle
 chown -R root:wheel /Library/GPUBundles/RedNaviMTLDriver.bundle
 chmod -R 755 /Library/GPUBundles/RedNaviMTLDriver.bundle
+xattr -cr /Library/GPUBundles/RedNaviMTLDriver.bundle
 codesign -f -s - /Library/GPUBundles/RedNaviMTLDriver.bundle
 rm -f /tmp/rednavi-metal.log
 echo "Installed. Metal processes started from now on load it; log: /tmp/rednavi-metal.log"

@@ -39,6 +39,7 @@ class RedNaviAccel : public IOGraphicsAccelerator2 {
     OSArray *log {nullptr};
     uint32_t openCount {0}, callCount {0}, probeCount {0};
     bool link {false};
+    bool answer {false};       // boot-arg rednavi_accel_answer=1: answer the first two calls of the device client (type 5) instead of refusing them
 
     // A collection that was made a property of a registry entry is frozen ("Trying to change a collection in the registry" panics in OSCollection::haveUpdated, which
     // is what the first version of this did on its second log line): the working array stays private and a copy is published.
@@ -64,14 +65,22 @@ public:
 #define RN_PURE(R, N, A, Q) R N A Q override;
 #include "IOGraphicsAccelerator2_pure.inc"
 #undef RN_PURE
+    // kxld refuses a subclass whose vtable has fewer entries than its superclass's ("Malformed vtable. Super class ... has 350 entries vs subclass ... with 349"),
+    // and counts entries differently from the slot tables of tools/accel_vtable.py (the first build had one slot too few by its count). New virtuals after the family's
+    // last slot are harmless: nothing in the family knows them.
+    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3(); virtual void rnPad4(); virtual void rnPad5(); virtual void rnPad6(); virtual void rnPad7();
 
     // One line in the log; printf-style, kernel formatting.
     void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+    bool answers() const { return answer; }
     void noteOpen() { IOLockLock(logLock); openCount++; IOLockUnlock(logLock); }
     void noteCall() { IOLockLock(logLock); callCount++; IOLockUnlock(logLock); }
 };
 
 OSDefineMetaClassAndStructors(RedNaviAccel, IOGraphicsAccelerator2)
+
+void RedNaviAccel::rnPad0() {} void RedNaviAccel::rnPad1() {} void RedNaviAccel::rnPad2() {} void RedNaviAccel::rnPad3() {}
+void RedNaviAccel::rnPad4() {} void RedNaviAccel::rnPad5() {} void RedNaviAccel::rnPad6() {} void RedNaviAccel::rnPad7() {}
 
 // The pure virtuals: the family calls these on a real accelerator; here a call is logged and refused.
 #define RN_PURE(R, N, A, Q) R RedNaviAccel::N A Q { note("family hook called: %s", #N); return sizeof(R) == sizeof(IOReturn) ? (R)(intptr_t)kIOReturnUnsupported : (R)0; }
@@ -162,6 +171,7 @@ bool RedNaviAccel::start(IOService *provider) {
     if (!IOService::start(provider)) return false;
     uint32_t arg = 0;
     link = PE_parse_boot_argn("rednavi_accel_link", &arg, sizeof(arg)) && arg == 1;
+    answer = PE_parse_boot_argn("rednavi_accel_answer", &arg, sizeof(arg)) && arg == 1;
     logLock = IOLockAlloc();
     log = OSArray::withCapacity(256);
     if (!logLock || !log) return false;
@@ -262,10 +272,18 @@ IOReturn RedNaviAccelClient::externalMethod(uint32_t selector, IOExternalMethodA
     acc->noteCall();
     const uint32_t *w = static_cast<const uint32_t *>(a ? a->structureInput : nullptr);
     const uint32_t n = a ? a->structureInputSize : 0;
-    acc->note("%s[%d] open type %u: externalMethod %u, scalar in %u (first 0x%llx), struct in %u (words %08x %08x %08x %08x), scalar out %u, struct out %u%s",
-              proc, pid, (unsigned)type, selector, a ? a->scalarInputCount : 0, a && a->scalarInputCount ? a->scalarInput[0] : 0ull, n,
-              n >= 4 ? w[0] : 0, n >= 8 ? w[1] : 0, n >= 12 ? w[2] : 0, n >= 16 ? w[3] : 0, a ? a->scalarOutputCount : 0, a ? a->structureOutputSize : 0,
-              a && a->asyncWakePort ? ", async" : "");
+    char words[96] = "";
+    for (uint32_t i = 0, len = 0; i < 8 && i * 4 < n && len < sizeof(words) - 10; i++) len += snprintf(words + len, sizeof(words) - len, "%s%08x", i ? " " : "", w[i]);
+    acc->note("%s[%d] open type %u: externalMethod %u, scalar in %u (first 0x%llx), struct in %u (%s), scalar out %u, struct out %u%s",
+              proc, pid, (unsigned)type, selector, a ? a->scalarInputCount : 0, a && a->scalarInputCount ? a->scalarInput[0] : 0ull, n, words,
+              a ? a->scalarOutputCount : 0, a ? a->structureOutputSize : 0, a && a->asyncWakePort ? ", async" : "");
+    // Opt-in answers for what the Metal framework asks first of the device client (type 5), seen in the log: selector 9 with a 16-byte "Metal" string (the API name;
+    // the Intel device node has the property API = "Metal") and selector 2 with a 600-byte structure out (I: device information). Zeros for the second; what Metal then asks
+    // is what the log is for.
+    if (acc->answers() && type == 5 && a) {
+        if (selector == 9 && n == 16) return kIOReturnSuccess;
+        if (selector == 2 && a->structureOutputSize == 600 && a->structureOutput) { bzero(a->structureOutput, 600); return kIOReturnSuccess; }
+    }
     return kIOReturnUnsupported;
 }
 

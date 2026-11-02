@@ -112,6 +112,7 @@ $(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
 	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -framework Foundation RedNaviMTL/plugin.m -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
 	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist
+	xattr -cr $(MTLBUNDLE)
 	codesign -f -s - $(MTLBUNDLE)
 	@echo "built $(MTLBUNDLE)"
 

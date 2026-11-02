@@ -80,6 +80,12 @@ __attribute__((constructor)) static void rn_load(void) {
     if (!k) { rn_log("objc_allocateClassPair failed (class exists?)"); return; }
     class_addMethod(object_getClass(k), @selector(resolveInstanceMethod:), (IMP)rn_resolve_instance, "c@::");
     class_addMethod(object_getClass(k), @selector(resolveClassMethod:), (IMP)rn_resolve_class, "c@::");
+    // The first message Metal sends to the plug-in class, seen in the log of the first stub: +bundleForClass (a class method with no argument); the answer is the bundle.
+    class_addMethod(object_getClass(k), sel_registerName("bundleForClass"), imp_implementationWithBlock(^id(id self) {
+        NSBundle *b = [NSBundle bundleForClass:self];
+        rn_log("+bundleForClass answered: %s", b.bundlePath.UTF8String);
+        return b;
+    }), "@@:");
     objc_registerClassPair(k);
     rn_log("class RedNaviMTLDevice registered, super %s", class_getName(sup));
 }
