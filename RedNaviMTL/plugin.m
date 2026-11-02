@@ -5,7 +5,7 @@
 //  - every selector that is sent to RedNaviMTLDevice and that nobody implements (class or instance side): it is logged and answered with nil/0, so that the log
 //    is the list of what the Metal framework expects from a driver beyond what the superclass already does.
 // Everything inherited from the superclass runs as it is; its calls into the kernel reach the accelerator kext, which logs them as well.
-// Log: /tmp/rednavi-metal.log (append, one line per event).
+// Log: /tmp/rednavi-metal-<uid>.log (append, one line per event).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #include <dlfcn.h>
@@ -28,7 +28,9 @@ static void rn_log(const char *fmt, ...) {
     n += vsnprintf(line + n, sizeof(line) - n - 2, fmt, ap);
     va_end(ap);
     line[n++] = '\n';
-    int fd = open("/tmp/rednavi-metal.log", O_WRONLY | O_APPEND | O_CREAT, 0666);
+    char path[64];
+    snprintf(path, sizeof(path), "/tmp/rednavi-metal-%d.log", (int)getuid());   // one file per user: a file made by a root process cannot be appended to by the others
+    int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0666);
     if (fd >= 0) { write(fd, line, n); close(fd); }
 }
 
