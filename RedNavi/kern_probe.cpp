@@ -323,6 +323,7 @@ class RedNaviProbe : public IOService {
     uint32_t boCount {0};
     uint32_t gartNextPage {16};                    // the first pages of the window are used by the boot-time tests
     struct rn_gmc gmcLive {};
+    bool gfxQueueOk {false};                       // the graphics queue is mapped and passed its self test (rednavi_gfx_queue=1)
     bool gpuLive {false};                          // the memory hub is on and the GART window is set up
     // The user address spaces (rn_vm_*): VMIDs 1 to 7, 48 bits, a root directory (PDB2) and the directories and page tables below it made on demand,
     // 4 KB pages of VRAM from a pool of kVmPoolPages per VMID starting at kVmTables.
@@ -1788,7 +1789,8 @@ class RedNaviClient : public IOUserClient {
     Map *maps {nullptr};                           // what is mapped in this connection's address space
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
-    uint32_t seqSubmitted {0};
+    uint32_t seqSubmitted {0};                     // the compute queue's counter (bit 31 clear)
+    uint32_t gfxSeqSubmitted {0};                  // the graphics queue's: bit 31 set once something was submitted
     uint32_t lostFrom {1}, lostTo {0};             // sequence numbers dropped by the last queue reset (none when lostFrom > lostTo)
     friend class RedNaviProbe;
 
@@ -1850,7 +1852,12 @@ class RedNaviClient : public IOUserClient {
     uint32_t fenceNow() const {
         return *reinterpret_cast<volatile uint32_t *>(gpuOwner->bos[fenceIdx].md->getBytesNoCopy());
     }
-    bool reached(uint32_t seq) const { return static_cast<int32_t>(fenceNow() - seq) >= 0; }
+    // Sequence numbers are 31-bit counters (bit 31 names the queue) compared modulo 2^31 against the fence of their queue.
+    uint32_t fenceWord(uint32_t ring) const {
+        return *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(gpuOwner->bos[fenceIdx].md->getBytesNoCopy()) + ring * 8);
+    }
+    static bool seqDone(uint32_t fenceValue, uint32_t seq) { return ((fenceValue - seq) & 0x7fffffffu) < 0x40000000u; }
+    bool reached(uint32_t seq) const { return seqDone(fenceWord(seq >> 31), seq); }
     Syncobj *findSync(uint32_t h) { return (h == 0 || h > kMaxSync || !sync[h - 1].used) ? nullptr : &sync[h - 1]; }
     // The timeline value: the highest point whose work is done. Done work leaves the pending list.
     uint64_t tlNow(Syncobj &s) {
@@ -1902,7 +1909,7 @@ class RedNaviClient : public IOUserClient {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
         case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, kRNLinuxDevInfo, sizeof(kRNLinuxDevInfo)); return kIOReturnSuccess;
         case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue (Linux says 4 compute, 1 graphics, 2 SDMA)
-            const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : 0;
+            const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : (r->query_hw_ip.type == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk) ? 1 : 0;
             putOut(out, outSize, &v, sizeof(v));
             return kIOReturnSuccess;
         }
@@ -1912,6 +1919,9 @@ class RedNaviClient : public IOUserClient {
             if (r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE && r->query_hw_ip.ip_instance == 0) {
                 memcpy(ip, kRNLinuxHwIpInfo[AMDGPU_HW_IP_COMPUTE], sizeof(ip));
                 reinterpret_cast<drm_amdgpu_info_hw_ip *>(ip)->available_rings = 1;       // Linux: 0xf, four compute rings
+            }
+            if (r->query_hw_ip.type == AMDGPU_HW_IP_GFX && r->query_hw_ip.ip_instance == 0 && gpuOwner->gfxQueueOk) {
+                memcpy(ip, kRNLinuxHwIpInfo[AMDGPU_HW_IP_GFX], sizeof(ip));                 // one graphics ring, as Linux (available_rings 1)
             }
             putOut(out, outSize, ip, sizeof(ip));
             return kIOReturnSuccess;
@@ -1972,7 +1982,7 @@ class RedNaviClient : public IOUserClient {
         case AMDGPU_INFO_GTT_USAGE: putOut(out, outSize, &gttUsed, sizeof(gttUsed)); return kIOReturnSuccess;
         case AMDGPU_INFO_MAX_IBS: {                                          // IBs per submit, one value per IP type: a submit of the kext takes one IB (Linux: 192, 125, 49, ...)
             uint32_t v[sizeof(kRNLinuxMaxIbs) / sizeof(kRNLinuxMaxIbs[0])];
-            for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE) ? 1 : 0;
+            for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE || (i == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk)) ? 1 : 0;
             putOut(out, outSize, v, sizeof(v));
             return kIOReturnSuccess;
         }
@@ -2073,6 +2083,7 @@ public:
                 o->vm_va_bytes = (1ull << 47) - RedNaviProbe::kVmMin;                // the lower half; the upper half is 0xffff800000000000 up to 2^64 - 4 MB
                 o->vmid = static_cast<uint32_t>(vmid);
                 o->va_map_limit = kMaxMaps;
+                o->gfx_queue = gpuOwner->gfxQueueOk ? 1 : 0;
                 o->vram_bytes = gpuOwner->devPool.totalPages * 4096; o->vram_free = gpuOwner->devPool.freePages * 4096;
                 o->vram_vis_bytes = gpuOwner->visPool.totalPages * 4096; o->vram_vis_free = gpuOwner->visPool.freePages * 4096;
                 rc = kIOReturnSuccess;
@@ -2116,7 +2127,8 @@ public:
             if (sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) && fenceIdx >= 0) {
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
                 uint64_t ibVa = 0;
-                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 0xFFFFF || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                const bool gfx = (in->flags & RN_SUBMIT_GFX) != 0;
+                if ((in->flags & ~RN_SUBMIT_GFX) != 0 || (gfx && !gpuOwner->gfxQueueOk) || in->ib_dwords == 0 || in->ib_dwords > 0xFFFFF || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
                 // A command buffer in the upper half of the address space hangs the compute queue (docs/COMPAT.md): the command processor does not run it and later
                 // dispatches of every connection stay dead until the next boot, a reset does not bring them back. Data and shaders up there work, so only this is refused.
                 if (ibVa >= (1ull << 47)) { rc = kIOReturnUnsupported; break; }
@@ -2129,16 +2141,18 @@ public:
                 for (uint32_t i = 0; i < in->in_count && waitRc == kIOReturnSuccess; i++) waitRc = syncWaitOne(*findSync(in->in[i].handle), in->in[i].point, 10000, true, false);
                 if (waitRc != kIOReturnSuccess) { rc = waitRc; break; }
                 IOLockLock(gpuOwner->queueLock);
-                const uint32_t seq = seqSubmitted + 1;
+                uint32_t seq = ((seqSubmitted + 1) & 0x7fffffffu) ? ((seqSubmitted + 1) & 0x7fffffffu) : 1;
+                if (gfx) seq = ((gfxSeqSubmitted + 1) & 0x7fffffffu) | 0x80000000u;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                int r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
-                if (r == -EAGAIN) {                                  // the ring stayed full for about 2 s: the queue is not draining, it is stuck
+                int r = gfx ? rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(vmid))
+                            : rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                if (r == -EAGAIN && !gfx) {                                  // the ring stayed full for about 2 s: the queue is not draining, it is stuck
                     uint32_t info[4];
                     const int rr = gpuOwner->resetQueue(info);
                     IOLog("RedNavi: ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
                     if (rr == 0) r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
                 }
-                if (r == 0) seqSubmitted = seq;                      // taken under the queue lock, in the order the packets reach the ring
+                if (r == 0) { if (gfx) gfxSeqSubmitted = seq; else seqSubmitted = seq; }   // taken under the queue lock, in the order the packets reach the ring
                 IOLockUnlock(gpuOwner->queueLock);
                 if (r == 0) {
                     for (uint32_t i = 0; i < in->out_count; i++) attachWork(*findSync(in->out[i].handle), in->out[i].point, seq);
@@ -2154,14 +2168,16 @@ public:
         case RN_UC_WAIT_SEQ:
             if (sized(args, sizeof(rn_uc_wait_seq), sizeof(rn_uc_wait_seq_result)) && fenceIdx >= 0) {
                 const rn_uc_wait_seq *in = static_cast<const rn_uc_wait_seq *>(args->structureInput);
-                if (static_cast<int32_t>(seqSubmitted - in->seq) < 0 || in->seq == 0) break;   // never submitted
+                const uint32_t ring = in->seq >> 31;
+                const uint32_t submitted = ring ? gfxSeqSubmitted : seqSubmitted;
+                if ((in->seq & 0x7fffffffu) == 0 || (ring && !gfxSeqSubmitted) || ((submitted - in->seq) & 0x7fffffffu) >= 0x40000000u) break;   // never submitted
                 const uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
-                const uint32_t fence0 = fenceNow();
+                const uint32_t fence0 = fenceWord(ring);
                 uint32_t ms = 0;
-                while (ms < timeout && static_cast<int32_t>(fenceNow() - in->seq) < 0) {
+                while (ms < timeout && !seqDone(fenceWord(ring), in->seq)) {
                     IOSleep(1);
                     ms++;
-                    if (ms == gpuOwner->hangMs && fenceNow() == fence0) {          // no progress for the whole hang time: the queue is stuck
+                    if (ms == gpuOwner->hangMs && fenceWord(ring) == fence0 && ring == 0) {   // (the graphics queue has no reset yet)          // no progress for the whole hang time: the queue is stuck
                         uint32_t info[4];
                         IOLockLock(gpuOwner->queueLock);
                         const int rr = gpuOwner->resetQueue(info);
@@ -2172,9 +2188,9 @@ public:
                 rn_uc_wait_seq_result *o = static_cast<rn_uc_wait_seq_result *>(args->structureOutput);
                 memset(o, 0, sizeof(*o));
                 IOLockLock(gpuOwner->queueLock);
-                o->signaled = fenceNow();
-                o->reached = static_cast<int32_t>(o->signaled - in->seq) >= 0;
-                if (o->reached && static_cast<int32_t>(in->seq - lostFrom) >= 0 && static_cast<int32_t>(lostTo - in->seq) >= 0) o->status = RN_UC_SEQ_LOST;
+                o->signaled = fenceWord(ring);
+                o->reached = seqDone(o->signaled, in->seq);
+                if (ring == 0 && o->reached && static_cast<int32_t>(in->seq - lostFrom) >= 0 && static_cast<int32_t>(lostTo - in->seq) >= 0) o->status = RN_UC_SEQ_LOST;
                 IOLockUnlock(gpuOwner->queueLock);
                 if (timeout) rn_gc_safe_mode(&gpuOwner->gpu, 0);
                 rc = kIOReturnSuccess;
@@ -3132,10 +3148,10 @@ void RedNaviProbe::sdmaTest() {
                     uint32_t mh = 1;
                     PE_parse_boot_argn("rednavi_mes_host", &mh, sizeof(mh));
                     if (mh != 0) {
-                        const int hb = createHostBo(0xA0000, true);   // write-combined: the CPU's stores go to memory without waiting in a cache line the GPU would have to snoop
+                        const int hb = createHostBo(0xB0000, true);   // write-combined: the CPU's stores go to memory without waiting in a cache line the GPU would have to snoop
                         if (hb >= 0) {
                             gMesHostMem = static_cast<volatile uint8_t *>(bos[hb].md->getBytesNoCopy());
-                            gMesHostSize = 0xA0000;
+                            gMesHostSize = 0xB0000;
                             gMesHostLogBase = bos[hb].gpuVa - kRNVramMcBase;
                             mesBase = gMesHostLogBase;
                         }
@@ -3152,6 +3168,19 @@ void RedNaviProbe::sdmaTest() {
                                      IOSleep(100);
                                  }, this, &mr);
                 publishMes(mr);
+                {   // Opt-in (rednavi_gfx_queue=1): the graphics queue through the MES, and a self test on it (docs/COMPAT.md, "Graphics queue")
+                    uint32_t gq = 0;
+                    if (PE_parse_boot_argn("rednavi_gfx_queue", &gq, sizeof(gq)) && gq == 1 && ((mr.q_active & 1u) || mr.add_ok)) {
+                        static struct rn_gfxq_result gr;
+                        rn_gfx_queue_map(&gpu, &gr);
+                        static const char *const gn[] = {"step", "add_status", "add_ok", "hqd_active_before", "hqd_active", "hqd_cntl", "hqd_base", "mqd_base", "doorbell_ctl", "rptr", "wptr",
+                                                         "cp_stat", "me_cntl", "scratch", "write_data", "fence", "rptr_word", "fault_status", "fault_lo", "fault_hi", "csb_dwords"};
+                        const uint32_t gv[] = {gr.step, gr.add_status, gr.add_ok, gr.hqd_active_before, gr.hqd_active, gr.hqd_cntl, gr.hqd_base, gr.mqd_base, gr.doorbell_ctl, gr.rptr, gr.wptr,
+                                               gr.cp_stat, gr.me_cntl, gr.scratch, gr.write_data, gr.fence, gr.rptr_word, gr.fault_status, gr.fault_lo, gr.fault_hi, gr.csb_dwords};
+                        rnPublish(this, "gfx-queue", gn, gv, sizeof(gv) / sizeof(gv[0]));
+                        gfxQueueOk = gr.step >= 7;
+                    }
+                }
                 if ((mr.q_active & 1u) || mr.add_ok) computeRingOff = gMesBaseUsed + 0x40000;   // the queue the MES mapped
                 if (mesClean == 1 && ((mr.q_active & 1u) || mr.add_ok)) cr.ok = 1;
                 if (mesClean == 2) {      // the MES is up (step 4): now a hand-programmed queue, to see whether it survives with the MES running

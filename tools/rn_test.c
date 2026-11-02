@@ -217,6 +217,36 @@ int main(int argc, char **argv) {
         IOServiceClose(c);
         return pr.v[0] == 0x600DC0DEu ? 0 : 2;
     }
+    if (argc > 1 && !strcmp(argv[1], "gfx")) {                  // gfx [N]: the plain dispatch on the graphics queue (a compute dispatch is valid on it), N times, interleaved with the compute queue
+        const int rounds = argc > 2 ? atoi(argv[2]) : 1;
+        Bo code, data;
+        if (createBo(c, 4096, &code) || createBo(c, 4096, &data) || vaMap(c, code.handle, 0x10000, 0, 4096) || vaMap(c, data.handle, 0x20000, 0, 4096)) return 1;
+        const uint32_t n = buildDispatch(code.cpu, 0x10000, 0x20000);
+        for (uint32_t i = 0; i < n; i++)
+            if ((code.cpu[i] & 0xFFFF00FFu) == (PACKET3(0x15, 3) & 0xFFFF00FFu) && ((code.cpu[i] >> 8) & 0xFF) == 0x15) code.cpu[i] |= 2u;   // DISPATCH_DIRECT: shader type compute (bit 1)
+        int fails = 0;
+        for (int r = 0; r < rounds; r++) {
+            for (int q = 1; q >= 0; q--) {                                   // graphics first, then compute
+                data.cpu[0] = 0xDEAD0000u;
+                struct rn_uc_submit in; memset(&in, 0, sizeof(in));
+                in.ib_va = 0x10000; in.ib_dwords = n; in.flags = q ? RN_SUBMIT_GFX : 0;
+                struct rn_uc_submit_result out; size_t outSize = sizeof(out);
+                kr = IOConnectCallStructMethod(c, RN_UC_SUBMIT, &in, sizeof(in), &out, &outSize);
+                uint32_t reached = 0;
+                kern_return_t kw = kr ? kr : waitSeq(c, out.seq, 3000, &reached, NULL);
+                const int ok = !kr && !kw && reached && data.cpu[0] == 0x600DC0DEu;
+                if (!ok || r == 0 || r == rounds - 1)
+                    printf("round %d %s queue: submit 0x%x seq 0x%08x, wait 0x%x, fence %s, result 0x%08x%s\n", r, q ? "graphics" : "compute ", kr, out.seq, kw, reached ? "reached" : "NOT reached", data.cpu[0], ok ? "" : "  FAIL");
+                if (!ok) { fails++; if (fails > 3) goto gfxdone; }
+            }
+        }
+gfxdone:;
+        struct rn_uc_diag d;
+        if (diag(c, 0, &d) == KERN_SUCCESS) printf("fault status 0x%x, address 0x%x%08x\n", d.fault_status, d.fault_addr_hi, d.fault_addr_lo);
+        printf("%d rounds, %d failures\n", rounds, fails);
+        IOServiceClose(c);
+        return fails ? 2 : 0;
+    }
     if (argc > 3 && !strcmp(argv[1], "peekv")) {                // peekv OFFSET COUNT: dwords of VRAM at a byte offset (hex), by the index/data registers
         struct rn_uc_vram_peek in = {strtoull(argv[2], NULL, 16), (uint32_t)atoi(argv[3]), 0};
         struct rn_uc_vram_peek_result out;

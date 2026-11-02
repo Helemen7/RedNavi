@@ -24,10 +24,10 @@ index 356df4d..fff4be6 100644
  
 diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
 new file mode 100644
-index 0000000..05b0dcd
+index 0000000..8d762e2
 --- /dev/null
 +++ b/src/amd/common/apple/ac_apple_iokit.c
-@@ -0,0 +1,1095 @@
+@@ -0,0 +1,1102 @@
 +/*
 + * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
 + *
@@ -765,6 +765,10 @@ index 0000000..05b0dcd
 +{
 +   if (va_range_type != amdgpu_gpu_va_range_general || size == 0)
 +      return -EINVAL;
++   /* The kext maps whole 4 KB pages: a range is rounded to them, and so is its alignment (RADV asks for 256 bytes for some small buffers; the next range would then start inside a page). */
++   size = (size + 4095) & ~4095ull;
++   if (va_base_alignment < 4096)
++      va_base_alignment = 4096;
 +   /* Policy of the bridge, not of Linux: a buffer goes to the upper half only when it has to be reachable with a 32-bit pointer (AMDGPU_VA_RANGE_32_BIT). Everything else,
 +    * AMDGPU_VA_RANGE_HIGH included, is placed in the lower half, because a command buffer in the upper half hangs the compute queue and a buffer's use is not known here. */
 +   struct vamgr *m = (flags & AMDGPU_VA_RANGE_32_BIT) ? &dev->high32 : &dev->low;
@@ -881,6 +885,8 @@ index 0000000..05b0dcd
 +   case AMDGPU_VA_OP_MAP:
 +      r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
 +      if (!r) track_map(dev, bo_handle, addr, offset, size);
++      else if (getenv("RN_BRIDGE_DEBUG"))
++         fprintf(stderr, "rn-bridge: map failed: bo %u offset 0x%llx size 0x%llx at 0x%llx\n", bo_handle, (unsigned long long)offset, (unsigned long long)size, (unsigned long long)addr);
 +      return r;
 +   case AMDGPU_VA_OP_UNMAP:
 +   case AMDGPU_VA_OP_CLEAR:
@@ -961,7 +967,7 @@ index 0000000..05b0dcd
 +                                 uint64_t timeout_ns, uint64_t flags, uint32_t *expired)
 +{
 +   (void)ctx_id; (void)ip_instance; (void)ring;
-+   if (ip_type != AMDGPU_HW_IP_COMPUTE || fence_seq_no == 0 || fence_seq_no > 0xffffffffull)
++   if ((ip_type != AMDGPU_HW_IP_COMPUTE && ip_type != AMDGPU_HW_IP_GFX) || fence_seq_no == 0 || fence_seq_no > 0xffffffffull)   /* the queue is in bit 31 of the number */
 +      return -EINVAL;
 +   uint64_t deadline;                                          /* libdrm: relative unless AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE, AMDGPU_TIMEOUT_INFINITE for ever */
 +   if (timeout_ns == AMDGPU_TIMEOUT_INFINITE)
@@ -1093,13 +1099,14 @@ index 0000000..05b0dcd
 +         fprintf(stderr, "rn-bridge: dumped, ib %u at 0x%llx, %u bytes\n", i, (unsigned long long)ibs[i]->va_start, ibs[i]->ib_bytes);
 +   }
 +   for (unsigned i = 0; i < n_ibs; i++) {
-+      if (ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
++      if ((ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE && ibs[i]->ip_type != AMDGPU_HW_IP_GFX) || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
 +         return -EINVAL;
 +      /* The kext holds at most RN_UC_SUBMIT_SYNC_MAX = 8 of each per submit; more than that is split nowhere, it is refused. */
 +      struct rn_uc_submit sub;
 +      memset(&sub, 0, sizeof(sub));
 +      sub.ib_va = ibs[i]->va_start;
 +      sub.ib_dwords = ibs[i]->ib_bytes / 4;
++      sub.flags = ibs[i]->ip_type == AMDGPU_HW_IP_GFX ? RN_SUBMIT_GFX : 0;
 +      if (i == 0) {
 +         if (n_in > RN_UC_SUBMIT_SYNC_MAX)
 +            return -EINVAL;
@@ -1367,10 +1374,10 @@ index 0000000..70a4648
 +#include "drm-uapi/amdgpu_drm.h"
 diff --git a/src/amd/common/apple/rn_uapi.h b/src/amd/common/apple/rn_uapi.h
 new file mode 100644
-index 0000000..5eea896
+index 0000000..5a581b3
 --- /dev/null
 +++ b/src/amd/common/apple/rn_uapi.h
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,232 @@
 +// The user client interface of RedNaviProbe, shared by the kext and user space programs (tools/rn_test.c, later the Mesa backend).
 +// Every method takes and returns one struct through IOConnectCallStructMethod; the sizes are checked exactly, so a layout change
 +// means a new RN_UAPI_VERSION. Plain C, fixed-width types only. The method set mirrors the DRM_AMDGPU_* commands RADV uses
@@ -1382,7 +1389,7 @@ index 0000000..5eea896
 +
 +#include "rn_drm_uapi.h"
 +
-+#define RN_UAPI_VERSION 7
++#define RN_UAPI_VERSION 8
 +
 +enum {
 +    RN_UC_INFO = 0,        // out rn_uc_info
@@ -1433,6 +1440,8 @@ index 0000000..5eea896
 +    uint64_t vram_free;
 +    uint64_t vram_vis_bytes;   // VRAM the CPU reaches through the PCI aperture (RN_BO_VRAM_VISIBLE), and what is left of it
 +    uint64_t vram_vis_free;
++    uint32_t gfx_queue;        // 1 when the graphics queue is mapped and RN_SUBMIT_GFX works
++    uint32_t pad;
 +};
 +
 +// Where a buffer lives. 0: wired host memory (the GTT domain), CPU cached, mapped by the GPU as system memory. RN_BO_VRAM: device-local VRAM, only the GPU reaches it
@@ -1524,6 +1533,12 @@ index 0000000..5eea896
 +typedef struct drm_amdgpu_cs_chunk_syncobj_ref rn_uc_sync_ref;
 +
 +#define RN_UC_SUBMIT_SYNC_MAX 8
++// rn_uc_submit.flags: RN_SUBMIT_GFX sends the command buffer to the graphics queue instead of the compute queue. Each queue has its own sequence numbers: those of the graphics
++// queue carry bit 31 (the counter is the low 31 bits), those of the compute queue have bit 31 clear, and a sequence number is compared modulo 2^31 against the fence of its queue
++// (a connection's fence page holds the compute fence in its first dword and the graphics fence in the third). Work on the two queues is not ordered: wait for the sequence number
++// (or a syncobj it signals) before depending on it.
++#define RN_SUBMIT_GFX 1u
++
 +struct rn_uc_submit {
 +    uint64_t ib_va;            // inside one mapping of this connection
 +    uint32_t ib_dwords;

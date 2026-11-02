@@ -727,6 +727,10 @@ int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_
 {
    if (va_range_type != amdgpu_gpu_va_range_general || size == 0)
       return -EINVAL;
+   /* The kext maps whole 4 KB pages: a range is rounded to them, and so is its alignment (RADV asks for 256 bytes for some small buffers; the next range would then start inside a page). */
+   size = (size + 4095) & ~4095ull;
+   if (va_base_alignment < 4096)
+      va_base_alignment = 4096;
    /* Policy of the bridge, not of Linux: a buffer goes to the upper half only when it has to be reachable with a 32-bit pointer (AMDGPU_VA_RANGE_32_BIT). Everything else,
     * AMDGPU_VA_RANGE_HIGH included, is placed in the lower half, because a command buffer in the upper half hangs the compute queue and a buffer's use is not known here. */
    struct vamgr *m = (flags & AMDGPU_VA_RANGE_32_BIT) ? &dev->high32 : &dev->low;
@@ -843,6 +847,8 @@ int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset,
    case AMDGPU_VA_OP_MAP:
       r = call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
       if (!r) track_map(dev, bo_handle, addr, offset, size);
+      else if (getenv("RN_BRIDGE_DEBUG"))
+         fprintf(stderr, "rn-bridge: map failed: bo %u offset 0x%llx size 0x%llx at 0x%llx\n", bo_handle, (unsigned long long)offset, (unsigned long long)size, (unsigned long long)addr);
       return r;
    case AMDGPU_VA_OP_UNMAP:
    case AMDGPU_VA_OP_CLEAR:
@@ -923,7 +929,7 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
                                  uint64_t timeout_ns, uint64_t flags, uint32_t *expired)
 {
    (void)ctx_id; (void)ip_instance; (void)ring;
-   if (ip_type != AMDGPU_HW_IP_COMPUTE || fence_seq_no == 0 || fence_seq_no > 0xffffffffull)
+   if ((ip_type != AMDGPU_HW_IP_COMPUTE && ip_type != AMDGPU_HW_IP_GFX) || fence_seq_no == 0 || fence_seq_no > 0xffffffffull)   /* the queue is in bit 31 of the number */
       return -EINVAL;
    uint64_t deadline;                                          /* libdrm: relative unless AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE, AMDGPU_TIMEOUT_INFINITE for ever */
    if (timeout_ns == AMDGPU_TIMEOUT_INFINITE)
@@ -1055,13 +1061,14 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
          fprintf(stderr, "rn-bridge: dumped, ib %u at 0x%llx, %u bytes\n", i, (unsigned long long)ibs[i]->va_start, ibs[i]->ib_bytes);
    }
    for (unsigned i = 0; i < n_ibs; i++) {
-      if (ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
+      if ((ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE && ibs[i]->ip_type != AMDGPU_HW_IP_GFX) || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
          return -EINVAL;
       /* The kext holds at most RN_UC_SUBMIT_SYNC_MAX = 8 of each per submit; more than that is split nowhere, it is refused. */
       struct rn_uc_submit sub;
       memset(&sub, 0, sizeof(sub));
       sub.ib_va = ibs[i]->va_start;
       sub.ib_dwords = ibs[i]->ib_bytes / 4;
+      sub.flags = ibs[i]->ip_type == AMDGPU_HW_IP_GFX ? RN_SUBMIT_GFX : 0;
       if (i == 0) {
          if (n_in > RN_UC_SUBMIT_SYNC_MAX)
             return -EINVAL;

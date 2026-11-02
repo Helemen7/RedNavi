@@ -1,5 +1,6 @@
 #include <IOKit/IOLib.h>      // before the compat headers: their min() macro breaks libkern.h
 #include "gfx11.h"
+#include "gfx11_csb.h"
 
 #include <string.h>
 
@@ -2225,4 +2226,218 @@ void rn_kiq_map_compute(struct rn_device *adev, u64 vaBase, u64 kiqOff, u64 queu
     if (res->ok) { gMapped = true; gMappedWptr = 0; }                        // later rn_compute_submit_ib calls use the mapped queue
 }
 
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------- graphics queue
+// The kernel graphics queue of GC 11: ME 0, pipe 0, queue 0, doorbell index 0x8B (AMDGPU_NAVI10_DOORBELL_GFX_RING0) times two in dwords, as gfx_v11_0_gfx_ring_init has it.
+// Linux maps it through the MES (amdgpu_gfx_enable_kgq: mes_v11_0_map_legacy_queue with queue_type AMDGPU_RING_TYPE_GFX), from an MQD that gfx_v11_0_gfx_mqd_init fills
+// (struct v11_gfx_mqd: the dword numbers below are those of v11_structs.h), and then gfx_v11_0_cp_gfx_start sends the clear state preamble through the ring.
+#ifndef CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET__SHIFT 0x2          // bits 27:2, gc_11_0_3_sh_mask.h
+#define CP_RB_DOORBELL_CONTROL__DOORBELL_OFFSET_MASK 0x0FFFFFFCL
+#endif
+static const u32 kGfxRingBytes = 0x8000, kGfxDoorbell = 0x8B << 1;
+static u32 gGfxWptr;                       // dwords written to the graphics ring so far (the ring is addressed by this counter modulo its size)
+static u32 gGfxLastVmid = 0xffffffffu;      // the VMID of the last job: a different one is a context switch
+static u64 gGfxBlk;                        // VRAM offset of the queue's block: rptr +0x1000, wptr +0x1008, MQD +0x2000, ring data +0x5000 (the same layout as a compute queue's)
+
+static void writeGfxMqd(struct rn_device *adev, u64 vaBase, u64 blk, u32 ringBytes, u32 doorbellDword) {
+    const u64 mqdOff = blk + 0x2000, ringOff = blk + kRingAt, rptrOff = blk + 0x1000, wptrOff = blk + 0x1008;
+    const u64 ringVa = vaBase + ringOff;
+    u32 qOrder = 0;
+    while ((4u << qOrder) < ringBytes) qOrder++;                            // order_base_2(queue_size / 4)
+    u32 mqdCtl = regCP_GFX_MQD_CONTROL_DEFAULT;
+    mqdCtl = REG_SET_FIELD(mqdCtl, CP_GFX_MQD_CONTROL, VMID, 0);
+    mqdCtl = REG_SET_FIELD(mqdCtl, CP_GFX_MQD_CONTROL, PRIV_STATE, 1);
+    mqdCtl = REG_SET_FIELD(mqdCtl, CP_GFX_MQD_CONTROL, CACHE_POLICY, 0);
+    u32 quantum = regCP_GFX_HQD_QUANTUM_DEFAULT;
+    quantum = REG_SET_FIELD(quantum, CP_GFX_HQD_QUANTUM, QUANTUM_EN, 1);
+    u32 hqdCntl = regCP_GFX_HQD_CNTL_DEFAULT;
+    hqdCntl = REG_SET_FIELD(hqdCntl, CP_GFX_HQD_CNTL, RB_BUFSZ, qOrder - 1);
+    hqdCntl = REG_SET_FIELD(hqdCntl, CP_GFX_HQD_CNTL, RB_BLKSZ, qOrder - 3);
+    hqdCntl = REG_SET_FIELD(hqdCntl, CP_GFX_HQD_CNTL, KMD_QUEUE, 1);
+    u32 db = regCP_RB_DOORBELL_CONTROL_DEFAULT;
+    db = REG_SET_FIELD(db, CP_RB_DOORBELL_CONTROL, DOORBELL_OFFSET, doorbellDword);
+    db = REG_SET_FIELD(db, CP_RB_DOORBELL_CONTROL, DOORBELL_EN, 1);
+    for (u32 o = 0; o < 512 * 4; o += 4) rn_vram_wr32(adev, mqdOff + o, 0);
+    for (u32 o = 0; o < ringBytes; o += 4) rn_vram_wr32(adev, ringOff + o, 0);
+    for (u32 o = 0; o < 16; o += 4) rn_vram_wr32(adev, blk + 0x1000 + o, 0);
+    struct { u32 dw; u32 v; } mqd[] = {
+        {128, lower_32_bits(vaBase + mqdOff) & 0xfffffffcu}, {129, upper_32_bits(vaBase + mqdOff)},   // cp_mqd_base_addr
+        {162, mqdCtl},                                                                                 // cp_gfx_mqd_control
+        {131, 0},                                                                                      // cp_gfx_hqd_vmid
+        {134, 0},                                                                                      // cp_gfx_hqd_queue_priority: low
+        {135, quantum},
+        {136, lower_32_bits(ringVa >> 8)}, {137, upper_32_bits(ringVa >> 8)},                          // cp_gfx_hqd_base
+        {139, lower_32_bits(vaBase + rptrOff) & 0xfffffffcu}, {140, upper_32_bits(vaBase + rptrOff) & 0xFFFFu},   // cp_gfx_hqd_rptr_addr
+        {141, lower_32_bits(vaBase + wptrOff) & 0xfffffffcu}, {142, upper_32_bits(vaBase + wptrOff) & 0xFFFFu},   // cp_rb_wptr_poll_addr
+        {143, db},                                                                                     // cp_rb_doorbell_control
+        {145, hqdCntl},                                                                                // cp_gfx_hqd_cntl
+        {138, regCP_GFX_HQD_RPTR_DEFAULT},                                                             // cp_gfx_hqd_rptr
+        {130, 1},                                                                                      // cp_gfx_hqd_active
+    };
+    for (u32 i = 0; i < sizeof(mqd) / sizeof(mqd[0]); i++) rn_vram_wr32(adev, mqdOff + mqd[i].dw * 4, mqd[i].v);
+    (void)rn_vram_rd32(adev, mqdOff + 511 * 4);
+    __sync_synchronize();
+}
+
+// Dwords to the graphics ring, the write pointer shadow, and the doorbell (a 64-bit write of the running dword count).
+static void gfxRingEmit(struct rn_device *adev, const u32 *pk, u32 n) {
+    const u32 mask = kGfxRingBytes / 4 - 1;
+    const u64 data = gGfxBlk + kRingAt;
+    const u32 w = gGfxWptr;
+    for (u32 i = 0; i < n; i++) rn_vram_wr32(adev, data + ((w + i) & mask) * 4, pk[i]);
+    gGfxWptr = w + n;
+    rn_vram_wr32(adev, gGfxBlk + 0x1008, w + n); rn_vram_wr32(adev, gGfxBlk + 0x100C, 0);
+    (void)rn_vram_rd32(adev, data + (((w + n - 1) & mask) * 4));
+    __sync_synchronize();
+    rn_hdp_flush(adev);
+    *reinterpret_cast<volatile u64 *>(gDoorbellBase + kGfxDoorbell * 4) = w + n;
+}
+
+int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
+    if (!gGfxBlk) return -EINVAL;
+    u32 pk[24];
+    u32 n = 0;
+    // What amdgpu_ib_schedule sends for a job on the graphics ring: FRAME_CONTROL start, CONTEXT_CONTROL (load enable, plus the load flags when the context changed since the
+    // last job: gfx_v11_0_ring_emit_cntxcntl), the INDIRECT_BUFFER (no INDIRECT_BUFFER_VALID bit on the graphics ring: gfx_v11_0_ring_emit_ib_gfx), the fence, FRAME_CONTROL end.
+    const bool ctxSwitch = gGfxLastVmid != vmid;
+    gGfxLastVmid = vmid;
+    pk[n++] = RN_PACKET3(0x90u, 0); pk[n++] = 0;                              // PACKET3_FRAME_CONTROL, FRAME_CMD(0) = start
+    pk[n++] = RN_PACKET3(0x28u, 1); pk[n++] = 0x80000000u | (ctxSwitch ? (0x8001u | 0x01000000u | 0x10002u) : 0u); pk[n++] = 0;
+    pk[n++] = RN_PACKET3(0x3Fu, 2);                                          // INDIRECT_BUFFER
+    pk[n++] = lower_32_bits(ibVa) & 0xfffffffcu;
+    pk[n++] = upper_32_bits(ibVa) & 0xFFFFu;
+    pk[n++] = (ibDwords & 0xFFFFFu) | ((vmid & 0xFu) << 24);
+    pk[n++] = RN_PACKET3(RN_PACKET3_RELEASE_MEM, 6);
+    pk[n++] = (1u << 22) | (1u << 21) | (1u << 13) | (1u << 12) | (3u << 25) | RN_CACHE_FLUSH_AND_INV_TS_EVENT | (5u << 8);
+    pk[n++] = (1u << 29);
+    pk[n++] = lower_32_bits(fenceVa); pk[n++] = upper_32_bits(fenceVa);
+    pk[n++] = fenceValue; pk[n++] = 0; pk[n++] = 0;
+    pk[n++] = RN_PACKET3(0x90u, 0); pk[n++] = 1u << 28;                       // FRAME_CMD(1) = end
+    u32 pad = (8u - (n & 7u)) & 7u;
+    if (pad == 1) pad = 9;
+    if (pad) {
+        pk[n++] = RN_PACKET3(RN_PACKET3_NOP, pad - 2);
+        for (u32 i = 1; i < pad; i++) pk[n++] = 0;
+    }
+    const u32 mask = kGfxRingBytes / 4 - 1;
+    if (gSubmitLock) IOLockLock(gSubmitLock);
+    int rc = 0;
+    u32 spins = 0, rptr = rn_vram_rd32(adev, gGfxBlk + 0x1000);
+    while (n > mask - ((gGfxWptr - rptr) & mask)) {                         // the ring is never filled completely, a full ring would look empty
+        if (spins++ == 0) gRingFullWaits++;
+        if (spins > 200000) { rc = -EAGAIN; break; }
+        udelay(10);
+        const u32 now = rn_vram_rd32(adev, gGfxBlk + 0x1000);
+        if (now != rptr) { rptr = now; spins = 1; }
+    }
+    if (rc == 0) gfxRingEmit(adev, pk, n);
+    if (gSubmitLock) IOLockUnlock(gSubmitLock);
+    return rc;
+}
+
+void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res) {
+    memset(res, 0, sizeof(*res));
+    if (!gMesCtx.valid || !gDoorbellBase) return;
+    const u64 vaBase = gMesCtx.vaBase, blk = gMesCtx.qOff + 0x5C000;       // after the MES event log (base + 0x50000 .. 0x94000)
+    gGfxBlk = blk;
+    gGfxWptr = 0;
+    rn_gc_safe_mode(adev, 1);
+    // gfx_v11_0_cp_set_doorbell_range: the graphics doorbells, from gfx_ring0 to the end of the graphics user queues (0x100)
+    WREG32_SOC15(RN_GC, 0, regCP_RB_DOORBELL_RANGE_LOWER, (0x8B * 2) << 2);
+    WREG32_SOC15(RN_GC, 0, regCP_RB_DOORBELL_RANGE_UPPER, (0x100 * 2) << 2);
+    res->step = 1;
+    // The hand-programmed graphics ring test left its hardware queue active: the MES maps a free one.
+    grbmSelect(adev, 0, 0, 0, 0);
+    res->hqd_active_before = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE);
+    WREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE, 0);
+    for (int i = 0; i < 1000 && (RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE) & 1u); i++) udelay(1);
+    writeGfxMqd(adev, vaBase, blk, kGfxRingBytes, kGfxDoorbell);
+    res->step = 2;
+    {
+        union MESAPI__ADD_QUEUE p;
+        memset(&p, 0, sizeof(p));
+        p.header.type = MES_API_TYPE_SCHEDULER;
+        p.header.opcode = MES_SCH_API_ADD_QUEUE;
+        p.header.dwsize = API_FRAME_SIZE_IN_DWORDS;
+        p.pipe_id = 0;
+        p.queue_id = 0;
+        p.doorbell_offset = kGfxDoorbell;
+        p.mqd_addr = vaBase + blk + 0x2000;
+        p.wptr_addr = vaBase + blk + 0x1008;
+        p.queue_type = MES_QUEUE_TYPE_GFX;
+        p.map_legacy_kq = 1;
+        u32 st = 0;
+        res->add_ok = mesSendLate(adev, &p, offsetof(union MESAPI__ADD_QUEUE, api_status) / 4, &st);
+        res->add_status = st;
+    }
+    res->step = 3;
+    grbmSelect(adev, 0, 0, 0, 0);
+    res->hqd_active = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_ACTIVE);
+    res->hqd_cntl = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_CNTL);
+    res->hqd_base = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_BASE);
+    res->mqd_base = RREG32_SOC15(RN_GC, 0, regCP_GFX_MQD_BASE_ADDR);
+    res->doorbell_ctl = RREG32_SOC15(RN_GC, 0, regCP_RB_DOORBELL_CONTROL);
+    res->cp_stat = RREG32_SOC15(RN_GC, 0, regCP_STAT);
+    res->me_cntl = RREG32_SOC15(RN_GC, 0, regCP_ME_CNTL);
+    if (!(res->hqd_active & 1u)) goto out;
+    res->step = 4;
+    {   // gfx_v11_0_cp_gfx_start: the clear state, the default values of all context registers (gfx11_csb.h), between the preamble packets, then CLEAR_STATE, which makes the
+        // command processor load them into every context it creates. Without the defaults a new context starts with every register 0 and a draw produces nothing.
+        const u32 head[] = {RN_PACKET3(0x4Au, 0), 2u << 28,                     // PREAMBLE_CNTL: begin clear state
+                            RN_PACKET3(0x28u, 1), 0x80000000u, 0x80000000u};    // CONTEXT_CONTROL
+        gfxRingEmit(adev, head, sizeof(head) / sizeof(head[0]));
+        for (u32 e = 0; e < sizeof(kGfx11CsbExtents) / sizeof(kGfx11CsbExtents[0]); e++) {
+            const u32 hdr[] = {RN_PACKET3(0x69u, kGfx11CsbExtents[e].count), kGfx11CsbExtents[e].first_reg - 0xA000u};   // SET_CONTEXT_REG
+            gfxRingEmit(adev, hdr, 2);
+            gfxRingEmit(adev, kGfx11CsbExtents[e].values, kGfx11CsbExtents[e].count);
+        }
+        const u32 tail[] = {RN_PACKET3(0x69u, 1), 0xA1ECu - 0xA000u, 0,           // SET_CONTEXT_REG PA_SC_TILE_STEERING_OVERRIDE = 0 (gfx.config.pa_sc_tile_steering_override)
+                            RN_PACKET3(0x4Au, 0), 3u << 28,                       // PREAMBLE_CNTL: end clear state
+                            RN_PACKET3(0x12u, 0), 0};                             // CLEAR_STATE
+        gfxRingEmit(adev, tail, sizeof(tail) / sizeof(tail[0]));
+        res->csb_dwords = 5 + 934 + 2 * 7 + sizeof(tail) / sizeof(tail[0]);
+    }
+    {   // the ring test of Linux: SET_UCONFIG_REG SCRATCH_REG0
+        const u32 scratchDw = 0xc000u + 0x40u;
+        WREG32_SOC15(RN_GC, 0, regSCRATCH_REG0, 0xCAFEDEADu);
+        const u32 pk[] = {RN_PACKET3(RN_PACKET3_SET_UCONFIG_REG, 1), scratchDw - RN_PACKET3_SET_UCONFIG_REG_START, 0xDEADBEEFu};
+        gfxRingEmit(adev, pk, 3);
+        for (int i = 0; i < 2000; i++) { if (RREG32_SOC15(RN_GC, 0, regSCRATCH_REG0) == 0xDEADBEEFu) break; udelay(10); }
+        res->scratch = RREG32_SOC15(RN_GC, 0, regSCRATCH_REG0);
+    }
+    if (res->scratch != 0xDEADBEEFu) goto out;
+    res->step = 5;
+    {   // WRITE_DATA to memory (ME, DST_SEL 5, WR_CONFIRM)
+        const u64 target = vaBase + blk + 0x1010;
+        rn_vram_wr32(adev, blk + 0x1010, 0xCAFEDEADu);
+        const u32 pk[] = {RN_PACKET3(0x37u, 3), (5u << 8) | (1u << 20), lower_32_bits(target), upper_32_bits(target), 0x600DC0DEu};
+        gfxRingEmit(adev, pk, 5);
+        for (int i = 0; i < 2000; i++) { if (rn_vram_rd32(adev, blk + 0x1010) == 0x600DC0DEu) break; udelay(10); }
+        res->write_data = rn_vram_rd32(adev, blk + 0x1010);
+    }
+    if (res->write_data != 0x600DC0DEu) goto out;
+    res->step = 6;
+    {   // RELEASE_MEM, as the compute submit writes its fence
+        const u64 fenceVa = vaBase + blk + 0x1018;
+        rn_vram_wr32(adev, blk + 0x1018, 0);
+        const u32 pk[] = {RN_PACKET3(RN_PACKET3_RELEASE_MEM, 6),
+                          (1u << 22) | (1u << 21) | (1u << 13) | (1u << 12) | (3u << 25) | RN_CACHE_FLUSH_AND_INV_TS_EVENT | (5u << 8), (1u << 29),
+                          lower_32_bits(fenceVa), upper_32_bits(fenceVa), 0x77u, 0, 0};
+        gfxRingEmit(adev, pk, 8);
+        for (int i = 0; i < 2000; i++) { if (rn_vram_rd32(adev, blk + 0x1018) == 0x77u) break; udelay(10); }
+        res->fence = rn_vram_rd32(adev, blk + 0x1018);
+    }
+    if (res->fence == 0x77u) res->step = 7;
+out:
+    grbmSelect(adev, 0, 0, 0, 0);
+    res->rptr = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_RPTR);
+    res->wptr = RREG32_SOC15(RN_GC, 0, regCP_GFX_HQD_WPTR);
+    res->rptr_word = rn_vram_rd32(adev, blk + 0x1000);
+    res->fault_status = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_STATUS);
+    res->fault_lo = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_LO32);
+    res->fault_hi = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_ADDR_HI32);
+    rn_gc_safe_mode(adev, 0);
 }

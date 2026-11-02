@@ -128,3 +128,7 @@ One failure is unexplained: the first `saturate 600` right after the first boot 
 ### VRAM, 2026-11-02
 
 Buffers in device-local VRAM (about 13.5 GB) and CPU-visible VRAM (78 MB) from the kext's allocator; design, the PTE finding (offset, not MC address) and the results are in docs/COMPAT.md, "VRAM buffers". Memory types RADV now reports: host (heap of 2 GB), device-local VRAM, CPU-visible VRAM (78 MB heap).
+
+### Graphics, 2026-11-02
+
+RADV now reports a queue family with GRAPHICS (flags 0xf) next to the compute-only one; a triangle renders correctly into a tiled image in VRAM. Details and what is missing in docs/COMPAT.md, "Graphics queue". Tools: `test/vk_draw.c` (`vk_draw [size] [linear|clear]`), `test/vk_stress.c` (`VK_QUEUE_COMPUTE_ONLY=1` picks the compute-only family).

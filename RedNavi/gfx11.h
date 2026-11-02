@@ -174,6 +174,18 @@ void rn_compute_diag(struct rn_device *adev, u32 out[11]);   // out[8..10]: SDMA
 // RLC safe mode (gfx_v11_0_set_safe_mode): keeps the graphics block out of GFXOFF while it is being used; enter 0 leaves it again.
 // The doorbell and queue registers as they are now (compare with the values that were programmed): HQD doorbell control, CP_PQ_STATUS, the
 // MEC doorbell range (lower, upper), NBIO DOORBELL_APER_EN, HQD PQ base, PQ control, MQD base.
+// The kernel graphics queue (ME 0, pipe 0, queue 0), mapped through the MES like the compute queue (ADD_QUEUE with MES_QUEUE_TYPE_GFX and map_legacy_kq), and a self test on it:
+// a SET_UCONFIG_REG to SCRATCH_REG0, a WRITE_DATA to memory and a RELEASE_MEM fence. Needs rn_mes_start to have mapped the compute queue (it reuses the scheduler ring).
+struct rn_gfxq_result {
+    u32 step;                                                  // 1 doorbell range set, 2 MQD written, 3 ADD_QUEUE answered, 4 queue active, 5 scratch test, 6 WRITE_DATA, 7 RELEASE_MEM
+    u32 add_status, add_ok;                                    // api status of the ADD_QUEUE frame, and whether the scheduler answered it
+    u32 hqd_active_before, hqd_active, hqd_cntl, hqd_base, mqd_base, doorbell_ctl, rptr, wptr;   // CP_GFX_HQD_* before the map and after it
+    u32 cp_stat, me_cntl, scratch, write_data, fence, rptr_word, fault_status, fault_lo, fault_hi, csb_dwords;
+};
+void rn_gfx_queue_map(struct rn_device *adev, struct rn_gfxq_result *res);
+// An indirect buffer on the graphics queue followed by a fence write (the same two packets rn_compute_submit_ib sends); 0, -EAGAIN when the ring stayed full for 2 s without the
+// read position moving (nothing was written), -EINVAL.
+int rn_gfx_submit_ib(struct rn_device *adev, u64 ib_va, u32 ib_dwords, u64 fence_va, u32 fence_value, u32 vmid);
 int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]);   // see gfx11.cpp; info: [0] failed step, [1] HQD_ACTIVE after the dequeue, [2] api status of the failing frame, [3] HQD_ACTIVE after the re-map
 void rn_compute_ring_state(struct rn_device *adev, u32 out[4]);   // [0] rptr write-back word, [1] wptr word, [2] driver wptr of the mapped compute ring, all in dwords, [3] submits that had to wait for room
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]);

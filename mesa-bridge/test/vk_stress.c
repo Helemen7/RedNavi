@@ -544,7 +544,11 @@ int main(int argc, char **argv)
    VkQueueFamilyProperties qf[8];
    vkGetPhysicalDeviceQueueFamilyProperties(pd, &nq, qf);
    int fam = -1;
-   for (uint32_t i = 0; i < nq; i++) if (fam < 0 && (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT)) fam = (int)i;
+   const int computeOnly = getenv("VK_QUEUE_COMPUTE_ONLY") != NULL;      /* default: the first family that can compute (the graphics one when there is one); with the variable, one that cannot draw */
+   for (uint32_t i = 0; i < nq; i++) {
+      printf("queue family %u: flags 0x%x, %u queue(s)\n", i, qf[i].queueFlags, qf[i].queueCount);
+      if (fam < 0 && (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && (!computeOnly || !(qf[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))) fam = (int)i;
+   }
    if (fam < 0) { fprintf(stderr, "no compute queue\n"); return 2; }
    family = (uint32_t)fam;
    float prio = 1.0f;

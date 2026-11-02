@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 7
+#define RN_UAPI_VERSION 8
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -60,6 +60,8 @@ struct rn_uc_info {
     uint64_t vram_free;
     uint64_t vram_vis_bytes;   // VRAM the CPU reaches through the PCI aperture (RN_BO_VRAM_VISIBLE), and what is left of it
     uint64_t vram_vis_free;
+    uint32_t gfx_queue;        // 1 when the graphics queue is mapped and RN_SUBMIT_GFX works
+    uint32_t pad;
 };
 
 // Where a buffer lives. 0: wired host memory (the GTT domain), CPU cached, mapped by the GPU as system memory. RN_BO_VRAM: device-local VRAM, only the GPU reaches it
@@ -151,6 +153,12 @@ struct drm_amdgpu_cs_chunk_syncobj_ref {                  // drm_amdgpu_cs_chunk
 typedef struct drm_amdgpu_cs_chunk_syncobj_ref rn_uc_sync_ref;
 
 #define RN_UC_SUBMIT_SYNC_MAX 8
+// rn_uc_submit.flags: RN_SUBMIT_GFX sends the command buffer to the graphics queue instead of the compute queue. Each queue has its own sequence numbers: those of the graphics
+// queue carry bit 31 (the counter is the low 31 bits), those of the compute queue have bit 31 clear, and a sequence number is compared modulo 2^31 against the fence of its queue
+// (a connection's fence page holds the compute fence in its first dword and the graphics fence in the third). Work on the two queues is not ordered: wait for the sequence number
+// (or a syncobj it signals) before depending on it.
+#define RN_SUBMIT_GFX 1u
+
 struct rn_uc_submit {
     uint64_t ib_va;            // inside one mapping of this connection
     uint32_t ib_dwords;

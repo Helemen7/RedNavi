@@ -65,3 +65,7 @@ Step 2 decides the schedule; steps 1 and 5 are mostly software.
 ## State, 2026-11-02 (later)
 
 VRAM buffers work (docs/COMPAT.md): device-local and CPU-visible pools, RADV reports memory types for both. Open: the graphics queue, MSI, the PCI location, 2 MB leaf entries, clearing of device-local buffers, buffers above 1 GB.
+
+## State, 2026-11-02 (graphics)
+
+The graphics queue works (docs/COMPAT.md): a triangle is drawn by RADV into VRAM. Open: reset of the graphics queue, display of a rendered image, MSI, the PCI location, 2 MB leaf entries, clearing device-local buffers, buffers above 1 GB, Metal (M6).
