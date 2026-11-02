@@ -9,7 +9,7 @@
 
 #include "rn_drm_uapi.h"
 
-#define RN_UAPI_VERSION 5
+#define RN_UAPI_VERSION 6
 
 enum {
     RN_UC_INFO = 0,        // out rn_uc_info
@@ -35,10 +35,12 @@ enum {
 
 // A buffer is mapped into the caller with IOConnectMapMemory64(connection, handle, ...): the memory type is the handle.
 //
-// Every connection owns a GPU virtual address space (a VMID, 1 to 7, so at most 7 connections at a time): the lower half of the 48-bit space,
-// four levels of page table as in Linux. Command buffers are addressed in it: a buffer is put there with RN_UC_VA_MAP at an address the caller picks
-// from [vm_va_start, vm_va_start + vm_va_bytes) (the lowest 2 MB are kept free, as amdgpu does), and only what is mapped is reachable by the GPU
-// for this connection's command buffers. Addresses with bit 47 set (the upper half, 0xffff800000000000 and up in canonical form) are refused: see docs/COMPAT.md. Mapping is read, write and execute. The gpu_va that RN_UC_BO_CREATE returns is the
+// Every connection owns a GPU virtual address space (a VMID, 1 to 7, so at most 7 connections at a time) of 48 bits, four levels of page table as in
+// Linux. Command buffers are addressed in it: a buffer is put there with RN_UC_VA_MAP at an address the caller picks, from the lower half
+// [vm_va_start, vm_va_start + vm_va_bytes) or from the upper half, which is given in canonical form (bits 63:47 all set: 0xffff800000000000 and up, as
+// DEV_INFO's high_va_offset and high_va_max say) and never crosses the hole between the halves. Only what is mapped is reachable by the GPU for this
+// connection's command buffers. A command buffer (the IB of a submit) must lie in the lower half: submitting one from the upper half is refused
+// (kIOReturnUnsupported). Data buffers and shader code work in both halves. Mapping is read, write and execute. The gpu_va that RN_UC_BO_CREATE returns is the
 // buffer's address in the kernel's own window and is not valid in a connection's address space.
 
 struct rn_uc_info {
@@ -49,7 +51,7 @@ struct rn_uc_info {
     uint64_t max_bo_bytes;
     uint32_t bo_count;         // buffers of this connection
     uint32_t bo_limit;         // buffers one connection can hold
-    uint64_t vm_va_start;      // the lowest address that can be mapped; the space ends at vm_va_start + vm_va_bytes = 2^47
+    uint64_t vm_va_start;      // the lowest address of the lower half that can be mapped; the half ends at vm_va_start + vm_va_bytes = 2^47
     uint64_t vm_va_bytes;
     uint32_t vmid;
     uint32_t va_map_limit;     // mappings one connection can hold
@@ -200,6 +202,7 @@ struct rn_uc_diag {
     uint32_t pq_base, pq_control, mqd_base;
     uint32_t ring_rptr_word, ring_wptr_word, driver_wptr, ring_full_waits;
     uint32_t seq_submitted, seq_signaled;     // this connection's context
+    uint32_t flush_failures, flush_last_ack;  // TLB flushes (engine 17) whose acknowledge never came, and the last acknowledge register read
 };
 
 #endif

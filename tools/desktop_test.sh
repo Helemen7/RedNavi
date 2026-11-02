@@ -1,14 +1,14 @@
 #!/bin/bash
 # Deploy the built kext and rn_test to the development desktop, reboot it, and run rn_test modes over ssh once the kext has published the MES result.
 #
-#     tools/desktop_test.sh [mode ...]          modes: plain ring seq info syncobj bo vm vmhole vmfault (default: all of them, vmfault last because it leaves compute stuck until a reset)
+#     tools/desktop_test.sh [mode ...]          modes: plain ring seq info syncobj bo vm vmhole high vmfault (default: all of them, vmfault last because it leaves compute stuck until a reset)
 #
 # Needs `make DEBUG=1` done, rn_test built for x86_64 (clang -O1 -arch x86_64 -mmacosx-version-min=12 -framework IOKit -framework CoreFoundation tools/rn_test.c -o rn_test_x86),
 # ssh keys for helemen7@mac-desktop.lab and a sudoers rule that lets that user run `reboot`. Private to this setup (docs/TEST_MACHINES.md), kept here so that it is not lost.
 W="$(cd "$(dirname "$0")/.." && pwd)"
 D=helemen7@mac-desktop.lab
 T="${RN_TEST_BIN:-$W/rn_test_x86}"
-modes=("$@"); [ ${#modes[@]} -eq 0 ] && modes=(plain ring seq info syncobj bo vm vmhole plain vmfault plain)
+modes=("$@"); [ ${#modes[@]} -eq 0 ] && modes=(plain ring seq info syncobj bo vm vmhole high plain vmfault plain)
 # The disk numbers move when USB sticks are in (the internal EFI was disk0s1, with sticks plugged in it is disk3s1): identify the EFI by what it is, an internal disk whose
 # OpenCore config carries the RedNavi boot-args, not by its number.
 loc=$(ssh -o BatchMode=yes $D "diskutil info /Volumes/EFI | grep 'Device Location' | awk '{print \$3}'")

@@ -53,6 +53,7 @@ void rn_gart_clear(struct rn_device *adev, const struct rn_gmc *gmc) {
 static IOLock *gFlushLock;              // invalidation engine 17 is one request/acknowledge register pair: one flush at a time
 
 // Invalidates the TLBs of every VMID in `mask` (bit n = VMID n) through engine 17, the one Linux uses for flushes done by register (amdgpu_gmc_flush_gpu_tlb).
+static u32 gFlushFailures, gFlushLastAck;   // flushes whose acknowledge never came, and the last acknowledge register read
 static int flushVmids(struct rn_device *adev, u32 mask) {
     if (gFlushLock) IOLockLock(gFlushLock);
     u32 req = 0;                                                             // gfxhub_v3_0_3_get_invalidate_req(flush type 0)
@@ -67,9 +68,11 @@ static int flushVmids(struct rn_device *adev, u32 mask) {
     WREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_REQ, req);
     int rc = -1;
     for (int i = 0; i < 100000; i++) {                                       // up to ~100 ms
-        if ((RREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ACK) & mask) == mask) { rc = 0; break; }
+        gFlushLastAck = RREG32_SOC15(RN_GC, 0, regGCVM_INVALIDATE_ENG17_ACK);
+        if ((gFlushLastAck & mask) == mask) { rc = 0; break; }
         udelay(1);
     }
+    if (rc) gFlushFailures++;
     // The engine acknowledged but a changed PTE was still used on hardware (gart-dynamic test): also do what rn_gfxhub_enable does to
     // start from empty caches, pulse the L1 TLB and L2 cache invalidation in GCVM_L2_CNTL2.
     u32 tmp = RREG32_SOC15(RN_GC, 0, regGCVM_L2_CNTL2);
@@ -169,6 +172,8 @@ void rn_vm_write_pte(struct rn_device *adev, u64 tableVramOffset, u32 index, u64
 }
 
 int rn_vm_flush(struct rn_device *adev, u32 vmid) { return flushVmids(adev, 1u << vmid); }
+
+void rn_vm_flush_stats(u32 out[2]) { out[0] = gFlushFailures; out[1] = gFlushLastAck; }
 
 u64 rn_gart_read_pte(struct rn_device *adev, const struct rn_gmc *gmc, u32 page) {
     const u64 slot = gmc->pt_vram_offset + (u64)page * 8;
@@ -1998,13 +2003,51 @@ void rn_mes_start(struct rn_device *adev, u64 vaBase, u64 base, const struct rn_
 // Gets a hung legacy compute queue going again, the way Linux resets a kernel compute queue through the MES (gfx_v11_0_reset_kcq, mes_v11_0_reset_queue_mmio,
 // amdgpu_gfx_mes_reset_queue_start): dequeue the hardware queue and reset its waves, have the MES remove it (REMOVE_QUEUE with unmap_legacy_queue and remove_queue_after_reset),
 // put the MQD and the ring back as they were at boot and have the MES map it again (ADD_QUEUE with map_legacy_kq). Everything that was in the ring or running is lost. Returns 0, or
-// -ENODEV (no mapped queue), -EIO with info[0] the step that failed: 1 the hardware queue did not go inactive, 2 REMOVE_QUEUE, 3 ADD_QUEUE, 4 the queue is not active afterwards.
-int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]) {
-    memset(info, 0, 4 * sizeof(u32));
-    if (!gMesCtx.valid || !gMapped) return -ENODEV;
+// -ENODEV (no mapped queue), -EIO with info[0] the step that failed: 1 the hardware queue did not go inactive, 2 REMOVE_QUEUE, 3 ADD_QUEUE, 4 the queue is not active afterwards, 5 it is mapped but takes no work (a second pass resets the MEC pipe first; info[2] then holds the first pass's failure, 5).
+// After a bad access of the command processor itself (an IB that cannot be fetched) the dequeue and the MES frames can all succeed and the compute pipe still does not run
+// anything: Linux then resets the MEC pipe (mes_v11_0_reset_compute_pipe_mmio). The pipe is held in reset, the hardware queues on it are cleared, and the pipe goes back
+// to the start of its firmware; every queue on it is lost, here the one MES mapped.
+static void mecPipeReset(struct rn_device *adev, u32 pipe) {
+    u32 hold = RREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_CNTL);
+    const u32 release = REG_SET_FIELD(hold, CP_MEC_RS64_CNTL, MEC_PIPE0_RESET, 0);
+    hold = REG_SET_FIELD(hold, CP_MEC_RS64_CNTL, MEC_PIPE0_RESET, 1);          // pipe 0 is the only one RedNavi maps a queue on
+    (void)pipe;
+    WREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_CNTL, hold);
+    for (u32 q = 0; q < 8; q++) {
+        grbmSelect(adev, 1, 0, 0, q);
+        WREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE, 0);
+        WREG32_SOC15(RN_GC, 0, regCP_HQD_DEQUEUE_REQUEST, 0);
+    }
+    grbmSelect(adev, 0, 0, 0, 0);
+    WREG32_SOC15(RN_GC, 0, regCP_MEC_RS64_CNTL, release);
+    msleep(5);
+}
+
+// Does the mapped queue run what it is given? A two-dword NOP into the ring and the read pointer word must follow the write pointer (the ring was just rebuilt, write pointer 0).
+static bool mappedQueueAlive(struct rn_device *adev) {
+    const u32 mmask = gMappedRingBytes / 4 - 1;
+    const u64 data = gMesCtx.qOff + gMappedRingAt, wptrOff = gMesCtx.qOff + 0x1008;
+    const u32 w = gMappedWptr;
+    rn_vram_wr32(adev, data + ((w) & mmask) * 4, RN_PACKET3(RN_PACKET3_NOP, 0));
+    rn_vram_wr32(adev, data + ((w + 1) & mmask) * 4, 0);
+    gMappedWptr = w + 2;
+    rn_vram_wr32(adev, wptrOff, w + 2); rn_vram_wr32(adev, wptrOff + 4, 0);
+    (void)rn_vram_rd32(adev, data + ((w + 1) & mmask) * 4);
+    __sync_synchronize();
+    rn_hdp_flush(adev);
+    *reinterpret_cast<volatile u64 *>(gDoorbellBase + gMappedDoorbell * 4) = w + 2;
+    for (int i = 0; i < 100; i++) {
+        if (rn_vram_rd32(adev, gMesCtx.qOff + 0x1000) == ((w + 2) & mmask)) return true;
+        msleep(1);
+    }
+    return false;
+}
+
+static int queueResetPass(struct rn_device *adev, u32 info[4], bool pipeReset) {
     if (gSubmitLock) IOLockLock(gSubmitLock);                                // no submit while the ring and the wptr are rebuilt
     int rc = -EIO;
     rn_gc_safe_mode(adev, 1);
+    if (pipeReset) mecPipeReset(adev, gMesCtx.pipe);
     grbmSelect(adev, 1, gMesCtx.pipe, 0, gMesCtx.queue);
     WREG32_SOC15(RN_GC, 0, regCP_HQD_DEQUEUE_REQUEST, 2);
     WREG32_SOC15(RN_GC, 0, regSPI_COMPUTE_QUEUE_RESET, 1);
@@ -2057,10 +2100,25 @@ int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]) {
     info[3] = RREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE);
     grbmSelect(adev, 0, 0, 0, 0);
     if (!(info[3] & 1u)) { info[0] = 4; goto out; }
+    if (!mappedQueueAlive(adev)) { info[0] = 5; goto out; }                // mapped and active, and still does not take work
     rc = 0;
 out:
     rn_gc_safe_mode(adev, 0);
     if (gSubmitLock) IOLockUnlock(gSubmitLock);
+    return rc;
+}
+
+int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]) {
+    memset(info, 0, 4 * sizeof(u32));
+    if (!gMesCtx.valid || !gMapped) return -ENODEV;
+    int rc = queueResetPass(adev, info, false);
+    if (rc != 0 && info[0] == 5) {                                          // the queue is back but the pipe does not run it: reset the pipe and map again
+        u32 first[4];
+        memcpy(first, info, sizeof(first));
+        rc = queueResetPass(adev, info, true);
+        info[2] = first[0];                                                 // the failure of the first pass is kept for the caller to see
+        if (rc == 0) info[0] = 0;
+    }
     return rc;
 }
 

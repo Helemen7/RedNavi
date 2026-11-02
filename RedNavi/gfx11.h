@@ -164,6 +164,7 @@ void rn_vm_write_pte(struct rn_device *adev, u64 table_vram_offset, u32 index, u
 int rn_vm_flush(struct rn_device *adev, u32 vmid);
 u64 rn_gart_read_pte(struct rn_device *adev, const struct rn_gmc *gmc, u32 page);
 void rn_vm_clear_fault(struct rn_device *adev);
+void rn_vm_flush_stats(u32 out[2]);   // [0] TLB flushes whose acknowledge never came, [1] the last acknowledge register value read
 // Fills ib with the PM4 of a 1x1x1 dispatch of the shader at shader_va (the packets of rn_compute_dispatch_test, without the fence)
 // and returns the number of dwords.
 // What the compute queue and the memory hub say now: HQD read pointer, wptr, active, CP_STAT, the VM fault status and address.

@@ -282,7 +282,7 @@ class RedNaviProbe : public IOService {
     // The user address spaces (rn_vm_*): VMIDs 1 to 7, 48 bits, a root directory (PDB2) and the directories and page tables below it made on demand,
     // 4 KB pages of VRAM from a pool of kVmPoolPages per VMID starting at kVmTables.
     static constexpr uint64_t kVmMin = 0x10000ull;         // virtual_address_offset of DEV_INFO on Linux 7.0 for this card
-    static constexpr uint64_t kVmEnd = 1ull << 47;           // the lower half of the 48-bit space; an IB at an address with bit 47 set hung the compute queue (docs/COMPAT.md), so the upper half is refused
+    static constexpr uint64_t kVmEnd = 1ull << 48;           // the 48-bit space: the lower half 0 to 2^47 and the upper half, which a program sees sign-extended (0xffff800000000000 and up)
     static constexpr uint64_t kVmTables = 0x0D000000ull;   // VRAM
     static constexpr uint32_t kVmPoolPages = 1024;         // 4 MB per VMID: about 1000 tables, enough to map around 1 GB spread out
     uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
@@ -1764,10 +1764,16 @@ class RedNaviClient : public IOUserClient {
         if (handle == 0 || handle > kMaxHandles) return -1;
         return boIdx[handle - 1];
     }
-    // An address of the lower half (bits 63:47 clear); see kVmEnd.
-    static bool canonical(uint64_t va, uint64_t *out) {
-        if (va >> 47) return false;
-        *out = va;
+    // A program's address of `size` bytes as the 48 bits the page table is built over: the lower half as it is, the upper half only in canonical form (bits 63:47 all
+    // set) with the high bits dropped, as Linux does in the GEM_VA ioctl (AMDGPU_GMC_HOLE_MASK). A range does not cross the hole: it stays in its half.
+    static bool canonical(uint64_t va, uint64_t size, uint64_t *out) {
+        if (va < (1ull << 47)) {
+            if (size > (1ull << 47) - va) return false;
+            *out = va;
+            return true;
+        }
+        if (va < 0xffff800000000000ull || size > ~va + 1) return false;
+        *out = va & 0x0000FFFFFFFFFFFFull;
         return true;
     }
     // Is [va, va + len) inside one mapping of this connection's address space?
@@ -1998,7 +2004,7 @@ public:
                 o->bo_count = boUsed;
                 o->bo_limit = kMaxHandles;
                 o->vm_va_start = RedNaviProbe::kVmMin;
-                o->vm_va_bytes = RedNaviProbe::kVmEnd - RedNaviProbe::kVmMin;
+                o->vm_va_bytes = (1ull << 47) - RedNaviProbe::kVmMin;                // the lower half; the upper half is 0xffff800000000000 up to 2^64 - 4 MB
                 o->vmid = static_cast<uint32_t>(vmid);
                 o->va_map_limit = kMaxMaps;
                 rc = kIOReturnSuccess;
@@ -2039,7 +2045,10 @@ public:
             if (sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) && fenceIdx >= 0) {
                 const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
                 uint64_t ibVa = 0;
-                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !canonical(in->ib_va, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                if (in->flags != 0 || in->ib_dwords == 0 || in->ib_dwords > 4096 || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                // A command buffer in the upper half of the address space hangs the compute queue (docs/COMPAT.md): the command processor does not run it and later
+                // dispatches of every connection stay dead until the next boot, a reset does not bring them back. Data and shaders up there work, so only this is refused.
+                if (ibVa >= (1ull << 47)) { rc = kIOReturnUnsupported; break; }
                 if (in->in_count > RN_UC_SUBMIT_SYNC_MAX || in->out_count > RN_UC_SUBMIT_SYNC_MAX) break;
                 bool badSync = false;
                 for (uint32_t i = 0; i < in->in_count; i++) if (!findSync(in->in[i].handle)) badSync = true;
@@ -2121,7 +2130,7 @@ public:
                 const rn_uc_va_map *in = static_cast<const rn_uc_va_map *>(args->structureInput);
                 const int idx = boOf(in->handle);
                 uint64_t va = 0;
-                if (idx < 0 || in->flags != 0 || in->size == 0 || ((in->va | in->offset | in->size) & 4095) || !canonical(in->va, &va)) break;
+                if (idx < 0 || in->flags != 0 || in->size == 0 || ((in->va | in->offset | in->size) & 4095) || !canonical(in->va, in->size, &va)) break;
                 if (va < RedNaviProbe::kVmMin || in->size > RedNaviProbe::kVmEnd - va) break;
                 if (in->offset > gpuOwner->bos[idx].size || in->size > gpuOwner->bos[idx].size - in->offset) break;
                 bool clash = false;
@@ -2141,7 +2150,7 @@ public:
             if (sized(args, sizeof(rn_uc_va_unmap), 0)) {
                 const rn_uc_va_unmap *in = static_cast<const rn_uc_va_unmap *>(args->structureInput);
                 uint64_t va = 0;
-                if (!canonical(in->va, &va)) break;
+                if (!canonical(in->va, in->size, &va)) break;
                 for (uint32_t i = 0; i < kMaxMaps; i++)
                     if (maps[i].used && maps[i].va == va && maps[i].size == in->size) { unmapSlot(i); rc = kIOReturnSuccess; break; }
             }
@@ -2286,6 +2295,7 @@ public:
                 o->doorbell_aper_en = d2[4]; o->pq_base = d2[5]; o->pq_control = d2[6]; o->mqd_base = d2[7];
                 o->ring_rptr_word = rs[0]; o->ring_wptr_word = rs[1]; o->driver_wptr = rs[2]; o->ring_full_waits = rs[3];
                 o->seq_submitted = seqSubmitted; o->seq_signaled = fenceIdx >= 0 ? fenceNow() : 0;
+                { u32 fs[2]; rn_vm_flush_stats(fs); o->flush_failures = fs[0]; o->flush_last_ack = fs[1]; }
                 if (req->flags & RN_UC_DIAG_CLEAR_FAULT) rn_vm_clear_fault(&gpuOwner->gpu);
                 rc = kIOReturnSuccess;
             }

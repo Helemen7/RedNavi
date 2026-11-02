@@ -33,7 +33,7 @@ Lacks, in the order RADV needs it:
 
 ## State, 2026-11-02
 
-Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: the upper half of the address space (RADV's 32-bit range is there; an IB at such an address hung the queue once), memory in VRAM and bigger buffers (host memory only, 1 MB each, 64 MB of GART that is never recycled), the Mesa backend `ac_apple_iokit.c` and the patches of docs/M5_MESA_BUILD.md, a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
+Done and verified on the 7800 XT: user client with per-connection buffers and fences (rn_uapi.h version 5), four-level GPU address spaces over the lower 47 bits, queue reset after a fault, timeline syncobjs, the INFO queries (DEV_INFO and FW_VERSION as the Linux kernel answered them). Open, in the order RADV will hit them: command buffers in the upper half of the address space hang the queue (data and shaders there work; the kext refuses such an IB and the bridge keeps IBs low, docs/COMPAT.md; the cause is unknown), memory in VRAM and bigger buffers (host memory only, 1 MB each, 64 MB of GART that is never recycled), the Mesa backend `ac_apple_iokit.c` and the patches of docs/M5_MESA_BUILD.md, a graphics queue (RADV may refuse a device without one: the kext reports none), TIMESTAMP and the sensors, MSI.
 
 ## Proposed user client shape
 

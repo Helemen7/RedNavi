@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -132,7 +133,7 @@ static uint32_t buildDispatch(volatile uint32_t *cpu, uint64_t codeVa, uint64_t 
     for (int i = 0; i < 64; i++) cpu[0x100 / 4 + i] = i < 11 ? shader[i] : 0xBF9F0000u;   // s_code_end padding
     uint32_t ib[48], n = 0;
     const uint64_t sva = codeVa + 0x100;
-    ib[n++] = PACKET3(0x76, 2); ib[n++] = SHREG(0x1bac); ib[n++] = (uint32_t)(sva >> 8); ib[n++] = (uint32_t)(sva >> 40);      // COMPUTE_PGM_LO/HI
+    ib[n++] = PACKET3(0x76, 2); ib[n++] = SHREG(0x1bac); ib[n++] = (uint32_t)(sva >> 8); ib[n++] = (uint32_t)((sva >> 40) & 0xff);      // COMPUTE_PGM_LO/HI: the high register has 8 bits (COMPUTE_PGM_HI__DATA_MASK 0xff), bits above must stay 0
     ib[n++] = PACKET3(0x76, 2); ib[n++] = SHREG(0x1bb2); ib[n++] = 0x002C0000u; ib[n++] = 0x80u;                              // PGM_RSRC1/2
     ib[n++] = PACKET3(0x76, 1); ib[n++] = SHREG(0x1bc8); ib[n++] = 0;                                                         // PGM_RSRC3
     ib[n++] = PACKET3(0x76, 3); ib[n++] = SHREG(0x1ba4); ib[n++] = 0; ib[n++] = 0; ib[n++] = 0;                               // START_X/Y/Z
@@ -153,6 +154,24 @@ static kern_return_t waitDword(io_connect_t c, uint32_t handle, uint32_t offset,
     return kr;
 }
 
+// A connection with a code buffer and a data buffer mapped at 0x10000 and 0x20000 and the dispatch built for them (one low dispatch, as the plain test).
+typedef struct { io_connect_t c; Bo code, data; uint32_t n; } Conn;
+static int connSetup(io_service_t svc, Conn *k) {
+    if (IOServiceOpen(svc, mach_task_self(), 0, &k->c) != KERN_SUCCESS) return -1;
+    if (createBo(k->c, 4096, &k->code) || createBo(k->c, 4096, &k->data)) return -1;
+    if (vaMap(k->c, k->code.handle, 0x10000, 0, 4096) || vaMap(k->c, k->data.handle, 0x20000, 0, 4096)) return -1;
+    k->n = buildDispatch(k->code.cpu, 0x10000, 0x20000);
+    return 0;
+}
+static int connRun(Conn *k, const char *what) {
+    k->data.cpu[0] = 0xDEAD0000u;
+    kern_return_t kr = submitIb(k->c, 0x10000, k->n);
+    uint32_t r = 0;
+    waitSeq(k->c, gSeq, 1500, &r, NULL);
+    printf("%-44s: submit 0x%x, fence %s, result 0x%08x\n", what, kr, r ? "reached" : "NOT reached", k->data.cpu[0]);
+    return r && k->data.cpu[0] == 0x600DC0DEu;
+}
+
 int main(int argc, char **argv) {
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviProbe"));
     if (!svc) { printf("no RedNaviProbe service\n"); return 1; }
@@ -160,6 +179,13 @@ int main(int argc, char **argv) {
     kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &c);
     if (kr != KERN_SUCCESS) { printf("IOServiceOpen: 0x%x (administrator or boot-arg rednavi_uc_anyone=1)\n", kr); return 1; }
 
+    if (argc > 1 && !strcmp(argv[1], "reset")) {               // reset the compute queue and nothing else (after a test left it stuck)
+        struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+        kr = IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, NULL, 0, &rr, &rrSize);
+        printf("queue reset: 0x%x, status %u, resets so far %u\n", kr, rr.status, rr.resets);
+        IOServiceClose(c);
+        return kr || rr.status ? 2 : 0;
+    }
     struct rn_uc_info info;
     size_t infoSize = sizeof(info);
     kr = IOConnectCallStructMethod(c, RN_UC_INFO, NULL, 0, &info, &infoSize);
@@ -199,6 +225,7 @@ int main(int argc, char **argv) {
                    d.hqd_rptr, d.hqd_wptr, d.hqd_active, d.cp_stat, d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.ring_wptr,
                    d.sdma0_version, d.grbm_status, d.rlc_gpm_stat, d.hqd_doorbell_control, d.cp_pq_status, d.doorbell_range_lower,
                    d.doorbell_range_upper, d.doorbell_aper_en, d.pq_base, d.pq_control, d.mqd_base);
+        if (diag(c, 0, &d) == KERN_SUCCESS) printf("       sequence %u submitted, %u signaled; TLB flush failures %u, last acknowledge 0x%x\n", d.seq_submitted, d.seq_signaled, d.flush_failures, d.flush_last_ack);
     }
     if (ok && argc > 1 && !strcmp(argv[1], "ring")) {          // rptr write-back word against the driver's wptr over many submits (the ring holds 2048 dwords)
         for (uint32_t k = 1; k <= 300; k++) {
@@ -396,6 +423,81 @@ int main(int argc, char **argv) {
             printf("destroy: 0x%x, again: 0x%x, wait on it: 0x%x (expect 0 and two errors)\n", kr, kr2, kr3); if (kr || !kr2 || !kr3) ok = 0;
         }
     }
+    if (ok && argc > 1 && !strcmp(argv[1], "high")) {          // which part of a dispatch fails in the upper half: the command buffer, the shader, or the store
+        const uint64_t lowC = 0x400000, highC = 0xffff800000200000ull, lowD = 0x500000, highD = 0xffff800ff0300000ull;
+        if (vaMap(c, code.handle, lowC, 0, 4096) || vaMap(c, code.handle, highC, 0, 4096) || vaMap(c, data.handle, lowD, 0, 4096) || vaMap(c, data.handle, highD, 0, 4096)) {
+            printf("map failed\n"); ok = 0;
+        } else {
+            static const struct { const char *name; int ibHigh, pgmHigh, storeHigh; } cases[] = {
+                {"store high only", 0, 0, 1}, {"shader high only", 0, 1, 0}, {"shader and store high", 0, 1, 1},
+                {"command buffer high only", 1, 0, 0}, {"command buffer and shader high", 1, 1, 0}, {"all high", 1, 1, 1}};   // the cases with the command buffer high last: they can leave the queue stuck
+            const unsigned nCases = sizeof(cases) / sizeof(cases[0]);
+            const int rev = argc > 2 && !strcmp(argv[2], "rev"), only = (argc > 2 && argv[2][0] >= '0' && argv[2][0] <= '9') ? atoi(argv[2]) : -1;
+            const int repeat = (argc > 3) ? atoi(argv[3]) : 1;        // high N R: case N, R times, one line with the count
+            for (unsigned kk = 0; kk < nCases * (unsigned)(only >= 0 ? repeat : 1); kk++) {
+                const unsigned k = only >= 0 ? (unsigned)only : (rev ? nCases - 1 - kk : kk);
+                if (only >= 0 && (int)k != only) continue;
+                {   // every case from a freshly reset queue and a cleared fault latch
+                    struct rn_uc_diag d0; struct rn_uc_reset_result r0; size_t r0Size = sizeof(r0);
+                    IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, NULL, 0, &r0, &r0Size);
+                    diag(c, RN_UC_DIAG_CLEAR_FAULT, &d0);
+                }
+                const uint64_t ibVa = cases[k].ibHigh ? highC : lowC, pgm = cases[k].pgmHigh ? highC : lowC, store = cases[k].storeHigh ? highD : lowD;
+                const uint32_t nn = buildDispatch(code.cpu, pgm, store);
+                data.cpu[0] = 0xDEAD0000u;
+                kr = submitIb(c, ibVa, nn);
+                if (cases[k].ibHigh) {
+                    printf("%-34s: submit 0x%x (expect 0xe00002c7: refused, a command buffer in the upper half hangs the queue)\n", cases[k].name, kr);
+                    if (kr != (kern_return_t)0xe00002c7) ok = 0;
+                    continue;
+                }
+                uint32_t r1 = 0;
+                waitSeq(c, gSeq, 1500, &r1, NULL);
+                printf("%-34s: submit 0x%x, fence %s, result 0x%08x\n", cases[k].name, kr, r1 ? "reached" : "NOT reached", data.cpu[0]);
+                {
+                    struct rn_uc_diag d;
+                    diag(c, 0, &d);
+                    if (d.fault_status) printf("    VM fault 0x%x at page 0x%x%08x\n", d.fault_status, d.fault_addr_hi, d.fault_addr_lo);
+                }
+                if (!r1) {
+                    struct rn_uc_diag d;
+                    diag(c, 0, &d);
+                    printf("    hqd rptr 0x%x wptr 0x%x active %u, pq control 0x%x, fault 0x%x at page 0x%x%08x, GRBM_STATUS 0x%x\n", d.hqd_rptr, d.hqd_wptr, d.hqd_active, d.pq_control,
+                           d.fault_status, d.fault_addr_hi, d.fault_addr_lo, d.grbm_status);
+                    diag(c, RN_UC_DIAG_CLEAR_FAULT, &d);
+                    struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+                    kr = IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, NULL, 0, &rr, &rrSize);
+                    printf("    queue reset: 0x%x, status %u\n", kr, rr.status);
+                }
+            }
+            buildDispatch(code.cpu, lowC, lowD);
+            data.cpu[0] = 0xDEAD0000u;
+            submitIb(c, lowC, buildDispatch(code.cpu, lowC, lowD));
+            uint32_t r2 = 0; waitSeq(c, gSeq, 2000, &r2, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 500, &r2);
+            printf("a low dispatch afterwards: result 0x%08x, reached %u\n", data.cpu[0], r2); if (!r2) ok = 0;
+        }
+    }
+    if (ok && argc > 1 && !strcmp(argv[1], "fresh")) {         // are fences of connections opened AFTER an IB-high hang broken, and the ones opened before not?
+        Conn a, b, c3;
+        const uint64_t highC = 0xffff800000200000ull;
+        if (connSetup(svc, &a) || connSetup(svc, &b)) { printf("setup failed\n"); ok = 0; }
+        else {
+            connRun(&b, "connection B (opened before) first run");
+            vaMap(a.c, a.code.handle, highC, 0, 4096);
+            const uint32_t nh = buildDispatch(a.code.cpu, 0x10000, 0x20000);       // shader low, command buffer high: the case that hangs
+            a.data.cpu[0] = 0xDEAD0000u;
+            kr = submitIb(a.c, highC, nh);
+            uint32_t r1 = 0; waitSeq(a.c, gSeq, 1500, &r1, NULL);
+            printf("A: command buffer high, shader low: submit 0x%x, fence %s\n", kr, r1 ? "reached" : "NOT reached");
+            struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+            kr = IOConnectCallStructMethod(a.c, RN_UC_QUEUE_RESET, NULL, 0, &rr, &rrSize);
+            printf("queue reset: 0x%x, status %u, info step %u\n", kr, rr.status, rr.status);
+            int okA = connRun(&a, "connection A (the one that hung) afterwards");
+            int okB = connRun(&b, "connection B (opened before) afterwards");
+            const int okC = connSetup(svc, &c3) == 0 && connRun(&c3, "connection C (opened after) afterwards");
+            printf("A %s, B %s, C %s\n", okA ? "ok" : "BROKEN", okB ? "ok" : "BROKEN", okC ? "ok" : "BROKEN");
+        }
+    }
     if (ok && argc > 1 && !strcmp(argv[1], "bo")) {            // buffer lifetime: handles, ownership, release on close
         Bo extra;
         struct rn_uc_bo_free fr = {extra.handle = 0, 0};
@@ -471,26 +573,27 @@ int main(int argc, char **argv) {
                 printf("the shader stores through the new address: result 0x%08x, reached %u\n", data.cpu[0], r); if (!r) ok = 0;
             }
         }
-        if (ok && !strcmp(argv[1], "vmhole")) {   // the upper half is refused (an IB there hung the queue once, docs/COMPAT.md); nothing here goes to the GPU
-            kr = vaMap(c, code.handle, 0xffff800000200000ull, 0, 4096);
-            printf("a mapping in the upper half, canonical form: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+        if (ok && !strcmp(argv[1], "vmhole")) {   // the upper half is addressed in canonical form; what is not canonical, or crosses the hole, is refused
             kr = vaMap(c, code.handle, 0x0000800000200000ull, 0, 4096);
-            printf("a mapping with bit 47 set: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            printf("a mapping with bit 47 set and the high bits clear: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
             kr = vaMap(c, code.handle, 0x00007fffffffe000ull, 0, 8192);
             printf("a mapping that crosses 2^47: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
+            kr = vaMap(c, code.handle, 0xfffffffffffff000ull, 0, 8192);
+            printf("a mapping that runs past the top of the address space: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
         }
         // Far apart addresses, so that all four levels of the page table are used: different entries at every directory level.
         if (ok) {
             const uint64_t farCode = 0x00007ffffffe0000ull;
-            const uint64_t farData = 0x0000400000001000ull;
-            if (vaMap(c, code.handle, farCode, 0, 4096) || vaMap(c, data.handle, farData, 0, 4096)) { printf("map at the far addresses failed\n"); ok = 0; }
+            const uint64_t farData = !strcmp(argv[1], "vmhole") ? 0xffff800ff0300000ull : 0x0000400000001000ull;
+            const uint64_t farShader = !strcmp(argv[1], "vmhole") ? 0xffff800000200000ull : farCode;      // the shader may sit in the upper half too; the command buffer may not
+            if (vaMap(c, code.handle, farCode, 0, 4096) || vaMap(c, data.handle, farData, 0, 4096) || (farShader != farCode && vaMap(c, code.handle, farShader, 0, 4096))) { printf("map at the far addresses failed\n"); ok = 0; }
             else {
-                const uint32_t nf = buildDispatch(code.cpu, farCode, farData);
+                const uint32_t nf = buildDispatch(code.cpu, farShader, farData);
                 data.cpu[0] = 0xDEAD0000u;
                 if (submitIb(c, farCode, nf)) ok = 0;
                 waitSeq(c, gSeq, 2000, &r, NULL); waitDword(c, data.handle, 0, 0x600DC0DEu, 1000, &r);
-                printf("command buffer at 0x%llx, store to 0x%llx: result 0x%08x, reached %u\n", farCode, farData, data.cpu[0], r); if (!r) ok = 0;
-                if (vaUnmap(c, farCode, 4096) || vaUnmap(c, farData, 4096)) { printf("unmap at the far addresses failed\n"); ok = 0; }
+                printf("command buffer at 0x%llx, shader at 0x%llx, store to 0x%llx: result 0x%08x, reached %u\n", farCode, farShader, farData, data.cpu[0], r); if (!r) ok = 0;
+                if (vaUnmap(c, farCode, 4096) || vaUnmap(c, farData, 4096) || (farShader != farCode && vaUnmap(c, farShader, 4096))) { printf("unmap at the far addresses failed\n"); ok = 0; }
                 kr = submitIb(c, farCode, nf);
                 printf("a submit from the address just unmapped: 0x%x (expect an error)\n", kr); if (!kr) ok = 0;
                 kr = vaMap(c, data.handle, 0x0001000000000000ull, 0, 4096);
