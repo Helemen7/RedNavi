@@ -1,0 +1,1865 @@
+diff --git a/meson.build b/meson.build
+index 356df4d..fff4be6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -771,6 +771,10 @@ endif
+ # even if driver foo requires 2.4.0 and driver bar requires 2.4.3, if foo and
+ # bar are both on use 2.4.3 for both of them
+ dep_libdrm_amdgpu = null_dep
++if with_amd_vk and host_machine.system() == 'darwin'
++  # RedNavi: addrlib's Apple branch wants Apple's private addrExtDef.h; take the generic one
++  add_project_arguments('-DHAVE_TSERVER=1', language : ['c', 'cpp'])
++endif
+ dep_libdrm_intel = null_dep
+ 
+ _drm_ver = '2.4.109'
+@@ -782,7 +786,7 @@ _libdrm_checks = {
+   },
+   'amdgpu': {
+     'version': '2.4.133',
+-    'enabled': (with_amd_vk and not with_platform_windows) or with_gallium_radeonsi,
++    'enabled': (with_amd_vk and not with_platform_windows and host_machine.system() != 'darwin') or with_gallium_radeonsi,
+   },
+ }
+ 
+diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
+new file mode 100644
+index 0000000..9f931dd
+--- /dev/null
++++ b/src/amd/common/apple/ac_apple_iokit.c
+@@ -0,0 +1,958 @@
++/*
++ * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
++ *
++ * Written for the Mesa fork that RADV runs on macOS through (docs/M5_MESA_BUILD.md), where it takes the place of ac_linux_drm.c: every function below has the signature
++ * of its namesake in src/amd/common/ac_linux_drm.h and does what the DRM ioctl does, with one IOConnectCallStructMethod to the kext (RedNavi/rn_uapi.h) in between.
++ * Mesa is MIT licensed and so is this file when it lives in that tree; in the RedNavi repository it is under the licence of the project.
++ *
++ * What the kext does not have yet, and what that means here:
++ *   - memory is wired host memory for every domain (VRAM requests are served from it): up to 1 GB per buffer, 2 GB in all (the kext's boot-arg rednavi_bo_budget_mb), 1024 buffers per connection;
++ *   - one compute queue: every context shares it and its sequence numbers; graphics and SDMA submits are refused;
++ *   - a command buffer must lie in the lower half of the address space (a command buffer in the upper half hangs the queue); only 32-bit buffers get upper-half addresses;
++ *   - no external handles (dma-buf, sync files, opaque fds), no user queues, no sensors, no timestamp.
++ */
++#include "ac_apple_iokit.h"
++#include "ac_gpu_info.h"
++
++#include <IOKit/IOKitLib.h>
++#include <errno.h>
++#include <mach/mach.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#define RN_WAIT_SLICE_MS 5000u                                /* the kext waits at most 10 s per call; longer waits are made of slices */
++
++struct amdgpu_bo {
++   uint32_t handle;
++   uint64_t size;
++   void *cpu;
++   mach_vm_size_t cpu_len;
++};
++
++struct vamgr_seg {
++   uint64_t base, size;
++};
++
++struct vamgr {
++   struct vamgr_seg *free_list;                               /* sorted by base, no two adjacent */
++   uint32_t n, cap;
++   uint64_t start, end;
++};
++
++struct amdgpu_va {
++   struct ac_drm_device *dev;
++   struct vamgr *mgr;
++   uint64_t base, size;
++};
++
++struct ac_drm_device {
++   io_connect_t conn;
++   struct rn_uc_info info;
++   struct drm_amdgpu_info_device dev_info;
++   pthread_mutex_t lock;
++   struct vamgr low, high32;
++   struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
++   uint32_t nbos;
++   uint32_t next_ctx;
++   struct util_sync_provider sync;
++};
++
++int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
++{
++   (void)dev;
++   /* the kext does not publish the PCI location yet (the Linux run had 0000:03:00.0) */
++   info->pci.domain = 0;
++   info->pci.bus = 3;
++   info->pci.dev = 0;
++   info->pci.func = 0;
++   return 0;
++}
++
++void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info)
++{
++   (void)dev;
++   info->has_vm_always_valid = true;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- errors, time */
++
++static int errno_of(IOReturn kr)
++{
++   switch (kr) {
++   case kIOReturnSuccess: return 0;
++   case kIOReturnBadArgument: return -EINVAL;
++   case kIOReturnTimeout: return -ETIME;
++   case kIOReturnNoResources: case kIOReturnNoMemory: return -ENOMEM;
++   case kIOReturnNoSpace: return -ENOSPC;
++   case kIOReturnBusy: return -EBUSY;
++   case kIOReturnUnsupported: return -EOPNOTSUPP;
++   case kIOReturnNotPrivileged: return -EPERM;
++   case kIOReturnNotReady: return -EAGAIN;
++   default: return -EIO;
++   }
++}
++
++static uint64_t now_ns(void)
++{
++   struct timespec ts;
++   clock_gettime(CLOCK_MONOTONIC, &ts);
++   return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
++}
++
++static int call(struct ac_drm_device *dev, uint32_t selector, const void *in, size_t in_size, void *out, size_t out_size)
++{
++   size_t n = out_size;
++   return errno_of(IOConnectCallStructMethod(dev->conn, selector, in, in_size, out, out ? &n : NULL));
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- virtual addresses */
++
++/* The kernel does not hand out addresses (the user does, DRM_AMDGPU_GEM_VA maps at an address given), libdrm keeps a manager per range in user space. Same here: a sorted list of free segments. */
++static void vamgr_init(struct vamgr *m, uint64_t start, uint64_t end)
++{
++   m->start = start;
++   m->end = end;
++   m->n = 1;
++   m->cap = 16;
++   m->free_list = calloc(m->cap, sizeof(*m->free_list));
++   m->free_list[0].base = start;
++   m->free_list[0].size = end - start;
++}
++
++static int vamgr_alloc(struct vamgr *m, uint64_t size, uint64_t align, uint64_t required, uint64_t *out)
++{
++   if (align == 0)
++      align = 1;
++   for (uint32_t i = 0; i < m->n; i++) {
++      struct vamgr_seg *s = &m->free_list[i];
++      uint64_t base = required ? required : (s->base + align - 1) / align * align;
++      if (base < s->base || base + size > s->base + s->size || base + size < base)
++         continue;
++      uint64_t head = base - s->base, tail = s->base + s->size - (base + size);
++      if (head && tail) {                                      /* split: the tail becomes a new segment */
++         if (m->n == m->cap) {
++            m->cap *= 2;
++            m->free_list = realloc(m->free_list, m->cap * sizeof(*m->free_list));
++            s = &m->free_list[i];
++         }
++         memmove(&m->free_list[i + 2], &m->free_list[i + 1], (m->n - i - 1) * sizeof(*m->free_list));
++         m->free_list[i + 1].base = base + size;
++         m->free_list[i + 1].size = tail;
++         s->size = head;
++         m->n++;
++      } else if (head) {
++         s->size = head;
++      } else if (tail) {
++         s->base = base + size;
++         s->size = tail;
++      } else {
++         memmove(s, s + 1, (m->n - i - 1) * sizeof(*s));
++         m->n--;
++      }
++      *out = base;
++      return 0;
++   }
++   return -ENOMEM;
++}
++
++static void vamgr_free(struct vamgr *m, uint64_t base, uint64_t size)
++{
++   uint32_t i = 0;
++   while (i < m->n && m->free_list[i].base < base)
++      i++;
++   int merge_prev = i > 0 && m->free_list[i - 1].base + m->free_list[i - 1].size == base;
++   int merge_next = i < m->n && base + size == m->free_list[i].base;
++   if (merge_prev && merge_next) {
++      m->free_list[i - 1].size += size + m->free_list[i].size;
++      memmove(&m->free_list[i], &m->free_list[i + 1], (m->n - i - 1) * sizeof(*m->free_list));
++      m->n--;
++   } else if (merge_prev) {
++      m->free_list[i - 1].size += size;
++   } else if (merge_next) {
++      m->free_list[i].base = base;
++      m->free_list[i].size += size;
++   } else {
++      if (m->n == m->cap) {
++         m->cap *= 2;
++         m->free_list = realloc(m->free_list, m->cap * sizeof(*m->free_list));
++      }
++      memmove(&m->free_list[i + 1], &m->free_list[i], (m->n - i) * sizeof(*m->free_list));
++      m->free_list[i].base = base;
++      m->free_list[i].size = size;
++      m->n++;
++   }
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- sync provider */
++
++#define PROVIDER_DEV(p) ((struct ac_drm_device *)((char *)(p) - offsetof(struct ac_drm_device, sync)))
++
++/* DRM's syncobj wait takes an absolute CLOCK_MONOTONIC deadline in nanoseconds; the kext takes a relative timeout of at most 10 s. A longer wait is a loop of slices. */
++static int syncobj_wait_points(struct ac_drm_device *dev, uint32_t *handles, const uint64_t *points, unsigned n, int64_t deadline_ns, unsigned flags,
++                               uint32_t *first_signaled)
++{
++   if (n == 0 || n > RN_UC_SYNC_MAX)
++      return -EINVAL;
++   struct rn_uc_syncobj_wait in;
++   struct rn_uc_syncobj_wait_result out;
++   for (;;) {
++      int64_t now = (int64_t)now_ns();
++      int64_t rel = deadline_ns > now ? deadline_ns - now : 0;
++      if (rel > (int64_t)RN_WAIT_SLICE_MS * 1000000)
++         rel = (int64_t)RN_WAIT_SLICE_MS * 1000000;
++      memset(&in, 0, sizeof(in));
++      in.timeout_nsec = rel;
++      in.count = n;
++      in.flags = flags & (RN_UC_SYNCOBJ_WAIT_ALL | RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT | RN_UC_SYNCOBJ_WAIT_AVAILABLE);
++      for (unsigned i = 0; i < n; i++) {
++         in.handles[i] = handles[i];
++         in.points[i] = points ? points[i] : 0;
++      }
++      int r = call(dev, RN_UC_SYNCOBJ_WAIT, &in, sizeof(in), &out, sizeof(out));
++      if (r == 0) {
++         if (first_signaled)
++            *first_signaled = out.first_signaled;
++         return 0;
++      }
++      if (r != -ETIME)
++         return r;
++      if ((int64_t)now_ns() >= deadline_ns)
++         return -ETIME;
++   }
++}
++
++static int sp_create(struct util_sync_provider *p, uint32_t flags, uint32_t *handle)
++{
++   struct rn_uc_syncobj_create in = {flags & RN_UC_SYNCOBJ_CREATE_SIGNALED, 0};
++   struct rn_uc_syncobj_create_result out;
++   int r = call(PROVIDER_DEV(p), RN_UC_SYNCOBJ_CREATE, &in, sizeof(in), &out, sizeof(out));
++   if (r == 0)
++      *handle = out.handle;
++   return r;
++}
++
++static int sp_destroy(struct util_sync_provider *p, uint32_t handle)
++{
++   struct rn_uc_syncobj_destroy in = {handle, 0};
++   return call(PROVIDER_DEV(p), RN_UC_SYNCOBJ_DESTROY, &in, sizeof(in), NULL, 0);
++}
++
++static int sp_unsupported_fd(struct util_sync_provider *p, uint32_t handle, int *fd) { (void)p; (void)handle; (void)fd; return -ENOSYS; }
++static int sp_unsupported_fd_to_handle(struct util_sync_provider *p, int fd, uint32_t *handle) { (void)p; (void)fd; (void)handle; return -ENOSYS; }
++static int sp_unsupported_import(struct util_sync_provider *p, uint32_t handle, int fd) { (void)p; (void)handle; (void)fd; return -ENOSYS; }
++
++static int sp_wait(struct util_sync_provider *p, uint32_t *handles, unsigned n, int64_t timeout_nsec, unsigned flags, uint32_t *first)
++{
++   return syncobj_wait_points(PROVIDER_DEV(p), handles, NULL, n, timeout_nsec, flags, first);
++}
++
++static int sp_timeline_wait(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, unsigned n, int64_t timeout_nsec, unsigned flags,
++                            uint32_t *first)
++{
++   return syncobj_wait_points(PROVIDER_DEV(p), handles, points, n, timeout_nsec, flags, first);
++}
++
++static int sp_array(struct ac_drm_device *dev, uint32_t selector, const uint32_t *handles, const uint64_t *points, uint32_t count)
++{
++   for (uint32_t done = 0; done < count; done += RN_UC_SYNC_MAX) {
++      struct rn_uc_syncobj_array in;
++      uint32_t n = count - done < RN_UC_SYNC_MAX ? count - done : RN_UC_SYNC_MAX;
++      memset(&in, 0, sizeof(in));
++      in.count = n;
++      for (uint32_t i = 0; i < n; i++) {
++         in.handles[i] = handles[done + i];
++         in.points[i] = points ? points[done + i] : 0;
++      }
++      int r = call(dev, selector, &in, sizeof(in), NULL, 0);
++      if (r)
++         return r;
++   }
++   return 0;
++}
++
++static int sp_reset(struct util_sync_provider *p, const uint32_t *handles, uint32_t count) { return sp_array(PROVIDER_DEV(p), RN_UC_SYNCOBJ_RESET, handles, NULL, count); }
++static int sp_signal(struct util_sync_provider *p, const uint32_t *handles, uint32_t count) { return sp_array(PROVIDER_DEV(p), RN_UC_SYNCOBJ_SIGNAL, handles, NULL, count); }
++static int sp_timeline_signal(struct util_sync_provider *p, const uint32_t *handles, uint64_t *points, uint32_t count)
++{
++   return sp_array(PROVIDER_DEV(p), RN_UC_SYNCOBJ_SIGNAL, handles, points, count);
++}
++
++static int sp_query(struct util_sync_provider *p, uint32_t *handles, uint64_t *points, uint32_t count, uint32_t flags)
++{
++   (void)flags;                                               /* DRM_SYNCOBJ_QUERY_FLAGS_LAST_SUBMITTED: the kext answers the signaled value only */
++   struct ac_drm_device *dev = PROVIDER_DEV(p);
++   for (uint32_t done = 0; done < count; done += RN_UC_SYNC_MAX) {
++      struct rn_uc_syncobj_array in, out;
++      uint32_t n = count - done < RN_UC_SYNC_MAX ? count - done : RN_UC_SYNC_MAX;
++      memset(&in, 0, sizeof(in));
++      in.count = n;
++      for (uint32_t i = 0; i < n; i++)
++         in.handles[i] = handles[done + i];
++      int r = call(dev, RN_UC_SYNCOBJ_QUERY, &in, sizeof(in), &out, sizeof(out));
++      if (r)
++         return r;
++      for (uint32_t i = 0; i < n; i++)
++         points[done + i] = out.points[i];
++   }
++   return 0;
++}
++
++static int sp_transfer(struct util_sync_provider *p, uint32_t dst, uint64_t dst_point, uint32_t src, uint64_t src_point, uint32_t flags)
++{
++   struct rn_uc_syncobj_transfer in = {src, dst, src_point, dst_point, flags, 0};
++   return call(PROVIDER_DEV(p), RN_UC_SYNCOBJ_TRANSFER, &in, sizeof(in), NULL, 0);
++}
++
++static void sp_finalize(struct util_sync_provider *p) { (void)p; }
++static struct util_sync_provider *sp_clone(struct util_sync_provider *p) { return p; }
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- device */
++
++static int info_query(struct ac_drm_device *dev, unsigned id, unsigned size, void *value, const struct drm_amdgpu_info *extra)
++{
++   struct drm_amdgpu_info req;
++   if (extra)
++      req = *extra;
++   else
++      memset(&req, 0, sizeof(req));
++   req.return_pointer = 0;                                    /* the answer comes back in the output structure, not through a pointer */
++   req.return_size = size;
++   req.query = id;
++   if (size == 0 || size > 4096)
++      return -EINVAL;
++   return call(dev, RN_UC_INFO_QUERY, &req, sizeof(req), value, size);
++}
++
++int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, uint32_t *minor_version, ac_drm_device **device_handle)
++{
++   (void)fd;
++   (void)is_virtio;
++   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviProbe"));
++   if (!svc)
++      return -ENODEV;
++   struct ac_drm_device *dev = calloc(1, sizeof(*dev));
++   if (!dev) {
++      IOObjectRelease(svc);
++      return -ENOMEM;
++   }
++   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &dev->conn);
++   IOObjectRelease(svc);
++   if (kr != KERN_SUCCESS) {
++      free(dev);
++      return errno_of(kr);
++   }
++   pthread_mutex_init(&dev->lock, NULL);
++   int r = call(dev, RN_UC_INFO, NULL, 0, &dev->info, sizeof(dev->info));
++   if (r == 0 && dev->info.version != RN_UAPI_VERSION)
++      r = -EPROTO;                                            /* the kext and the bridge were built for different interfaces */
++   if (r == 0)
++      r = info_query(dev, AMDGPU_INFO_DEV_INFO, sizeof(dev->dev_info), &dev->dev_info, NULL);
++   if (r == 0) {
++      dev->nbos = dev->info.bo_limit + 1;
++      dev->bos = calloc(dev->nbos, sizeof(*dev->bos));
++      if (!dev->bos)
++         r = -ENOMEM;
++   }
++   if (r) {
++      IOServiceClose(dev->conn);
++      free(dev);
++      return r;
++   }
++   /* The lower range from where DEV_INFO says it starts to its maximum; the 32-bit range is the 4 GB of the upper half whose high dword is address32_hi. */
++   vamgr_init(&dev->low, dev->dev_info.virtual_address_offset, dev->dev_info.virtual_address_max);
++   vamgr_init(&dev->high32, dev->dev_info.high_va_offset, dev->dev_info.high_va_offset + (1ull << 32));
++   dev->next_ctx = 1;
++   dev->sync = (struct util_sync_provider) {
++      .create = sp_create, .destroy = sp_destroy, .handle_to_fd = sp_unsupported_fd, .fd_to_handle = sp_unsupported_fd_to_handle,
++      .import_sync_file = sp_unsupported_import, .export_sync_file = sp_unsupported_fd, .wait = sp_wait, .reset = sp_reset, .signal = sp_signal,
++      .timeline_signal = sp_timeline_signal, .timeline_wait = sp_timeline_wait, .query = sp_query, .transfer = sp_transfer, .finalize = sp_finalize,
++      .clone = sp_clone,
++   };
++   *major_version = 3;                                        /* what a DRM_AMDGPU_INFO user checks before it trusts the interface */
++   *minor_version = 64;
++   *device_handle = dev;
++   return 0;
++}
++
++struct util_sync_provider *ac_drm_device_get_sync_provider(ac_drm_device *dev) { return &dev->sync; }
++uintptr_t ac_drm_device_get_cookie(ac_drm_device *dev) { return (uintptr_t)dev; }
++int ac_drm_device_get_fd(ac_drm_device *dev) { (void)dev; return -1; }
++
++void ac_drm_device_deinitialize(ac_drm_device *dev)
++{
++   if (!dev)
++      return;
++   IOServiceClose(dev->conn);                                 /* the kext frees the buffers, the address space and the syncobjs of a closed connection */
++   free(dev->low.free_list);
++   free(dev->high32.free_list);
++   free(dev->bos);
++   pthread_mutex_destroy(&dev->lock);
++   free(dev);
++}
++
++const char *ac_drm_get_marketing_name(ac_drm_device *device)
++{
++   (void)device;
++   return "AMD Radeon RX 7800 XT";
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- queries */
++
++int ac_drm_query_info(ac_drm_device *dev, unsigned info_id, unsigned size, void *value)
++{
++   return info_query(dev, info_id, size, value, NULL);
++}
++
++int ac_drm_read_mm_registers(ac_drm_device *dev, unsigned dword_offset, unsigned count, uint32_t instance, uint32_t flags, uint32_t *values)
++{
++   struct drm_amdgpu_info req;
++   memset(&req, 0, sizeof(req));
++   req.read_mmr_reg.dword_offset = dword_offset;
++   req.read_mmr_reg.count = count;
++   req.read_mmr_reg.instance = instance;
++   req.read_mmr_reg.flags = flags;
++   return info_query(dev, AMDGPU_INFO_READ_MMR_REG, count * sizeof(uint32_t), values, &req);
++}
++
++int ac_drm_query_hw_ip_count(ac_drm_device *dev, unsigned type, uint32_t *count)
++{
++   struct drm_amdgpu_info req;
++   memset(&req, 0, sizeof(req));
++   req.query_hw_ip.type = type;
++   return info_query(dev, AMDGPU_INFO_HW_IP_COUNT, sizeof(*count), count, &req);
++}
++
++int ac_drm_query_hw_ip_info(ac_drm_device *dev, unsigned type, unsigned ip_instance, struct drm_amdgpu_info_hw_ip *info)
++{
++   struct drm_amdgpu_info req;
++   memset(&req, 0, sizeof(req));
++   req.query_hw_ip.type = type;
++   req.query_hw_ip.ip_instance = ip_instance;
++   return info_query(dev, AMDGPU_INFO_HW_IP_INFO, sizeof(*info), info, &req);
++}
++
++int ac_drm_query_firmware_version(ac_drm_device *dev, unsigned fw_type, unsigned ip_instance, unsigned index, uint32_t *version, uint32_t *feature)
++{
++   struct drm_amdgpu_info req;
++   struct drm_amdgpu_info_firmware fw;
++   memset(&req, 0, sizeof(req));
++   req.query_fw.fw_type = fw_type;
++   req.query_fw.ip_instance = ip_instance;
++   req.query_fw.index = index;
++   int r = info_query(dev, AMDGPU_INFO_FW_VERSION, sizeof(fw), &fw, &req);
++   if (r)
++      return r;
++   *version = fw.ver;
++   *feature = fw.feature;
++   return 0;
++}
++
++int ac_drm_query_uq_fw_area_info(ac_drm_device *dev, unsigned type, unsigned ip_instance, struct drm_amdgpu_info_uq_metadata *info)
++{
++   (void)dev; (void)type; (void)ip_instance; (void)info;
++   return -EOPNOTSUPP;                                        /* user queues */
++}
++
++/* As libdrm's amdgpu_query_gpu_info and Mesa's ac_drm_query_gpu_info: DEV_INFO and, below GFX9 only, registers. The one register read left is GB_ADDR_CONFIG. */
++int ac_drm_query_gpu_info(ac_drm_device *dev, struct amdgpu_gpu_info *info)
++{
++   const struct drm_amdgpu_info_device *d = &dev->dev_info;
++   memset(info, 0, sizeof(*info));
++   info->asic_id = d->device_id;
++   info->chip_rev = d->chip_rev;
++   info->chip_external_rev = d->external_rev;
++   info->family_id = d->family;
++   info->max_engine_clk = d->max_engine_clock;
++   info->max_memory_clk = d->max_memory_clock;
++   info->gpu_counter_freq = d->gpu_counter_freq;
++   info->enabled_rb_pipes_mask = d->enabled_rb_pipes_mask;
++   info->rb_pipes = d->num_rb_pipes;
++   info->ids_flags = d->ids_flags;
++   info->num_hw_gfx_contexts = d->num_hw_gfx_contexts;
++   info->num_shader_engines = d->num_shader_engines;
++   info->num_shader_arrays_per_engine = d->num_shader_arrays_per_engine;
++   info->vram_type = d->vram_type;
++   info->vram_bit_width = d->vram_bit_width;
++   info->ce_ram_size = d->ce_ram_size;
++   info->vce_harvest_config = d->vce_harvest_config;
++   info->pci_rev_id = d->pci_rev;
++   int r = ac_drm_read_mm_registers(dev, 0x263e, 1, 0xffffffff, 0, &info->gb_addr_cfg);
++   if (r)
++      return r;
++   info->cu_active_number = d->cu_active_number;
++   info->cu_ao_mask = d->cu_ao_mask;
++   memcpy(&info->cu_bitmap[0][0], &d->cu_bitmap[0][0], sizeof(info->cu_bitmap));
++   return 0;
++}
++
++int ac_drm_query_heap_info(ac_drm_device *dev, uint32_t heap, uint32_t flags, struct amdgpu_heap_info *info)
++{
++   struct drm_amdgpu_info_vram_gtt vg;
++   int r = ac_drm_query_info(dev, AMDGPU_INFO_VRAM_GTT, sizeof(vg), &vg);
++   if (r)
++      return r;
++   switch (heap) {
++   case AMDGPU_GEM_DOMAIN_VRAM:
++      info->heap_size = (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) ? vg.vram_cpu_accessible_size : vg.vram_size;
++      info->max_allocation = vg.vram_cpu_accessible_size;
++      return ac_drm_query_info(dev, (flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED) ? AMDGPU_INFO_VIS_VRAM_USAGE : AMDGPU_INFO_VRAM_USAGE,
++                               sizeof(info->heap_usage), &info->heap_usage);
++   case AMDGPU_GEM_DOMAIN_GTT:
++      info->heap_size = vg.gtt_size;
++      info->max_allocation = vg.vram_cpu_accessible_size;
++      return ac_drm_query_info(dev, AMDGPU_INFO_GTT_USAGE, sizeof(info->heap_usage), &info->heap_usage);
++   default:
++      return -EINVAL;
++   }
++}
++
++int ac_drm_query_sensor_info(ac_drm_device *dev, unsigned sensor_type, unsigned size, void *value)
++{
++   (void)dev; (void)sensor_type; (void)size; (void)value;
++   return -EOPNOTSUPP;                                        /* the SMU is not asked for sensors yet */
++}
++
++int ac_drm_query_video_caps_info(ac_drm_device *dev, unsigned cap_type, unsigned size, void *value)
++{
++   (void)dev; (void)cap_type; (void)size; (void)value;
++   return -EOPNOTSUPP;
++}
++
++int ac_drm_query_gpuvm_fault_info(ac_drm_device *dev, unsigned size, void *value)
++{
++   return ac_drm_query_info(dev, AMDGPU_INFO_GPUVM_FAULT, size, value);
++}
++
++int ac_drm_vm_reserve_vmid(ac_drm_device *dev, uint32_t flags) { (void)dev; (void)flags; return 0; }
++int ac_drm_vm_unreserve_vmid(ac_drm_device *dev, uint32_t flags) { (void)dev; (void)flags; return 0; }
++
++int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *value)
++{
++   switch (info) {
++   case amdgpu_sw_info_address32_hi:
++      *(uint32_t *)value = (uint32_t)(dev->dev_info.high_va_offset >> 32);
++      return 0;
++   default:
++      return -EINVAL;
++   }
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- buffers */
++
++int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *bo)
++{
++   /* Every domain is host memory behind the GART for now; GDS, GWS and OA do not exist. */
++   if (req->alloc_size == 0 || (req->preferred_heap & ~(uint32_t)(AMDGPU_GEM_DOMAIN_VRAM | AMDGPU_GEM_DOMAIN_GTT)))
++      return -EINVAL;
++   struct rn_uc_bo_create in = {req->alloc_size, 0, 0};
++   struct rn_uc_bo_info out;
++   int r = call(dev, RN_UC_BO_CREATE, &in, sizeof(in), &out, sizeof(out));
++   if (r)
++      return r;
++   struct amdgpu_bo *b = calloc(1, sizeof(*b));
++   if (!b || out.handle >= dev->nbos) {
++      struct rn_uc_bo_free f = {out.handle, 0};
++      call(dev, RN_UC_BO_FREE, &f, sizeof(f), NULL, 0);
++      free(b);
++      return -ENOMEM;
++   }
++   b->handle = out.handle;
++   b->size = out.size;
++   pthread_mutex_lock(&dev->lock);
++   dev->bos[b->handle] = b;
++   pthread_mutex_unlock(&dev->lock);
++   bo->abo = b;
++   return 0;
++}
++
++int ac_drm_bo_free(ac_drm_device *dev, ac_drm_bo bo)
++{
++   struct amdgpu_bo *b = bo.abo;
++   if (!b)
++      return -EINVAL;
++   if (b->cpu)
++      ac_drm_bo_cpu_unmap(dev, bo);
++   struct rn_uc_bo_free f = {b->handle, 0};
++   int r = call(dev, RN_UC_BO_FREE, &f, sizeof(f), NULL, 0);
++   pthread_mutex_lock(&dev->lock);
++   dev->bos[b->handle] = NULL;
++   pthread_mutex_unlock(&dev->lock);
++   free(b);
++   return r;
++}
++
++int ac_drm_bo_cpu_map(ac_drm_device *dev, ac_drm_bo bo, void **cpu)
++{
++   struct amdgpu_bo *b = bo.abo;
++   if (!b->cpu) {
++      mach_vm_address_t addr = 0;
++      mach_vm_size_t len = 0;
++      kern_return_t kr = IOConnectMapMemory64(dev->conn, b->handle, mach_task_self(), &addr, &len, kIOMapAnywhere);
++      if (kr != KERN_SUCCESS)
++         return errno_of(kr);
++      b->cpu = (void *)(uintptr_t)addr;
++      b->cpu_len = len;
++   }
++   *cpu = b->cpu;
++   return 0;
++}
++
++int ac_drm_bo_cpu_unmap(ac_drm_device *dev, ac_drm_bo bo)
++{
++   struct amdgpu_bo *b = bo.abo;
++   if (!b->cpu)
++      return 0;
++   kern_return_t kr = IOConnectUnmapMemory64(dev->conn, b->handle, mach_task_self(), (mach_vm_address_t)(uintptr_t)b->cpu);
++   b->cpu = NULL;
++   return errno_of(kr);
++}
++
++int ac_drm_bo_export(ac_drm_device *dev, ac_drm_bo bo, enum amdgpu_bo_handle_type type, uint32_t *shared_handle)
++{
++   (void)dev;
++   if (type != amdgpu_bo_handle_type_kms)
++      return -EOPNOTSUPP;                                      /* no dma-buf or flink names on macOS */
++   *shared_handle = bo.abo->handle;
++   return 0;
++}
++
++int ac_drm_bo_import(ac_drm_device *dev, enum amdgpu_bo_handle_type type, uint32_t shared_handle, struct ac_drm_bo_import_result *output)
++{
++   if (type != amdgpu_bo_handle_type_kms || shared_handle >= dev->nbos || !dev->bos[shared_handle])
++      return -EOPNOTSUPP;
++   output->bo.abo = dev->bos[shared_handle];
++   output->alloc_size = dev->bos[shared_handle]->size;
++   return 0;
++}
++
++int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
++{
++   (void)dev; (void)cpu; (void)size; (void)bo;
++   return -EOPNOTSUPP;
++}
++
++int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_bo_metadata *info)
++{
++   (void)dev; (void)bo_handle; (void)info;
++   return 0;                                                  /* tiling and metadata stay in user space: nothing to share with another process yet */
++}
++
++int ac_drm_bo_query_info(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_bo_info *info)
++{
++   if (bo_handle >= dev->nbos || !dev->bos[bo_handle])
++      return -EINVAL;
++   memset(info, 0, sizeof(*info));
++   info->alloc_size = dev->bos[bo_handle]->size;
++   info->phys_alignment = 4096;
++   info->preferred_heap = AMDGPU_GEM_DOMAIN_GTT;
++   return 0;
++}
++
++/* The queue is one and in order, so a buffer is idle when what was submitted last is done. The kext has no per-buffer record of its users. */
++int ac_drm_bo_wait_for_idle(ac_drm_device *dev, ac_drm_bo bo, uint64_t timeout_ns, bool *busy)
++{
++   (void)bo;
++   struct rn_uc_diag_req req = {0, 0};
++   struct rn_uc_diag d;
++   int r = call(dev, RN_UC_DIAG, &req, sizeof(req), &d, sizeof(d));
++   if (r)
++      return r;
++   uint32_t expired = 1;
++   if (d.seq_submitted != d.seq_signaled && (int32_t)(d.seq_signaled - d.seq_submitted) < 0)
++      r = ac_drm_cs_query_fence_status(dev, 0, AMDGPU_HW_IP_COMPUTE, 0, 0, d.seq_submitted, timeout_ns, 0, &expired);
++   *busy = !expired;
++   return r;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- address ranges and mappings */
++
++int ac_drm_va_range_alloc(ac_drm_device *dev, enum amdgpu_gpu_va_range va_range_type, uint64_t size, uint64_t va_base_alignment, uint64_t va_base_required,
++                          uint64_t *va_base_allocated, amdgpu_va_handle *va_range_handle, uint64_t flags)
++{
++   if (va_range_type != amdgpu_gpu_va_range_general || size == 0)
++      return -EINVAL;
++   /* Policy of the bridge, not of Linux: a buffer goes to the upper half only when it has to be reachable with a 32-bit pointer (AMDGPU_VA_RANGE_32_BIT). Everything else,
++    * AMDGPU_VA_RANGE_HIGH included, is placed in the lower half, because a command buffer in the upper half hangs the compute queue and a buffer's use is not known here. */
++   struct vamgr *m = (flags & AMDGPU_VA_RANGE_32_BIT) ? &dev->high32 : &dev->low;
++   uint64_t va;
++   pthread_mutex_lock(&dev->lock);
++   int r = vamgr_alloc(m, size, va_base_alignment, va_base_required, &va);
++   pthread_mutex_unlock(&dev->lock);
++   if (r)
++      return r;
++   struct amdgpu_va *h = calloc(1, sizeof(*h));
++   if (!h) {
++      pthread_mutex_lock(&dev->lock);
++      vamgr_free(m, va, size);
++      pthread_mutex_unlock(&dev->lock);
++      return -ENOMEM;
++   }
++   h->dev = dev;
++   h->mgr = m;
++   h->base = va;
++   h->size = size;
++   *va_base_allocated = va;
++   *va_range_handle = h;
++   return 0;
++}
++
++int ac_drm_va_range_free(amdgpu_va_handle h)
++{
++   if (!h)
++      return 0;
++   pthread_mutex_lock(&h->dev->lock);
++   vamgr_free(h->mgr, h->base, h->size);
++   pthread_mutex_unlock(&h->dev->lock);
++   free(h);
++   return 0;
++}
++
++int ac_drm_va_range_query(ac_drm_device *dev, enum amdgpu_gpu_va_range type, uint64_t *start, uint64_t *end)
++{
++   if (type != amdgpu_gpu_va_range_general)
++      return -EINVAL;
++   *start = dev->low.start;
++   *end = dev->low.end;
++   return 0;
++}
++
++/* DRM_AMDGPU_GEM_VA. The kext maps and unmaps exactly one range at a time: an unmap names the range of a map (RADV does that), and the page flags are always read, write and execute. */
++int ac_drm_bo_va_op_raw(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops)
++{
++   (void)flags;
++   struct rn_uc_va_unmap un = {addr, size};
++   struct rn_uc_va_map map = {bo_handle, 0, addr, offset, size};
++   switch (ops) {
++   case AMDGPU_VA_OP_MAP:
++      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++   case AMDGPU_VA_OP_UNMAP:
++   case AMDGPU_VA_OP_CLEAR:
++      return call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);
++   case AMDGPU_VA_OP_REPLACE:
++      call(dev, RN_UC_VA_UNMAP, &un, sizeof(un), NULL, 0);     /* nothing mapped there is not an error for a replace */
++      return call(dev, RN_UC_VA_MAP, &map, sizeof(map), NULL, 0);
++   default:
++      return -EINVAL;
++   }
++}
++
++int ac_drm_bo_va_op(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops)
++{
++   return ac_drm_bo_va_op_raw(dev, bo_handle, offset, size, addr, flags, ops);
++}
++
++/* The map is done when the call returns, so the timeline point is signaled right away; the syncobjs the update should wait for are already signaled by whoever made them. */
++int ac_drm_bo_va_op_raw2(ac_drm_device *dev, uint32_t bo_handle, uint64_t offset, uint64_t size, uint64_t addr, uint64_t flags, uint32_t ops,
++                         uint32_t vm_timeline_syncobj_out, uint64_t vm_timeline_point, uint64_t input_fence_syncobj_handles, uint32_t num_syncobj_handles)
++{
++   if (num_syncobj_handles) {
++      const struct drm_amdgpu_cs_chunk_sem *in = (const struct drm_amdgpu_cs_chunk_sem *)(uintptr_t)input_fence_syncobj_handles;
++      for (uint32_t i = 0; i < num_syncobj_handles; i++) {
++         uint32_t h = in[i].handle;
++         int r = syncobj_wait_points(dev, &h, NULL, 1, (int64_t)now_ns() + 10000000000ll, RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, NULL);
++         if (r)
++            return r;
++      }
++   }
++   int r = ac_drm_bo_va_op_raw(dev, bo_handle, offset, size, addr, flags, ops);
++   if (r == 0 && vm_timeline_syncobj_out) {
++      struct rn_uc_syncobj_array a;
++      memset(&a, 0, sizeof(a));
++      a.count = 1;
++      a.handles[0] = vm_timeline_syncobj_out;
++      a.points[0] = vm_timeline_point;
++      r = call(dev, RN_UC_SYNCOBJ_SIGNAL, &a, sizeof(a), NULL, 0);
++   }
++   return r;
++}
++
++/* ---------------------------------------------------------------------------------------------------------------------------------------------- contexts, submission, fences */
++
++int ac_drm_cs_ctx_create2(ac_drm_device *dev, uint32_t priority, uint32_t *ctx_id)
++{
++   (void)priority;
++   pthread_mutex_lock(&dev->lock);
++   *ctx_id = dev->next_ctx++;                                  /* all contexts share the connection's queue and sequence numbers */
++   pthread_mutex_unlock(&dev->lock);
++   return 0;
++}
++
++int ac_drm_cs_ctx_free(ac_drm_device *dev, uint32_t ctx_id) { (void)dev; (void)ctx_id; return 0; }
++
++int ac_drm_cs_ctx_stable_pstate(ac_drm_device *dev, uint32_t ctx_id, uint32_t op, uint32_t flags, uint32_t *out_flags)
++{
++   (void)dev; (void)ctx_id; (void)op; (void)flags;
++   if (out_flags)
++      *out_flags = 0;                                          /* AMDGPU_CTX_STABLE_PSTATE_NONE */
++   return 0;
++}
++
++/* The kext reports work lost in a queue reset through the wait of a sequence number; a context-wide "was there a reset" flag is not kept yet. */
++int ac_drm_cs_query_reset_state2(ac_drm_device *dev, uint32_t ctx_id, uint64_t *flags)
++{
++   (void)dev; (void)ctx_id;
++   *flags = 0;
++   return 0;
++}
++
++int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t ip_type, uint32_t ip_instance, uint32_t ring, uint64_t fence_seq_no,
++                                 uint64_t timeout_ns, uint64_t flags, uint32_t *expired)
++{
++   (void)ctx_id; (void)ip_instance; (void)ring;
++   if (ip_type != AMDGPU_HW_IP_COMPUTE || fence_seq_no == 0 || fence_seq_no > 0xffffffffull)
++      return -EINVAL;
++   uint64_t deadline;                                          /* libdrm: relative unless AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE, AMDGPU_TIMEOUT_INFINITE for ever */
++   if (timeout_ns == AMDGPU_TIMEOUT_INFINITE)
++      deadline = UINT64_MAX;
++   else if (flags & AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE)
++      deadline = timeout_ns;
++   else
++      deadline = now_ns() + timeout_ns;
++   for (;;) {
++      uint64_t now = now_ns();
++      uint64_t rel_ms = deadline > now ? (deadline - now) / 1000000 : 0;
++      if (rel_ms > RN_WAIT_SLICE_MS)
++         rel_ms = RN_WAIT_SLICE_MS;
++      struct rn_uc_wait_seq in = {(uint32_t)fence_seq_no, (uint32_t)rel_ms};
++      struct rn_uc_wait_seq_result out;
++      int r = call(dev, RN_UC_WAIT_SEQ, &in, sizeof(in), &out, sizeof(out));
++      if (r)
++         return r;
++      if (out.reached) {
++         *expired = 1;                                         /* a sequence lost in a queue reset counts as expired, out.status says it was not run */
++         return 0;
++      }
++      if (now_ns() >= deadline) {
++         *expired = 0;
++         return 0;
++      }
++   }
++}
++
++int ac_drm_cs_create_syncobj2(ac_drm_device *dev, uint32_t flags, uint32_t *handle) { return sp_create(&dev->sync, flags, handle); }
++int ac_drm_cs_destroy_syncobj(ac_drm_device *dev, uint32_t handle) { return sp_destroy(&dev->sync, handle); }
++int ac_drm_cs_syncobj_wait(ac_drm_device *dev, uint32_t *handles, unsigned n, int64_t timeout_nsec, unsigned flags, uint32_t *first)
++{
++   return syncobj_wait_points(dev, handles, NULL, n, timeout_nsec, flags, first);
++}
++int ac_drm_cs_syncobj_timeline_wait(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigned n, int64_t timeout_nsec, unsigned flags, uint32_t *first)
++{
++   return syncobj_wait_points(dev, handles, points, n, timeout_nsec, flags, first);
++}
++int ac_drm_cs_syncobj_query2(ac_drm_device *dev, uint32_t *handles, uint64_t *points, unsigned n, uint32_t flags) { return sp_query(&dev->sync, handles, points, n, flags); }
++int ac_drm_cs_syncobj_transfer(ac_drm_device *dev, uint32_t dst, uint64_t dst_point, uint32_t src, uint64_t src_point, uint32_t flags)
++{
++   return sp_transfer(&dev->sync, dst, dst_point, src, src_point, flags);
++}
++int ac_drm_cs_import_syncobj(ac_drm_device *dev, int shared_fd, uint32_t *handle) { (void)dev; (void)shared_fd; (void)handle; return -ENOSYS; }
++int ac_drm_cs_syncobj_export_sync_file(ac_drm_device *dev, uint32_t syncobj, int *sync_file_fd) { (void)dev; (void)syncobj; (void)sync_file_fd; return -ENOSYS; }
++int ac_drm_cs_syncobj_import_sync_file(ac_drm_device *dev, uint32_t syncobj, int sync_file_fd) { (void)dev; (void)syncobj; (void)sync_file_fd; return -ENOSYS; }
++int ac_drm_cs_syncobj_export_sync_file2(ac_drm_device *dev, uint32_t syncobj, uint64_t point, uint32_t flags, int *sync_file_fd)
++{
++   (void)dev; (void)syncobj; (void)point; (void)flags; (void)sync_file_fd;
++   return -ENOSYS;
++}
++
++void ac_drm_cs_chunk_fence_info_to_data(uint32_t bo_handle, uint64_t offset, struct drm_amdgpu_cs_chunk_data *data)
++{
++   data->fence_data.handle = bo_handle;
++   data->fence_data.offset = offset * sizeof(uint64_t);
++}
++
++/* DRM_AMDGPU_CS: the chunks of one submit. The IB chunks are submitted one after the other (the kext takes one command buffer per submit): the waits go with the first, the
++ * signals with the last, and the sequence number returned is the last one. The user-fence chunk is not needed (the fence is the kext's sequence number) and the buffer list is
++ * not needed (everything mapped stays mapped). */
++int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_handle, int num_chunks, struct drm_amdgpu_cs_chunk *chunks, uint64_t *seq_no)
++{
++   (void)ctx_id; (void)bo_list_handle;
++   const struct drm_amdgpu_cs_chunk_ib *ibs[8];
++   unsigned n_ibs = 0, n_in = 0, n_out = 0;
++   rn_uc_sync_ref in[RN_UC_SUBMIT_SYNC_MAX], out[RN_UC_SUBMIT_SYNC_MAX];
++
++   for (int i = 0; i < num_chunks; i++) {
++      const struct drm_amdgpu_cs_chunk *c = &chunks[i];
++      const void *data = (const void *)(uintptr_t)c->chunk_data;
++      switch (c->chunk_id) {
++      case AMDGPU_CHUNK_ID_IB:
++         if (n_ibs == 8)
++            return -EINVAL;
++         ibs[n_ibs++] = data;
++         break;
++      case AMDGPU_CHUNK_ID_FENCE:
++      case AMDGPU_CHUNK_ID_BO_HANDLES:
++      case AMDGPU_CHUNK_ID_CP_GFX_SHADOW:
++         break;
++      case AMDGPU_CHUNK_ID_DEPENDENCIES:
++      case AMDGPU_CHUNK_ID_SCHEDULED_DEPENDENCIES: {
++         const struct drm_amdgpu_cs_chunk_dep *dep = data;
++         for (uint32_t k = 0; k < c->length_dw * 4 / sizeof(*dep); k++) {
++            uint32_t expired = 0;
++            int r = ac_drm_cs_query_fence_status(dev, dep[k].ctx_id, dep[k].ip_type, dep[k].ip_instance, dep[k].ring, dep[k].handle, 10000000000ull, 0, &expired);
++            if (r || !expired)
++               return r ? r : -ETIME;
++         }
++         break;
++      }
++      case AMDGPU_CHUNK_ID_SYNCOBJ_IN:
++      case AMDGPU_CHUNK_ID_SYNCOBJ_OUT: {
++         const struct drm_amdgpu_cs_chunk_sem *sem = data;
++         unsigned *n = c->chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_IN ? &n_in : &n_out;
++         rn_uc_sync_ref *a = c->chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_IN ? in : out;
++         for (uint32_t k = 0; k < c->length_dw * 4 / sizeof(*sem); k++) {
++            if (*n == RN_UC_SUBMIT_SYNC_MAX)
++               return -EINVAL;
++            a[(*n)++] = (rn_uc_sync_ref){sem[k].handle, 0, 0};
++         }
++         break;
++      }
++      case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT:
++      case AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL: {
++         const struct drm_amdgpu_cs_chunk_syncobj *so = data;
++         unsigned *n = c->chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT ? &n_in : &n_out;
++         rn_uc_sync_ref *a = c->chunk_id == AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT ? in : out;
++         for (uint32_t k = 0; k < c->length_dw * 4 / sizeof(*so); k++) {
++            if (*n == RN_UC_SUBMIT_SYNC_MAX)
++               return -EINVAL;
++            a[(*n)++] = (rn_uc_sync_ref){so[k].handle, 0, so[k].point};
++         }
++         break;
++      }
++      default:
++         return -EINVAL;
++      }
++   }
++   if (n_ibs == 0)
++      return -EINVAL;
++
++   uint32_t last_seq = 0;
++   for (unsigned i = 0; i < n_ibs; i++) {
++      if (ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
++         return -EINVAL;
++      /* The kext holds at most RN_UC_SUBMIT_SYNC_MAX = 8 of each per submit; more than that is split nowhere, it is refused. */
++      struct rn_uc_submit sub;
++      memset(&sub, 0, sizeof(sub));
++      sub.ib_va = ibs[i]->va_start;
++      sub.ib_dwords = ibs[i]->ib_bytes / 4;
++      if (i == 0) {
++         if (n_in > RN_UC_SUBMIT_SYNC_MAX)
++            return -EINVAL;
++         sub.in_count = n_in;
++         memcpy(sub.in, in, n_in * sizeof(in[0]));
++      }
++      if (i == n_ibs - 1) {
++         if (n_out > RN_UC_SUBMIT_SYNC_MAX)
++            return -EINVAL;
++         sub.out_count = n_out;
++         memcpy(sub.out, out, n_out * sizeof(out[0]));
++      }
++      struct rn_uc_submit_result res;
++      int r = call(dev, RN_UC_SUBMIT, &sub, sizeof(sub), &res, sizeof(res));
++      if (r)
++         return r;
++      last_seq = res.seq;
++   }
++   *seq_no = last_seq;
++   return 0;
++}
+diff --git a/src/amd/common/apple/ac_apple_iokit.h b/src/amd/common/apple/ac_apple_iokit.h
+new file mode 100644
+index 0000000..1924c95
+--- /dev/null
++++ b/src/amd/common/apple/ac_apple_iokit.h
+@@ -0,0 +1,12 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * In the Mesa tree the prototypes and types of ac_apple_iokit.c are those of ac_linux_drm.h.
++ */
++#ifndef AC_APPLE_IOKIT_H
++#define AC_APPLE_IOKIT_H
++
++#include "ac_linux_drm.h"
++#include "util/u_sync_provider.h"
++#include "rn_uapi.h"
++
++#endif
+diff --git a/src/amd/common/apple/amdgpu.h b/src/amd/common/apple/amdgpu.h
+new file mode 100644
+index 0000000..da6f0f8
+--- /dev/null
++++ b/src/amd/common/apple/amdgpu.h
+@@ -0,0 +1,210 @@
++/*
++ * The part of libdrm's amdgpu/amdgpu.h that Mesa's src/amd/common/ac_linux_drm.h and the RADV amdgpu winsys use, for builds without libdrm (macOS, see
++ * ac_apple_iokit.c). Types and constants copied from libdrm (MIT licence, Copyright 2014 Advanced Micro Devices, Inc.), see NOTICE.
++ */
++#ifndef APPLE_AMDGPU_H
++#define APPLE_AMDGPU_H
++
++#include <stdint.h>
++#include "drm-uapi/amdgpu_drm.h"
++
++typedef struct amdgpu_bo *amdgpu_bo_handle;
++typedef struct amdgpu_va *amdgpu_va_handle;
++typedef struct amdgpu_context *amdgpu_context_handle;
++
++struct amdgpu_cs_fence {
++	amdgpu_context_handle context;
++	uint32_t ip_type;
++	uint32_t ip_instance;
++	uint32_t ring;
++	uint64_t fence;
++};
++
++#ifndef AMDGPU_TIMEOUT_INFINITE
++#define AMDGPU_TIMEOUT_INFINITE			0xffffffffffffffffull
++#endif
++#ifndef AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE
++#define AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE     (1 << 0)
++#endif
++#ifndef AMDGPU_VA_RANGE_32_BIT
++#define AMDGPU_VA_RANGE_32_BIT		0x1
++#endif
++#ifndef AMDGPU_VA_RANGE_HIGH
++#define AMDGPU_VA_RANGE_HIGH		0x2
++#endif
++#ifndef AMDGPU_VA_RANGE_REPLAYABLE
++#define AMDGPU_VA_RANGE_REPLAYABLE	0x4
++#endif
++
++enum amdgpu_bo_handle_type {
++	/** GEM flink name (needs DRM authentication, used by DRI2) */
++	amdgpu_bo_handle_type_gem_flink_name = 0,
++
++	/** KMS handle which is used by all driver ioctls */
++	amdgpu_bo_handle_type_kms = 1,
++
++	/** DMA-buf fd handle */
++	amdgpu_bo_handle_type_dma_buf_fd = 2,
++
++	/** Deprecated in favour of and same behaviour as
++	 * amdgpu_bo_handle_type_kms, use that instead of this
++	 */
++	amdgpu_bo_handle_type_kms_noimport = 3,
++};
++
++enum amdgpu_gpu_va_range
++{
++	/** Allocate from "normal"/general range */
++	amdgpu_gpu_va_range_general = 0
++};
++
++enum amdgpu_sw_info {
++	amdgpu_sw_info_address32_hi = 0,
++	/** Query the PRT control bit when the half VA range is reserved for
++	 * PRT when the device is initialized. This depends on the GFX version.
++	 * A return value of ~0 should be ignored.
++	 */
++	amdgpu_sw_info_address_prt_wa_control_bit = 1,
++};
++
++struct amdgpu_bo_alloc_request {
++	/** Allocation request. It must be aligned correctly. */
++	uint64_t alloc_size;
++
++	/**
++	 * It may be required to have some specific alignment requirements
++	 * for physical back-up storage (e.g. for displayable surface).
++	 * If 0 there is no special alignment requirement
++	 */
++	uint64_t phys_alignment;
++
++	/**
++	 * UMD should specify where to allocate memory and how it
++	 * will be accessed by the CPU.
++	 */
++	uint32_t preferred_heap;
++
++	/** Additional flags passed on allocation */
++	uint64_t flags;
++};
++
++struct amdgpu_bo_metadata {
++	/** Special flag associated with surface */
++	uint64_t flags;
++
++	/**
++	 * ASIC-specific tiling information (also used by DCE).
++	 * The encoding is defined by the AMDGPU_TILING_* definitions.
++	 */
++	uint64_t tiling_info;
++
++	/** Size of metadata associated with the buffer, in bytes. */
++	uint32_t size_metadata;
++
++	/** UMD specific metadata. Opaque for kernel */
++	uint32_t umd_metadata[64];
++};
++
++struct amdgpu_bo_info {
++	/** Allocated memory size */
++	uint64_t alloc_size;
++
++	/**
++	 * It may be required to have some specific alignment requirements
++	 * for physical back-up storage.
++	 */
++	uint64_t phys_alignment;
++
++	/** Heap where to allocate memory. */
++	uint32_t preferred_heap;
++
++	/** Additional allocation flags. */
++	uint64_t alloc_flags;
++
++	/** Metadata associated with buffer if any. */
++	struct amdgpu_bo_metadata metadata;
++};
++
++struct amdgpu_heap_info {
++	/** Theoretical max. available memory in the given heap */
++	uint64_t heap_size;
++
++	/**
++	 * Number of bytes allocated in the heap. This includes all processes
++	 * and private allocations in the kernel. It changes when new buffers
++	 * are allocated, freed, and moved. It cannot be larger than
++	 * heap_size.
++	 */
++	uint64_t heap_usage;
++
++	/**
++	 * Theoretical possible max. size of buffer which
++	 * could be allocated in the given heap
++	 */
++	uint64_t max_allocation;
++};
++
++struct amdgpu_gpu_info {
++	/** Asic id */
++	uint32_t asic_id;
++	/** Chip revision */
++	uint32_t chip_rev;
++	/** Chip external revision */
++	uint32_t chip_external_rev;
++	/** Family ID */
++	uint32_t family_id;
++	/** Special flags */
++	uint64_t ids_flags;
++	/** max engine clock*/
++	uint64_t max_engine_clk;
++	/** max memory clock */
++	uint64_t max_memory_clk;
++	/** number of shader engines */
++	uint32_t num_shader_engines;
++	/** number of shader arrays per engine */
++	uint32_t num_shader_arrays_per_engine;
++	/**  Number of available good shader pipes */
++	uint32_t avail_quad_shader_pipes;
++	/**  Max. number of shader pipes.(including good and bad pipes  */
++	uint32_t max_quad_shader_pipes;
++	/** Number of parameter cache entries per shader quad pipe */
++	uint32_t cache_entries_per_quad_pipe;
++	/**  Number of available graphics context */
++	uint32_t num_hw_gfx_contexts;
++	/** Number of render backend pipes */
++	uint32_t rb_pipes;
++	/**  Enabled render backend pipe mask */
++	uint32_t enabled_rb_pipes_mask;
++	/** Frequency of GPU Counter */
++	uint32_t gpu_counter_freq;
++	/** CC_RB_BACKEND_DISABLE.BACKEND_DISABLE per SE */
++	uint32_t backend_disable[4];
++	/** Value of MC_ARB_RAMCFG register*/
++	uint32_t mc_arb_ramcfg;
++	/** Value of GB_ADDR_CONFIG */
++	uint32_t gb_addr_cfg;
++	/** Values of the GB_TILE_MODE0..31 registers */
++	uint32_t gb_tile_mode[32];
++	/** Values of GB_MACROTILE_MODE0..15 registers */
++	uint32_t gb_macro_tile_mode[16];
++	/** Value of PA_SC_RASTER_CONFIG register per SE */
++	uint32_t pa_sc_raster_cfg[4];
++	/** Value of PA_SC_RASTER_CONFIG_1 register per SE */
++	uint32_t pa_sc_raster_cfg1[4];
++	/* CU info */
++	uint32_t cu_active_number;
++	uint32_t cu_ao_mask;
++	uint32_t cu_bitmap[4][4];
++	/* video memory type info*/
++	uint32_t vram_type;
++	/* video memory bit width*/
++	uint32_t vram_bit_width;
++	/** constant engine ram size*/
++	uint32_t ce_ram_size;
++	/* vce harvesting instance */
++	uint32_t vce_harvest_config;
++	/* PCI revision ID */
++	uint32_t pci_rev_id;
++};
++
++#endif
+diff --git a/src/amd/common/apple/rn_drm_uapi.h b/src/amd/common/apple/rn_drm_uapi.h
+new file mode 100644
+index 0000000..70a4648
+--- /dev/null
++++ b/src/amd/common/apple/rn_drm_uapi.h
+@@ -0,0 +1,2 @@
++/* In the Mesa tree the uapi comes from include/drm-uapi. */
++#include "drm-uapi/amdgpu_drm.h"
+diff --git a/src/amd/common/apple/rn_uapi.h b/src/amd/common/apple/rn_uapi.h
+new file mode 100644
+index 0000000..32b4405
+--- /dev/null
++++ b/src/amd/common/apple/rn_uapi.h
+@@ -0,0 +1,208 @@
++// The user client interface of RedNaviProbe, shared by the kext and user space programs (tools/rn_test.c, later the Mesa backend).
++// Every method takes and returns one struct through IOConnectCallStructMethod; the sizes are checked exactly, so a layout change
++// means a new RN_UAPI_VERSION. Plain C, fixed-width types only. The method set mirrors the DRM_AMDGPU_* commands RADV uses
++// (docs/M5_PLAN.md), so that a backend for Mesa's ac_drm_* layer maps one to one.
++#ifndef REDNAVI_RN_UAPI_H
++#define REDNAVI_RN_UAPI_H
++
++#include <stdint.h>
++
++#include "rn_drm_uapi.h"
++
++#define RN_UAPI_VERSION 6
++
++enum {
++    RN_UC_INFO = 0,        // out rn_uc_info
++    RN_UC_BO_CREATE = 1,   // in rn_uc_bo_create, out rn_uc_bo_info
++    RN_UC_BO_FREE = 2,     // in rn_uc_bo_free
++    RN_UC_SUBMIT = 3,      // in rn_uc_submit, out rn_uc_submit_result
++    RN_UC_BO_WAIT = 4,     // in rn_uc_bo_wait, out rn_uc_bo_wait_result
++    RN_UC_DIAG = 5,        // in rn_uc_diag_req, out rn_uc_diag
++    RN_UC_WAIT_SEQ = 6,    // in rn_uc_wait_seq, out rn_uc_wait_seq_result
++    RN_UC_VA_MAP = 7,      // in rn_uc_va_map
++    RN_UC_VA_UNMAP = 8,    // in rn_uc_va_unmap
++    RN_UC_QUEUE_RESET = 9, // out rn_uc_reset_result
++    RN_UC_INFO_QUERY = 10, // in struct drm_amdgpu_info (return_pointer unused), out: the answer, as many bytes as the caller asks for in return_size
++    RN_UC_SYNCOBJ_CREATE = 11,   // in rn_uc_syncobj_create, out rn_uc_syncobj_create_result
++    RN_UC_SYNCOBJ_DESTROY = 12,  // in rn_uc_syncobj_destroy
++    RN_UC_SYNCOBJ_WAIT = 13,     // in rn_uc_syncobj_wait, out rn_uc_syncobj_wait_result
++    RN_UC_SYNCOBJ_RESET = 14,    // in rn_uc_syncobj_array
++    RN_UC_SYNCOBJ_SIGNAL = 15,   // in rn_uc_syncobj_array (points: 0 signals the binary state, a point signals the timeline up to it)
++    RN_UC_SYNCOBJ_QUERY = 16,    // in rn_uc_syncobj_array, out rn_uc_syncobj_array (points filled)
++    RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
++    RN_UC_COUNT
++};
++
++// A buffer is mapped into the caller with IOConnectMapMemory64(connection, handle, ...): the memory type is the handle.
++//
++// Every connection owns a GPU virtual address space (a VMID, 1 to 7, so at most 7 connections at a time) of 48 bits, four levels of page table as in
++// Linux. Command buffers are addressed in it: a buffer is put there with RN_UC_VA_MAP at an address the caller picks, from the lower half
++// [vm_va_start, vm_va_start + vm_va_bytes) or from the upper half, which is given in canonical form (bits 63:47 all set: 0xffff800000000000 and up, as
++// DEV_INFO's high_va_offset and high_va_max say) and never crosses the hole between the halves. Only what is mapped is reachable by the GPU for this
++// connection's command buffers. A command buffer (the IB of a submit) must lie in the lower half: submitting one from the upper half is refused
++// (kIOReturnUnsupported). Data buffers and shader code work in both halves. Mapping is read, write and execute. The gpu_va that RN_UC_BO_CREATE returns is the
++// buffer's address in the kernel's own window and is not valid in a connection's address space.
++
++struct rn_uc_info {
++    uint32_t version;          // RN_UAPI_VERSION
++    uint32_t doorbell_mapped;  // 1 when the compute queue can take submits
++    uint64_t gart_base;        // GPU address of the window the buffers live in
++    uint64_t gart_bytes;       // size of the window (addresses are never reused, see docs/COMPAT.md)
++    uint64_t max_bo_bytes;
++    uint32_t bo_count;         // buffers of this connection
++    uint32_t bo_limit;         // buffers one connection can hold
++    uint64_t vm_va_start;      // the lowest address of the lower half that can be mapped; the half ends at vm_va_start + vm_va_bytes = 2^47
++    uint64_t vm_va_bytes;
++    uint32_t vmid;
++    uint32_t va_map_limit;     // mappings one connection can hold
++};
++
++struct rn_uc_bo_create {
++    uint64_t size;             // bytes, rounded up to 4 KB
++    uint32_t flags;            // 0
++    uint32_t pad;
++};
++
++struct rn_uc_bo_info {
++    uint32_t handle;           // 1 and up, local to the connection
++    uint32_t pad;
++    uint64_t gpu_va;
++    uint64_t size;
++};
++
++struct rn_uc_bo_free {
++    uint32_t handle;
++    uint32_t pad;
++};
++
++// Every connection has one context with one fence: each submit gets the next sequence number (1, 2, 3, ...) and the GPU writes it to a
++// kernel-owned dword when the IB has finished, so a sequence number is done when the fence has reached it. Sequence numbers are 32 bits and
++// compared modulo 2^32; a submit that is refused (ring full, bad address) does not use one.
++struct rn_uc_va_map {
++    uint32_t handle;
++    uint32_t flags;            // 0
++    uint64_t va;               // 4 KB aligned, inside the window, not overlapping another mapping
++    uint64_t offset;           // into the buffer, 4 KB aligned
++    uint64_t size;             // 4 KB aligned, offset + size within the buffer
++};
++
++struct rn_uc_va_unmap {
++    uint64_t va;               // exactly the va and size of one mapping
++    uint64_t size;
++};
++
++// Synchronisation objects, after DRM's (drm_syncobj_*), per connection: a handle names an object of this connection. One object has a binary state
++// (point 0: signaled or not) and a timeline (points above 0, a 64-bit value that only grows). Work that signals an object does it when its fence is done:
++// `rn_uc_sync_ref` is drm_amdgpu_cs_chunk_syncobj (handle, flags, point) and goes in a submit as a wait before the IB or a signal after it.
++// Arrays are inline, up to RN_UC_SYNC_MAX entries, where DRM passes a pointer.
++#define RN_UC_SYNC_MAX 16
++#define RN_UC_SYNCOBJ_CREATE_SIGNALED 1u                 // DRM_SYNCOBJ_CREATE_SIGNALED
++#define RN_UC_SYNCOBJ_WAIT_ALL 1u                        // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL
++#define RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT 2u                 // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: wait for work to be attached first
++#define RN_UC_SYNCOBJ_WAIT_AVAILABLE 4u                  // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE: work attached is enough, it need not be done
++
++struct rn_uc_syncobj_create { uint32_t flags; uint32_t pad; };
++struct rn_uc_syncobj_create_result { uint32_t handle; uint32_t pad; };
++struct rn_uc_syncobj_destroy { uint32_t handle; uint32_t pad; };
++
++struct rn_uc_syncobj_wait {
++    int64_t timeout_nsec;      // relative, at most 10 s, 0 only looks
++    uint32_t count;            // handles
++    uint32_t flags;            // RN_UC_SYNCOBJ_WAIT_*
++    uint32_t handles[RN_UC_SYNC_MAX];
++    uint64_t points[RN_UC_SYNC_MAX];   // 0: the binary state
++};
++struct rn_uc_syncobj_wait_result { uint32_t first_signaled; uint32_t pad; };
++
++struct rn_uc_syncobj_array {
++    uint32_t count;
++    uint32_t flags;
++    uint32_t handles[RN_UC_SYNC_MAX];
++    uint64_t points[RN_UC_SYNC_MAX];
++};
++
++struct rn_uc_syncobj_transfer {
++    uint32_t src_handle, dst_handle;
++    uint64_t src_point, dst_point;
++    uint32_t flags, pad;
++};
++
++struct drm_amdgpu_cs_chunk_syncobj_ref {                  // drm_amdgpu_cs_chunk_syncobj, field for field
++    uint32_t handle;
++    uint32_t flags;
++    uint64_t point;
++};
++typedef struct drm_amdgpu_cs_chunk_syncobj_ref rn_uc_sync_ref;
++
++#define RN_UC_SUBMIT_SYNC_MAX 8
++struct rn_uc_submit {
++    uint64_t ib_va;            // inside one mapping of this connection
++    uint32_t ib_dwords;
++    uint32_t flags;            // 0
++    uint32_t in_count;         // syncobjs to wait for before the IB runs (the CPU waits before the packets go to the ring, at most 10 s)
++    uint32_t out_count;        // syncobjs the IB signals when it is done (at their point)
++    rn_uc_sync_ref in[RN_UC_SUBMIT_SYNC_MAX];
++    rn_uc_sync_ref out[RN_UC_SUBMIT_SYNC_MAX];
++};
++
++struct rn_uc_submit_result {
++    uint32_t seq;
++    uint32_t pad;
++};
++
++struct rn_uc_wait_seq {
++    uint32_t seq;              // a sequence number a submit returned (a later one is refused)
++    uint32_t timeout_ms;       // 0: only look (a fence status query); at most 10000
++};
++
++// A shader that hangs or faults can leave the compute queue stuck. When a wait for a sequence number ran for rednavi_hang_ms (boot-arg, default 8000) without
++// the fence moving, the kernel resets the queue (as Linux resets a hung kernel compute queue through the MES): everything in the ring and running is
++// dropped, the fences of all connections jump to their last submitted number so that nobody waits for good, and the numbers that did not complete are
++// reported as lost to the connection that owned them (RN_UC_SEQ_LOST, from wait_seq). The queue is usable again afterwards. RN_UC_QUEUE_RESET asks for
++// the same reset right away, for a client that has its own watchdog.
++#define RN_UC_SEQ_DONE 0
++#define RN_UC_SEQ_LOST 1
++struct rn_uc_wait_seq_result {
++    uint32_t reached;
++    uint32_t signaled;         // the fence value now: every sequence number up to it is done
++    uint32_t status;           // RN_UC_SEQ_DONE, or RN_UC_SEQ_LOST: reached because the queue was reset, the work did not (all) run
++    uint32_t pad;
++};
++
++struct rn_uc_reset_result {
++    uint32_t status;           // 0: the queue was reset and mapped again; otherwise the step that failed (see rn_compute_queue_reset in gfx11.cpp)
++    uint32_t resets;           // resets since boot
++    uint32_t lost_from;        // this connection's sequence numbers lost in the reset, from..to; none when lost_from > lost_to
++    uint32_t lost_to;
++};
++
++struct rn_uc_bo_wait {
++    uint32_t handle;
++    uint32_t offset;           // byte offset of a dword
++    uint32_t value;            // wait until the dword equals it
++    uint32_t timeout_ms;       // at most 10000
++};
++
++struct rn_uc_bo_wait_result {
++    uint32_t reached;
++    uint32_t pad;
++};
++
++#define RN_UC_DIAG_CLEAR_FAULT 1u   // after reading, clear the latched GCVM_L2_PROTECTION_FAULT_STATUS (it keeps the first fault until then)
++struct rn_uc_diag_req {
++    uint32_t flags;
++    uint32_t pad;
++};
++
++struct rn_uc_diag {
++    uint32_t hqd_rptr, hqd_wptr, hqd_active, cp_stat;
++    uint32_t fault_status, fault_addr_lo, fault_addr_hi, ring_wptr;
++    uint32_t sdma0_version, grbm_status, rlc_gpm_stat;
++    uint32_t hqd_doorbell_control, cp_pq_status, doorbell_range_lower, doorbell_range_upper, doorbell_aper_en;
++    uint32_t pq_base, pq_control, mqd_base;
++    uint32_t ring_rptr_word, ring_wptr_word, driver_wptr, ring_full_waits;
++    uint32_t seq_submitted, seq_signaled;     // this connection's context
++    uint32_t flush_failures, flush_last_ack;  // TLB flushes (engine 17) whose acknowledge never came, and the last acknowledge register read
++};
++
++#endif
+diff --git a/src/amd/common/apple/xf86drm.h b/src/amd/common/apple/xf86drm.h
+new file mode 100644
+index 0000000..4cef5fd
+--- /dev/null
++++ b/src/amd/common/apple/xf86drm.h
+@@ -0,0 +1,64 @@
++/*
++ * SPDX-License-Identifier: MIT
++ *
++ * The few definitions of libdrm's xf86drm.h that RADV's amdgpu winsys and util/os_drm.h use, for macOS where there is no libdrm and no DRM node
++ * (the GPU is reached through the RedNavi IOKit user client, see ac_apple_iokit.c).
++ */
++#ifndef APPLE_XF86DRM_H
++#define APPLE_XF86DRM_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/ioccom.h>
++#include <sys/types.h>
++
++#include "drm-uapi/drm.h"
++
++#define DRM_IOC_VOID IOC_VOID
++#define DRM_IOC_READ IOC_OUT
++#define DRM_IOC_WRITE IOC_IN
++#define DRM_IOC(dir, group, nr, size) _IOC(dir, group, nr, size)
++
++#define DRM_NODE_PRIMARY 0
++#define DRM_NODE_CONTROL 1
++#define DRM_NODE_RENDER 2
++
++typedef struct _drmPciBusInfo {
++   uint16_t domain;
++   uint8_t bus;
++   uint8_t dev;
++   uint8_t func;
++} drmPciBusInfo;
++
++typedef struct _drmDevice {
++   char **nodes;
++} drmDevice, *drmDevicePtr;
++
++static inline int
++drmGetDeviceFromDevId(dev_t dev_id, uint32_t flags, drmDevicePtr *device)
++{
++   (void)dev_id; (void)flags; (void)device;
++   return -1;
++}
++
++static inline void
++drmFreeDevice(drmDevicePtr *device)
++{
++   (void)device;
++}
++
++static inline int
++drmGetCap(int fd, uint64_t capability, uint64_t *value)
++{
++   (void)fd; (void)capability; (void)value;
++   return -1;
++}
++
++static inline char *
++drmGetFormatModifierName(uint64_t modifier)
++{
++   (void)modifier;
++   return NULL;
++}
++
++#endif
+diff --git a/src/amd/common/meson.build b/src/amd/common/meson.build
+index 819bec0..081903f 100644
+--- a/src/amd/common/meson.build
++++ b/src/amd/common/meson.build
+@@ -203,7 +203,12 @@ if with_gfx_compute
+   )
+ endif
+ 
+-if not with_platform_windows
++if host_machine.system() == 'darwin'
++  # RedNavi: the ac_drm_* layer over an IOKit user client instead of DRM ioctls
++  amd_common_files += files(
++    'apple/ac_apple_iokit.c',
++  )
++elif not with_platform_windows
+   amd_common_files += files(
+     'ac_linux_drm.c',
+   )
+@@ -238,7 +243,7 @@ libamd_common = static_library(
+   'amd_common',
+   [amd_common_files, gfx10_format_table_c],
+   include_directories : [
+-    inc_include, inc_src, inc_amd, inc_virtio_gpu,
++    inc_include, inc_src, inc_amd, inc_virtio_gpu, inc_amd_apple,
+   ],
+   dependencies : [dep_llvm.partial_dependency(compile_args: true, includes: true)] + [
+     dep_thread, dep_elf, dep_libdrm_amdgpu, dep_valgrind, dep_zstd,
+diff --git a/src/amd/meson.build b/src/amd/meson.build
+index 92fe3d1..e3cd080 100644
+--- a/src/amd/meson.build
++++ b/src/amd/meson.build
+@@ -2,6 +2,7 @@
+ # SPDX-License-Identifier: MIT
+ 
+ inc_amd = include_directories('.')
++inc_amd_apple = host_machine.system() == 'darwin' ? include_directories('common/apple') : []
+ 
+ if with_tools.contains('drm-shim')
+   subdir('drm-shim')
+diff --git a/src/amd/vulkan/meson.build b/src/amd/vulkan/meson.build
+index 9e122fd..f1502f2 100644
+--- a/src/amd/vulkan/meson.build
++++ b/src/amd/vulkan/meson.build
+@@ -269,6 +269,15 @@ if with_platform_android
+   radv_deps += dep_android
+ endif
+ 
++if host_machine.system() == 'darwin'
++  # RedNavi: the amdgpu winsys talks to the kext through IOKit (src/amd/common/apple)
++  radv_deps += [dependency('appleframeworks', modules : ['IOKit', 'CoreFoundation'])]
++  # optional layer entrypoints are weak references (radv_entrypoints --weak); Mach-O needs this to leave them null
++  radv_darwin_link_args = ['-Wl,-undefined,dynamic_lookup']
++else
++  radv_darwin_link_args = []
++endif
++
+ radv_build_id = get_option('radv-build-id')
+ if radv_build_id != ''
+   radv_flags += '-DRADV_BUILD_ID_OVERRIDE="' + radv_build_id + '"'
+@@ -285,7 +294,7 @@ libvulkan_radeon = shared_library(
+   vs_module_defs : vulkan_api_def,
+   include_directories : [
+     inc_include, inc_src, inc_amd, inc_amd_common, inc_amd_common_llvm,
+-    inc_util, inc_virtio_gpu
++    inc_util, inc_virtio_gpu, inc_amd_apple
+   ],
+   link_with : [
+     libamd_common, libamd_common_llvm, libamdgpu_addrlib,
+@@ -300,7 +309,7 @@ libvulkan_radeon = shared_library(
+   c_args : [no_override_init_args, radv_flags, c_msvc_compat_args],
+   cpp_args : [radv_flags, cpp_msvc_compat_args],
+   link_args : [
+-    ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args,
++    ld_args_build_id, ld_args_bsymbolic, ld_args_gc_sections, vulkan_icd_link_args, radv_darwin_link_args,
+   ],
+   link_depends : vulkan_icd_link_depends,
+   gnu_symbol_visibility : 'hidden',
+diff --git a/src/amd/vulkan/radv_instance.c b/src/amd/vulkan/radv_instance.c
+index 66190a5..cc0104c 100644
+--- a/src/amd/vulkan/radv_instance.c
++++ b/src/amd/vulkan/radv_instance.c
+@@ -320,7 +320,11 @@ radv_CreateInstance(const VkInstanceCreateInfo *pCreateInfo, const VkAllocationC
+          fprintf(stderr, "radv: Failed to open log file: %s.\n", filename);
+    }
+ 
++#ifdef __APPLE__
++   instance->vk.physical_devices.enumerate = radv_apple_enumerate_physical_devices;
++#else
+    instance->vk.physical_devices.try_create_for_drm = create_drm_physical_device;
++#endif
+    instance->vk.physical_devices.destroy = radv_physical_device_destroy;
+ 
+    if (RADV_DEBUG(instance, STARTUP))
+diff --git a/src/amd/vulkan/radv_physical_device.c b/src/amd/vulkan/radv_physical_device.c
+index 415efc9..7a2e420 100644
+--- a/src/amd/vulkan/radv_physical_device.c
++++ b/src/amd/vulkan/radv_physical_device.c
+@@ -34,8 +34,11 @@
+ #include "radv_video.h"
+ #include "radv_wsi.h"
+ 
+-#ifdef _WIN32
++#if defined(_WIN32)
+ typedef void *drmDevicePtr;
++#elif defined(__APPLE__)
++#include "drm-uapi/amdgpu_drm.h"
++#include "winsys/amdgpu/radv_amdgpu_winsys_public.h"
+ #else
+ #include "drm-uapi/amdgpu_drm.h"
+ #include "util/os_drm.h"
+@@ -2612,8 +2615,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+ #else
+    VkResult result;
+    int fd = -1;
+-   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+    enum radv_drm_device_type drm_device_type;
++#ifdef __APPLE__
++   /* There is no DRM node: the winsys talks to the RedNavi IOKit user client (src/amd/common/apple), fd stays -1. */
++   const char *path = "RedNaviProbe";
++   drm_device_type = RADV_DRM_DEVICE_APPLE_IOKIT;
++#else
++   const char *path = drm_device->nodes[DRM_NODE_RENDER];
+    drmVersionPtr version;
+ 
+    fd = open(path, O_RDWR | O_CLOEXEC);
+@@ -2652,6 +2660,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+                        path);
+    }
+    drmFreeVersion(version);
++#endif
+ 
+    if (RADV_DEBUG(instance, STARTUP))
+       fprintf(stderr, "radv: info: Found device '%s'.\n", path);
+@@ -2716,6 +2725,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    pdev->sync_types[num_sync_types++] = NULL;
+    pdev->vk.supported_sync_types = pdev->sync_types;
+ 
++#ifndef __APPLE__
+    if (instance->vk.enabled_extensions.KHR_display) {
+       pdev->wsi_master_fd = open(drm_device->nodes[DRM_NODE_PRIMARY], O_RDWR | O_CLOEXEC);
+       if (pdev->wsi_master_fd >= 0) {
+@@ -2734,6 +2744,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+       if (fd != -1)
+          pdev->wsi_syncobj_fd = os_dupfd_cloexec(fd);
+    }
++#endif
+ 
+    /* Allow all devices on a virtual winsys, otherwise do a basic support check. */
+    if (!radv_is_gpu_supported(&pdev->info)) {
+@@ -2876,6 +2887,13 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+    radv_physical_device_get_supported_extensions(pdev, &pdev->vk.supported_extensions);
+    radv_physical_device_get_features(pdev, &pdev->vk.supported_features);
+ 
++#ifdef __APPLE__
++   pdev->available_nodes = 0;
++   pdev->bus_info.domain = pdev->info.pci.domain;
++   pdev->bus_info.bus = pdev->info.pci.bus;
++   pdev->bus_info.dev = pdev->info.pci.dev;
++   pdev->bus_info.func = pdev->info.pci.func;
++#else
+    struct stat primary_stat = {0}, render_stat = {0};
+ 
+    pdev->available_nodes = drm_device->available_nodes;
+@@ -2896,6 +2914,7 @@ radv_physical_device_try_create(struct radv_instance *instance, drmDevicePtr drm
+       goto fail;
+    }
+    pdev->render_devid = render_stat.st_rdev;
++#endif
+ 
+    if (radv_device_get_cache_uuid(pdev, pdev->cache_uuid)) {
+       result = vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "cannot generate UUID");
+@@ -2969,7 +2988,7 @@ fail_fd:
+ VkResult
+ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device, struct vk_physical_device **out)
+ {
+-#ifndef _WIN32
++#if !defined(_WIN32) && !defined(__APPLE__)
+    bool supported_device = false;
+ 
+    if (!(device->available_nodes & (1 << DRM_NODE_RENDER)))
+@@ -2992,6 +3011,24 @@ create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *d
+ #endif
+ }
+ 
++#ifdef __APPLE__
++VkResult
++radv_apple_enumerate_physical_devices(struct vk_instance *vk_instance)
++{
++   struct radv_physical_device *pdev = NULL;
++   VkResult result = radv_physical_device_try_create((struct radv_instance *)vk_instance, NULL, &pdev);
++
++   /* No RedNavi user client: no device, which is not an error for the loader. */
++   if (result == VK_ERROR_INCOMPATIBLE_DRIVER)
++      return VK_SUCCESS;
++   if (result != VK_SUCCESS)
++      return result;
++
++   list_addtail(&pdev->vk.link, &vk_instance->physical_devices.list);
++   return VK_SUCCESS;
++}
++#endif
++
+ static VkQueueFlags
+ radv_queue_family_protected_flag(const struct radv_physical_device *pdev, enum radv_queue_family qf)
+ {
+diff --git a/src/amd/vulkan/radv_physical_device.h b/src/amd/vulkan/radv_physical_device.h
+index 7d6823a..015e00f 100644
+--- a/src/amd/vulkan/radv_physical_device.h
++++ b/src/amd/vulkan/radv_physical_device.h
+@@ -29,7 +29,10 @@
+ #include "vk_sync.h"
+ #include "vk_sync_timeline.h"
+ 
+-#ifndef _WIN32
++#if defined(__APPLE__)
++/* RedNavi: no libdrm on macOS, the GPU is reached through an IOKit user client (src/amd/common/apple) */
++#include <xf86drm.h>
++#elif !defined(_WIN32)
+ #include <xf86drm.h>
+ #endif
+ 
+@@ -76,6 +79,7 @@ enum radv_drm_device_type {
+    RADV_DRM_DEVICE_AMDGPU,
+    RADV_DRM_DEVICE_AMDGPU_VPIPE,
+    RADV_DRM_DEVICE_VIRTIO,
++   RADV_DRM_DEVICE_APPLE_IOKIT,
+ };
+ 
+ struct radv_physical_device {
+@@ -274,6 +278,10 @@ bool radv_use_bvh8(const struct radv_physical_device *pdev);
+ 
+ bool radv_is_dcc_disabled(const struct radv_physical_device *pdev);
+ 
++#ifdef __APPLE__
++VkResult radv_apple_enumerate_physical_devices(struct vk_instance *vk_instance);
++#endif
++
+ VkResult create_drm_physical_device(struct vk_instance *vk_instance, struct _drmDevice *device,
+                                     struct vk_physical_device **out);
+ 
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+index 59348f1..2dffc46 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_bo.c
+@@ -27,6 +27,13 @@
+ #include "util/u_math.h"
+ #include "util/u_memory.h"
+ 
++/* On macOS there is no DRM fd to mmap: the IOKit backend maps buffers itself, as the virtio one does. */
++#ifdef __APPLE__
++#define RADV_AMDGPU_BO_CPU_MAP_VIA_DEVICE(ws) true
++#else
++#define RADV_AMDGPU_BO_CPU_MAP_VIA_DEVICE(ws) ((ws)->info.is_virtio)
++#endif
++
+ static void radv_amdgpu_winsys_bo_destroy(struct radeon_winsys *_ws, struct radeon_winsys_bo *_bo);
+ 
+ static int
+@@ -720,9 +727,9 @@ radv_amdgpu_winsys_bo_map(struct radeon_winsys *_ws, struct radeon_winsys_bo *_b
+ 
+    assert(!bo->cpu_map);
+ 
+-#if HAVE_AMDGPU_VIRTIO
++#if HAVE_AMDGPU_VIRTIO || defined(__APPLE__)
+    struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+-   if (ws->info.is_virtio) {
++   if (RADV_AMDGPU_BO_CPU_MAP_VIA_DEVICE(ws)) {
+       /* We can't use DRM_AMDGPU_GEM_MMAP directly on virtio. Instead use bo_cpu_map since
+        * the virtio version will map the buffer at the given address (if not NULL).
+        */
+@@ -766,9 +773,9 @@ radv_amdgpu_winsys_bo_unmap(struct radeon_winsys *_ws, struct radeon_winsys_bo *
+    if (replace) {
+       (void)mmap(bo->cpu_map, bo->base.size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
+-#if HAVE_AMDGPU_VIRTIO
++#if HAVE_AMDGPU_VIRTIO || defined(__APPLE__)
+       struct radv_amdgpu_winsys *ws = radv_amdgpu_winsys(_ws);
+-      if (ws->info.is_virtio)
++      if (RADV_AMDGPU_BO_CPU_MAP_VIA_DEVICE(ws))
+          ac_drm_bo_cpu_unmap(ws->dev, bo->bo);
+       else
+ #endif
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+index 0c44496..561ffce 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_cs.c
+@@ -6,7 +6,7 @@
+  */
+ 
+ #include <assert.h>
+-#include <libsync.h>
++#include "util/libsync.h"
+ #include <pthread.h>
+ #include <stdlib.h>
+ #include "drm-uapi/amdgpu_drm.h"
+diff --git a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+index 552266e..47d49a9 100644
+--- a/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
++++ b/src/amd/vulkan/winsys/amdgpu/radv_amdgpu_winsys.c
+@@ -359,7 +359,11 @@ radv_amdgpu_winsys_query_info(int fd, bool is_virtio, bool cache_compat, struct
+    info->base.ip[AMD_IP_SDMA].num_queues = MIN2(info->base.ip[AMD_IP_SDMA].num_queues, MAX_RINGS_PER_TYPE);
+    info->base.ip[AMD_IP_COMPUTE].num_queues = MIN2(info->base.ip[AMD_IP_COMPUTE].num_queues, MAX_RINGS_PER_TYPE);
+ 
++#ifdef __APPLE__
++   info->syncobj_sync_type = vk_drm_syncobj_get_type_from_provider(ac_drm_device_get_sync_provider(dev));
++#else
+    info->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
++#endif
+ 
+    /* Determine which context priorities are supported. */
+    for (uint32_t p = RADEON_CTX_PRIORITY_LOW; p <= RADEON_CTX_PRIORITY_REALTIME; p++) {
+diff --git a/src/util/u_sync_provider.h b/src/util/u_sync_provider.h
+index 1b556be..7a1b86f 100644
+--- a/src/util/u_sync_provider.h
++++ b/src/util/u_sync_provider.h
+@@ -3,6 +3,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <stddef.h>
+ #include <stdint.h>
+ 
+ #ifndef U_SYNC_PROVIDER_H
+diff --git a/src/vulkan/runtime/meson.build b/src/vulkan/runtime/meson.build
+index 0ac4d48..a4f6f09 100644
+--- a/src/vulkan/runtime/meson.build
++++ b/src/vulkan/runtime/meson.build
+@@ -58,6 +58,9 @@ vulkan_lite_runtime_deps = [
+ if dep_libdrm.found()
+   vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+   vulkan_lite_runtime_deps += dep_libdrm
++elif host_machine.system() == 'darwin' and with_amd_vk
++  # RedNavi: syncobjs come from an util_sync_provider, there is no DRM fd
++  vulkan_lite_runtime_files += files('vk_drm_syncobj.c')
+ endif
+ 
+ if with_platform_android
+diff --git a/src/vulkan/runtime/vk_drm_syncobj.c b/src/vulkan/runtime/vk_drm_syncobj.c
+index 57de98e..4e387bd 100644
+--- a/src/vulkan/runtime/vk_drm_syncobj.c
++++ b/src/vulkan/runtime/vk_drm_syncobj.c
+@@ -24,7 +24,9 @@
+ #include "vk_drm_syncobj.h"
+ 
+ #include <sched.h>
++#ifndef __APPLE__
+ #include <xf86drm.h>
++#endif
+ 
+ #include "drm-uapi/drm.h"
+ 

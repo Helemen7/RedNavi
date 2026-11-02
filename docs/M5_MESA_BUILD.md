@@ -76,3 +76,17 @@ The expected size is of the order of 1500 lines of C. The structs on the wire ar
 - How much memory model RADV insists on: it expects CPU-visible device-local memory and a GTT heap. The kext has host memory only for now (docs/M5_PLAN.md).
 
 The first useful measurement is `meson setup` of a full checkout with the patches of this page applied, with `-Dvulkan-drivers=amd -Dllvm=disabled -Dgallium-drivers= -Dglx=disabled -Degl=disabled`. It was not done.
+
+## Build result, 2026-11-02 (Mesa bd830ce, 27.0.0-devel)
+
+`mesa-bridge/patches/0001-radv-darwin-iokit.patch` applies on that commit and builds `libvulkan_radeon.dylib` on macOS 15 (x86_64) with `-Dvulkan-drivers=amd`. Verified on the development Mac only: the loader loads the ICD and RADV starts, then stops with "failed to initialize device" because the kext is not there. Not yet run against the card.
+
+```
+git apply mesa-bridge/patches/0001-radv-darwin-iokit.patch      # in a Mesa checkout at bd830ce
+PATH=<venv with mako, meson, ninja>:$PATH:/opt/local/bin \
+meson setup build -Dvulkan-drivers=amd -Dgallium-drivers= -Dllvm=disabled -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+  -Dplatforms= -Dvulkan-layers= -Dbuild-tests=false -Dbuildtype=release -Dgles1=disabled -Dgles2=disabled -Dopengl=false -Dvideo-codecs=
+ninja -C build
+```
+
+Needs glslang (BVH shaders) from MacPorts. What the patch does: the `ac_drm_*` layer is `src/amd/common/apple/ac_apple_iokit.c` instead of `ac_linux_drm.c`; `apple/amdgpu.h` and `apple/xf86drm.h` stand in for libdrm; RADV enumerates its one device through `physical_devices.enumerate` with no DRM node (`RADV_DRM_DEVICE_APPLE_IOKIT`, fd -1); syncobjs come from the bridge's sync provider; buffers are mapped by `ac_drm_bo_cpu_map` as on virtio; addrlib is built with `-DHAVE_TSERVER` (the Apple branch wants a private header); weak layer entrypoints need `-Wl,-undefined,dynamic_lookup`. `libzstd` must be bundled next to the dylib (`tools/vk_run.sh` and `tools/rn_icd.json` run `vulkaninfo` with `VK_ICD_FILENAMES` and `DYLD_LIBRARY_PATH` pointing at the bundle).
