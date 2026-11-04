@@ -13,6 +13,7 @@ OUT := build/$(CONFIG)
 KEXT := $(OUT)/RedNavi.kext
 FBKEXT := $(OUT)/RedNaviFB.kext
 ACCELKEXT := $(OUT)/RedNaviAccel.kext
+ACCEL2KEXT := $(OUT)/RedNaviAccel2.kext
 CXX := clang++
 ARCH := -arch x86_64
 CXXFLAGS := $(ARCH) $(OPT) -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fno-common -mkernel \
@@ -34,7 +35,7 @@ endif
 LDFLAGS := $(ARCH) -Xlinker -kext -nostdlib -lkmod -L$(SDK)/Library -lkmodc++ -lcc_kext \
 	-Xlinker -object_path_lto -Xlinker /dev/null -mmacosx-version-min=12.0
 
-all: $(KEXT) $(FBKEXT) $(ACCELKEXT)
+all: $(KEXT) $(FBKEXT) $(ACCELKEXT) $(ACCEL2KEXT)
 
 # Every header of the kext: gfx11.h, rn_uapi.h, the generated splash and register headers changed behind a stale object once (a new splash that never reached the build).
 $(OUT)/kern_probe.o: RedNavi/kern_probe.cpp $(wildcard RedNavi/*.h compat/include/*/*.h)
@@ -105,6 +106,21 @@ $(ACCELKEXT): $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o RedNaviAccel/In
 	$(CXX) $(LDFLAGS) $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o -o $(ACCELKEXT)/Contents/MacOS/RedNaviAccel
 	cp RedNaviAccel/Info.plist.in $(ACCELKEXT)/Contents/Info.plist
 	@echo "built $(ACCELKEXT)"
+
+# RedNaviAccel2 (M6): the same family dependency, but the family's own start() runs (docs/M6_ACCELERATOR_STUDY.md).
+$(OUT)/accel2_kern_accel2.o: RedNaviAccel2/kern_accel2.cpp RedNaviAccel/IOGraphicsAccelerator2.h
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
+$(OUT)/accel2_kern_info.o: RedNaviAccel2/kern_info.c
+	@mkdir -p $(OUT)
+	clang $(ARCH) $(OPT) -mkernel -nostdinc -isystem $(SDK)/Headers -DKERNEL -mmacosx-version-min=12.0 -c $< -o $@
+
+$(ACCEL2KEXT): $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o RedNaviAccel2/Info.plist.in
+	@mkdir -p $(ACCEL2KEXT)/Contents/MacOS
+	$(CXX) $(LDFLAGS) $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o -o $(ACCEL2KEXT)/Contents/MacOS/RedNaviAccel2
+	cp RedNaviAccel2/Info.plist.in $(ACCEL2KEXT)/Contents/Info.plist
+	@echo "built $(ACCEL2KEXT)"
 
 # The Metal plug-in stub (user space, docs/M6_ACCELERATOR_STUDY.md) and the program that makes Metal load it.
 MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
