@@ -269,8 +269,11 @@ void *RedNaviAccel2::getStampMemory(unsigned int *size) {
     rnNote("getStampMemory(size %p)", size);
     if (gStage < 2) return nullptr;
     IOBufferMemoryDescriptor *d = rnStampDesc();
-    uint32_t reported = rnStampSize();
-    PE_parse_boot_argn("rednavi_accel2_stampreport", &reported, sizeof(reported));   // what is told to the family, if it is to differ from the buffer
+    // The size told to the family is NOT the length of the buffer: with 0x10000 (the buffer's length) IOAccelDeviceCreateWithAPIProperty read past the end of the mapping,
+    // with 0x108 it ran to the end and the device was created (observed 2026-11-04 with the one-process harness, tools/mtl_init_harness.m; 0x108 is also the number
+    // Intel's reply of selector 2 has at +8). 0x108 is 64 stamps of 4 bytes plus 8. rednavi_accel2_stampreport=<hex> overrides it.
+    uint32_t reported = 0x108;
+    PE_parse_boot_argn("rednavi_accel2_stampreport", &reported, sizeof(reported));
     if (size) *size = reported;
     rnNote("getStampMemory -> descriptor %p (bytes %p)", (void *)d, rnStampPage());
     return d;
