@@ -1,7 +1,7 @@
-# The AIR to SPIR-V translator: licence options (decision pending)
+# The AIR to SPIR-V translator: licence options and the decision
 
 The plug-in receives Metal kernels as AIR (LLVM bitcode with Apple's metadata, in a `.metallib` container, read by `RedNaviMTL/metallib.c`) and RADV wants SPIR-V.
-Something has to translate. `RedNaviMTL/rn_air.h` is the seam: the translator is a separate shared library, `librn_air2spirv.dylib`, found next to RADV and loaded with `dlopen`,
+**Decision (2026-11-05, project owner): use NullMoth's fork of metal2vulkan, kept in a repository of its own, [Helemen7/rn-air2spirv](https://github.com/Helemen7/rn-air2spirv)** (private for now), written in Rust, loaded by the plug-in at run time. The rest of this page is the reasoning. Something has to translate. `RedNaviMTL/rn_air.h` is the seam: the translator is a separate shared library, `librn_air2spirv.dylib`, found next to RADV and loaded with `dlopen`,
 with a four-line C interface. **Nothing of a translator is in this repository today.** (Of NullMoth's repository only the declaration headers of the Apple classes were looked at, once, and not used; see the project notes.) This page is what has to be decided before one is.
 
 ## What each candidate brings
@@ -33,3 +33,16 @@ with a four-line C interface. **Nothing of a translator is in this repository to
 I have not looked at either translator's source or tests. Whether AIR kernels with `constant uint &`, `thread_position_in_grid` and `device uint *` (the test kernel `mesa-bridge/test/vk_dispatch.metal`)
 translate, how `[[buffer(i)]]` maps to descriptors, whether the threadgroup size is a specialization constant, are all unknown. The interface (`rn_air_kernel_info`) assumes storage buffers at set 0
 binding = Metal index, one push constant block for the constant data, and a fixed local size; if the translator does otherwise, `rn_air.h` and `compute.m` change.
+
+## What was done after the decision
+
+- `Helemen7/rn-air2spirv` has the history of NullMoth's `translator/` directory (87 commits, original authors kept), `LICENSE`/`COPYING` (LGPL-3.0), a README that says where the code comes from, and
+  `rn-capi/`: a small new crate that builds `librn_air2spirv.dylib` with the two functions of `RedNaviMTL/rn_air.h`.
+- It builds with `cargo build --release` (Rust 1.99, MacPorts; first build about 6 minutes). The translator needs `llvm-dis` (LLVM 19 from MacPorts works, the binary is `llvm-dis-mp-19`) and
+  `spirv-val` at run time. **Distribution problem, open**: an end user without LLVM and SPIRV-Tools cannot use the plug-in; shipping the two tools next to the library is possible
+  (`rn_air.c` looks for them there) but the LLVM tool is not small.
+- `tools/air_translate_test.c` takes one kernel of a real `.metallib` (`mesa-bridge/test/vk_dispatch.metal`, built with the Metal Toolchain) through the plug-in's code and the library:
+  772 bytes of SPIR-V accepted by `spirv-val` for Vulkan 1.2, two storage-buffer bindings (Metal buffer 0 writable, buffer 1 read-only: a `constant uint &` argument is a storage buffer
+  too), threadgroup size as specialization constants 0, 1, 2.
+- The plug-in side follows that contract (`RedNaviMTL/compute.m`): the binding list is not 0..n-1, `setBytes` becomes a small buffer, the pipeline is made per threadgroup size.
+  Not yet run on the GPU.
