@@ -81,7 +81,7 @@ long RedNaviEventMachine::completeBarrier(vendevtBarrierRec *b) { rnNote("event 
 long RedNaviEventMachine::writeBarrierElement(vendevtBarrierRec *b, int i, unsigned int v) { rnNote("event machine writeBarrierElement(%p, %d, %u)", (void *)b, i, v); return 0; }
 
 // The display machine (what the family does when a framebuffer changes mode or powers off): all of it is the family's except the two notifications that tell the
-// hardware-specific part, which are ours. Logged and ignored for now.
+// hardware-specific part, which are ours. Logged and answered with true for now.
 class RedNaviDisplayMachine : public IOAccelDisplayMachine {
     OSDeclareDefaultStructors(RedNaviDisplayMachine)
 public:
@@ -92,8 +92,9 @@ public:
 static_assert(sizeof(RedNaviDisplayMachine) == 376, "IOAccelDisplayMachine is 376 bytes in the registry");
 OSDefineMetaClassAndStructors(RedNaviDisplayMachine, IOAccelDisplayMachine)
 void RedNaviDisplayMachine::rnPad0() {} void RedNaviDisplayMachine::rnPad1() {} void RedNaviDisplayMachine::rnPad2() {} void RedNaviDisplayMachine::rnPad3() {}
-long RedNaviDisplayMachine::displayModeWillChange() { rnNote("display machine displayModeWillChange"); return 0; }
-long RedNaviDisplayMachine::displayModeDidChange() { rnNote("display machine displayModeDidChange"); return 0; }
+// The family calls both as bool and panics on false ("display_mode_did_change: driver returns false", IOAccelDisplayMachine.cpp:345, seen 2026-11-04): true is success.
+long RedNaviDisplayMachine::displayModeWillChange() { rnNote("display machine displayModeWillChange"); return 1; }
+long RedNaviDisplayMachine::displayModeDidChange() { rnNote("display machine displayModeDidChange"); return 1; }
 
 
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
