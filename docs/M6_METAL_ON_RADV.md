@@ -54,7 +54,7 @@ Not done in this slice: buffer offsets, `setBuffers`, textures, blit, render, `M
    `setComputePipelineState:`, `setBuffer:offset:atIndex:`, `setBytes:length:atIndex:`, `dispatchThreadgroups:threadsPerThreadgroup:`, `endEncoding`; `MTLBuffer` over an
    `rn_vk_buffer` (`contents` is the mapped pointer). Which methods each protocol needs is read from the protocol list at run time, not guessed (the stub already logs every
    selector nobody implements).
-2. **Shader path.** `-newLibraryWithSource:` is compiled to AIR by Apple's compiler service (not by the driver); the driver receives the function through the vendor hooks listed in
+2. **Shader path (reader, `MTLLibrary`/`MTLFunction` and the translator seam done; the translator itself is decided in M6_AIR_TRANSLATOR_LICENCE.md).** `-newLibraryWithSource:` is compiled to AIR by Apple's compiler service (not by the driver); the driver receives the function through the vendor hooks listed in
    the Intel class (`getComputeFunctionId:compilerOptions:...`, `computeVariantWithCompilerOutput:...`, `newComputePipelineWithDescriptor:variant:`). The AIR-to-SPIR-V
    translator has to be an LGPL component of its own (metal2vulkan, as in docs/ARCHITECTURE.md); until it exists a test can hand the plug-in SPIR-V through a private hook.
 3. **Fences and events**: `MTLCommandBuffer` completion handlers on a `VkFence` thread; `waitUntilCompleted`.

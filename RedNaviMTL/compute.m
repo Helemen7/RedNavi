@@ -14,6 +14,8 @@
 #import <objc/runtime.h>
 #include <stdlib.h>
 #include "rn_vk.h"
+#include "rn_air.h"
+#include "metallib.h"
 
 extern void rn_log(const char *fmt, ...);
 
@@ -82,6 +84,8 @@ static rn_vk *rn_vk_shared(void) {
 @public
     rn_vk_compute *c;
     unsigned nbuf, push;
+    unsigned pushIndex;              // the Metal buffer index that setBytes fills (0xffffffff: none)
+    unsigned localSize[3];
     id<MTLDevice> dev;
     NSString *label_;
 }
@@ -158,7 +162,7 @@ static rn_vk *rn_vk_shared(void) {
     for (NSUInteger i = 0; i < range.length; i++) [self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
 }
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
-    if (!pso || index < pso->nbuf) { rn_log("setBytes at index %lu: below the buffer count, not supported yet", (unsigned long)index); return; }
+    if (!pso || index != pso->pushIndex) { rn_log("setBytes at index %lu: the pipeline takes constant data at index %d only", (unsigned long)index, pso ? (int)pso->pushIndex : -1); return; }
     if (length > sizeof(push)) length = sizeof(push);
     memcpy(push, bytes, length);
     pushLen = (uint32_t)length;
@@ -271,6 +275,121 @@ static rn_vk *rn_vk_shared(void) {
 - (void)insertDebugCaptureBoundary {}
 @end
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------------- libraries and functions
+
+@interface RedNaviMTLFunction : NSObject {
+@public
+    NSString *name;
+    MTLFunctionType type;
+    NSData *bitcode;
+    id<MTLDevice> dev;
+    NSString *label_;
+}
+@end
+@implementation RedNaviMTLFunction
++ (void)load { class_addProtocol(self, @protocol(MTLFunction)); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)name { return name; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (MTLFunctionType)functionType { return type; }
+- (MTLPatchType)patchType { return MTLPatchTypeNone; }
+- (NSInteger)patchControlPointCount { return -1; }
+- (NSArray *)vertexAttributes { return nil; }
+- (NSArray *)stageInputAttributes { return nil; }
+- (NSDictionary<NSString *, MTLFunctionConstant *> *)functionConstantsDictionary { return @{}; }
+- (MTLFunctionOptions)options { return MTLFunctionOptionNone; }
+@end
+
+@interface RedNaviMTLLibrary : NSObject {
+@public
+    id<MTLDevice> dev;
+    NSData *data;
+    NSMutableDictionary<NSString *, RedNaviMTLFunction *> *funcs;
+    NSArray<NSString *> *names;
+    NSString *label_;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)d data:(NSData *)blob error:(NSError **)error;
+@end
+@implementation RedNaviMTLLibrary
++ (void)load { class_addProtocol(self, @protocol(MTLLibrary)); }
+- (instancetype)initWithDevice:(id<MTLDevice>)d data:(NSData *)blob error:(NSError **)error {
+    if (!(self = [super init])) return nil;
+    rn_mtl_func fn[512];
+    unsigned cnt = 0;
+    int rc = rn_metallib_parse(blob.bytes, blob.length, fn, 512, &cnt);
+    if (rc) {
+        rn_log("newLibraryWithData: not a metallib this reader understands (code %d)", rc);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"unreadable metallib (%d)", rc]}];
+        return nil;
+    }
+    dev = d; data = blob; funcs = [NSMutableDictionary new];
+    NSMutableArray *nm = [NSMutableArray new];
+    for (unsigned i = 0; i < cnt && i < 512; i++) {
+        RedNaviMTLFunction *f = [RedNaviMTLFunction new];
+        f->name = @(fn[i].name);
+        f->type = (MTLFunctionType)(fn[i].type + 1);       // the container has 0 vertex, 1 fragment, 2 kernel
+        f->bitcode = [blob subdataWithRange:NSMakeRange(fn[i].bitcode_off, fn[i].bitcode_size)];
+        f->dev = d;
+        funcs[f->name] = f;
+        [nm addObject:f->name];
+    }
+    names = nm;
+    rn_log("library: %u functions", cnt);
+    return self;
+}
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (NSArray<NSString *> *)functionNames { return names; }
+- (MTLLibraryType)type { return MTLLibraryTypeExecutable; }
+- (NSString *)installName { return nil; }
+- (id<MTLFunction>)newFunctionWithName:(NSString *)functionName {
+    RedNaviMTLFunction *f = funcs[functionName];
+    if (!f) return nil;
+    RedNaviMTLFunction *c = [RedNaviMTLFunction new];
+    c->name = f->name; c->type = f->type; c->bitcode = f->bitcode; c->dev = f->dev;
+    return (id)c;
+}
+- (id<MTLFunction>)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues error:(NSError **)error { return [self newFunctionWithName:functionName]; }
+@end
+
+// A compute pipeline state from a function of a library: the function's bitcode goes to the translator (rn_air.h), the SPIR-V to RADV.
+static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
+    RedNaviMTLFunction *f = (RedNaviMTLFunction *)fobj;
+    NSString *why = nil;
+    if (![f isKindOfClass:[RedNaviMTLFunction class]]) why = @"the function is not from a RedNavi library";
+    else if (f->type != MTLFunctionTypeKernel) why = @"only kernel functions are supported";
+    rn_vk *vk = why ? NULL : rn_vk_shared();
+    if (!why && !vk) why = @"RADV is not available";
+    if (!why) {
+        char err[300] = "";
+        uint32_t *spv = NULL;
+        size_t spvBytes = 0;
+        rn_air_kernel_info info = {0, 0, 0xffffffffu, {1, 1, 1}};
+        if (rn_air_translate(NULL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
+            why = [NSString stringWithUTF8String:err];
+        } else {
+            rn_vk_compute *c = rn_vk_compute_create(vk, spv, spvBytes, info.buffer_count, info.push_bytes);
+            rn_air_free(spv);
+            if (!c) why = @"RADV refused the translated module";
+            else {
+                RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
+                p->c = c; p->nbuf = info.buffer_count; p->push = info.push_bytes; p->pushIndex = info.push_index; p->dev = dev;
+                for (int i = 0; i < 3; i++) p->localSize[i] = info.local_size[i];
+                return p;
+            }
+        }
+    }
+    rn_log("compute pipeline for %s failed: %s", [f isKindOfClass:[RedNaviMTLFunction class]] ? f->name.UTF8String : "?", why.UTF8String);
+    if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: why}];
+    return nil;
+}
+
+// Test hook for tools/mtl_library_test.m: a library from data without a device.
+id rn_test_library(NSData *blob, NSError **error) { return [[RedNaviMTLLibrary alloc] initWithDevice:nil data:blob error:error]; }
+
 // ---------------------------------------------------------------------------------------------------------------------------------------- installation on the device class
 
 typedef uintptr_t (*rn_imp_len_opt)(id, SEL, NSUInteger, NSUInteger);
@@ -318,7 +437,48 @@ void rn_compute_install(Class k, Class sup) {
         rn_vk_compute *c = rn_vk_compute_create(vk, spirv.bytes, spirv.length, (unsigned)nbuf, (unsigned)push);
         if (!c) { rn_log("compute pipeline from SPIR-V failed"); return nil; }
         RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
-        p->c = c; p->nbuf = (unsigned)nbuf; p->push = (unsigned)push; p->dev = (id<MTLDevice>)self;
+        p->c = c; p->nbuf = (unsigned)nbuf; p->push = (unsigned)push; p->pushIndex = (unsigned)nbuf; p->dev = (id<MTLDevice>)self;
         return p;
     }), "@40@0:8@16Q24Q32");
+
+    // Libraries and compute pipeline states built from them. Outside the gate everything goes to the superclass.
+    typedef uintptr_t (*imp_data_err)(id, SEL, id, NSError **);
+    typedef uintptr_t (*imp_fn_err)(id, SEL, id, NSError **);
+    typedef uintptr_t (*imp_fn_opt_refl_err)(id, SEL, id, NSUInteger, void *, NSError **);
+    typedef uintptr_t (*imp_fn_handler)(id, SEL, id, id);
+    SEL s3 = sel_registerName("newLibraryWithData:error:");
+    Method m3 = class_getInstanceMethod(sup, s3);
+    imp_data_err o3 = m3 ? (imp_data_err)method_getImplementation(m3) : NULL;
+    class_addMethod(k, s3, imp_implementationWithBlock(^uintptr_t(id self, id data, NSError **error) {
+        if (!rn_gate()) return o3 ? o3(self, s3, data, error) : 0;
+        const void *buf = NULL;
+        size_t size = 0;
+        dispatch_data_t map = dispatch_data_create_map((dispatch_data_t)data, &buf, &size);
+        NSData *blob = [NSData dataWithBytes:buf length:size];
+        (void)map;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLLibrary alloc] initWithDevice:(id<MTLDevice>)self data:blob error:error]);
+    }), m3 ? method_getTypeEncoding(m3) : "@32@0:8@16^@24");
+    SEL s4 = sel_registerName("newComputePipelineStateWithFunction:error:");
+    Method m4 = class_getInstanceMethod(sup, s4);
+    imp_fn_err o4 = m4 ? (imp_fn_err)method_getImplementation(m4) : NULL;
+    class_addMethod(k, s4, imp_implementationWithBlock(^uintptr_t(id self, id fn, NSError **error) {
+        if (!rn_gate()) return o4 ? o4(self, s4, fn, error) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_pso_from_function((id<MTLDevice>)self, fn, error));
+    }), m4 ? method_getTypeEncoding(m4) : "@32@0:8@16^@24");
+    SEL s5 = sel_registerName("newComputePipelineStateWithFunction:options:reflection:error:");
+    Method m5 = class_getInstanceMethod(sup, s5);
+    imp_fn_opt_refl_err o5 = m5 ? (imp_fn_opt_refl_err)method_getImplementation(m5) : NULL;
+    class_addMethod(k, s5, imp_implementationWithBlock(^uintptr_t(id self, id fn, NSUInteger options, void *reflection, NSError **error) {
+        if (!rn_gate()) return o5 ? o5(self, s5, fn, options, reflection, error) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_pso_from_function((id<MTLDevice>)self, fn, error));
+    }), m5 ? method_getTypeEncoding(m5) : "@48@0:8@16Q24^@32^@40");
+    SEL s6 = sel_registerName("newComputePipelineStateWithFunction:completionHandler:");
+    Method m6 = class_getInstanceMethod(sup, s6);
+    imp_fn_handler o6 = m6 ? (imp_fn_handler)method_getImplementation(m6) : NULL;
+    class_addMethod(k, s6, imp_implementationWithBlock(^void(id self, id fn, void (^handler)(id, NSError *)) {
+        if (!rn_gate()) { if (o6) o6(self, s6, fn, handler); return; }
+        NSError *error = nil;
+        id p = rn_pso_from_function((id<MTLDevice>)self, fn, &error);
+        handler(p, error);
+    }), m6 ? method_getTypeEncoding(m6) : "v32@0:8@16@?24");
 }

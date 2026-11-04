@@ -42,9 +42,13 @@ struct rn_vk_compute {
 
 static void seterr(char *err, size_t n, const char *what, long v) { if (err && n) snprintf(err, n, "%s (%ld)", what, v); }
 
+const char *rn_vk_dir(void) {
+    const char *d = getenv("RN_VK_DIR");
+    return d ? d : "/Library/Application Support/RedNavi/vk";
+}
+
 rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
-    if (!dir) dir = getenv("RN_VK_DIR");
-    if (!dir) dir = "/Library/Application Support/RedNavi/vk";
+    if (!dir) dir = rn_vk_dir();
     char path[1024];
     snprintf(path, sizeof(path), "%s/libvulkan_radeon.dylib", dir);
     rn_vk *vk = calloc(1, sizeof(*vk));

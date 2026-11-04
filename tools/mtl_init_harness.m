@@ -74,6 +74,43 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            if (getenv("RN_AIR_TEST")) {
+                // A kernel from a .metallib through the official API, no SPIR-V hook: newLibraryWithData:error:, newFunctionWithName:, newComputePipelineStateWithFunction:error:.
+                // With RN_AIR_FUNC the kernel is run like vk_dispatch.metal (buffer 0 = out, bytes at index 1 = add); without a translator the pipeline error is printed.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_AIR_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                printf("library %p, %lu functions (%s)\n", (__bridge void *)lib, (unsigned long)lib.functionNames.count, e ? e.localizedDescription.UTF8String : "no error");
+                if (!lib) return 30;
+                const char *fname = getenv("RN_AIR_FUNC");
+                NSString *want = fname ? @(fname) : nil;
+                if (!want) for (NSString *n in lib.functionNames) { id<MTLFunction> f = [lib newFunctionWithName:n]; if (f.functionType == MTLFunctionTypeKernel) { want = n; break; } }
+                id<MTLFunction> fn = [lib newFunctionWithName:want];
+                printf("function %s -> %p type %ld\n", want.UTF8String, (__bridge void *)fn, fn ? (long)fn.functionType : -1L);
+                if (!fn) return 31;
+                id<MTLComputePipelineState> pso = [d newComputePipelineStateWithFunction:fn error:&e];
+                printf("pipeline %p, error: %s\n", (__bridge void *)pso, e ? e.localizedDescription.UTF8String : "none");
+                if (!pso || !fname) return pso ? 0 : 32;
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLBuffer> buf = [d newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
+                uint32_t *p = buf.contents;
+                for (int i = 0; i < 256; i++) p[i] = 0xdeadbeef;
+                uint32_t add = 7;
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pso];
+                [enc setBuffer:buf offset:0 atIndex:0];
+                [enc setBytes:&add length:4 atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                unsigned bad = 0;
+                for (uint32_t i = 0; i < 256; i++) if (p[i] != i * 3u + add) bad++;
+                printf("AIR kernel through Metal on RADV: status %ld, %u of 256 values wrong\n", (long)cb.status, bad);
+                return bad ? 1 : 0;
+            }
             if (getenv("RN_COMPUTE_TEST")) {
                 // The compute path through the official Metal API (RedNaviMTL/compute.m), on RADV: v[i] = i * 3 + 7 over 4 threadgroups of 64.
                 id<MTLDevice> d = (id<MTLDevice>)r;
