@@ -14,7 +14,7 @@ class IOAccelEventMachine2 : public OSObject {
     OSDeclareAbstractStructors(IOAccelEventMachine2)
 public:
     uint8_t rn_em2_opaque[224];
-    virtual void init(IOGraphicsAccelerator2*, unsigned int, int);   // slot 35
+    virtual bool init(IOGraphicsAccelerator2*, unsigned int, int);   // slot 35
     virtual void getClientTestEventFunc() = 0;   // slot 36
     virtual void getNumStamps();   // slot 37
     virtual void setStampBaseAddress(unsigned int volatile*);   // slot 38
@@ -69,7 +69,7 @@ class IOAccelEventMachineFast2 : public IOAccelEventMachine2 {
     OSDeclareAbstractStructors(IOAccelEventMachineFast2)
 public:
     uint8_t rn_emf2_opaque[3136];
-    virtual void init(IOGraphicsAccelerator2*, unsigned int, int);   // slot 35
+    virtual bool init(IOGraphicsAccelerator2*, unsigned int, int);   // slot 35
     virtual void getClientTestEventFunc();   // slot 36
     virtual void initEvent(IOAccelEvent*);   // slot 40
     virtual void cleanEvent(IOAccelEvent*);   // slot 41
