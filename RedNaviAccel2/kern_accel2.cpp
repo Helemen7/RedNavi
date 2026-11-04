@@ -25,6 +25,8 @@
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSSymbol.h>
 #include <pexpert/pexpert.h>
+#include <kern/thread_call.h>
+#include <kern/clock.h>
 #include <stdarg.h>
 
 static_assert(sizeof(IOGraphicsAccelerator2) == 3544, "the family class is 3544 bytes in the registry (docs/M6_ACCEL_ABI.md)");
@@ -33,7 +35,9 @@ static IOLock *gLogLock;
 static OSArray *gLog;          // private; a copy is published (a collection that is a registry property is frozen)
 static uint32_t gStage;
 
-static IOService *gProv;       // the PCI device, set in probe(); it outlives every object of this kext
+static IOService *gProv;
+class RedNaviAccel2;
+static IOService *gSelf;     // the accelerator, retained, for the delayed registerService()       // the PCI device, set in probe(); it outlives every object of this kext
 
 // A line of the log, to IOLog and to the provider's property. Safe from any thread that may sleep.
 static void rnNote(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
@@ -198,7 +202,24 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
 bool RedNaviAccel2::start(IOService *provider) {
     bool ok = IOGraphicsAccelerator2::start(provider);
     rnNote("family start -> %s", ok ? "true" : "false");
-    if (ok && gStage >= 3) { registerService(); rnNote("registerService called"); }
+    if (!ok || gStage < 3) return ok;
+    // Boot-arg rednavi_accel2_delay=<seconds>: register later, so that a panic after the registration comes when SSH is up and tools/accel2_watch.sh can follow the log
+    // (a panic loses the property; registration at once crashed 17 s into the boot, before SSH answers).
+    uint32_t delay = 0;
+    PE_parse_boot_argn("rednavi_accel2_delay", &delay, sizeof(delay));
+    if (!delay) { registerService(); rnNote("registerService called"); return ok; }
+    static thread_call_t call;
+    gSelf = this;
+    retain();
+    call = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
+        rnNote("registerService after the delay");
+        gSelf->registerService();
+        rnNote("registerService returned");
+    }, nullptr);
+    uint64_t deadline;
+    clock_interval_to_deadline(delay, NSEC_PER_SEC, &deadline);
+    thread_call_enter_delayed(call, deadline);
+    rnNote("registerService in %u s", delay);
     return ok;
 }
 
