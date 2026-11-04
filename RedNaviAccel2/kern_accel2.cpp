@@ -16,6 +16,7 @@
 #include <IOKit/IOLocks.h>
 #include <IOKit/graphics/IOAccelerator.h>
 #include "../RedNaviAccel/IOGraphicsAccelerator2.h"
+#include "IOAccelEventMachineFast2.h"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSArray.h>
@@ -30,13 +31,54 @@ static IOLock *gLogLock;
 static OSArray *gLog;          // private; a copy is published (a collection that is a registry property is frozen)
 static uint32_t gStage;
 
+static IOService *gProv;       // the PCI device, set in probe(); it outlives every object of this kext
+
+// A line of the log, to IOLog and to the provider's property. Safe from any thread that may sleep.
+static void rnNote(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static void rnNote(const char *fmt, ...) {
+    char line[220];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    IOLog("RedNaviAccel2: %s\n", line);
+    if (!gLog || !gLogLock || !gProv) return;
+    OSString *s = OSString::withCString(line);
+    if (!s) return;
+    IOLockLock(gLogLock);
+    if (gLog->getCount() >= 256) gLog->removeObject(0);
+    gLog->setObject(s);
+    if (OSArray *snapshot = OSArray::withArray(gLog)) {
+        gProv->setProperty("rednavi-accel2-log", snapshot);
+        snapshot->release();
+    }
+    IOLockUnlock(gLogLock);
+    s->release();
+}
+
+// The event machine: the family's IOAccelEventMachineFast2 implements all but four of its virtuals (the ones that write a stamp or a barrier into the command stream of
+// the hardware engine); those four are ours. In this first version they log and do nothing, so the family can build and initialise the object.
+class RedNaviEventMachine : public IOAccelEventMachineFast2 {
+    OSDeclareDefaultStructors(RedNaviEventMachine)
+public:
+    long writeStamp(int, vendevtCommandRec *, unsigned int) override;
+    long prepareBarrier(vendevtBarrierRec *) override;
+    long completeBarrier(vendevtBarrierRec *) override;
+    long writeBarrierElement(vendevtBarrierRec *, int, unsigned int) override;
+    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3();
+};
+static_assert(sizeof(RedNaviEventMachine) == 3376, "IOAccelEventMachineFast2 is 3376 bytes in the registry");
+OSDefineMetaClassAndStructors(RedNaviEventMachine, IOAccelEventMachineFast2)
+void RedNaviEventMachine::rnPad0() {} void RedNaviEventMachine::rnPad1() {} void RedNaviEventMachine::rnPad2() {} void RedNaviEventMachine::rnPad3() {}
+long RedNaviEventMachine::writeStamp(int ch, vendevtCommandRec *rec, unsigned int v) { rnNote("event machine writeStamp(channel %d, %p, %u)", ch, (void *)rec, v); return 0; }
+long RedNaviEventMachine::prepareBarrier(vendevtBarrierRec *b) { rnNote("event machine prepareBarrier(%p)", (void *)b); return 0; }
+long RedNaviEventMachine::completeBarrier(vendevtBarrierRec *b) { rnNote("event machine completeBarrier(%p)", (void *)b); return 0; }
+long RedNaviEventMachine::writeBarrierElement(vendevtBarrierRec *b, int i, unsigned int v) { rnNote("event machine writeBarrierElement(%p, %d, %u)", (void *)b, i, v); return 0; }
+
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
-    // A line of the log, to IOLog and to the provider's property. Safe from any thread that may sleep.
-    void note(const char *fmt, ...) __attribute__((format(printf, 2, 3)));
     void *allocByName(const char *hook, const char *cls);
     void dumpWords(const char *what, const void *p, uint32_t bytes);
-    IOService *prov {nullptr};
 
 public:
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
@@ -67,49 +109,26 @@ OSDefineMetaClassAndStructors(RedNaviAccel2, IOGraphicsAccelerator2)
 void RedNaviAccel2::rnPad0() {} void RedNaviAccel2::rnPad1() {} void RedNaviAccel2::rnPad2() {} void RedNaviAccel2::rnPad3() {}
 void RedNaviAccel2::rnPad4() {} void RedNaviAccel2::rnPad5() {} void RedNaviAccel2::rnPad6() {} void RedNaviAccel2::rnPad7() {}
 
-void RedNaviAccel2::note(const char *fmt, ...) {
-    char line[220];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    IOLog("RedNaviAccel2: %s\n", line);
-    IOService *p = getProvider();
-    if (!p) p = prov;
-    if (!gLog || !gLogLock || !p) return;
-    OSString *s = OSString::withCString(line);
-    if (!s) return;
-    IOLockLock(gLogLock);
-    if (gLog->getCount() >= 256) gLog->removeObject(0);
-    gLog->setObject(s);
-    if (OSArray *snapshot = OSArray::withArray(gLog)) {
-        p->setProperty("rednavi-accel2-log", snapshot);
-        snapshot->release();
-    }
-    IOLockUnlock(gLogLock);
-    s->release();
-}
-
 void RedNaviAccel2::dumpWords(const char *what, const void *p, uint32_t bytes) {
     const uint32_t *w = static_cast<const uint32_t *>(p);
     for (uint32_t i = 0; i < bytes / 4; i += 8) {
         char s[96];
         int len = 0;
         for (uint32_t j = i; j < i + 8 && j < bytes / 4; j++) len += snprintf(s + len, sizeof(s) - (size_t)len, "%s%08x", j > i ? " " : "", w[j]);
-        note("%s +0x%x: %s", what, i * 4, s);
+        rnNote("%s +0x%x: %s", what, i * 4, s);
     }
 }
 
 // An instance of the family's concrete class by name, via its metaclass (no header needed). NULL if the class is not registered or is abstract (an abstract class's
 // metaclass alloc() returns NULL). The object is not initialised: the family's caller is expected to do that, which is one of the things this stage finds out.
 void *RedNaviAccel2::allocByName(const char *hook, const char *cls) {
-    if (gStage < 2) { note("%s called (stage %u: refused)", hook, gStage); return nullptr; }
+    if (gStage < 2) { rnNote("%s called (stage %u: refused)", hook, gStage); return nullptr; }
     const OSSymbol *sym = OSSymbol::withCString(cls);
     const OSMetaClass *mc = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
     if (sym) sym->release();
-    if (!mc) { note("%s: class %s is not registered", hook, cls); return nullptr; }
+    if (!mc) { rnNote("%s: class %s is not registered", hook, cls); return nullptr; }
     OSObject *o = mc->alloc();
-    note("%s: %s size %u -> %p%s", hook, cls, mc->getClassSize(), o, o ? "" : " (abstract)");
+    rnNote("%s: %s size %u -> %p%s", hook, cls, mc->getClassSize(), o, o ? "" : " (abstract)");
     return o;
 }
 
@@ -119,18 +138,23 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
     gStage = arg;
     if (!gLogLock) gLogLock = IOLockAlloc();
     if (!gLog) gLog = OSArray::withCapacity(256);
-    prov = provider;
-    note("probe on %s, stage %u", provider ? provider->getName() : "?", gStage);
+    gProv = provider;
+    rnNote("probe on %s, stage %u", provider ? provider->getName() : "?", gStage);
     return IOService::probe(provider, score);
 }
 
 void *RedNaviAccel2::getStampMemory(unsigned int *size) {
-    note("getStampMemory(size %p)", size);
+    rnNote("getStampMemory(size %p)", size);
     if (gStage >= 2 && size) *size = 0;
     return nullptr;
 }
 
-void *RedNaviAccel2::newEventMachine() { return allocByName("newEventMachine", "IOAccelEventMachineFast2"); }
+void *RedNaviAccel2::newEventMachine() {
+    if (gStage < 2) { rnNote("newEventMachine called (stage %u: refused)", gStage); return nullptr; }
+    RedNaviEventMachine *m = OSTypeAlloc(RedNaviEventMachine);
+    rnNote("newEventMachine: RedNaviEventMachine size %u -> %p", (unsigned)sizeof(RedNaviEventMachine), (void *)m);
+    return m;
+}
 void *RedNaviAccel2::createUserGPUTask() { return allocByName("createUserGPUTask", "IOAccelTask"); }
 void *RedNaviAccel2::createKernelGPUTask() { return allocByName("createKernelGPUTask", "IOAccelTask"); }
 void *RedNaviAccel2::newDisplayMachine() { return allocByName("newDisplayMachine", "IOAccelDisplayMachine"); }
@@ -145,7 +169,7 @@ void *RedNaviAccel2::newResource() { return allocByName("newResource", "IOAccelR
 void *RedNaviAccel2::newMemoryMap() { return allocByName("newMemoryMap", "IOAccelMemoryMap"); }
 
 bool RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
-    note("populateAccelConfig(%p)", cfg);
+    rnNote("populateAccelConfig(%p)", cfg);
     if (gStage < 2) return false;
     // The structure's size is unknown; 64 bytes is a read that stays inside any plausible one, to see whether the family pre-fills it.
     if (cfg) dumpWords("IOAccelConfig", cfg, 64);
@@ -153,11 +177,11 @@ bool RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
 }
 
 bool RedNaviAccel2::configureDevice(IOPCIDevice *pci) {
-    note("configureDevice(%s)", pci ? pci->getName() : "?");
+    rnNote("configureDevice(%s)", pci ? pci->getName() : "?");
     return gStage >= 2;
 }
 
 bool RedNaviAccel2::teardownDevice(IOPCIDevice *pci) {
-    note("teardownDevice(%s)", pci ? pci->getName() : "?");
+    rnNote("teardownDevice(%s)", pci ? pci->getName() : "?");
     return gStage >= 2;
 }
