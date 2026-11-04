@@ -2,14 +2,14 @@
 
 The plug-in receives Metal kernels as AIR (LLVM bitcode with Apple's metadata, in a `.metallib` container, read by `RedNaviMTL/metallib.c`) and RADV wants SPIR-V.
 Something has to translate. `RedNaviMTL/rn_air.h` is the seam: the translator is a separate shared library, `librn_air2spirv.dylib`, found next to RADV and loaded with `dlopen`,
-with a four-line C interface. **Nothing of a translator is in this repository today.** This page is what has to be decided before one is.
+with a four-line C interface. **Nothing of a translator is in this repository today.** (Of NullMoth's repository only the declaration headers of the Apple classes were looked at, once, and not used; see the project notes.) This page is what has to be decided before one is.
 
 ## What each candidate brings
 
 | | licence | what it is | notes |
 |---|---|---|---|
 | metal2vulkan (upstream, steelbrain/metal2vulkan) | LGPL-3.0-or-later (as NullMoth's `NOTICE` states) | an AIR to SPIR-V translator | not read by us; maturity and the Metal subset it covers are unknown (I) |
-| NullMoth's `translator/` | the same: a fork of the above, their changes released "under the same licence" (their `NOTICE`) | the fork they ship | lives in a repository whose kexts and plug-in are PolyForm Noncommercial; only the `translator/` directory is LGPL. We have not opened their repository's sources |
+| NullMoth's `translator/` | the same: a fork of the above, their changes released "under the same licence" (their `NOTICE`) | the fork they ship | lives in a repository whose kexts and plug-in are PolyForm Noncommercial; only the `translator/` directory is LGPL. We have not opened that directory |
 | our own, permissively licensed | BSD-3 | LLVM IR to SPIR-V with Apple's `air.*` intrinsics and address spaces lowered | the biggest job; the SPIRV-LLVM-Translator (Apache-2.0 with LLVM exception) could be a base (I: not checked) |
 
 ## What LGPL-3.0 asks of a BSD-3 project (my reading, not legal advice)
