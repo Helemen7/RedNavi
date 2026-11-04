@@ -171,10 +171,20 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
     return IOService::probe(provider, score);
 }
 
+// The stamps the event machine reads to learn how far the engines got. A NULL here panicked in IOAccelEventMachineFast2::checkGPUProgress (a null read at +0x45, called by
+// the family's gpu_progress_check timer, 2026-11-04), so the family wants memory. A zeroed page of host memory: nothing writes stamps yet, so every channel looks idle.
+// 64 KB are allocated and 4096 bytes reported (the page of 64-byte slots the Intel accelerator publishes for its event machine, docs/logs/intel_device_client_selector2.txt).
 void *RedNaviAccel2::getStampMemory(unsigned int *size) {
+    static void *stamps;
     rnNote("getStampMemory(size %p)", size);
-    if (gStage >= 2 && size) *size = 0;
-    return nullptr;
+    if (gStage < 2) return nullptr;
+    if (!stamps) {
+        stamps = IOMallocAligned(0x10000, 0x1000);
+        if (stamps) bzero(stamps, 0x10000);
+    }
+    if (size) *size = 0x1000;
+    rnNote("getStampMemory -> %p", stamps);
+    return stamps;
 }
 
 void *RedNaviAccel2::newEventMachine() {
