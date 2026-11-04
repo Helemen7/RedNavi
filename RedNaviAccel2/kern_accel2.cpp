@@ -80,7 +80,16 @@ static IOBufferMemoryDescriptor *rnStampDesc() {
     static IOBufferMemoryDescriptor *d;
     if (!d) {
         d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, 0x10000, 0x1000);
-        if (d) bzero(d->getBytesNoCopy(), 0x10000);
+        if (d) {
+            bzero(d->getBytesNoCopy(), 0x10000);
+            // Experiment knobs: IOAccelDeviceCreateWithAPIProperty scans this memory and falls off its end when it is all zero (the fault is exactly at the end of the
+            // mapping, with 4 KB and with 64 KB), so something nonzero is expected in it. rednavi_accel2_stampfill=<hex> fills every 32-bit word, rednavi_accel2_stampslot=<hex>
+            // sets the first word of every 64-byte slot (applied after the fill).
+            uint32_t *w = static_cast<uint32_t *>(d->getBytesNoCopy());
+            uint32_t v = 0;
+            if (PE_parse_boot_argn("rednavi_accel2_stampfill", &v, sizeof(v))) for (unsigned i = 0; i < 0x10000 / 4; i++) w[i] = v;
+            if (PE_parse_boot_argn("rednavi_accel2_stampslot", &v, sizeof(v))) for (unsigned i = 0; i < 0x10000 / 4; i += 16) w[i] = v;
+        }
     }
     return d;
 }
@@ -108,14 +117,16 @@ void RedNaviEventMachine::rnPad0() {} void RedNaviEventMachine::rnPad1() {} void
 bool RedNaviEventMachine::init(IOGraphicsAccelerator2 *a, unsigned int n, int m) {
     // Experiment knobs (internal EFI boot-args, no reinstall): the arguments the family passes (1000, 1) against what Intel's reply of selector 2 suggests (0x40 at +0x14).
     uint32_t arg = 0;
+    // m is the number of stamps the device client lists (the table of selector 2 has that many offsets): the family passes 1, Intel's reply has 64.
     unsigned int n2 = n;
-    int m2 = m;
+    int m2 = 64;
     if (PE_parse_boot_argn("rednavi_accel2_em_n", &arg, sizeof(arg))) n2 = arg;
     if (PE_parse_boot_argn("rednavi_accel2_em_m", &arg, sizeof(arg))) m2 = static_cast<int>(arg);
-    bool ok = IOAccelEventMachineFast2::init(a, n2, m2);
     void *st = rnStampPage();
+    if (PE_parse_boot_argn("rednavi_accel2_em_early", &arg, sizeof(arg)) && arg && st) setStampBaseAddress(static_cast<volatile unsigned int *>(st));   // before the family's init
+    bool ok = IOAccelEventMachineFast2::init(a, n2, m2);
     rnNote("event machine init(%p, %u, %d) asked by the family, called with (%u, %d): family init %s, stamp page %p", (void *)a, n, m, n2, m2, ok ? "true" : "false", st);
-    if (ok && st) setStampBaseAddress(static_cast<volatile unsigned int *>(st));
+    if (ok && st && !(PE_parse_boot_argn("rednavi_accel2_em_early", &arg, sizeof(arg)) && arg)) setStampBaseAddress(static_cast<volatile unsigned int *>(st));
     return ok;
 }
 // The offset of a channel's stamp in the stamp memory. Intel's subclass overrides this, the family's default leaves the table that selector 2 of the device client returns
