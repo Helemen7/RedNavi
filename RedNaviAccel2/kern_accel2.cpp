@@ -76,19 +76,24 @@ static void rnNote(const char *fmt, ...) {
 // So: one zeroed 64 KB buffer descriptor (the event machine is initialised for 1000 stamps of 64 bytes, and with 4096 bytes IOAccelDeviceCreateWithAPIProperty in
 // user space faulted one page past the mapped memory; the Intel accelerator's 64-byte slots are in docs/logs/intel_device_client_selector2.txt),
 // its address for the event machine and the descriptor itself for getStampMemory(). Nothing writes stamps yet, so every channel looks idle.
+static uint32_t rnStampSize() {
+    uint32_t v = 0x10000;       // rednavi_accel2_stampsize=<hex>: length of the buffer (the experiment: does the fault move with the end?)
+    PE_parse_boot_argn("rednavi_accel2_stampsize", &v, sizeof(v));
+    return v;
+}
 static IOBufferMemoryDescriptor *rnStampDesc() {
     static IOBufferMemoryDescriptor *d;
     if (!d) {
-        d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, 0x10000, 0x1000);
+        d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, rnStampSize(), 0x1000);
         if (d) {
-            bzero(d->getBytesNoCopy(), 0x10000);
+            bzero(d->getBytesNoCopy(), rnStampSize());
             // Experiment knobs: IOAccelDeviceCreateWithAPIProperty scans this memory and falls off its end when it is all zero (the fault is exactly at the end of the
             // mapping, with 4 KB and with 64 KB), so something nonzero is expected in it. rednavi_accel2_stampfill=<hex> fills every 32-bit word, rednavi_accel2_stampslot=<hex>
             // sets the first word of every 64-byte slot (applied after the fill).
             uint32_t *w = static_cast<uint32_t *>(d->getBytesNoCopy());
             uint32_t v = 0;
-            if (PE_parse_boot_argn("rednavi_accel2_stampfill", &v, sizeof(v))) for (unsigned i = 0; i < 0x10000 / 4; i++) w[i] = v;
-            if (PE_parse_boot_argn("rednavi_accel2_stampslot", &v, sizeof(v))) for (unsigned i = 0; i < 0x10000 / 4; i += 16) w[i] = v;
+            if (PE_parse_boot_argn("rednavi_accel2_stampfill", &v, sizeof(v))) for (unsigned i = 0; i < rnStampSize() / 4; i++) w[i] = v;
+            if (PE_parse_boot_argn("rednavi_accel2_stampslot", &v, sizeof(v))) for (unsigned i = 0; i < rnStampSize() / 4; i += 16) w[i] = v;
         }
     }
     return d;
@@ -264,7 +269,9 @@ void *RedNaviAccel2::getStampMemory(unsigned int *size) {
     rnNote("getStampMemory(size %p)", size);
     if (gStage < 2) return nullptr;
     IOBufferMemoryDescriptor *d = rnStampDesc();
-    if (size) *size = 0x10000;
+    uint32_t reported = rnStampSize();
+    PE_parse_boot_argn("rednavi_accel2_stampreport", &reported, sizeof(reported));   // what is told to the family, if it is to differ from the buffer
+    if (size) *size = reported;
     rnNote("getStampMemory -> descriptor %p (bytes %p)", (void *)d, rnStampPage());
     return d;
 }
