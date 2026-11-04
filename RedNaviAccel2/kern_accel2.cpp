@@ -73,13 +73,14 @@ static void rnNote(const char *fmt, ...) {
 //  - raw memory from getStampMemory(): IOAccelDevice2::deviceStart + 0x32 read the first word of the returned pointer as a vtable and called slot 4 (OSObject::retain)
 //    through it (RDI was the stamp page, RCX = 0, CR2 = 0x20), so getStampMemory() returns an OSObject, in all likelihood an IOMemoryDescriptor that the device maps into
 //    its client.
-// So: one zeroed 4096-byte buffer descriptor (the page of 64-byte slots the Intel accelerator publishes for its event machine, docs/logs/intel_device_client_selector2.txt),
+// So: one zeroed 64 KB buffer descriptor (the event machine is initialised for 1000 stamps of 64 bytes, and with 4096 bytes IOAccelDeviceCreateWithAPIProperty in
+// user space faulted one page past the mapped memory; the Intel accelerator's 64-byte slots are in docs/logs/intel_device_client_selector2.txt),
 // its address for the event machine and the descriptor itself for getStampMemory(). Nothing writes stamps yet, so every channel looks idle.
 static IOBufferMemoryDescriptor *rnStampDesc() {
     static IOBufferMemoryDescriptor *d;
     if (!d) {
-        d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, 0x1000, 0x1000);
-        if (d) bzero(d->getBytesNoCopy(), 0x1000);
+        d = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | kIOMemoryKernelUserShared, 0x10000, 0x1000);
+        if (d) bzero(d->getBytesNoCopy(), 0x10000);
     }
     return d;
 }
@@ -238,7 +239,7 @@ void *RedNaviAccel2::getStampMemory(unsigned int *size) {
     rnNote("getStampMemory(size %p)", size);
     if (gStage < 2) return nullptr;
     IOBufferMemoryDescriptor *d = rnStampDesc();
-    if (size) *size = 0x1000;
+    if (size) *size = 0x10000;
     rnNote("getStampMemory -> descriptor %p (bytes %p)", (void *)d, rnStampPage());
     return d;
 }

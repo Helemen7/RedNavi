@@ -227,6 +227,13 @@ __attribute__((constructor)) static void rn_load(void) {
         return b;
     }), "@@:");
     for (Class c = sup; c && c != [NSObject class]; c = class_getSuperclass(c)) rn_wrap_init(k, c);
+    // -featureProfile has type Q (a 64-bit integer, read from the Intel driver's metadata on a Mac that has it: MTLIGAccelDevice, "Q16@0:8"). Unimplemented it answered 0 and
+    // -[_MTLDevice initLimits] asserted _limits.maxColorAttachments > 0. The value is a version threshold: +[_MTLDevice featureProfile:supportsFeatureSet:] says profile 10000 supports
+    // the feature sets 10000, 10001, 10003 and 10004, any profile from 10001 up also 10005; the Intel UHD 617 reports 10002, which is used here until a reason to change it shows up.
+    class_addMethod(k, sel_registerName("featureProfile"), imp_implementationWithBlock(^unsigned long long(id self) {
+        rn_log("featureProfile asked, answering 10002");
+        return 10002ull;
+    }), "Q16@0:8");
     // Metal asserts [newDevice conformsToProtocol:@protocol(MTLDevice)] in MTLAddDevice, and a class made at run time declares no protocol (the log of 2026-11-04 showed
     // -initWithAcceleratorPort: succeeding and "conforms to MTLDevice: no"). The vendor classes declare it in their class metadata; here it is added by hand.
     // The superclasses conform in fact (they implement the methods), only the declaration is missing.
