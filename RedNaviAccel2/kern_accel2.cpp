@@ -292,9 +292,10 @@ void *RedNaviAccel2::makeTask(const char *hook, unsigned int n) {
     if (!t) { rnNote("%s: no memory", hook); return nullptr; }
     IORangeAllocator *ra[4] = {};
     for (int i = 0; i < 4; i++) ra[i] = IORangeAllocator::withRange((1ULL << 40) - 1, 0x1000, 0, 0);
-    bool ok = false;
-    if (gStage >= 3) ok = t->init(this, n, ra);       // stage 2 keeps the verified behaviour: the task is handed out as allocated
-    rnNote("%s: IOAccelTask %p, init(%p, %u, allocators) -> %s", hook, (void *)t, (void *)this, n, gStage >= 3 ? (ok ? "true" : "false") : "skipped (stage 2)");
+    // Initialised at every stage: left uninitialised at stage 2 it panicked as soon as any shared client was closed (IOAccelSharedUserClient2::sharedStop ->
+    // IOAccelTask::prune_orphaned_mappings, 2026-11-04, 22 s after boot); at stage 3 the same init ran for hours of boots without a panic.
+    bool ok = t->init(this, n, ra);
+    rnNote("%s: IOAccelTask %p, init(%p, %u, allocators) -> %s", hook, (void *)t, (void *)this, n, ok ? "true" : "false");
     return t;
 }
 void *RedNaviAccel2::createUserGPUTask() { return makeTask("createUserGPUTask", 1); }
