@@ -9,6 +9,7 @@ collection itself). The kernel's offset base is found by comparing a slot every 
   accel_vtable.py --pure BASE DERIVED    the pure virtual slots of BASE, named by what the shipped class DERIVED puts there
   accel_vtable.py --markdown FILE        writes the document docs/M6_ACCEL_ABI.md
   accel_vtable.py --summary              slot and pure-virtual counts for the classes the M6 study lists
+  accel_vtable.py --header-chain HEADER STUBS   writes IOAccelClasses.h and the stub subclasses (see CHAIN, write_chain)
   accel_vtable.py --header-class FILE CLASS PARENT BASE_SLOTS PARENT_SIZE SIZE DERIVED   (see write_class_header)
   accel_vtable.py --header-event FILE    writes the declaration of IOAccelEventMachine2 and IOAccelEventMachineFast2 (see write_event_header)
   accel_vtable.py --header DIR           writes DIR/IOGraphicsAccelerator2.h and DIR/IOGraphicsAccelerator2_pure.inc: a declaration of the class with its 84 virtuals in
@@ -195,6 +196,79 @@ def write_class_header(path, cls, parent, base_slots, parent_size, size, derived
     open(path, 'w').write('\n'.join(h))
     print('%s: %d own virtuals, %d pure' % (cls, len(lines), sum(1 for l in lines if '= 0' in l)))
 
+# (class, parent, parent's slot count, parent's size, own size, shipped subclasses that name the pure slots, stub?) in declaration order. Slot counts of the SDK parents:
+# OSObject 35, IOUserClient 300 (counted with -fdump-vtable-layouts on a subclass). Sizes are the registry's (docs/M6_ACCEL_ABI.md).
+CHAIN = [
+    ('IOAccelMemory', 'OSObject', 35, 16, 176, ['IOAccelSysMemory'], False),
+    ('IOAccelVidMemory', 'IOAccelMemory', None, 176, 272, ['AMDRadeonX6000_AMDAccelVidMemory', 'IOAccelSysMemory'], True),
+    ('IOAccelResource2', 'OSObject', 35, 16, 384, ['IGAccelResource'], True),
+    ('IOAccelMemoryMap', 'OSObject', 35, 16, 280, ['IGAccelMemoryMap'], True),
+    ('IOAccelSubmitter2', 'IOUserClient', 300, 216, 1384, ['IGAccelGLContext'], False),
+    ('IOAccelContext2', 'IOAccelSubmitter2', None, 1384, 4264, ['IGAccelGLContext'], False),
+    ('IOAccelGLContext2', 'IOAccelContext2', None, 4264, 4664, ['IGAccelGLContext'], True),
+    ('IOAccel2DContext2', 'IOAccelContext2', None, 4264, 4352, ['IGAccel2DContext'], True),
+    ('IOAccelSurface', 'IOUserClient', 300, 216, 4920, ['IGAccelSurface'], True),
+]
+
+def write_chain(hpath, spath):
+    """Declarations of the classes behind the family's memory, resource, context and surface factories, and a stub subclass of each one that has pure virtuals of its
+    own (all return 0 and log their first call: they are only here so that the family can allocate the objects)."""
+    import re
+    decl = {}      # class -> {slot: (name, args, const, ret, pure)} as declared
+    nslots = {}
+    types, hl, sl = set(), [], []
+    known = {'IOService', 'IOPCIDevice', 'IOFramebuffer', 'IOMemoryDescriptor', 'IOUserClient', 'IOExternalMethodArguments', 'IOExternalMethodDispatch', 'IOAccelSurfaceInformation', 'IOAccelSurfaceScaling'}
+    for cls, parent, pslots, psize, size, ders, stub in CHAIN:
+        t = slots(cls)
+        dts = [slots(d) for d in ders]
+        pdecl = decl.get(parent, {})
+        if pslots is None: pslots = nslots[parent]
+        nslots[cls] = len(t)
+        mine = {i: v for i, v in pdecl.items()}
+        lines, over = [], []
+        for i in range(pslots, len(t)):
+            pure = 'pure_virtual' in t[i]
+            src = t[i]
+            if pure:
+                src = next((d[i] for d in dts if d and i < len(d) and 'pure_virtual' not in d[i]), None)
+                if src is None: raise SystemExit('no name for pure slot %d of %s' % (i, cls))
+            name, args, const = parse(dem(src))
+            ret = 'long' if pure else 'void'
+            mine[i] = (name, args, const, ret, pure)
+            lines.append('    virtual %s %s(%s)%s%s;   // slot %d' % (ret, name, args, ' const' if const else '', ' = 0' if pure else '', i))
+            for tt in re.findall(r'\b(IO[A-Za-z0-9_]+|vendevt[A-Za-z0-9]+|e[A-Z][A-Za-z0-9]+)\b', args): types.add(tt)
+        for i, (name, args, const, ret, pure) in pdecl.items():      # inherited pure virtuals that this class implements, and ones it still leaves pure
+            if not pure: continue
+            if 'pure_virtual' in t[i]: continue
+            n2, a2, c2 = parse(dem(t[i]))
+            mine[i] = (n2, a2, c2, ret, False)
+            over.append('    virtual %s %s(%s)%s;   // slot %d, implemented by the family' % (ret, n2, a2, ' const' if c2 else '', i))
+        decl[cls] = mine
+        hl += ['class %s : public %s {' % (cls, parent), '    OSDeclareAbstractStructors(%s)' % cls, 'public:', '    uint8_t rn_pad_%s[%d];' % (cls, size - psize)] + over + lines + ['};', '']
+        if stub:
+            sname = 'RedNavi' + cls[len('IOAccel'):]
+            pures = sorted(i for i, v in mine.items() if v[4])
+            sl += ['class %s : public %s {' % (sname, cls), '    OSDeclareDefaultStructors(%s)' % sname, 'public:']
+            for i in pures:
+                name, args, const, ret, _ = mine[i]
+                sl.append('    %s %s(%s)%s override;' % (ret, name, args, ' const' if const else ''))
+            sl += ['    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3();', '};',
+                   'static_assert(sizeof(%s) == %d, "%s is %d bytes in the registry");' % (sname, size, cls, size),
+                   'OSDefineMetaClassAndStructors(%s, %s)' % (sname, cls),
+                   'void %s::rnPad0() {} void %s::rnPad1() {} void %s::rnPad2() {} void %s::rnPad3() {}' % ((sname,) * 4)]
+            for i in pures:
+                name, args, const, ret, _ = mine[i]
+                sl.append('%s %s::%s(%s)%s { static bool seen; if (!seen) { seen = true; rnNote("%s::%s called (stub, returns 0)"); } return 0; }' % (ret, sname, name, args, ' const' if const else '', sname, name))
+            sl.append('')
+    h = ['// Generated by tools/accel_vtable.py --header-chain from the symbol tables of this Mac\'s IOAcceleratorFamily2 (docs/M6_ACCEL_ABI.md). Do not edit.',
+         '// The memory, resource, context and surface classes of the family as a third-party subclass has to see them: parents, registry sizes, own virtuals in vtable',
+         '// order, pure ones declared long. Data members are padding, return types are guesses.',
+         '#pragma once', '#include <IOKit/IOService.h>', '#include <IOKit/IOUserClient.h>', '#include <IOKit/IOMemoryDescriptor.h>', '#include <IOKit/graphics/IOAccelTypes.h>', '']
+    for tt in sorted(types - known - {c[0] for c in CHAIN}): h.append(('enum %s : int {};' if re.match(r'e[A-Z]', tt) else 'class %s;') % tt)
+    open(hpath, 'w').write('\n'.join(h + [''] + hl))
+    open(spath, 'w').write('// Generated by tools/accel_vtable.py --header-chain: stub subclasses for the abstract classes of IOAccelClasses.h. Included by kern_accel2.cpp after rnNote.\n' + '\n'.join(sl))
+    print('chain: %d classes declared, %d stubs' % (len(CHAIN), sum(1 for c in CHAIN if c[6])))
+
 def write_markdown(path):
     import os
     def table(cls, derived, start):
@@ -234,6 +308,8 @@ def main(argv):
         write_markdown(argv[1])
     elif argv[0] == '--header':
         write_header(argv[1])
+    elif argv[0] == '--header-chain':
+        write_chain(argv[1], argv[2])
     elif argv[0] == '--header-class':
         write_class_header(argv[1], argv[2], argv[3], int(argv[4]), int(argv[5]), int(argv[6]), argv[7])
     elif argv[0] == '--header-event':
