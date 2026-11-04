@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
 #include <dlfcn.h>
+#include "../mesa-bridge/test/vk_dispatch_spv.h"
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <stdio.h>
@@ -72,6 +73,35 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            if (getenv("RN_COMPUTE_TEST")) {
+                // The compute path through the official Metal API (RedNaviMTL/compute.m), on RADV: v[i] = i * 3 + 7 over 4 threadgroups of 64.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLBuffer> buf = [d newBufferWithLength:256 * 4 options:MTLResourceStorageModeShared];
+                NSData *spv = [NSData dataWithBytes:vk_dispatch_spv length:vk_dispatch_spv_len];
+                id<MTLComputePipelineState> pso = ((id (*)(id, SEL, NSData *, NSUInteger, NSUInteger))objc_msgSend)(d, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), spv, 1, 4);
+                printf("queue %p, buffer %p (length %lu), pipeline %p\n", (__bridge void *)q, (__bridge void *)buf, (unsigned long)buf.length, (__bridge void *)pso);
+                if (!q || !buf || !pso) return 20;
+                uint32_t *p = buf.contents;
+                for (int i = 0; i < 256; i++) p[i] = 0xdeadbeef;
+                uint32_t add = 7;
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:pso];
+                [enc setBuffer:buf offset:0 atIndex:0];
+                [enc setBytes:&add length:4 atIndex:1];
+                [enc dispatchThreadgroups:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [enc endEncoding];
+                __block int completed = 0;
+                [cb addCompletedHandler:^(id<MTLCommandBuffer> c) { completed = 1; }];
+                [cb commit];
+                [cb waitUntilCompleted];
+                unsigned bad = 0;
+                for (uint32_t i = 0; i < 256; i++) if (p[i] != i * 3u + add) bad++;
+                printf("command buffer status %ld, completion handler %d, error %s\n", (long)cb.status, completed, cb.error ? cb.error.localizedDescription.UTF8String : "none");
+                printf("compute through Metal on RADV: %u of 256 values wrong (v[255] = %u)\n", bad, p[255]);
+                return bad ? 1 : 0;
+            }
             // The command queue: the plug-in class answers nil to newCommandQueue*, so the implementation of MTLIOAccelDevice is called directly.
             SEL qs = sel_registerName("newCommandQueueWithDescriptor:");
             Method qm = class_getInstanceMethod(objc_getClass("MTLIOAccelDevice"), qs);

@@ -26,6 +26,27 @@ Metal.framework loaded: `rn_vk: device AMD Radeon RX 7800 XT (RADV NAVI32)`, `0 
 Where the libraries live: the bundle looks in `$RN_VK_DIR`, else `/Library/Application Support/RedNavi/vk` (RADV 19 MB, `libzstd`). Shipping them inside the bundle
 (`Contents/Frameworks`) is the alternative, with the 19 MB signed along; undecided.
 
+## Compute path through the Metal API (done, V, 2026-11-04)
+
+`RedNaviMTL/compute.m`: `RedNaviMTLCommandQueue`, `RedNaviMTLCommandBuffer` (runs the recorded dispatches synchronously at `-commit`, then the completion handlers),
+`RedNaviMTLComputeCommandEncoder`, `RedNaviMTLBuffer` (an `rn_vk_buffer`, `contents` is the mapped pointer) and `RedNaviMTLComputePipelineState`. They are classes of their own
+that declare the Metal protocols, not subclasses of the Apple vendor classes. Handed out only in a process that has `RN_METAL_COMPUTE` set; without it `newCommandQueue*` answer nil and
+`newBuffer*` go to the superclass, so Core Animation and WindowServer stay on the software path. Render and blit encoders are nil. The shader bypass is
+`-[RedNaviMTLDevice rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:]`; `-setBytes:length:atIndex:` at an index >= the buffer count fills the push constants.
+
+Test (`tools/mtl_init_harness.m`, `RN_METAL_COMPUTE=1 RN_COMPUTE_TEST=1 RN_VK_DIR=~/rn/vk`), all through the official API (`newCommandQueue`, `newBufferWithLength:options:`,
+`commandBuffer`, `computeCommandEncoder`, `setComputePipelineState:`, `setBuffer:offset:atIndex:`, `setBytes:length:atIndex:`, `dispatchThreadgroups:threadsPerThreadgroup:`,
+`endEncoding`, `addCompletedHandler:`, `commit`, `waitUntilCompleted`):
+
+```
+queue 0x600003aca2a0, buffer 0x6000034c85d0 (length 1024), pipeline 0x6000034c0720
+command buffer status 4, completion handler 1, error none
+compute through Metal on RADV: 0 of 256 values wrong (v[255] = 772)
+```
+
+Not done in this slice: buffer offsets, `setBuffers`, textures, blit, render, `MTLLibrary` / `MTLFunction` (the shader still comes in as SPIR-V), asynchronous execution,
+`MTLSharedEvent`, private-storage buffers in VRAM.
+
 ## Order of work
 
 1. **Queue, command buffer, compute encoder, buffer** (smallest slice that runs something). `RedNaviMTLCommandQueue` (subclass of `MTLIOAccelCommandQueue`, init by
