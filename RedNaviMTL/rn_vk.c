@@ -36,8 +36,11 @@ struct rn_vk {
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
 struct rn_vk_compute {
-    VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkPipeline pipe; VkDescriptorPool dp; VkDescriptorSet ds;
-    unsigned nbuf, push;
+    VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
+    unsigned nbind, push, binds[16];
+    int spec;
+    struct { uint32_t l[3]; VkPipeline pipe; } variants[8];
+    unsigned nvariants;
 };
 
 static void seterr(char *err, size_t n, const char *what, long v) { if (err && n) snprintf(err, n, "%s (%ld)", what, v); }
@@ -149,38 +152,70 @@ void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b) {
     free(b);
 }
 
-rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t bytes, unsigned nbuf, unsigned push_bytes) {
-    if (nbuf == 0 || nbuf > 16) return NULL;
+rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t bytes, unsigned nbind, const rn_vk_binding *binds, unsigned push_bytes, int specialize_local_size) {
+    if (nbind == 0 || nbind > 16) return NULL;
     rn_vk_compute *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
-    c->nbuf = nbuf; c->push = push_bytes;
+    c->nbind = nbind; c->push = push_bytes; c->spec = specialize_local_size;
     VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spirv};
     if (vk->CreateShaderModule(vk->dev, &smi, NULL, &c->sm) != VK_SUCCESS) goto fail;
     VkDescriptorSetLayoutBinding b[16];
-    for (unsigned i = 0; i < nbuf; i++) b[i] = (VkDescriptorSetLayoutBinding){.binding = i, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
-    VkDescriptorSetLayoutCreateInfo dsl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nbuf, .pBindings = b};
+    for (unsigned i = 0; i < nbind; i++) {
+        c->binds[i] = binds[i].binding;
+        b[i] = (VkDescriptorSetLayoutBinding){.binding = binds[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+    }
+    VkDescriptorSetLayoutCreateInfo dsl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nbind, .pBindings = b};
     if (vk->CreateDescriptorSetLayout(vk->dev, &dsl, NULL, &c->dsl) != VK_SUCCESS) goto fail;
     VkPushConstantRange pcr = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .offset = 0, .size = push_bytes};
     VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &c->dsl, .pushConstantRangeCount = push_bytes ? 1 : 0, .pPushConstantRanges = &pcr};
     if (vk->CreatePipelineLayout(vk->dev, &plci, NULL, &c->pl) != VK_SUCCESS) goto fail;
-    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = c->sm, .pName = "main"},
-                                       .layout = c->pl};
-    if (vk->CreateComputePipelines(vk->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &c->pipe) != VK_SUCCESS) goto fail;
-    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = nbuf};
+    VkDescriptorPoolSize ps = {.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = nbind};
     VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 1, .poolSizeCount = 1, .pPoolSizes = &ps};
     if (vk->CreateDescriptorPool(vk->dev, &dpi, NULL, &c->dp) != VK_SUCCESS) goto fail;
     VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = c->dp, .descriptorSetCount = 1, .pSetLayouts = &c->dsl};
     if (vk->AllocateDescriptorSets(vk->dev, &dsa, &c->ds) != VK_SUCCESS) goto fail;
+    // the pipeline of the module's own local size is built now so that a module RADV refuses is found at creation, not at the first dispatch
+    uint32_t own[3] = {1, 1, 1};
+    if (!c->spec) {
+        VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                           .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = c->sm, .pName = "main"},
+                                           .layout = c->pl};
+        if (vk->CreateComputePipelines(vk->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &c->variants[0].pipe) != VK_SUCCESS) goto fail;
+        memcpy(c->variants[0].l, own, sizeof(own));
+        c->nvariants = 1;
+    }
     return c;
 fail:
     rn_vk_compute_destroy(vk, c);
     return NULL;
 }
+unsigned rn_vk_compute_binding_count(const rn_vk_compute *c) { return c->nbind; }
+
+// The pipeline for a local size (specialization constants 0, 1, 2), made on first use.
+static VkPipeline pipeline_for(rn_vk *vk, rn_vk_compute *c, const uint32_t l[3]) {
+    for (unsigned i = 0; i < c->nvariants; i++) {
+        if (!c->spec) return c->variants[0].pipe;
+        if (!memcmp(c->variants[i].l, l, 12)) return c->variants[i].pipe;
+    }
+    if (c->nvariants >= 8) return VK_NULL_HANDLE;
+    VkSpecializationMapEntry entries[3] = {{0, 0, 4}, {1, 4, 4}, {2, 8, 4}};
+    uint32_t data[3] = {l[0], l[1], l[2]};
+    VkSpecializationInfo si = {.mapEntryCount = 3, .pMapEntries = entries, .dataSize = sizeof(data), .pData = data};
+    VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+                                       .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = c->sm, .pName = "main", .pSpecializationInfo = &si},
+                                       .layout = c->pl};
+    VkPipeline p;
+    if (vk->CreateComputePipelines(vk->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    memcpy(c->variants[c->nvariants].l, l, 12);
+    c->variants[c->nvariants].pipe = p;
+    c->nvariants++;
+    return p;
+}
+
 void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c) {
     if (!c) return;
     if (c->dp) vk->DestroyDescriptorPool(vk->dev, c->dp, NULL);
-    if (c->pipe) vk->DestroyPipeline(vk->dev, c->pipe, NULL);
+    for (unsigned i = 0; i < c->nvariants; i++) if (c->variants[i].pipe) vk->DestroyPipeline(vk->dev, c->variants[i].pipe, NULL);
     if (c->pl) vk->DestroyPipelineLayout(vk->dev, c->pl, NULL);
     if (c->dsl) vk->DestroyDescriptorSetLayout(vk->dev, c->dsl, NULL);
     if (c->sm) vk->DestroyShaderModule(vk->dev, c->sm, NULL);
@@ -189,16 +224,19 @@ void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c) {
 
 uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk) { return vk->storageAlign; }
 
-int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const uint64_t *offsets, const void *push, uint32_t gx, uint32_t gy, uint32_t gz) {
+int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const uint64_t *offsets, const void *push, const uint32_t groups[3], const uint32_t local[3]) {
     VkDescriptorBufferInfo bi[16];
     VkWriteDescriptorSet w[16];
-    for (unsigned i = 0; i < c->nbuf; i++) {
+    for (unsigned i = 0; i < c->nbind; i++) {
         const uint64_t off = offsets ? offsets[i] : 0;
         if (off % vk->storageAlign || off >= buffers[i]->size) return 4;
         bi[i] = (VkDescriptorBufferInfo){.buffer = buffers[i]->buf, .offset = off, .range = buffers[i]->size - off};
-        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = c->binds[i], .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
     }
-    vk->UpdateDescriptorSets(vk->dev, c->nbuf, w, 0, NULL);
+    static const uint32_t one[3] = {1, 1, 1};
+    VkPipeline pipe = pipeline_for(vk, c, local ? local : one);
+    if (!pipe) return 5;
+    vk->UpdateDescriptorSets(vk->dev, c->nbind, w, 0, NULL);
     VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
     VkCommandBuffer cb;
     if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return 1;
@@ -206,10 +244,10 @@ int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, co
     int rc = 2;
     VkFence fence = VK_NULL_HANDLE;
     if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
-    vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pipe);
+    vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pl, 0, 1, &c->ds, 0, NULL);
     if (c->push && push) vk->CmdPushConstants(cb, c->pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, c->push, push);
-    vk->CmdDispatch(cb, gx, gy, gz);
+    vk->CmdDispatch(cb, groups[0], groups[1], groups[2]);
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;

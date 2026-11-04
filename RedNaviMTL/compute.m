@@ -83,8 +83,11 @@ static rn_vk *rn_vk_shared(void) {
 @interface RedNaviMTLComputePipelineState : NSObject {
 @public
     rn_vk_compute *c;
-    unsigned nbuf, push;
-    unsigned pushIndex;              // the Metal buffer index that setBytes fills (0xffffffff: none)
+    unsigned nbind;                  // buffers of the pipeline, in the order of its rn_vk bindings
+    unsigned metalIndex[16];         // the Metal buffer index each of them takes
+    unsigned push;                   // bytes of push constants (the hand-made SPIR-V path; 0 for translated kernels)
+    unsigned pushIndex;              // the Metal index that setBytes fills into the push constants (0xffffffff: none: setBytes data becomes a small buffer)
+    BOOL spec;                       // the threadgroup size is specialized at dispatch (translated kernels)
     unsigned localSize[3];
     id<MTLDevice> dev;
     NSString *label_;
@@ -108,9 +111,10 @@ static rn_vk *rn_vk_shared(void) {
     RedNaviMTLComputePipelineState *pso;
     RedNaviMTLBuffer *bufs[16];
     uint64_t offs[16];
+    NSData *bytesAt[16];
     uint8_t push[128];
     uint32_t pushLen;
-    MTLSize groups;
+    MTLSize groups, tpt;
 }
 @end
 @implementation RNDispatch
@@ -123,6 +127,7 @@ static rn_vk *rn_vk_shared(void) {
     RedNaviMTLComputePipelineState *pso;
     RedNaviMTLBuffer *bufs[16];
     uint64_t offs[16];
+    NSData *bytesAt[16];
     uint8_t push[128];
     uint32_t pushLen;
     NSString *label_;
@@ -157,30 +162,42 @@ static rn_vk *rn_vk_shared(void) {
     if (index >= 16) return;
     bufs[index] = (RedNaviMTLBuffer *)buffer;
     offs[index] = offset;
+    bytesAt[index] = nil;
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
 }
+// Constant data. A hand-made SPIR-V pipeline has push constants at one index; for a translated kernel every [[buffer(n)]] is a storage buffer, also the one the app fills with
+// setBytes, so the bytes are kept and turned into a small buffer when the command buffer runs.
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
-    if (!pso || index != pso->pushIndex) { rn_log("setBytes at index %lu: the pipeline takes constant data at index %d only", (unsigned long)index, pso ? (int)pso->pushIndex : -1); return; }
-    if (length > sizeof(push)) length = sizeof(push);
-    memcpy(push, bytes, length);
-    pushLen = (uint32_t)length;
+    if (index >= 16) return;
+    if (pso && index == pso->pushIndex) {
+        if (length > sizeof(push)) length = sizeof(push);
+        memcpy(push, bytes, length);
+        pushLen = (uint32_t)length;
+        return;
+    }
+    bytesAt[index] = [NSData dataWithBytes:bytes length:length];
+    bufs[index] = nil;
 }
-- (void)record:(MTLSize)groups {
+- (void)record:(MTLSize)groups threads:(MTLSize)tpt {
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
     d->pso = pso;
-    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; }
+    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
     d->groups = groups;
+    d->tpt = tpt;
     [cb->records addObject:d];
 }
-- (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt { [self record:tg]; }
+- (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt { [self record:tg threads:tpt]; }
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
-    MTLSize g = {(threads.width + tpt.width - 1) / (tpt.width ? tpt.width : 1), (threads.height + tpt.height - 1) / (tpt.height ? tpt.height : 1), (threads.depth + tpt.depth - 1) / (tpt.depth ? tpt.depth : 1)};
-    [self record:g];
+    NSUInteger w = tpt.width ? tpt.width : 1, h = tpt.height ? tpt.height : 1, dd = tpt.depth ? tpt.depth : 1;
+    if (threads.width % w || threads.height % h || threads.depth % dd)
+        rn_log("dispatchThreads with a grid that is not a multiple of the threadgroup: the threads past the grid run too (not handled yet)");
+    MTLSize g = {(threads.width + w - 1) / w, (threads.height + h - 1) / h, (threads.depth + dd - 1) / dd};
+    [self record:g threads:tpt];
 }
 - (void)endEncoding { ended = YES; }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope {}
@@ -235,15 +252,28 @@ static rn_vk *rn_vk_shared(void) {
     if (!vk) [self fail:@"RADV is not available"];
     for (RNDispatch *d in records) {
         if (st == MTLCommandBufferStatusError) break;
+        RedNaviMTLComputePipelineState *p = d->pso;
         rn_vk_buffer *bv[16];
         uint64_t ov[16];
-        for (unsigned i = 0; i < d->pso->nbuf; i++) {
-            if (!d->bufs[i]) { [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", i]]; break; }
-            bv[i] = d->bufs[i]->b;
-            ov[i] = d->offs[i];
+        NSMutableArray *temps = [NSMutableArray new];       // buffers made from setBytes data, alive until the dispatch is done
+        for (unsigned i = 0; i < p->nbind; i++) {
+            const unsigned mi = p->metalIndex[i];
+            if (d->bufs[mi]) { bv[i] = d->bufs[mi]->b; ov[i] = d->offs[mi]; continue; }
+            if (d->bytesAt[mi]) {
+                RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[mi].length options:0];
+                if (!t) { [self fail:@"no memory for constant data"]; break; }
+                memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[mi].bytes, d->bytesAt[mi].length);
+                [temps addObject:t];
+                bv[i] = t->b; ov[i] = 0;
+                continue;
+            }
+            [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", mi]];
+            break;
         }
         if (st == MTLCommandBufferStatusError) break;
-        int rc = rn_vk_dispatch(vk, d->pso->c, bv, ov, d->pushLen ? d->push : NULL, (uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth);
+        const uint32_t groups[3] = {(uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth};
+        const uint32_t local[3] = {(uint32_t)d->tpt.width, (uint32_t)d->tpt.height, (uint32_t)d->tpt.depth};
+        int rc = rn_vk_dispatch(vk, p->c, bv, ov, d->pushLen ? d->push : NULL, groups, local);
         if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
@@ -367,16 +397,21 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
         char err[300] = "";
         uint32_t *spv = NULL;
         size_t spvBytes = 0;
-        rn_air_kernel_info info = {0, 0, 0xffffffffu, {1, 1, 1}};
+        rn_air_kernel_info info;
+        memset(&info, 0, sizeof(info));
         if (rn_air_translate(NULL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithUTF8String:err];
         } else {
-            rn_vk_compute *c = rn_vk_compute_create(vk, spv, spvBytes, info.buffer_count, info.push_bytes);
-            rn_air_free(spv);
-            if (!c) why = @"RADV refused the translated module";
+            rn_vk_binding binds[16];
+            unsigned n = info.binding_count < 16 ? info.binding_count : 16;
+            for (unsigned i = 0; i < n; i++) { binds[i].binding = info.bindings[i].binding; binds[i].writable = info.bindings[i].writable; }
+            rn_vk_compute *c = n ? rn_vk_compute_create(vk, spv, spvBytes, n, binds, 0, 1) : NULL;
+            rn_air_free(spv, spvBytes);
+            if (!c) why = n ? @"RADV refused the translated module" : @"the kernel uses no buffers";
             else {
                 RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
-                p->c = c; p->nbuf = info.buffer_count; p->push = info.push_bytes; p->pushIndex = info.push_index; p->dev = dev;
+                p->c = c; p->nbind = n; p->push = 0; p->pushIndex = 0xffffffffu; p->spec = YES; p->dev = dev;
+                for (unsigned i = 0; i < n; i++) p->metalIndex[i] = info.bindings[i].metal_index;
                 for (int i = 0; i < 3; i++) p->localSize[i] = info.local_size[i];
                 return p;
             }
@@ -434,10 +469,14 @@ void rn_compute_install(Class k, Class sup) {
     class_addMethod(k, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), imp_implementationWithBlock(^id(id self, NSData *spirv, NSUInteger nbuf, NSUInteger push) {
         rn_vk *vk = rn_gate() ? rn_vk_shared() : NULL;
         if (!vk) return nil;
-        rn_vk_compute *c = rn_vk_compute_create(vk, spirv.bytes, spirv.length, (unsigned)nbuf, (unsigned)push);
+        if (nbuf == 0 || nbuf > 16) return nil;
+        rn_vk_binding binds[16];
+        for (unsigned i = 0; i < nbuf; i++) { binds[i].binding = i; binds[i].writable = 1; }
+        rn_vk_compute *c = rn_vk_compute_create(vk, spirv.bytes, spirv.length, (unsigned)nbuf, binds, (unsigned)push, 0);
         if (!c) { rn_log("compute pipeline from SPIR-V failed"); return nil; }
         RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
-        p->c = c; p->nbuf = (unsigned)nbuf; p->push = (unsigned)push; p->pushIndex = (unsigned)nbuf; p->dev = (id<MTLDevice>)self;
+        p->c = c; p->nbind = (unsigned)nbuf; p->push = (unsigned)push; p->pushIndex = (unsigned)nbuf; p->spec = NO; p->dev = (id<MTLDevice>)self;
+        for (unsigned i = 0; i < nbuf; i++) p->metalIndex[i] = i;
         return p;
     }), "@40@0:8@16Q24Q32");
 

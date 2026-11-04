@@ -3,9 +3,10 @@
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 typedef int (*translate_fn)(const void *, size_t, const char *, rn_air_kernel_info *, uint32_t **, size_t *, char *, size_t);
-typedef void (*free_fn)(void *);
+typedef void (*free_fn)(void *, size_t);
 
 static void *g_lib;
 static translate_fn g_translate;
@@ -18,6 +19,13 @@ static int load(const char *dir, char *err, size_t errlen) {
     snprintf(path, sizeof(path), "%s/librn_air2spirv.dylib", dir);
     g_lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!g_lib) { snprintf(err, errlen, "no AIR translator: %s", dlerror()); return 1; }
+    // tools next to the library, if any
+    static const char *const tools[][2] = {{"METAL2VULKAN_LLVM_DIS", "llvm-dis"}, {"METAL2VULKAN_SPIRV_VAL", "spirv-val"}};
+    for (unsigned i = 0; i < 2; i++) {
+        char tp[1024];
+        snprintf(tp, sizeof(tp), "%s/%s", dir, tools[i][1]);
+        if (!getenv(tools[i][0]) && access(tp, X_OK) == 0) setenv(tools[i][0], tp, 0);
+    }
     g_translate = (translate_fn)dlsym(g_lib, "rn_air_translate");
     g_free = (free_fn)dlsym(g_lib, "rn_air_free");
     if (!g_translate || !g_free) { snprintf(err, errlen, "%s does not export rn_air_translate and rn_air_free", path); g_translate = NULL; return 1; }
@@ -29,4 +37,4 @@ int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const c
     return g_translate(bitcode, bytes, entry, info, spirv, spirv_bytes, err, errlen);
 }
 
-void rn_air_free(uint32_t *spirv) { if (g_free) g_free(spirv); }
+void rn_air_free(uint32_t *spirv, size_t bytes) { if (g_free) g_free(spirv, bytes); }
