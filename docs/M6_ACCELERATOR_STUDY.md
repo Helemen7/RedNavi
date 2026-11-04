@@ -197,3 +197,22 @@ Tools that made this possible without breaking the desktop: boot-args that vary 
 **Result, 2026-11-04 (stage 3, `rednavi_accel2_stampreport=0x108`): Metal sees the accelerator.** `mtl_probe`: `1 Metal devices`, `Apple (registryID 0x1000004ea)`, the node `RedNaviAccel2` registered; no kernel panic and no Metal assertion in any process while the desktop ran. The name "Apple" is the default: the vendor methods that give the product name and the capabilities (`productName`, `familyName`, `supports*`, the 173 methods `MTLIGAccelDevice` adds over `MTLIOAccelDevice`) are not implemented yet.
 
 Still open: the stubs of the memory, resource, context and surface classes return 0 and some of them are `bool` (the display machine already needed `true`); `eventTimeout` and the stamp interrupts that Intel overrides; `newDevice` and `newSharedUserClient` (Intel overrides them, ours use the family's); +0x08 of the reply; the integer argument of `IOAccelTask::init`; and everything after device creation (command queue, buffers, a compute pipeline, the real command path to the engines, a drawable).
+
+## 10. Follow-up, 2026-11-04: what Metal does to create the device, and where the command queue is made
+
+Observed with `tools/iokit_trace.c` (an interposing library, `DYLD_INSERT_LIBRARIES`, works on the test desktop because SIP is off) under `tools/mtl_init_harness.m` (`RN_QUEUE=1` also asks for a queue). Everything below answered with success from the family's own code on `RedNaviAccel2`.
+
+**Device creation (`-[MTLIOAccelDevice initWithAcceleratorPort:]`).**
+
+| step | call |
+|---|---|
+| 1 | `IOServiceOpen(accelerator, type 5)`, the device client |
+| 2 | struct method 9 (the API name "Metal", 16 bytes in), 2 (600 bytes out: the event machine reply of section 8/9), 0 (64 bytes out: the same `IOAccelConfig` words that `populateAccelConfig` was given), 7 (24 bytes out) |
+| 3 | `IOServiceOpen(IOSurfaceRoot, type 0)` with a few of its methods |
+| 4 | `IOServiceOpen(accelerator, type 6)`, the shared client: struct methods 9 (16 bytes out) and 10 (24 bytes out) |
+
+No `IOConnectMapMemory`: the memory is shared through IOSurface. Metal then calls `-featureProfile` (36 times, one per process) and the other overrides of the plug-in class.
+
+**The queue is the plug-in's.** `MTLIOAccelDevice` implements `-newCommandQueueWithDescriptor:` by calling `-newCommandQueueWithMaxCommandBufferCount:`, which is where a vendor class instantiates its own queue class, and `_MTLDevice` implements `-newCommandQueue` and that method in terms of each other. Without a vendor override they call each other for ever (Terminal, whose Core Animation render thread asks for a queue in every process, sat in it with a 52 GB footprint). The Intel driver's chain, from the Objective-C metadata of this Mac (names and type encodings only): `MTLIGAccelCommandQueue` (808 bytes) -> `MTLIOAccelCommandQueue` (712; `-initWithDevice:descriptor:`, `-submitCommandBuffers:count:`, `-setGPUPriority:`, `-setLabel:`, `-setCompletionQueue:`) -> `_MTLCommandQueue` (680, 72 methods; `-initWithDevice:`). The vendor queue overrides `-commandBuffer` and `-commandBufferWithUnretainedReferences`, so command buffers and encoders (blit, compute, render) are vendor classes too. The queue creation never reached the kernel in the harness: the plug-in's `newCommandQueue*` answer nil (so Core Animation falls back to software).
+
+What this means for the design (I, not yet tried): the kernel accelerator only has to make Metal find a device; the Metal objects (queue, command buffer, encoders, buffers, textures, pipeline states) are implemented by the plug-in. With RADV in user space (M5) the plug-in's objects can encode into Vulkan instead of into an Intel/AMD kernel command stream, which keeps the kernel side as it is.

@@ -62,6 +62,15 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            // The command queue: the plug-in class answers nil to newCommandQueue*, so the implementation of MTLIOAccelDevice is called directly.
+            SEL qs = sel_registerName("newCommandQueueWithDescriptor:");
+            Method qm = class_getInstanceMethod(objc_getClass("MTLIOAccelDevice"), qs);
+            if (qm && getenv("RN_QUEUE")) {
+                id desc = [[objc_getClass("MTLCommandQueueDescriptor") alloc] init];
+                fprintf(stderr, "--- newCommandQueueWithDescriptor: (MTLIOAccelDevice's own)\n");
+                id q = ((id (*)(id, SEL, id))method_getImplementation(qm))(r, qs, desc);
+                printf("queue -> %p class %s\n", (__bridge void *)q, q ? class_getName(object_getClass(q)) : "-");
+            }
         }
     }
     return 0;
