@@ -131,6 +131,7 @@ class RedNaviAccel2 : public IOGraphicsAccelerator2 {
 
 public:
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
+    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     // The 17 pure virtuals, written out because each one logs its own arguments.
     void *getStampMemory(unsigned int *size) override;
     void *newEventMachine() override;
@@ -190,6 +191,15 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
     gProv = provider;
     rnNote("probe on %s, stage %u", provider ? provider->getName() : "?", gStage);
     return IOService::probe(provider, score);
+}
+
+// The family's start() builds everything but does not register the service (the node stayed !registered and Metal saw no device), which the Intel subclass presumably does
+// after it; stage 3 and up do it here.
+bool RedNaviAccel2::start(IOService *provider) {
+    bool ok = IOGraphicsAccelerator2::start(provider);
+    rnNote("family start -> %s", ok ? "true" : "false");
+    if (ok && gStage >= 3) { registerService(); rnNote("registerService called"); }
+    return ok;
 }
 
 void *RedNaviAccel2::getStampMemory(unsigned int *size) {

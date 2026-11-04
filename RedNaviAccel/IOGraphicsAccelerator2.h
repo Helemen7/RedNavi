@@ -115,4 +115,6 @@ public:
     virtual void describeDriverAllocations(IOAccelAllocationInfo*);   // slot 347
     virtual void newCommandQueue();   // slot 348
     virtual void ktraceStateChanged();   // slot 349
+    bool start(IOService *) APPLE_KEXT_OVERRIDE;
+    void stop(IOService *) APPLE_KEXT_OVERRIDE;
 };
