@@ -95,6 +95,7 @@ class RedNaviEventMachine : public IOAccelEventMachineFast2 {
     OSDeclareDefaultStructors(RedNaviEventMachine)
 public:
     bool init(IOGraphicsAccelerator2 *, unsigned int, int) override;
+    unsigned int getStampOffset(int) override;
     long writeStamp(int, vendevtCommandRec *, unsigned int) override;
     long prepareBarrier(vendevtBarrierRec *) override;
     long completeBarrier(vendevtBarrierRec *) override;
@@ -110,6 +111,12 @@ bool RedNaviEventMachine::init(IOGraphicsAccelerator2 *a, unsigned int n, int m)
     rnNote("event machine init(%p, %u, %d): family init %s, stamp page %p", (void *)a, n, m, ok ? "true" : "false", st);
     if (ok && st) setStampBaseAddress(static_cast<volatile unsigned int *>(st));
     return ok;
+}
+// The offset of a channel's stamp in the stamp memory. Intel's subclass overrides this, the family's default leaves the table that selector 2 of the device client returns
+// (at 0x5c) all zero: the Intel one holds 63 offsets, 0x40 to 0xfc0 in steps of 0x40 (docs/logs/intel_device_client_selector2.txt), and the framework's IOAccelDeviceCreate
+// crashed with ours. 64-byte slots, the first one at 0x40; 1000 stamps fit in the 64 KB buffer.
+unsigned int RedNaviEventMachine::getStampOffset(int channel) {
+    return channel >= 0 && channel < 1000 ? static_cast<unsigned int>(channel + 1) * 0x40u : 0u;
 }
 long RedNaviEventMachine::writeStamp(int ch, vendevtCommandRec *rec, unsigned int v) { rnNote("event machine writeStamp(channel %d, %p, %u)", ch, (void *)rec, v); return 0; }
 long RedNaviEventMachine::prepareBarrier(vendevtBarrierRec *b) { rnNote("event machine prepareBarrier(%p)", (void *)b); return 0; }

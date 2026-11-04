@@ -146,6 +146,9 @@ def write_header(outdir):
     open(os.path.join(outdir, 'IOGraphicsAccelerator2_pure.inc'), 'w').write('\n'.join(inc) + '\n')
     print('%d virtuals, %d pure, forward declared: %s' % (len(rows), sum(1 for r in rows if r[4]), ' '.join(fwd)))
 
+# return types of the event machine slots that are known (35 init: OSObject::init is bool; 39 getStampOffset: the offset in the stamp memory, an unsigned int)
+EVENT_RET = {35: 'bool', 39: 'unsigned int'}
+
 def write_event_header(path):
     """IOAccelEventMachine2 (240 bytes, parent OSObject, own virtuals from slot 35) and IOAccelEventMachineFast2 (3376 bytes, 95 slots, its 4 pure virtuals at 84-87)
     declared so that a third-party subclass gets the family's vtable: every slot that Fast2 implements is re-declared in Fast2 (the subclass's vtable then points at the
@@ -159,10 +162,10 @@ def write_event_header(path):
     types, base, derived = set(), [], []
     for i in range(OS_SLOTS, F2_SLOTS):
         f2pure = 'pure_virtual' in f2[i]
-        name, args, const, line = decl(i, 'long' if f2pure else ('bool' if i == 35 else 'void'), f2pure)
+        name, args, const, line = decl(i, 'long' if f2pure else EVENT_RET.get(i, 'void'), f2pure)
         for t in re.findall(r'\b(IO[A-Za-z0-9_]+|vendevt[A-Za-z]+)\b', args): types.add(t)
         if i < M2_SLOTS:
-            base.append(decl(i, 'bool' if i == 35 else 'void', 'pure_virtual' in m2[i])[3])
+            base.append(decl(i, EVENT_RET.get(i, 'void'), 'pure_virtual' in m2[i])[3])
             if dem(f2[i]).startswith('IOAccelEventMachineFast2::') and not f2pure: derived.append(line)
         else:
             derived.append(line)

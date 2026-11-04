@@ -18,7 +18,7 @@ public:
     virtual void getClientTestEventFunc() = 0;   // slot 36
     virtual void getNumStamps();   // slot 37
     virtual void setStampBaseAddress(unsigned int volatile*);   // slot 38
-    virtual void getStampOffset(int);   // slot 39
+    virtual unsigned int getStampOffset(int);   // slot 39
     virtual void initEvent(IOAccelEvent*) = 0;   // slot 40
     virtual void cleanEvent(IOAccelEvent*) = 0;   // slot 41
     virtual void finishStamp(int) = 0;   // slot 42

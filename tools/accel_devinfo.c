@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 int main(void) {
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAccelerator"));
     if (!s) { puts("no accelerator"); return 1; }
@@ -23,6 +24,14 @@ int main(void) {
         for (int j = 0; j < 16; j++) printf("%02x ", out[i + j]);
         printf(" ");
         for (int j = 0; j < 16; j++) putchar(isprint(out[i + j]) ? out[i + j] : '.');
+        putchar('\n');
+    }
+    // Memory the device client offers: IOConnectMapMemory64 for types 0 to 7, address, size and the first words (what IOAccelDeviceCreate maps in user space)
+    for (uint32_t t = 0; t < 8; t++) {
+        mach_vm_address_t addr = 0; mach_vm_size_t size = 0;
+        kr = IOConnectMapMemory64(c, t, mach_task_self(), &addr, &size, kIOMapAnywhere);
+        printf("map memory type %u: 0x%x", t, kr);
+        if (!kr) { printf(" addr 0x%llx size 0x%llx first words", (unsigned long long)addr, (unsigned long long)size); for (int i = 0; i < 4 && (size_t)i * 4 < size; i++) printf(" %08x", ((uint32_t *)addr)[i]); }
         putchar('\n');
     }
     return 0;
