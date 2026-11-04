@@ -29,7 +29,10 @@ rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t byt
 void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c);
 
 // Records one dispatch, submits it to the compute queue and waits for it (0 on success). The first synchronous version: a command buffer of the Metal side will batch these.
-int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const void *push, uint32_t gx, uint32_t gy, uint32_t gz);
+// offsets: byte offset of each buffer binding (NULL: all 0); each binding covers the buffer from there to its end. Vulkan wants the offset to be a multiple of
+// rn_vk_storage_offset_alignment(); a binding that is not is refused (return 4).
+int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const uint64_t *offsets, const void *push, uint32_t gx, uint32_t gy, uint32_t gz);
+uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk);
 
 // The test of tools/mtl_init_harness: the compute shader of mesa-bridge/test/vk_dispatch.comp (v[i] = i * 3 + 7, 64 invocations per group). Prints to stderr, returns 0 when every value is right.
 int rn_vk_selftest(const char *dir);

@@ -103,6 +103,7 @@ static rn_vk *rn_vk_shared(void) {
 @public
     RedNaviMTLComputePipelineState *pso;
     RedNaviMTLBuffer *bufs[16];
+    uint64_t offs[16];
     uint8_t push[128];
     uint32_t pushLen;
     MTLSize groups;
@@ -117,6 +118,7 @@ static rn_vk *rn_vk_shared(void) {
     RedNaviMTLCommandBuffer *cb;
     RedNaviMTLComputePipelineState *pso;
     RedNaviMTLBuffer *bufs[16];
+    uint64_t offs[16];
     uint8_t push[128];
     uint32_t pushLen;
     NSString *label_;
@@ -149,8 +151,8 @@ static rn_vk *rn_vk_shared(void) {
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state { pso = (RedNaviMTLComputePipelineState *)state; }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
     if (index >= 16) return;
-    if (offset) rn_log("setBuffer: offset %lu not supported yet (the buffer is bound whole)", (unsigned long)offset);
     bufs[index] = (RedNaviMTLBuffer *)buffer;
+    offs[index] = offset;
 }
 - (void)setBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
@@ -165,7 +167,7 @@ static rn_vk *rn_vk_shared(void) {
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
     d->pso = pso;
-    for (unsigned i = 0; i < 16; i++) d->bufs[i] = bufs[i];
+    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
     d->groups = groups;
@@ -230,13 +232,16 @@ static rn_vk *rn_vk_shared(void) {
     for (RNDispatch *d in records) {
         if (st == MTLCommandBufferStatusError) break;
         rn_vk_buffer *bv[16];
+        uint64_t ov[16];
         for (unsigned i = 0; i < d->pso->nbuf; i++) {
             if (!d->bufs[i]) { [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", i]]; break; }
             bv[i] = d->bufs[i]->b;
+            ov[i] = d->offs[i];
         }
         if (st == MTLCommandBufferStatusError) break;
-        int rc = rn_vk_dispatch(vk, d->pso->c, bv, d->pushLen ? d->push : NULL, (uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth);
-        if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
+        int rc = rn_vk_dispatch(vk, d->pso->c, bv, ov, d->pushLen ? d->push : NULL, (uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth);
+        if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
+        else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     for (MTLCommandBufferHandler h in completed) h((id)self);

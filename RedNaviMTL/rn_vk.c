@@ -22,6 +22,7 @@ struct rn_vk {
     VkInstance inst;
     VkPhysicalDevice pd;
     VkPhysicalDeviceMemoryProperties mp;
+    VkDeviceSize storageAlign;
     char name[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE];
     VkDevice dev;
     VkQueue queue;
@@ -72,6 +73,7 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     VkPhysicalDeviceProperties props;
     vk->GetPhysicalDeviceProperties(vk->pd, &props);
     strlcpy(vk->name, props.deviceName, sizeof(vk->name));
+    vk->storageAlign = props.limits.minStorageBufferOffsetAlignment ? props.limits.minStorageBufferOffsetAlignment : 4;
     vk->GetPhysicalDeviceMemoryProperties(vk->pd, &vk->mp);
     uint32_t nq = 0;
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->pd, &nq, NULL);
@@ -181,11 +183,15 @@ void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c) {
     free(c);
 }
 
-int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const void *push, uint32_t gx, uint32_t gy, uint32_t gz) {
+uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk) { return vk->storageAlign; }
+
+int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const uint64_t *offsets, const void *push, uint32_t gx, uint32_t gy, uint32_t gz) {
     VkDescriptorBufferInfo bi[16];
     VkWriteDescriptorSet w[16];
     for (unsigned i = 0; i < c->nbuf; i++) {
-        bi[i] = (VkDescriptorBufferInfo){.buffer = buffers[i]->buf, .offset = 0, .range = VK_WHOLE_SIZE};
+        const uint64_t off = offsets ? offsets[i] : 0;
+        if (off % vk->storageAlign || off >= buffers[i]->size) return 4;
+        bi[i] = (VkDescriptorBufferInfo){.buffer = buffers[i]->buf, .offset = off, .range = buffers[i]->size - off};
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi[i]};
     }
     vk->UpdateDescriptorSets(vk->dev, c->nbuf, w, 0, NULL);

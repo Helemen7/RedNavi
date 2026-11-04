@@ -11,6 +11,7 @@
 #include <mach/mach_vm.h>
 #include <dlfcn.h>
 #include "../mesa-bridge/test/vk_dispatch_spv.h"
+#include "../mesa-bridge/test/vk_copy2_spv.h"
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <stdio.h>
@@ -100,7 +101,44 @@ int main(int argc, char **argv) {
                 for (uint32_t i = 0; i < 256; i++) if (p[i] != i * 3u + add) bad++;
                 printf("command buffer status %ld, completion handler %d, error %s\n", (long)cb.status, completed, cb.error ? cb.error.localizedDescription.UTF8String : "none");
                 printf("compute through Metal on RADV: %u of 256 values wrong (v[255] = %u)\n", bad, p[255]);
-                return bad ? 1 : 0;
+                // Two buffers with offsets, bound with -setBuffers:offsets:withRange:. A (2048 bytes) holds a[i] = i from byte 512 on, B (2048 bytes) is written from byte 1024 on:
+                // B[256 + i] = A[128 + i] * 2 + 5 for i < 128 (two threadgroups); everything else of B must keep its marker.
+                id<MTLBuffer> A = [d newBufferWithLength:2048 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> B = [d newBufferWithLength:2048 options:MTLResourceStorageModeShared];
+                id<MTLComputePipelineState> pso2 = ((id (*)(id, SEL, NSData *, NSUInteger, NSUInteger))objc_msgSend)(d, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"),
+                    [NSData dataWithBytes:vk_copy2_spv length:vk_copy2_spv_len], 2, 4);
+                uint32_t *pa = A.contents, *pb = B.contents;
+                for (int i = 0; i < 512; i++) { pa[i] = 0xaaaa0000u + i; pb[i] = 0xbbbbbbbb; }
+                for (int i = 0; i < 128; i++) pa[128 + i] = i;
+                uint32_t add2 = 5;
+                id<MTLCommandBuffer> cb2 = [q commandBuffer];
+                id<MTLComputeCommandEncoder> e2 = [cb2 computeCommandEncoder];
+                [e2 setComputePipelineState:pso2];
+                id<MTLBuffer> bl[2] = {A, B};
+                NSUInteger ol[2] = {512, 1024};
+                [e2 setBuffers:bl offsets:ol withRange:NSMakeRange(0, 2)];
+                [e2 setBytes:&add2 length:4 atIndex:2];
+                [e2 dispatchThreadgroups:MTLSizeMake(2, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [e2 endEncoding];
+                [cb2 commit]; [cb2 waitUntilCompleted];
+                unsigned bad2 = 0;
+                for (int i = 0; i < 512; i++) {
+                    uint32_t want = (i >= 256 && i < 384) ? (uint32_t)(i - 256) * 2u + add2 : 0xbbbbbbbbu;
+                    if (pb[i] != want) bad2++;
+                }
+                printf("two buffers with offsets through setBuffers:offsets:withRange: status %ld: %u of 512 words wrong (B[256] = %u, B[383] = %u, B[384] = 0x%x)\n", (long)cb2.status, bad2, pb[256], pb[383], pb[384]);
+                // An offset that is not a multiple of the alignment must fail the command buffer, not the kernel.
+                id<MTLCommandBuffer> cb3 = [q commandBuffer];
+                id<MTLComputeCommandEncoder> e3 = [cb3 computeCommandEncoder];
+                [e3 setComputePipelineState:pso2];
+                [e3 setBuffer:A offset:2 atIndex:0];
+                [e3 setBuffer:B offset:0 atIndex:1];
+                [e3 setBytes:&add2 length:4 atIndex:2];
+                [e3 dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                [e3 endEncoding];
+                [cb3 commit]; [cb3 waitUntilCompleted];
+                printf("misaligned offset: status %ld (5 = error), error: %s\n", (long)cb3.status, cb3.error ? cb3.error.localizedDescription.UTF8String : "none");
+                return (bad || bad2 || cb2.status != MTLCommandBufferStatusCompleted || cb3.status != MTLCommandBufferStatusError) ? 1 : 0;
             }
             // The command queue: the plug-in class answers nil to newCommandQueue*, so the implementation of MTLIOAccelDevice is called directly.
             SEL qs = sel_registerName("newCommandQueueWithDescriptor:");

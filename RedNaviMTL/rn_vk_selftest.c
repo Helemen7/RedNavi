@@ -14,7 +14,7 @@ __attribute__((visibility("default"))) int rn_vk_selftest(const char *dir) {
     if (!b || !c) { fprintf(stderr, "buffer or pipeline failed\n"); return 11; }
     uint32_t *p = rn_vk_buffer_contents(b);
     for (uint32_t i = 0; i < count; i++) p[i] = 0xdeadbeef;
-    int rc = rn_vk_dispatch(vk, c, &b, &add, groups, 1, 1);
+    int rc = rn_vk_dispatch(vk, c, &b, NULL, &add, groups, 1, 1);
     if (rc) { fprintf(stderr, "dispatch failed: %d\n", rc); return 12; }
     uint32_t bad = 0;
     for (uint32_t i = 0; i < count; i++) if (p[i] != i * 3u + add) bad++;
