@@ -1,0 +1,51 @@
+# M6: Metal objects on RADV (the plug-in side)
+
+Status: started 2026-11-04. The kernel side makes Metal find a device (docs/M6_ACCELERATOR_STUDY.md, sections 9 and 10). This page is about what the plug-in
+(`RedNaviMTL/`, loaded by Metal.framework into every process that uses Metal) has to implement so that the device does work, and how RADV (M5) carries it.
+**V** = observed on the 7800 XT or in a shipped file; **I** = inferred, not checked.
+
+## Why the plug-in and not the kernel
+
+Metal asks the vendor plug-in for the objects that matter: the device class (`RedNaviMTLDevice`, a subclass of `MTLIOAccelDevice`), and through it the command queue,
+command buffers and encoders (V: `MTLIGAccelCommandQueue` -> `MTLIOAccelCommandQueue` -> `_MTLCommandQueue`; the Intel queue overrides `-commandBuffer`, so those are vendor
+classes too), buffers, textures, samplers and pipeline states. The base class `-newCommandQueueWithDescriptor:` calls `-newCommandQueueWithMaxCommandBufferCount:` and
+that is where the vendor makes its queue (V: without an override the two base methods call each other for ever). The kernel client of the device (types 5 and 6) is only used for
+the setup calls listed in the study (V). Nothing in the observed device creation submits GPU work. Consequence (I): the plug-in is free to implement the Metal objects on
+anything, and RADV in user space is the obvious choice: it is already running here (M5), it speaks to the kext through the user client, and it brings its own shader compiler.
+
+## The layer under the Metal objects: `RedNaviMTL/rn_vk.[ch]` (done, V)
+
+A small C layer that opens RADV from the plug-in: `dlopen` of `libvulkan_radeon.dylib` and `vk_icdGetInstanceProcAddr`, **without the Vulkan loader** (RADV needs only the system
+libraries and `libzstd` next to it, `@loader_path`), instance, device, one compute queue, a command pool. Host-visible storage buffers, a compute pipeline from SPIR-V with
+N storage buffers and push constants, one synchronous dispatch (record, submit, wait). Nothing is opened until `rn_vk_open()`, so a process that only enumerates devices does
+not pay for it, and the kext's user client is not opened by every Dock or Spotlight.
+
+Test: `rn_vk_selftest()` (the shader of `mesa-bridge/test/vk_dispatch.comp`) called by `tools/mtl_init_harness.m` with `RN_VK_SELFTEST=1 RN_VK_DIR=<dir>` in a process that has
+Metal.framework loaded: `rn_vk: device AMD Radeon RX 7800 XT (RADV NAVI32)`, `0 of 256 values wrong` (2026-11-04, stage 3, RedNaviAccel2 registered at the same time).
+
+Where the libraries live: the bundle looks in `$RN_VK_DIR`, else `/Library/Application Support/RedNavi/vk` (RADV 19 MB, `libzstd`). Shipping them inside the bundle
+(`Contents/Frameworks`) is the alternative, with the 19 MB signed along; undecided.
+
+## Order of work
+
+1. **Queue, command buffer, compute encoder, buffer** (smallest slice that runs something). `RedNaviMTLCommandQueue` (subclass of `MTLIOAccelCommandQueue`, init by
+   `-initWithDevice:descriptor:`) answering `-commandBuffer`; a command buffer class that records into a list and executes it in `-commit`; `MTLComputeCommandEncoder` methods
+   `setComputePipelineState:`, `setBuffer:offset:atIndex:`, `setBytes:length:atIndex:`, `dispatchThreadgroups:threadsPerThreadgroup:`, `endEncoding`; `MTLBuffer` over an
+   `rn_vk_buffer` (`contents` is the mapped pointer). Which methods each protocol needs is read from the protocol list at run time, not guessed (the stub already logs every
+   selector nobody implements).
+2. **Shader path.** `-newLibraryWithSource:` is compiled to AIR by Apple's compiler service (not by the driver); the driver receives the function through the vendor hooks listed in
+   the Intel class (`getComputeFunctionId:compilerOptions:...`, `computeVariantWithCompilerOutput:...`, `newComputePipelineWithDescriptor:variant:`). The AIR-to-SPIR-V
+   translator has to be an LGPL component of its own (metal2vulkan, as in docs/ARCHITECTURE.md); until it exists a test can hand the plug-in SPIR-V through a private hook.
+3. **Fences and events**: `MTLCommandBuffer` completion handlers on a `VkFence` thread; `waitUntilCompleted`.
+4. **Textures, samplers, render pipelines, presentation**: textures over `VkImage`, a drawable of a `CAMetalLayer` over the swapchain of M6 step 1 (flip primitive of the kext).
+5. **Device properties**: `name`, `registryID` (the accelerator's, V: the log shows it), limits, the 173 methods Intel's class adds over `MTLIOAccelDevice`; every `supports*` answered from RADV's
+   physical device features. `featureProfile` is 10002 (V, section 9).
+
+## Not decided / unknown
+
+- One Vulkan device per process or a shared service: per process is how a Metal driver works (each process has its own device client) and is what is built; a service would save
+  memory but needs IPC for every buffer.
+- Memory: Metal's `MTLStorageModeShared` maps to host-visible memory (done); `Private` should be device-local VRAM, with copies through a transfer queue (the bridge has no SDMA).
+- Whether Core Animation, once it gets a real queue, needs render pipelines at once (it does for compositing windows): until step 4 the queue must keep answering nil to
+  its `newCommandQueue` so it falls back to software (V: this is how Terminal works now).
+- Hardening: every client is an administrator today (docs/M6_PLAN.md, step 5).

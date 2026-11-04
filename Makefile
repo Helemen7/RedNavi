@@ -126,7 +126,7 @@ $(ACCEL2KEXT): $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o RedNaviAcce
 MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
 $(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
-	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -framework Foundation -framework IOKit RedNaviMTL/plugin.m -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
+	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -framework Foundation -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
 	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist
 	xattr -cr $(MTLBUNDLE)
 	codesign -f -s - $(MTLBUNDLE)

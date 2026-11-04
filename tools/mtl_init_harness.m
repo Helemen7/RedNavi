@@ -9,6 +9,7 @@
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
+#include <dlfcn.h>
 #include <signal.h>
 #include <sys/ucontext.h>
 #include <stdio.h>
@@ -45,6 +46,15 @@ int main(int argc, char **argv) {
         NSBundle *b = [NSBundle bundleWithPath:path];
         NSError *e = nil;
         printf("bundle load: %d\n", [b loadAndReturnError:&e]);
+        if (getenv("RN_VK_SELFTEST")) {
+            // RADV inside this process, with Metal loaded: the bundle's rn_vk_selftest (RedNaviMTL/rn_vk.c)
+            NSString *exe = [b executablePath];
+            void *h = dlopen(exe.UTF8String, RTLD_NOLOAD | RTLD_NOW);
+            int (*st)(const char *) = h ? dlsym(h, "rn_vk_selftest") : NULL;
+            printf("rn_vk_selftest %s\n", st ? "found" : "missing");
+            if (st) { int rc = st(getenv("RN_VK_DIR")); printf("rn_vk_selftest -> %d\n", rc); }
+            return 0;
+        }
         Class k = objc_getClass("RedNaviMTLDevice");
         printf("class: %s\n", k ? class_getName(k) : "nil");
         if (!k) return 1;
