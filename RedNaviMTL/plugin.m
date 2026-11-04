@@ -227,6 +227,14 @@ __attribute__((constructor)) static void rn_load(void) {
         return b;
     }), "@@:");
     for (Class c = sup; c && c != [NSObject class]; c = class_getSuperclass(c)) rn_wrap_init(k, c);
+    // Metal asserts [newDevice conformsToProtocol:@protocol(MTLDevice)] in MTLAddDevice, and a class made at run time declares no protocol (the log of 2026-11-04 showed
+    // -initWithAcceleratorPort: succeeding and "conforms to MTLDevice: no"). The vendor classes declare it in their class metadata; here it is added by hand.
+    // The superclasses conform in fact (they implement the methods), only the declaration is missing.
+    const char *protoNames[] = {"MTLDevice", "MTLDeviceSPI"};
+    for (size_t i = 0; i < sizeof(protoNames) / sizeof(protoNames[0]); i++) {
+        Protocol *p = objc_getProtocol(protoNames[i]);
+        rn_log("protocol %s: %s%s", protoNames[i], p ? "found" : "not found", p && class_addProtocol(k, p) ? ", added" : "");
+    }
     objc_registerClassPair(k);
     rn_log("class RedNaviMTLDevice registered, super %s", class_getName(sup));
 }
