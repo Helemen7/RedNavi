@@ -227,6 +227,22 @@ __attribute__((constructor)) static void rn_load(void) {
         return b;
     }), "@@:");
     for (Class c = sup; c && c != [NSObject class]; c = class_getSuperclass(c)) rn_wrap_init(k, c);
+    // Command queues. The superclass _MTLDevice implements -newCommandQueueWithMaxCommandBufferCount: and -newCommandQueue in terms of each other and relies on the vendor class
+    // to override them (the Intel class does, both are in its method list). Left alone they loop forever allocating MTLCommandQueueDescriptor objects: Terminal's render thread
+    // sat in -[_MTLDevice newCommandQueueWithMaxCommandBufferCount:] with a 52 GB footprint (2026-11-04). There is no command path to the GPU yet, so every newCommandQueue*
+    // method answers nil, and callers (Core Animation) fall back to the software path.
+    for (Class c = sup; c && c != [NSObject class]; c = class_getSuperclass(c)) {
+        unsigned n = 0;
+        Method *list = class_copyMethodList(c, &n);
+        for (unsigned i = 0; i < n; i++) {
+            SEL sel = method_getName(list[i]);
+            if (strncmp(sel_getName(sel), "newCommandQueue", 15) != 0) continue;
+            const char *enc = method_getTypeEncoding(list[i]);
+            if (class_addMethod(k, sel, imp_implementationWithBlock(^id(id self) { rn_log("-%s: no command path yet, answering nil", sel_getName(sel)); return nil; }), enc))
+                rn_log("overriding -%s (%s) of %s: answers nil", sel_getName(sel), enc ? enc : "?", class_getName(c));
+        }
+        free(list);
+    }
     // -featureProfile has type Q (a 64-bit integer, read from the Intel driver's metadata on a Mac that has it: MTLIGAccelDevice, "Q16@0:8"). Unimplemented it answered 0 and
     // -[_MTLDevice initLimits] asserted _limits.maxColorAttachments > 0. The value is a version threshold: +[_MTLDevice featureProfile:supportsFeatureSet:] says profile 10000 supports
     // the feature sets 10000, 10001, 10003 and 10004, any profile from 10001 up also 10005; the Intel UHD 617 reports 10002, which is used here until a reason to change it shows up.
