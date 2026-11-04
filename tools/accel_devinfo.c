@@ -6,6 +6,14 @@
 #include <stdint.h>
 int main(void) {
     io_service_t s = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOAccelerator"));
+    if (!s) {
+        // an accelerator that is not registered (RedNaviAccel2 below stage 3) is not found by matching: walk the service plane for an IOAccelerator
+        io_iterator_t it;
+        if (IORegistryCreateIterator(kIOMainPortDefault, kIOServicePlane, kIORegistryIterateRecursively, &it) == KERN_SUCCESS) {
+            io_object_t o;
+            while (!s && (o = IOIteratorNext(it))) { if (IOObjectConformsTo(o, "IOAccelerator")) s = o; else IOObjectRelease(o); }
+        }
+    }
     if (!s) { puts("no accelerator"); return 1; }
     io_name_t cls; IOObjectGetClass(s, cls); printf("accelerator class %s\n", cls);
     io_connect_t c;

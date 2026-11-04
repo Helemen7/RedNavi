@@ -106,17 +106,24 @@ static_assert(sizeof(RedNaviEventMachine) == 3376, "IOAccelEventMachineFast2 is 
 OSDefineMetaClassAndStructors(RedNaviEventMachine, IOAccelEventMachineFast2)
 void RedNaviEventMachine::rnPad0() {} void RedNaviEventMachine::rnPad1() {} void RedNaviEventMachine::rnPad2() {} void RedNaviEventMachine::rnPad3() {}
 bool RedNaviEventMachine::init(IOGraphicsAccelerator2 *a, unsigned int n, int m) {
-    bool ok = IOAccelEventMachineFast2::init(a, n, m);
+    // Experiment knobs (internal EFI boot-args, no reinstall): the arguments the family passes (1000, 1) against what Intel's reply of selector 2 suggests (0x40 at +0x14).
+    uint32_t arg = 0;
+    unsigned int n2 = n;
+    int m2 = m;
+    if (PE_parse_boot_argn("rednavi_accel2_em_n", &arg, sizeof(arg))) n2 = arg;
+    if (PE_parse_boot_argn("rednavi_accel2_em_m", &arg, sizeof(arg))) m2 = static_cast<int>(arg);
+    bool ok = IOAccelEventMachineFast2::init(a, n2, m2);
     void *st = rnStampPage();
-    rnNote("event machine init(%p, %u, %d): family init %s, stamp page %p", (void *)a, n, m, ok ? "true" : "false", st);
+    rnNote("event machine init(%p, %u, %d) asked by the family, called with (%u, %d): family init %s, stamp page %p", (void *)a, n, m, n2, m2, ok ? "true" : "false", st);
     if (ok && st) setStampBaseAddress(static_cast<volatile unsigned int *>(st));
     return ok;
 }
 // The offset of a channel's stamp in the stamp memory. Intel's subclass overrides this, the family's default leaves the table that selector 2 of the device client returns
 // (at 0x5c) all zero: the Intel one holds 63 offsets, 0x40 to 0xfc0 in steps of 0x40 (docs/logs/intel_device_client_selector2.txt), and the framework's IOAccelDeviceCreate
-// crashed with ours. 64-byte slots, the first one at 0x40; 1000 stamps fit in the 64 KB buffer.
+// crashed with ours. Intel's table starts at 0x58 with 0 and goes 0x40, 0x80, ... so the offset is channel * 64 (the first version had (channel + 1) * 64, one slot
+// off); 1000 stamps fit in the 64 KB buffer.
 unsigned int RedNaviEventMachine::getStampOffset(int channel) {
-    return channel >= 0 && channel < 1000 ? static_cast<unsigned int>(channel + 1) * 0x40u : 0u;
+    return channel >= 0 && channel < 1000 ? static_cast<unsigned int>(channel) * 0x40u : 0u;
 }
 long RedNaviEventMachine::writeStamp(int ch, vendevtCommandRec *rec, unsigned int v) { rnNote("event machine writeStamp(channel %d, %p, %u)", ch, (void *)rec, v); return 0; }
 long RedNaviEventMachine::prepareBarrier(vendevtBarrierRec *b) { rnNote("event machine prepareBarrier(%p)", (void *)b); return 0; }
@@ -295,6 +302,24 @@ void RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
     if (gStage < 2) return;
     // The structure's size is unknown; 64 bytes is a read that stays inside any plausible one, to see whether the family pre-fills it.
     if (cfg) dumpWords("IOAccelConfig", cfg, 64);
+    // Experiment knob: boot-arg rednavi_accel2_cfg=<offset>=<value>,<offset>=<value>... (hexadecimal, 32-bit values, offsets multiple of 4 below 0x40, the part that was read).
+    char spec[128];
+    if (cfg && PE_parse_boot_argn("rednavi_accel2_cfg", spec, sizeof(spec))) {
+        uint32_t *w = reinterpret_cast<uint32_t *>(cfg);
+        for (const char *p = spec; *p;) {
+            uint64_t off = 0, val = 0;
+            if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+            for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); p++) off = off * 16 + (*p <= '9' ? *p - '0' : *p - 'a' + 10);
+            if (*p == '=') p++;
+            if (*p == '0' && (p[1] == 'x' || p[1] == 'X')) p += 2;
+            for (; (*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'); p++) val = val * 16 + (*p <= '9' ? *p - '0' : *p - 'a' + 10);
+            if (*p == ',') p++;
+            if (off < 0x40 && !(off & 3)) { w[off / 4] = static_cast<uint32_t>(val); rnNote("IOAccelConfig +0x%x = 0x%x (rednavi_accel2_cfg)", (unsigned)off, (unsigned)val); }
+            else rnNote("IOAccelConfig: offset 0x%x refused", (unsigned)off);
+            if (!*p) break;
+        }
+        dumpWords("IOAccelConfig after", cfg, 64);
+    }
 }
 
 bool RedNaviAccel2::configureDevice(IOPCIDevice *pci) {
