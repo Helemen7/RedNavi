@@ -6,7 +6,8 @@
 // same match category. The value of the boot-arg is the stage:
 //   1  every hook is logged and configureDevice() fails, so the family's start() stops at its first call into us and nothing else runs (the safe stage: shows what the
 //      family calls, in which order, with which arguments);
-//   2  configureDevice() and teardownDevice() succeed, populateAccelConfig() succeeds without writing (the size of IOAccelConfig is not known; its first bytes are dumped
+//   2  configureDevice() and teardownDevice() succeed (they return bool: the family logs "configureDevice failed" on a returned kIOReturnSuccess, which is 0; the first
+//      version declared them IOReturn), populateAccelConfig() succeeds without writing (the size of IOAccelConfig is not known; its first bytes are dumped
 //      before and after), and the factories hand out instances of the family's own concrete classes by name when the class exists and is not abstract, else NULL.
 // The log is the property rednavi-accel2-log of the PCI device (the provider outlives this object when start() fails, and IOLog is not reliably visible), last 256 lines.
 // Clean-room: written from the exported symbol tables and the registry of this Mac, no code of the family or of NullMoth.
@@ -43,9 +44,9 @@ public:
     void *getStampMemory(unsigned int *size) override;
     void *newEventMachine() override;
     void *createUserGPUTask() override;
-    IOReturn populateAccelConfig(IOAccelConfig *cfg) override;
-    IOReturn configureDevice(IOPCIDevice *pci) override;
-    IOReturn teardownDevice(IOPCIDevice *pci) override;
+    bool populateAccelConfig(IOAccelConfig *cfg) override;
+    bool configureDevice(IOPCIDevice *pci) override;
+    bool teardownDevice(IOPCIDevice *pci) override;
     void *createKernelGPUTask() override;
     void *newDisplayMachine() override;
     void *newGLContext() override;
@@ -143,20 +144,20 @@ void *RedNaviAccel2::newVidMemory() { return allocByName("newVidMemory", "IOAcce
 void *RedNaviAccel2::newResource() { return allocByName("newResource", "IOAccelResource2"); }
 void *RedNaviAccel2::newMemoryMap() { return allocByName("newMemoryMap", "IOAccelMemoryMap"); }
 
-IOReturn RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
+bool RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
     note("populateAccelConfig(%p)", cfg);
-    if (gStage < 2) return kIOReturnUnsupported;
+    if (gStage < 2) return false;
     // The structure's size is unknown; 64 bytes is a read that stays inside any plausible one, to see whether the family pre-fills it.
     if (cfg) dumpWords("IOAccelConfig", cfg, 64);
-    return kIOReturnSuccess;
+    return true;
 }
 
-IOReturn RedNaviAccel2::configureDevice(IOPCIDevice *pci) {
+bool RedNaviAccel2::configureDevice(IOPCIDevice *pci) {
     note("configureDevice(%s)", pci ? pci->getName() : "?");
-    return gStage >= 2 ? kIOReturnSuccess : kIOReturnUnsupported;
+    return gStage >= 2;
 }
 
-IOReturn RedNaviAccel2::teardownDevice(IOPCIDevice *pci) {
+bool RedNaviAccel2::teardownDevice(IOPCIDevice *pci) {
     note("teardownDevice(%s)", pci ? pci->getName() : "?");
-    return gStage >= 2 ? kIOReturnSuccess : kIOReturnUnsupported;
+    return gStage >= 2;
 }

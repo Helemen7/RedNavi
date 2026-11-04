@@ -75,10 +75,10 @@ public:
     virtual void * createUserGPUTask() = 0;   // slot 307
     virtual void acceleratorFinalize();   // slot 308
     virtual void submitSwapCopy(IOAccelEvent*, IOAccelResource2*, IOAccelResource2*);   // slot 309
-    virtual IOReturn populateAccelConfig(IOAccelConfig*) = 0;   // slot 310
+    virtual bool populateAccelConfig(IOAccelConfig*) = 0;   // slot 310
     virtual void calcMaxGPUPhysicalMemoryBytes(unsigned long long);   // slot 311
-    virtual IOReturn configureDevice(IOPCIDevice*) = 0;   // slot 312
-    virtual IOReturn teardownDevice(IOPCIDevice*) = 0;   // slot 313
+    virtual bool configureDevice(IOPCIDevice*) = 0;   // slot 312
+    virtual bool teardownDevice(IOPCIDevice*) = 0;   // slot 313
     virtual void * createKernelGPUTask() = 0;   // slot 314
     virtual void systemWillSleep();   // slot 315
     virtual void systemDidWake();   // slot 316
