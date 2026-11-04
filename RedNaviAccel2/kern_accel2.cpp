@@ -148,7 +148,7 @@ public:
     void *getStampMemory(unsigned int *size) override;
     void *newEventMachine() override;
     void *createUserGPUTask() override;
-    bool populateAccelConfig(IOAccelConfig *cfg) override;
+    void populateAccelConfig(IOAccelConfig *cfg) override;
     bool configureDevice(IOPCIDevice *pci) override;
     bool teardownDevice(IOPCIDevice *pci) override;
     void *createKernelGPUTask() override;
@@ -264,12 +264,11 @@ void *RedNaviAccel2::newVidMemory() { return allocStub<RedNaviVidMemory>("newVid
 void *RedNaviAccel2::newResource() { return allocStub<RedNaviResource2>("newResource"); }
 void *RedNaviAccel2::newMemoryMap() { return allocStub<RedNaviMemoryMap>("newMemoryMap"); }
 
-bool RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
+void RedNaviAccel2::populateAccelConfig(IOAccelConfig *cfg) {
     rnNote("populateAccelConfig(%p)", cfg);
-    if (gStage < 2) return false;
+    if (gStage < 2) return;
     // The structure's size is unknown; 64 bytes is a read that stays inside any plausible one, to see whether the family pre-fills it.
     if (cfg) dumpWords("IOAccelConfig", cfg, 64);
-    return true;
 }
 
 bool RedNaviAccel2::configureDevice(IOPCIDevice *pci) {

@@ -104,7 +104,7 @@ def slots(cls):
 RET_GUESS = {  # return types are not in the mangled names; the ABI does not need them, the stubs of the pure virtuals do
     'getStampMemory': 'void *', 'newEventMachine': 'void *', 'createUserGPUTask': 'void *', 'createKernelGPUTask': 'void *', 'newDisplayMachine': 'void *',
     'newGLContext': 'void *', 'newCLContext': 'void *', 'newSurface': 'void *', 'new2DContext': 'void *', 'newVideoContext': 'void *', 'newSysMemory': 'void *',
-    'newVidMemory': 'void *', 'newResource': 'void *', 'newMemoryMap': 'void *', 'populateAccelConfig': 'bool', 'configureDevice': 'bool', 'teardownDevice': 'bool'}
+    'newVidMemory': 'void *', 'newResource': 'void *', 'newMemoryMap': 'void *', 'populateAccelConfig': 'void', 'configureDevice': 'bool', 'teardownDevice': 'bool'}
 GA2_SIZE, ACCELERATOR_SIZE = 3544, 136
 
 def parse(demangled):

@@ -2,7 +2,7 @@
 RN_PURE(void *, getStampMemory, (unsigned int*), )
 RN_PURE(void *, newEventMachine, (), )
 RN_PURE(void *, createUserGPUTask, (), )
-RN_PURE(bool, populateAccelConfig, (IOAccelConfig*), )
+RN_PURE(void, populateAccelConfig, (IOAccelConfig*), )
 RN_PURE(bool, configureDevice, (IOPCIDevice*), )
 RN_PURE(bool, teardownDevice, (IOPCIDevice*), )
 RN_PURE(void *, createKernelGPUTask, (), )
