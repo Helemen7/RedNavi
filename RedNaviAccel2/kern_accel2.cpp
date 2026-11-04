@@ -17,6 +17,7 @@
 #include <IOKit/graphics/IOAccelerator.h>
 #include "../RedNaviAccel/IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
+#include "IOAccelDisplayMachine.h"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSArray.h>
@@ -74,6 +75,22 @@ long RedNaviEventMachine::writeStamp(int ch, vendevtCommandRec *rec, unsigned in
 long RedNaviEventMachine::prepareBarrier(vendevtBarrierRec *b) { rnNote("event machine prepareBarrier(%p)", (void *)b); return 0; }
 long RedNaviEventMachine::completeBarrier(vendevtBarrierRec *b) { rnNote("event machine completeBarrier(%p)", (void *)b); return 0; }
 long RedNaviEventMachine::writeBarrierElement(vendevtBarrierRec *b, int i, unsigned int v) { rnNote("event machine writeBarrierElement(%p, %d, %u)", (void *)b, i, v); return 0; }
+
+// The display machine (what the family does when a framebuffer changes mode or powers off): all of it is the family's except the two notifications that tell the
+// hardware-specific part, which are ours. Logged and ignored for now.
+class RedNaviDisplayMachine : public IOAccelDisplayMachine {
+    OSDeclareDefaultStructors(RedNaviDisplayMachine)
+public:
+    long displayModeWillChange() override;
+    long displayModeDidChange() override;
+    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3();
+};
+static_assert(sizeof(RedNaviDisplayMachine) == 376, "IOAccelDisplayMachine is 376 bytes in the registry");
+OSDefineMetaClassAndStructors(RedNaviDisplayMachine, IOAccelDisplayMachine)
+void RedNaviDisplayMachine::rnPad0() {} void RedNaviDisplayMachine::rnPad1() {} void RedNaviDisplayMachine::rnPad2() {} void RedNaviDisplayMachine::rnPad3() {}
+long RedNaviDisplayMachine::displayModeWillChange() { rnNote("display machine displayModeWillChange"); return 0; }
+long RedNaviDisplayMachine::displayModeDidChange() { rnNote("display machine displayModeDidChange"); return 0; }
+
 
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
@@ -157,7 +174,12 @@ void *RedNaviAccel2::newEventMachine() {
 }
 void *RedNaviAccel2::createUserGPUTask() { return allocByName("createUserGPUTask", "IOAccelTask"); }
 void *RedNaviAccel2::createKernelGPUTask() { return allocByName("createKernelGPUTask", "IOAccelTask"); }
-void *RedNaviAccel2::newDisplayMachine() { return allocByName("newDisplayMachine", "IOAccelDisplayMachine"); }
+void *RedNaviAccel2::newDisplayMachine() {
+    if (gStage < 2) { rnNote("newDisplayMachine called (stage %u: refused)", gStage); return nullptr; }
+    RedNaviDisplayMachine *m = OSTypeAlloc(RedNaviDisplayMachine);
+    rnNote("newDisplayMachine: RedNaviDisplayMachine size %u -> %p", (unsigned)sizeof(RedNaviDisplayMachine), (void *)m);
+    return m;
+}
 void *RedNaviAccel2::newGLContext() { return allocByName("newGLContext", "IOAccelGLContext2"); }
 void *RedNaviAccel2::newCLContext() { return allocByName("newCLContext", "IOAccelCLContext2"); }
 void *RedNaviAccel2::newSurface() { return allocByName("newSurface", "IOAccelSurface"); }
