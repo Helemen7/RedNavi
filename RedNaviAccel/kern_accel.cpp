@@ -83,7 +83,10 @@ void RedNaviAccel::rnPad0() {} void RedNaviAccel::rnPad1() {} void RedNaviAccel:
 void RedNaviAccel::rnPad4() {} void RedNaviAccel::rnPad5() {} void RedNaviAccel::rnPad6() {} void RedNaviAccel::rnPad7() {}
 
 // The pure virtuals: the family calls these on a real accelerator; here a call is logged and refused.
-#define RN_PURE(R, N, A, Q) R RedNaviAccel::N A Q { note("family hook called: %s", #N); return sizeof(R) == sizeof(IOReturn) ? (R)(intptr_t)kIOReturnUnsupported : (R)0; }
+// What a refused hook returns: kIOReturnUnsupported for an IOReturn-sized result, 0 for the others (pointers, bool), nothing for void.
+template <class R> static inline R rnRefusal() { return sizeof(R) == sizeof(IOReturn) ? (R)(intptr_t)kIOReturnUnsupported : (R)0; }
+template <> inline void rnRefusal<void>() {}
+#define RN_PURE(R, N, A, Q) R RedNaviAccel::N A Q { note("family hook called: %s", #N); return rnRefusal<R>(); }
 #include "IOGraphicsAccelerator2_pure.inc"
 #undef RN_PURE
 
