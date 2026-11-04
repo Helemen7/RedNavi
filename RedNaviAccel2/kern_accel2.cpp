@@ -20,6 +20,8 @@
 #include "IOAccelEventMachineFast2.h"
 #include "IOAccelDisplayMachine.h"
 #include "IOAccelClasses.h"
+#include <IOKit/IORangeAllocator.h>
+#include "IOAccelTask.h"
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSArray.h>
@@ -133,6 +135,7 @@ long RedNaviDisplayMachine::displayModeDidChange() { rnNote("display machine dis
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
     void *allocByName(const char *hook, const char *cls);
+    void *makeTask(const char *hook, unsigned int n);
     template <class T> void *allocStub(const char *hook) {
         if (gStage < 2) { rnNote("%s called (stage %u: refused)", hook, gStage); return nullptr; }
         T *o = OSTypeAlloc(T);
@@ -246,8 +249,23 @@ void *RedNaviAccel2::newEventMachine() {
     rnNote("newEventMachine: RedNaviEventMachine size %u -> %p", (unsigned)sizeof(RedNaviEventMachine), (void *)m);
     return m;
 }
-void *RedNaviAccel2::createUserGPUTask() { return allocByName("createUserGPUTask", "IOAccelTask"); }
-void *RedNaviAccel2::createKernelGPUTask() { return allocByName("createKernelGPUTask", "IOAccelTask"); }
+// The task (a GPU address space with the allocators that hand out its addresses). The family does not initialise what these two factories return: an uninitialised task
+// panicked in IOAccelSharedUserClient2::sharedStop -> IOAccelTask::prune_orphaned_mappings (a null accelerator pointer, a read at +0xc78 of it, 2026-11-04), and the Intel
+// subclass of IOAccelTask overrides neither init nor anything but free, so the factory is where init(accelerator, n, allocators) is called. What the unsigned int means
+// is not known (a count or a kind); the allocators are four ranges of 1 TB of GPU virtual address space, none of this is used yet.
+void *RedNaviAccel2::makeTask(const char *hook, unsigned int n) {
+    if (gStage < 2) { rnNote("%s called (stage %u: refused)", hook, gStage); return nullptr; }
+    IOAccelTask *t = OSTypeAlloc(IOAccelTask);
+    if (!t) { rnNote("%s: no memory", hook); return nullptr; }
+    IORangeAllocator *ra[4] = {};
+    for (int i = 0; i < 4; i++) ra[i] = IORangeAllocator::withRange((1ULL << 40) - 1, 0x1000, 0, 0);
+    bool ok = false;
+    if (gStage >= 3) ok = t->init(this, n, ra);       // stage 2 keeps the verified behaviour: the task is handed out as allocated
+    rnNote("%s: IOAccelTask %p, init(%p, %u, allocators) -> %s", hook, (void *)t, (void *)this, n, gStage >= 3 ? (ok ? "true" : "false") : "skipped (stage 2)");
+    return t;
+}
+void *RedNaviAccel2::createUserGPUTask() { return makeTask("createUserGPUTask", 1); }
+void *RedNaviAccel2::createKernelGPUTask() { return makeTask("createKernelGPUTask", 0); }
 void *RedNaviAccel2::newDisplayMachine() {
     if (gStage < 2) { rnNote("newDisplayMachine called (stage %u: refused)", gStage); return nullptr; }
     RedNaviDisplayMachine *m = OSTypeAlloc(RedNaviDisplayMachine);
