@@ -44,10 +44,20 @@ typedef struct {
     uint32_t local_size[3];            // default threads per threadgroup of the module
     uint32_t local_size_spec_ids[3];   // specialization constant ids of the three dimensions
     uint32_t dispatch_push_bytes;      // push constants (at offset 0) each dispatch must write: 48 = thread grid, thread base, threadgroup base, threadgroup grid (4 x uint32[3])
+    // vertex and fragment stages
+    uint32_t set;                      // the descriptor set of the module: vertex 0, fragment 1 (the two stages of a pipeline share one namespace of binding numbers)
+    uint32_t render_target_count;      // fragment: the colour attachments it writes (locations)
+    uint32_t render_target_locations[8];
+    uint32_t uses_vertex_index, uses_instance_index;   // vertex
 } rn_air_kernel_info;
+enum { RN_AIR_KERNEL = 0, RN_AIR_VERTEX = 1, RN_AIR_FRAGMENT = 2 };
 
 // 0 on success. dir: where to look for librn_air2spirv.dylib (NULL: rn_vk_dir()).
 int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
+// The same for a vertex or fragment function (stage: RN_AIR_*). Vertex functions that read their input with [[stage_in]] attributes are refused for now; the varyings of a vertex
+// and a fragment function that are translated apart meet by their Location numbers, which the translator derives from the names. A vertex module is in descriptor set 0, a fragment
+// module in set 1 (info.set), with the same per-binding ABI as kernels; neither has the dispatch push constants.
+int rn_air_translate_stage(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
 void rn_air_free(uint32_t *spirv, size_t bytes);
 
 #ifdef __cplusplus

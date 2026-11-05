@@ -16,7 +16,8 @@
     X(DestroyCommandPool) X(AllocateCommandBuffers) X(FreeCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdBindPipeline) X(CmdBindDescriptorSets) \
     X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(WaitForFences) X(QueueSubmit) X(ResetDescriptorPool) \
     X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) X(CreateImageView) X(DestroyImageView) X(CreateSampler) X(DestroySampler) \
-    X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer)
+    X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer) X(CmdClearColorImage) X(CreateRenderPass) X(DestroyRenderPass) X(CreateFramebuffer) X(DestroyFramebuffer) \
+    X(CreateGraphicsPipelines) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdSetViewport) X(CmdSetScissor) X(CmdDraw)
 
 struct rn_vk {
     void *lib;
@@ -37,7 +38,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h; unsigned texel; int storage, initialized, dirty; };
+struct rn_vk_image { VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h; unsigned texel; int storage, color, initialized, dirty; };
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -94,8 +95,8 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     if (nq > 8) nq = 8;
     vk->GetPhysicalDeviceQueueFamilyProperties(vk->pd, &nq, qf);
     int fam = -1;
-    for (uint32_t i = 0; i < nq; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { fam = (int)i; break; }
-    if (fam < 0) { seterr(err, errlen, "no compute queue family", 0); goto fail; }
+    for (uint32_t i = 0; i < nq; i++) if ((qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) == (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) { fam = (int)i; break; }
+    if (fam < 0) { seterr(err, errlen, "no graphics and compute queue family", 0); goto fail; }
     vk->family = (uint32_t)fam;
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qci = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = vk->family, .queueCount = 1, .pQueuePriorities = &prio};
@@ -105,6 +106,9 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     memset(&want, 0, sizeof(want));
     want.shaderStorageImageReadWithoutFormat = have.shaderStorageImageReadWithoutFormat;
     want.shaderStorageImageWriteWithoutFormat = have.shaderStorageImageWriteWithoutFormat;
+    want.shaderInt64 = have.shaderInt64;                        // the translated vertex shaders declare Int64
+    want.vertexPipelineStoresAndAtomics = have.vertexPipelineStoresAndAtomics;
+    want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics;
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &want};
     r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev);
     if (r != VK_SUCCESS) { seterr(err, errlen, "vkCreateDevice", r); goto fail; }
@@ -335,9 +339,10 @@ rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) {
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     if ((f & need) != need) goto fail;
     im->storage = (f & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+    im->color = (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0)};
+                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0)};
     if (vk->CreateImage(vk->dev, &ici, NULL, &im->img) != VK_SUCCESS) goto fail;
     VkMemoryRequirements mr;
     vk->GetImageMemoryRequirements(vk->dev, im->img, &mr);
@@ -373,30 +378,27 @@ void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *im) {
 
 typedef struct { uint32_t local[3], groups[3], pc[12]; } region;
 
-static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, const void *push, const region *regs, unsigned nregs) {
-    VkDescriptorBufferInfo bi[RN_VK_MAX_BINDINGS];
-    VkDescriptorImageInfo ii[RN_VK_MAX_BINDINGS];
-    VkWriteDescriptorSet w[RN_VK_MAX_BINDINGS];
-    rn_vk_image *up[RN_VK_MAX_BINDINGS], *down[RN_VK_MAX_BINDINGS];
-    unsigned nup = 0, ndown = 0;
-    for (unsigned i = 0; i < c->nbind; i++) {
-        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = c->ds, .dstBinding = c->binds[i], .descriptorCount = 1, .descriptorType = desc_type(c->kinds[i])};
+// Fills the descriptor writes of one set from the resources of a dispatch or a draw. Every image goes into `in` (it must be current on the card before the work), the ones the shader
+// may write into `out` (copied back afterwards). 0, or 4 (buffer offset) or 6 (resource missing or unusable).
+static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsigned *binds, const VkSampler *statics, const rn_vk_arg *args, VkDescriptorSet set, VkDescriptorBufferInfo *bi,
+                       VkDescriptorImageInfo *ii, VkWriteDescriptorSet *w, rn_vk_image **in, unsigned *nin, rn_vk_image **out, unsigned *nout) {
+    for (unsigned i = 0; i < n; i++) {
+        w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = binds[i], .descriptorCount = 1, .descriptorType = desc_type(kinds[i])};
         const rn_vk_arg *a = &args[i];
-        switch (c->kinds[i]) {
-        case RN_VK_BUFFER: {
+        switch (kinds[i]) {
+        case RN_VK_BUFFER:
             if (!a->buffer) return 6;
             if (a->offset % vk->storageAlign || a->offset >= a->buffer->size) return 4;
             bi[i] = (VkDescriptorBufferInfo){.buffer = a->buffer->buf, .offset = a->offset, .range = a->buffer->size - a->offset};
             w[i].pBufferInfo = &bi[i];
             break;
-        }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
-            if (!a->image || (c->kinds[i] == RN_VK_STORAGE_IMAGE && !a->image->storage)) return 6;
+            if (!a->image || (kinds[i] == RN_VK_STORAGE_IMAGE && !a->image->storage)) return 6;
             ii[i] = (VkDescriptorImageInfo){.imageView = a->image->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
             w[i].pImageInfo = &ii[i];
-            up[nup++] = a->image;
-            if (c->kinds[i] == RN_VK_STORAGE_IMAGE) down[ndown++] = a->image;
+            in[(*nin)++] = a->image;
+            if (kinds[i] == RN_VK_STORAGE_IMAGE) out[(*nout)++] = a->image;
             break;
         case RN_VK_SAMPLER:
             if (!a->sampler) return 6;
@@ -404,11 +406,59 @@ static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, 
             w[i].pImageInfo = &ii[i];
             break;
         default:
-            ii[i] = (VkDescriptorImageInfo){.sampler = c->statics[i]};
+            ii[i] = (VkDescriptorImageInfo){.sampler = statics[i]};
             w[i].pImageInfo = &ii[i];
             break;
         }
     }
+    return 0;
+}
+
+// The images of a submission: the first use takes an image out of UNDEFINED (its layout stays GENERAL, which sampling, storage and attachment use all accept) and what the host wrote goes in.
+static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, unsigned n) {
+    for (unsigned i = 0; i < n; i++) {
+        int seen = 0;
+        for (unsigned j = 0; j < i; j++) seen |= im[j] == im[i];
+        if (seen) continue;
+        if (!im[i]->initialized) {
+            VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                       .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im[i]->img,
+                                       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+            im[i]->initialized = 1;
+        }
+        if (im[i]->dirty) {
+            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im[i]->w, im[i]->h, 1}};
+            vk->CmdCopyBufferToImage(cb, im[i]->stage->buf, im[i]->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
+            im[i]->dirty = 0;
+        }
+    }
+}
+// After the work: the images the shaders wrote are copied to their host copies. The caller has made the writes visible to the transfer stage.
+static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, unsigned n) {
+    unsigned done = 0;
+    for (unsigned i = 0; i < n; i++) {
+        int seen = 0;
+        for (unsigned j = 0; j < i; j++) seen |= im[j] == im[i];
+        if (seen) continue;
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im[i]->w, im[i]->h, 1}};
+        vk->CmdCopyImageToBuffer(cb, im[i]->img, VK_IMAGE_LAYOUT_GENERAL, im[i]->stage->buf, 1, &bc);
+        done++;
+    }
+    if (done) {
+        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
+        vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
+    }
+}
+
+static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, const void *push, const region *regs, unsigned nregs) {
+    VkDescriptorBufferInfo bi[RN_VK_MAX_BINDINGS];
+    VkDescriptorImageInfo ii[RN_VK_MAX_BINDINGS];
+    VkWriteDescriptorSet w[RN_VK_MAX_BINDINGS];
+    rn_vk_image *up[RN_VK_MAX_BINDINGS], *down[RN_VK_MAX_BINDINGS];
+    unsigned nup = 0, ndown = 0;
+    int fr = fill_writes(vk, c->nbind, c->kinds, c->binds, c->statics, args, c->ds, bi, ii, w, up, &nup, down, &ndown);
+    if (fr) return fr;
     VkPipeline pipes[8];
     if (nregs > 8) return 5;
     for (unsigned i = 0; i < nregs; i++) if (!(pipes[i] = pipeline_for(vk, c, regs[i].local))) return 5;
@@ -420,22 +470,7 @@ static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, 
     int rc = 2;
     VkFence fence = VK_NULL_HANDLE;
     if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
-    // images: the first use takes them out of UNDEFINED (their layout stays GENERAL, which sampling and storage both accept); what the host wrote goes in
-    for (unsigned i = 0; i < nup; i++) {
-        rn_vk_image *im = up[i];
-        if (!im->initialized) {
-            VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                                       .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im->img,
-                                       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
-            vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
-            im->initialized = 1;
-        }
-        if (im->dirty) {
-            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im->w, im->h, 1}};
-            vk->CmdCopyBufferToImage(cb, im->stage->buf, im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
-            im->dirty = 0;
-        }
-    }
+    images_in(vk, cb, up, nup);
     VkMemoryBarrier in = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &in, 0, NULL, 0, NULL);
     vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, c->pl, 0, 1, &c->ds, 0, NULL);
@@ -447,14 +482,7 @@ static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, 
     }
     VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, NULL, 0, NULL);
-    for (unsigned i = 0; i < ndown; i++) {
-        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {down[i]->w, down[i]->h, 1}};
-        vk->CmdCopyImageToBuffer(cb, down[i]->img, VK_IMAGE_LAYOUT_GENERAL, down[i]->stage->buf, 1, &bc);
-    }
-    if (ndown) {
-        VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
-        vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
-    }
+    images_out(vk, cb, down, ndown);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto done;
@@ -500,4 +528,223 @@ int rn_vk_dispatch_threads(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, c
         regs[n++] = r;
     }
     return dispatch_regions(vk, c, args, NULL, regs, n);
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------- render pipelines and passes
+
+struct rn_vk_render {
+    VkShaderModule vs, fs;
+    VkDescriptorSetLayout dsl[2];
+    VkPipelineLayout pl;
+    VkRenderPass rp;
+    VkPipeline pipe;
+    unsigned n[2], kinds[2][RN_VK_MAX_BINDINGS], binds[2][RN_VK_MAX_BINDINGS];
+    VkSampler statics[2][RN_VK_MAX_BINDINGS];
+    unsigned nt;
+    VkFormat fmts[8];
+};
+
+// A set layout from the bindings of one stage; the descriptors of each type are counted into `count` (buffers, sampled images, storage images, samplers).
+static int make_layout(rn_vk *vk, unsigned n, const rn_vk_binding *binds, VkShaderStageFlags stage, unsigned *kinds, unsigned *bn, VkSampler *statics, uint32_t count[4], VkDescriptorSetLayout *out) {
+    if (n > RN_VK_MAX_BINDINGS) return 0;
+    VkDescriptorSetLayoutBinding b[RN_VK_MAX_BINDINGS];
+    for (unsigned i = 0; i < n; i++) {
+        kinds[i] = binds[i].kind;
+        bn[i] = binds[i].binding;
+        const VkDescriptorType t = desc_type(binds[i].kind);
+        b[i] = (VkDescriptorSetLayoutBinding){.binding = binds[i].binding, .descriptorType = t, .descriptorCount = 1, .stageFlags = stage};
+        count[t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? 0 : t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 2 : 3]++;
+        if (binds[i].kind == RN_VK_STATIC_SAMPLER) {
+            if (!binds[i].sampler) return 0;
+            VkSamplerCreateInfo si = sampler_info(binds[i].sampler);
+            if (vk->CreateSampler(vk->dev, &si, NULL, &statics[i]) != VK_SUCCESS) return 0;
+        }
+    }
+    VkDescriptorSetLayoutCreateInfo dsl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = n, .pBindings = n ? b : NULL};
+    return vk->CreateDescriptorSetLayout(vk->dev, &dsl, NULL, out) == VK_SUCCESS;
+}
+
+static VkFormat render_vkformat(int f) { return vk_format(f); }
+
+rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
+    if (!d->ntargets || d->ntargets > 8) return NULL;
+    rn_vk_render *r = calloc(1, sizeof(*r));
+    if (!r) return NULL;
+    r->nt = d->ntargets;
+    uint32_t count[4] = {0, 0, 0, 0};
+    VkShaderModuleCreateInfo sm = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = d->vs_bytes, .pCode = d->vs};
+    if (vk->CreateShaderModule(vk->dev, &sm, NULL, &r->vs) != VK_SUCCESS) goto fail;
+    sm.codeSize = d->fs_bytes; sm.pCode = d->fs;
+    if (vk->CreateShaderModule(vk->dev, &sm, NULL, &r->fs) != VK_SUCCESS) goto fail;
+    r->n[0] = d->nvbind; r->n[1] = d->nfbind;
+    if (!make_layout(vk, d->nvbind, d->vbinds, VK_SHADER_STAGE_VERTEX_BIT, r->kinds[0], r->binds[0], r->statics[0], count, &r->dsl[0])) goto fail;
+    if (!make_layout(vk, d->nfbind, d->fbinds, VK_SHADER_STAGE_FRAGMENT_BIT, r->kinds[1], r->binds[1], r->statics[1], count, &r->dsl[1])) goto fail;
+    VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = r->dsl};
+    if (vk->CreatePipelineLayout(vk->dev, &plci, NULL, &r->pl) != VK_SUCCESS) goto fail;
+    // The pass the pipeline is made for: every attachment is loaded and stored and stays in GENERAL (clears are done by the caller before the pass).
+    VkAttachmentDescription att[8];
+    VkAttachmentReference ref[8];
+    VkPipelineColorBlendAttachmentState cba[8];
+    for (unsigned i = 0; i < r->nt; i++) {
+        r->fmts[i] = render_vkformat(d->target_formats[i]);
+        if (r->fmts[i] == VK_FORMAT_UNDEFINED) goto fail;
+        att[i] = (VkAttachmentDescription){.format = r->fmts[i], .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                           .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
+                                           .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL};
+        ref[i] = (VkAttachmentReference){i, VK_IMAGE_LAYOUT_GENERAL};
+        cba[i] = (VkPipelineColorBlendAttachmentState){.colorWriteMask = 0xf};
+    }
+    VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = r->nt, .pColorAttachments = ref};
+    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub};
+    if (vk->CreateRenderPass(vk->dev, &rpi, NULL, &r->rp) != VK_SUCCESS) goto fail;
+    static const VkPrimitiveTopology topo[5] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+                                                VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
+    VkPipelineShaderStageCreateInfo st[2] = {
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = r->vs, .pName = "main"},
+        {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = r->fs, .pName = "main"}};
+    VkPipelineVertexInputStateCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = topo[d->topology < 5 ? d->topology : 3]};
+    VkPipelineViewportStateCreateInfo vp = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .polygonMode = VK_POLYGON_MODE_FILL, .cullMode = VK_CULL_MODE_NONE,
+                                                 .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
+    VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
+    VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = cba};
+    const VkDynamicState dyn[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 2, .pDynamicStates = dyn};
+    VkGraphicsPipelineCreateInfo gp = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
+                                       .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = r->pl,
+                                       .renderPass = r->rp, .subpass = 0};
+    if (vk->CreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gp, NULL, &r->pipe) != VK_SUCCESS) goto fail;
+    return r;
+fail:
+    rn_vk_render_destroy(vk, r);
+    return NULL;
+}
+
+void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r) {
+    if (!r) return;
+    if (r->pipe) vk->DestroyPipeline(vk->dev, r->pipe, NULL);
+    if (r->rp) vk->DestroyRenderPass(vk->dev, r->rp, NULL);
+    if (r->pl) vk->DestroyPipelineLayout(vk->dev, r->pl, NULL);
+    for (int s = 0; s < 2; s++) {
+        for (unsigned i = 0; i < r->n[s]; i++) if (r->statics[s][i]) vk->DestroySampler(vk->dev, r->statics[s][i], NULL);
+        if (r->dsl[s]) vk->DestroyDescriptorSetLayout(vk->dev, r->dsl[s], NULL);
+    }
+    if (r->vs) vk->DestroyShaderModule(vk->dev, r->vs, NULL);
+    if (r->fs) vk->DestroyShaderModule(vk->dev, r->fs, NULL);
+    free(r);
+}
+
+int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_draw *draws, unsigned nd) {
+    if (!nt || nt > 8 || !nd) return 6;
+    rn_vk_render *p0 = draws[0].pipe;
+    for (unsigned i = 0; i < nt; i++) {
+        if (!targets[i].image || !targets[i].image->color || targets[i].image->w != targets[0].image->w || targets[i].image->h != targets[0].image->h) return 6;
+    }
+    for (unsigned d = 0; d < nd; d++) {
+        const rn_vk_render *p = draws[d].pipe;
+        if (!p || p->nt != nt) return 5;
+        for (unsigned i = 0; i < nt; i++) if (p->fmts[i] != targets[i].image->fmt) return 5;
+    }
+    const uint32_t W = targets[0].image->w, H = targets[0].image->h;
+    int rc = 2;
+    VkDescriptorPool pool = VK_NULL_HANDLE;
+    VkFramebuffer fb = VK_NULL_HANDLE;
+    VkFence fence = VK_NULL_HANDLE;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    VkDescriptorSet *sets = calloc(2 * (size_t)nd, sizeof(*sets));
+    rn_vk_image **in = calloc(8 + (size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*in));
+    rn_vk_image **out = calloc(8 + (size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*out));
+    VkWriteDescriptorSet *w = calloc((size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*w));
+    VkDescriptorBufferInfo *bi = calloc((size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*bi));
+    VkDescriptorImageInfo *ii = calloc((size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*ii));
+    if (!sets || !in || !out || !w || !bi || !ii) goto done;
+    unsigned nin = 0, nout = 0, nw = 0;
+    for (unsigned i = 0; i < nt; i++) { in[nin++] = targets[i].image; out[nout++] = targets[i].image; }
+    // descriptor pool for every set of every draw (a set is written when the commands are recorded, so draws must not share one)
+    uint32_t cnt[4] = {0, 0, 0, 0};
+    for (unsigned d = 0; d < nd; d++)
+        for (int s = 0; s < 2; s++)
+            for (unsigned i = 0; i < draws[d].pipe->n[s]; i++) {
+                const unsigned k = draws[d].pipe->kinds[s][i];
+                cnt[k == RN_VK_BUFFER ? 0 : k == RN_VK_SAMPLED_IMAGE ? 1 : k == RN_VK_STORAGE_IMAGE ? 2 : 3]++;
+            }
+    VkDescriptorPoolSize ps[4];
+    static const VkDescriptorType ty[4] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
+    uint32_t nps = 0;
+    for (int k = 0; k < 4; k++) if (cnt[k]) ps[nps++] = (VkDescriptorPoolSize){ty[k], cnt[k]};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2 * nd, .poolSizeCount = nps, .pPoolSizes = nps ? ps : NULL};
+    if (vk->CreateDescriptorPool(vk->dev, &dpi, NULL, &pool) != VK_SUCCESS) goto done;
+    for (unsigned d = 0; d < nd; d++) {
+        for (int s = 0; s < 2; s++) {
+            const rn_vk_render *p = draws[d].pipe;
+            VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl[s]};
+            if (vk->AllocateDescriptorSets(vk->dev, &dsa, &sets[2 * d + s]) != VK_SUCCESS) goto done;
+            if (!p->n[s]) continue;
+            const rn_vk_arg *args = s ? draws[d].fargs : draws[d].vargs;
+            if (!args) { rc = 6; goto done; }
+            const int fr = fill_writes(vk, p->n[s], p->kinds[s], p->binds[s], p->statics[s], args, sets[2 * d + s], bi + nw, ii + nw, w + nw, in + nin, &nin, out + nout, &nout);
+            if (fr) { rc = fr; goto done; }
+            nw += p->n[s];
+        }
+    }
+    if (nw) vk->UpdateDescriptorSets(vk->dev, nw, w, 0, NULL);
+    VkImageView views[8];
+    for (unsigned i = 0; i < nt; i++) views[i] = targets[i].image->view;
+    VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = p0->rp, .attachmentCount = nt, .pAttachments = views, .width = W, .height = H, .layers = 1};
+    if (vk->CreateFramebuffer(vk->dev, &fbi, NULL, &fb) != VK_SUCCESS) goto done;
+    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) { cb = VK_NULL_HANDLE; goto done; }
+    VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
+    images_in(vk, cb, in, nin);
+    int clears = 0;
+    for (unsigned i = 0; i < nt; i++) clears |= targets[i].clear != 0;
+    VkMemoryBarrier tt = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT};
+    if (clears) {
+        vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &tt, 0, NULL, 0, NULL);
+        for (unsigned i = 0; i < nt; i++) {
+            if (!targets[i].clear) continue;
+            VkClearColorValue cc;
+            memcpy(cc.float32, targets[i].color, sizeof(cc.float32));
+            VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
+        }
+    }
+    VkMemoryBarrier toGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+                             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                           0, 1, &toGfx, 0, NULL, 0, NULL);
+    VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = p0->rp, .framebuffer = fb, .renderArea = {{0, 0}, {W, H}}};
+    vk->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    for (unsigned d = 0; d < nd; d++) {
+        const rn_vk_draw *dr = &draws[d];
+        vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pipe);
+        vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 0, 2, &sets[2 * d], 0, NULL);
+        // Metal's clip space is y-up, Vulkan's y-down: the viewport is flipped (origin at the bottom, negative height)
+        const double *v = dr->viewport;
+        VkViewport vp = dr->has_viewport ? (VkViewport){(float)v[0], (float)(v[1] + v[3]), (float)v[2], (float)-v[3], (float)v[4], (float)v[5]} : (VkViewport){0, (float)H, (float)W, -(float)H, 0.0f, 1.0f};
+        VkRect2D sc = dr->has_scissor ? (VkRect2D){{(int32_t)dr->scissor[0], (int32_t)dr->scissor[1]}, {dr->scissor[2], dr->scissor[3]}} : (VkRect2D){{0, 0}, {W, H}};
+        vk->CmdSetViewport(cb, 0, 1, &vp);
+        vk->CmdSetScissor(cb, 0, 1, &sc);
+        vk->CmdDraw(cb, dr->vertex_count, dr->instance_count ? dr->instance_count : 1, dr->first_vertex, dr->first_instance);
+    }
+    vk->CmdEndRenderPass(cb);
+    VkMemoryBarrier fromGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                               .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fromGfx, 0, NULL, 0, NULL);
+    images_out(vk, cb, out, nout);
+    if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto done;
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    if (vk->QueueSubmit(vk->queue, 1, &si, fence) != VK_SUCCESS) goto done;
+    rc = vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 8000000000ull) == VK_SUCCESS ? 0 : 3;
+done:
+    if (fence) vk->DestroyFence(vk->dev, fence, NULL);
+    if (cb) vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
+    if (fb) vk->DestroyFramebuffer(vk->dev, fb, NULL);
+    if (pool) vk->DestroyDescriptorPool(vk->dev, pool, NULL);
+    free(sets); free(in); free(out); free(w); free(bi); free(ii);
+    return rc;
 }

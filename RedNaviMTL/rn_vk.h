@@ -74,6 +74,33 @@ int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, const voi
 int rn_vk_dispatch_threads(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, const uint32_t threads[3], const uint32_t tpt[3]);
 uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk);
 
+// Render pipelines and render passes (docs/M6_METAL_ON_RADV.md). The vertex module is in descriptor set 0 and the fragment module in set 1 (RedNaviMTL/rn_air.h); the vertex input is
+// empty (shaders read vertices from buffers with the vertex index), no culling, no depth, no blending, one sample. The viewport is flipped to Metal's y-up clip space: the
+// translated vertex shaders write Position as Metal has it and Vulkan's clip space is y-down, so the viewport gets a negative height.
+typedef struct rn_vk_render rn_vk_render;
+typedef struct {
+    const uint32_t *vs; size_t vs_bytes;
+    const uint32_t *fs; size_t fs_bytes;
+    unsigned nvbind; const rn_vk_binding *vbinds;      // vertex module resources (set 0)
+    unsigned nfbind; const rn_vk_binding *fbinds;      // fragment module resources (set 1)
+    unsigned ntargets; int target_formats[8];          // RN_VK_* of each colour attachment
+    unsigned topology;                                 // 0 points, 1 lines, 2 line strip, 3 triangles, 4 triangle strip
+} rn_vk_render_desc;
+rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d);   // NULL: RADV refused it
+void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
+
+typedef struct { rn_vk_image *image; int clear; float color[4]; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded
+typedef struct {
+    rn_vk_render *pipe;
+    const rn_vk_arg *vargs, *fargs;                    // one per binding of the vertex and fragment module
+    int has_viewport; double viewport[6];              // x, y, width, height, znear, zfar (Metal's); default: the whole target
+    int has_scissor; uint32_t scissor[4];              // x, y, width, height; default: the whole target
+    uint32_t first_vertex, vertex_count, instance_count, first_instance;
+} rn_vk_draw;
+// One render pass over the targets with the draws in order, submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
+// offset is wrong). The targets' host copies are current afterwards.
+int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_draw *draws, unsigned ndraws);
+
 // The test of tools/mtl_init_harness: the compute shader of mesa-bridge/test/vk_dispatch.comp (v[i] = i * 3 + 7, 64 invocations per group). Prints to stderr, returns 0 when every value is right.
 int rn_vk_selftest(const char *dir);
 

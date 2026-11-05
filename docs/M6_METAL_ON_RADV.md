@@ -73,6 +73,26 @@ Limits: 2D, one level, one sample, a dozen pixel formats (`rn_vk_format_of` in `
 
 Distribution debt: `llvm-dis` and `libLLVM.dylib` (124 MB) must go before release; options are a bitcode reader in Rust or a static subset of LLVM.
 
+## Render encoder: triangles into a texture (done, V, 2026-11-05)
+
+`RedNaviMTLRenderCommandEncoder` draws into 2D textures through the official Metal API on RADV. Test (`tools/mtl_init_harness`, `RN_TRI_TEST`, shaders `mesa-bridge/test/vk_tri.metal`): a 40 x 24 RGBA8 target cleared to grey, one triangle in the top-left quadrant of Metal's clip space with a different colour at each corner, the vertices read from buffers with `[[vertex_id]]`. Verified: 118 of the quadrant's 240 pixels drawn (a half is about 120), the three corners red, green and blue with the interpolated values the barycentric coordinates give (38 185 32 at one probe), nothing outside the quadrant, the bottom-left and bottom-right still grey (so the image is not flipped). The earlier compute, texture and AIR tests still pass.
+
+What the translator does for vertex and fragment functions (read off its output, not assumed; the step that settled the design):
+
+- **Descriptor sets collide.** Both stages default to set 0 and the buffer band 0-31, so vertex `buffer(0)` and fragment `buffer(0)` would be the same binding. `rn-capi` translates the fragment function with a descriptor layout in set 1 (`TransformOptions::with_descriptor_layout`); sets 2 and 3 are the translator's own (bindless heap, input attachments). The pipeline layout has the vertex set at 0 and the fragment set at 1.
+- **Varyings** meet by `Location`, derived from the names: vertex output and fragment input both came out at location 0 in two independent translations. Not verified with several varyings or differently ordered structs.
+- **Clip space.** The vertex shader stores `Position` as written, no y flip. Vulkan's clip space is y-down, so the host sets the viewport with origin at the bottom and a negative height (core Vulkan 1.1). The fragment shader uses `OriginUpperLeft`, which matches Metal's fragment position.
+- Vertex modules declare the Int64 capability; the device is created with `shaderInt64`, `vertexPipelineStoresAndAtomics` and `fragmentStoresAndAtomics` when the card has them. The queue family now has to do graphics as well as compute.
+
+How it is built: `rn_air_translate_stage` (vertex 1, fragment 2); `rn_vk_render_create` makes a classic render pass (every attachment loaded and stored, always in `GENERAL`, clears done with `vkCmdClearColorImage` before the pass) and a graphics pipeline with an empty vertex input, dynamic viewport and scissor, no culling, no depth, no blending, one sample. Vulkan fixes the topology in the pipeline and Metal passes it with the draw, so a pipeline is made per primitive type on first use. `rn_vk_render_pass` writes the descriptor sets of every draw from a per-pass pool, copies what the host wrote in, runs the draws, and copies the targets back to their host copies. In `compute.m` the command buffer keeps compute dispatches and render passes in one ordered list (they run synchronously at commit).
+
+Limits (what is refused or ignored; the render encoder and the command queue exist only in processes with `RN_METAL_COMPUTE` set, so WindowServer is not affected):
+
+- Vertex functions with `[[stage_in]]` attributes are refused (no vertex descriptors yet): vertices have to come from buffers.
+- No depth or stencil, no blending (logged and ignored), no culling or winding state (culling is always off), no indexed draws, no indirect draws, no multisampling, no tessellation.
+- A render pass with no draws does not apply its clear. Store actions are ignored (the target is always stored). Only textures made by this plug-in are render targets.
+- Not verified: several draws or passes in one command buffer, instancing, fragment textures and samplers in a render pass, more than one colour attachment, line and point topologies, runtime `MTLSamplerState` in a render pass.
+
 ## Order of work
 
 1. **Queue, command buffer, compute encoder, buffer** (smallest slice that runs something). `RedNaviMTLCommandQueue` (subclass of `MTLIOAccelCommandQueue`, init by

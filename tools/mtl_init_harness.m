@@ -74,6 +74,70 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            if (getenv("RN_TRI_TEST")) {
+                // A render pipeline from a .metallib (mesa-bridge/test/vk_tri.metal) through the official API: a 40 x 24 RGBA8 target cleared to grey, one triangle in the top-left
+                // quadrant of Metal's clip space (x from -1 to 0, y from 0 to 1: pixels x < 20, y < 12, a different colour at each corner). The asserts catch a flipped image (the bottom-left
+                // must stay grey), varyings that do not meet (the colours) and anything drawn outside the triangle's quadrant.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_TRI_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 50; }
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+                pd.fragmentFunction = [lib newFunctionWithName:@"tri_fragment"];
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                printf("render pipeline %p, error: %s\n", (__bridge void *)rps, e ? e.localizedDescription.UTF8String : "none");
+                if (!rps) return 51;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:40 height:24 mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                id<MTLTexture> target = [d newTextureWithDescriptor:td];
+                if (!target) { printf("no target texture\n"); return 52; }
+                const float pos[3][4] = {{-1, 1, 0, 1}, {0, 1, 0, 1}, {-1, 0, 0, 1}};
+                const float col[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};
+                const float tint[4] = {1, 1, 1, 1};
+                MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                rpd.colorAttachments[0].texture = target;
+                rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1.0);
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                if (!enc) { printf("no render encoder\n"); return 53; }
+                [enc setRenderPipelineState:rps];
+                [enc setVertexBytes:pos length:sizeof(pos) atIndex:0];
+                [enc setVertexBytes:col length:sizeof(col) atIndex:1];
+                [enc setFragmentBytes:tint length:sizeof(tint) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [enc endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                uint8_t px[40 * 24 * 4];
+                [target getBytes:px bytesPerRow:40 * 4 fromRegion:MTLRegionMake2D(0, 0, 40, 24) mipmapLevel:0];
+                #define PX(x, y) (px + ((y) * 40 + (x)) * 4)
+                int bad = 0, inTri = 0;
+                for (int y = 0; y < 24; y++) for (int x = 0; x < 40; x++) {
+                    const uint8_t *p = PX(x, y);
+                    const int grey = p[0] == 51 && p[1] == 51 && p[2] == 51 && p[3] == 255;
+                    if (!grey) inTri++;
+                    if (!grey && (x >= 20 || y >= 12)) { if (bad < 5) printf("  drawn outside the quadrant: (%d,%d) = %u %u %u %u\n", x, y, p[0], p[1], p[2], p[3]); bad++; }
+                }
+                const uint8_t *a = PX(2, 1), *b = PX(14, 1), *c = PX(2, 9), *far = PX(39, 23), *bl = PX(2, 22);
+                printf("status %ld, error %s; %d pixels differ from the clear colour (a half of the 20 x 12 quadrant is about 120)\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none", inTri);
+                printf("near the red corner (2,1): %u %u %u; near green (14,1): %u %u %u; near blue (2,9): %u %u %u; bottom-right: %u %u %u; bottom-left: %u %u %u\n",
+                       a[0], a[1], a[2], b[0], b[1], b[2], c[0], c[1], c[2], far[0], far[1], far[2], bl[0], bl[1], bl[2]);
+                int fails = bad;
+                if (!(a[0] > 180 && a[1] < 70 && a[2] < 70)) { printf("  FAIL: the red corner is not red\n"); fails++; }
+                if (!(b[1] > 140 && b[0] < 110 && b[2] < 110)) { printf("  FAIL: the green corner is not green\n"); fails++; }
+                if (!(c[2] > 140 && c[0] < 110 && c[1] < 110)) { printf("  FAIL: the blue corner is not blue\n"); fails++; }
+                if (!(far[0] == 51 && far[1] == 51 && far[2] == 51)) { printf("  FAIL: the bottom-right is not the clear colour\n"); fails++; }
+                if (!(bl[0] == 51 && bl[1] == 51 && bl[2] == 51)) { printf("  FAIL: the bottom-left is not the clear colour (image flipped?)\n"); fails++; }
+                if (inTri < 100 || inTri > 140) { printf("  FAIL: the triangle covers %d pixels, not about 120\n", inTri); fails++; }
+                printf("render encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

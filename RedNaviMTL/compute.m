@@ -260,6 +260,37 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 - (BOOL)supportsIndirectCommandBuffers { return NO; }
 @end
 
+// The resources a Metal encoder has bound, turned into the rn_vk arguments of a pipeline's bindings (compute, vertex and fragment stages all use it). Returns an error text or nil.
+// setBytes data becomes a small buffer that is kept in `temps` until the work is done.
+static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kind, const unsigned *mi, RedNaviMTLBuffer *const *bufs, const uint64_t *offs, NSData *const *bytesAt,
+                              RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps) {
+    for (unsigned i = 0; i < n; i++) {
+        const unsigned m = mi[i];
+        switch (kind[i]) {
+        case RN_VK_BUFFER:
+            if (m < 16 && bufs[m]) { av[i].buffer = bufs[m]->b; av[i].offset = offs[m]; break; }
+            if (m < 16 && bytesAt[m]) {
+                RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:bytesAt[m].length options:0];
+                if (!t) return @"no memory for constant data";
+                memcpy(rn_vk_buffer_contents(t->b), bytesAt[m].bytes, bytesAt[m].length);
+                [temps addObject:t];
+                av[i].buffer = t->b;
+                break;
+            }
+            return [NSString stringWithFormat:@"no buffer bound at index %u", m];
+        case RN_VK_SAMPLED_IMAGE:
+        case RN_VK_STORAGE_IMAGE:
+            if (m < 16 && texs[m]) { av[i].image = texs[m]->img; break; }
+            return [NSString stringWithFormat:@"no texture bound at index %u", m];
+        case RN_VK_SAMPLER:
+            if (m < 16 && samps[m]) { av[i].sampler = samps[m]->s; break; }
+            return [NSString stringWithFormat:@"no sampler state bound at index %u", m];
+        default: break;
+        }
+    }
+    return nil;
+}
+
 // One recorded dispatch.
 @interface RNDispatch : NSObject {
 @public
@@ -275,6 +306,81 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 }
 @end
 @implementation RNDispatch
+@end
+
+// ---------------------------------------------------------------------------------------------------------------------------------------- render pipelines and passes
+
+// A render pipeline: the translated modules and their bindings are kept, the Vulkan pipeline is made per primitive type (Vulkan fixes the topology in the pipeline, Metal passes it
+// with the draw); the triangle list is made at once so that a module RADV refuses is found when the state is created.
+@interface RedNaviMTLRenderPipelineState : NSObject {
+@public
+    NSData *spv[2];                                 // vertex, fragment
+    unsigned n[2], kind[2][RN_VK_MAX_BINDINGS], mi[2][RN_VK_MAX_BINDINGS];
+    rn_vk_binding binds[2][RN_VK_MAX_BINDINGS];
+    rn_vk_sampler_desc sampl[2][RN_VK_MAX_BINDINGS];
+    unsigned nt;
+    int tfmt[8];
+    rn_vk_render *byPrim[5];
+    id<MTLDevice> dev;
+    NSString *label_;
+}
+- (rn_vk_render *)renderForPrimitive:(unsigned)prim;
+@end
+@implementation RedNaviMTLRenderPipelineState
++ (void)load { class_addProtocol(self, @protocol(MTLRenderPipelineState)); }
+- (void)dealloc { for (int i = 0; i < 5; i++) if (byPrim[i]) rn_vk_render_destroy(rn_vk_shared(), byPrim[i]); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return 0; }
+- (BOOL)threadgroupSizeMatchesTileSize { return NO; }
+- (NSUInteger)imageblockSampleLength { return 0; }
+- (BOOL)supportsIndirectCommandBuffers { return NO; }
+- (rn_vk_render *)renderForPrimitive:(unsigned)prim {
+    if (prim > 4) return NULL;
+    if (byPrim[prim]) return byPrim[prim];
+    rn_vk *vk = rn_vk_shared();
+    if (!vk) return NULL;
+    rn_vk_render_desc d;
+    memset(&d, 0, sizeof(d));
+    d.vs = spv[0].bytes; d.vs_bytes = spv[0].length; d.fs = spv[1].bytes; d.fs_bytes = spv[1].length;
+    d.nvbind = n[0]; d.vbinds = binds[0]; d.nfbind = n[1]; d.fbinds = binds[1];
+    d.ntargets = nt; d.topology = prim;
+    for (unsigned i = 0; i < nt; i++) d.target_formats[i] = tfmt[i];
+    byPrim[prim] = rn_vk_render_create(vk, &d);
+    return byPrim[prim];
+}
+@end
+
+// One recorded draw: the pipeline and what was bound to each stage at that time.
+@interface RNDraw : NSObject {
+@public
+    RedNaviMTLRenderPipelineState *pso;
+    RedNaviMTLBuffer *bufs[2][16];
+    uint64_t offs[2][16];
+    NSData *bytesAt[2][16];
+    RedNaviMTLTexture *texs[2][16];
+    RedNaviMTLSamplerState *samps[2][16];
+    BOOL hasViewport, hasScissor;
+    double viewport[6];
+    uint32_t scissor[4];
+    unsigned prim, vertexStart, vertexCount, instanceCount, baseInstance;
+}
+@end
+@implementation RNDraw
+@end
+
+// A render pass: its colour attachments with their load actions and the draws, run when the command buffer is committed.
+@interface RNRenderPass : NSObject {
+@public
+    RedNaviMTLTexture *tex[8];
+    BOOL clear[8];
+    float clearColor[8][4];
+    unsigned nt;
+    NSMutableArray<RNDraw *> *draws;
+}
+@end
+@implementation RNRenderPass
 @end
 
 @class RedNaviMTLCommandBuffer;
@@ -299,7 +405,7 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 @public
     id<MTLCommandQueue> queue;
     id<MTLDevice> dev;
-    NSMutableArray<RNDispatch *> *records;
+    NSMutableArray *records;                    // RNDispatch and RNRenderPass in the order they were encoded
     NSMutableArray *completed, *scheduled;
     MTLCommandBufferStatus st;
     NSError *err;
@@ -307,6 +413,8 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
     dispatch_semaphore_t done;
 }
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d;
+- (void)runRenderPass:(RNRenderPass *)rp;
+- (void)fail:(NSString *)why;
 @end
 
 @implementation RedNaviMTLComputeCommandEncoder
@@ -380,6 +488,86 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 - (void)popDebugGroup {}
 @end
 
+
+@interface RedNaviMTLRenderCommandEncoder : NSObject {
+    RedNaviMTLCommandBuffer *cb;
+    RNRenderPass *pass;
+    RedNaviMTLRenderPipelineState *pso;
+    RedNaviMTLBuffer *bufs[2][16];
+    uint64_t offs[2][16];
+    NSData *bytesAt[2][16];
+    RedNaviMTLTexture *texs[2][16];
+    RedNaviMTLSamplerState *samps[2][16];
+    BOOL hasViewport, hasScissor;
+    double viewport[6];
+    uint32_t scissor[4];
+    NSString *label_;
+    BOOL ended;
+}
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c pass:(RNRenderPass *)p;
+@end
+@implementation RedNaviMTLRenderCommandEncoder
++ (void)load { class_addProtocol(self, @protocol(MTLRenderCommandEncoder)); class_addProtocol(self, @protocol(MTLCommandEncoder)); }
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c pass:(RNRenderPass *)p { if ((self = [super init])) { cb = c; pass = p; } return self; }
+- (id<MTLDevice>)device { return cb->dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { pso = (RedNaviMTLRenderPipelineState *)state; }
+- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (i < 16) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
+- (void)bindBytes:(const void *)bytes length:(NSUInteger)len index:(NSUInteger)i stage:(int)st { if (i < 16) { bytesAt[st][i] = [NSData dataWithBytes:bytes length:len]; bufs[st][i] = nil; } }
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:0]; }
+- (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
+    for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:0];
+}
+- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (index < 16) offs[0][index] = offset; }
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:0]; }
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:1]; }
+- (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
+    for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:1];
+}
+- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (index < 16) offs[1][index] = offset; }
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:1]; }
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[0][i] = (RedNaviMTLTexture *)t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[1][i] = (RedNaviMTLTexture *)t; }
+- (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexTexture:t[i] atIndex:r.location + i]; }
+- (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentTexture:t[i] atIndex:r.location + i]; }
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < 16) samps[0][i] = (RedNaviMTLSamplerState *)s; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < 16) samps[1][i] = (RedNaviMTLSamplerState *)s; }
+- (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexSamplerState:s[i] atIndex:r.location + i]; }
+- (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentSamplerState:s[i] atIndex:r.location + i]; }
+- (void)setViewport:(MTLViewport)v {
+    hasViewport = YES;
+    viewport[0] = v.originX; viewport[1] = v.originY; viewport[2] = v.width; viewport[3] = v.height; viewport[4] = v.znear; viewport[5] = v.zfar;
+}
+- (void)setScissorRect:(MTLScissorRect)r { hasScissor = YES; scissor[0] = (uint32_t)r.x; scissor[1] = (uint32_t)r.y; scissor[2] = (uint32_t)r.width; scissor[3] = (uint32_t)r.height; }
+// state that is not implemented yet is logged once and ignored: culling is off, there is no depth test and no blending
+- (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
+- (void)setCullMode:(MTLCullMode)m { if (m != MTLCullModeNone) [self ignored:"cull mode"]; }
+- (void)setFrontFacingWinding:(MTLWinding)w {}
+- (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) [self ignored:"triangle fill mode"]; }
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s { [self ignored:"depth stencil state"]; }
+- (void)setDepthBias:(float)d slopeScale:(float)s clamp:(float)c {}
+- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { [self ignored:"blend color"]; }
+- (void)setStencilReferenceValue:(uint32_t)v {}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base {
+    if (!pso) { rn_log("draw without a render pipeline state"); return; }
+    RNDraw *d = [RNDraw new];
+    d->pso = pso;
+    for (int s = 0; s < 2; s++) for (int i = 0; i < 16; i++) { d->bufs[s][i] = bufs[s][i]; d->offs[s][i] = offs[s][i]; d->bytesAt[s][i] = bytesAt[s][i]; d->texs[s][i] = texs[s][i]; d->samps[s][i] = samps[s][i]; }
+    d->hasViewport = hasViewport; memcpy(d->viewport, viewport, sizeof(viewport));
+    d->hasScissor = hasScissor; memcpy(d->scissor, scissor, sizeof(scissor));
+    d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
+    [pass->draws addObject:d];
+}
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances { [self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:instances baseInstance:0]; }
+- (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count { [self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:1 baseInstance:0]; }
+- (void)endEncoding { if (ended) return; ended = YES; [cb->records addObject:pass]; }
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)a beforeStages:(MTLRenderStages)b {}
+- (void)insertDebugSignpost:(NSString *)string {}
+- (void)pushDebugGroup:(NSString *)string {}
+- (void)popDebugGroup {}
+@end
+
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d {
@@ -410,7 +598,53 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder { return (id)[[RedNaviMTLComputeCommandEncoder alloc] initWithCommandBuffer:self]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t { return [self computeCommandEncoder]; }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder { rn_log("blitCommandEncoder: not implemented, nil"); return nil; }
-- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { rn_log("renderCommandEncoder: not implemented, nil"); return nil; }
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+    RNRenderPass *rp = [RNRenderPass new];
+    rp->draws = [NSMutableArray new];
+    for (NSUInteger i = 0; i < 8; i++) {
+        MTLRenderPassColorAttachmentDescriptor *ca = d.colorAttachments[i];
+        if (!ca.texture) break;
+        if (![ca.texture isKindOfClass:[RedNaviMTLTexture class]]) { rn_log("renderCommandEncoder: attachment %lu is not a RedNavi texture", (unsigned long)i); return nil; }
+        rp->tex[i] = (RedNaviMTLTexture *)ca.texture;
+        rp->clear[i] = ca.loadAction == MTLLoadActionClear;
+        rp->clearColor[i][0] = (float)ca.clearColor.red; rp->clearColor[i][1] = (float)ca.clearColor.green; rp->clearColor[i][2] = (float)ca.clearColor.blue; rp->clearColor[i][3] = (float)ca.clearColor.alpha;
+        rp->nt = (unsigned)i + 1;
+    }
+    if (!rp->nt) { rn_log("renderCommandEncoder: no colour attachment (depth-only passes are not implemented)"); return nil; }
+    if (d.depthAttachment.texture || d.stencilAttachment.texture) rn_log("renderCommandEncoder: depth and stencil attachments are not implemented, ignored");
+    return (id)[[RedNaviMTLRenderCommandEncoder alloc] initWithCommandBuffer:self pass:rp];
+}
+- (void)runRenderPass:(RNRenderPass *)rp {
+    rn_vk *vk = rn_vk_shared();
+    const NSUInteger nd = rp->draws.count;
+    if (!nd) { rn_log("render pass without draws: its clears are not applied (not implemented)"); return; }
+    rn_vk_target tg[8];
+    for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}}; }
+    rn_vk_draw *dr = calloc(nd, sizeof(*dr));
+    rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*va));
+    rn_vk_arg (*fa)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*fa));
+    NSMutableArray *temps = [NSMutableArray new];
+    NSString *bad = (dr && va && fa) ? nil : @"out of memory";
+    for (NSUInteger k = 0; k < nd && !bad; k++) {
+        RNDraw *d = rp->draws[k];
+        RedNaviMTLRenderPipelineState *p = d->pso;
+        rn_vk_render *r = [p renderForPrimitive:d->prim];
+        if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
+        bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
+        if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps);
+        dr[k] = (rn_vk_draw){.pipe = r, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
+                             .instance_count = d->instanceCount, .first_instance = d->baseInstance};
+        memcpy(dr[k].viewport, d->viewport, sizeof(dr[k].viewport));
+        memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
+    }
+    int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
+    free(dr); free(va); free(fa);
+    if (bad) [self fail:bad];
+    else if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
+    else if (rc == 5) [self fail:@"the render pipeline does not match the attachments of the pass"];
+    else if (rc == 6) [self fail:@"a resource of the render pipeline is missing or cannot be used as bound"];
+    else if (rc) [self fail:[NSString stringWithFormat:@"render pass failed (%d)", rc]];
+}
 - (void)fail:(NSString *)why {
     rn_log("command buffer failed: %s", why.UTF8String);
     err = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal userInfo:@{NSLocalizedDescriptionKey: why}];
@@ -423,41 +657,16 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
     for (MTLCommandBufferHandler h in scheduled) h((id)self);
     rn_vk *vk = rn_vk_shared();
     if (!vk) [self fail:@"RADV is not available"];
-    for (RNDispatch *d in records) {
+    for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
+        if ([rec isKindOfClass:[RNRenderPass class]]) { [self runRenderPass:rec]; continue; }
+        RNDispatch *d = rec;
         RedNaviMTLComputePipelineState *p = d->pso;
         rn_vk_arg av[RN_VK_MAX_BINDINGS];
         memset(av, 0, sizeof(av));
         NSMutableArray *temps = [NSMutableArray new];       // buffers made from setBytes data, alive until the dispatch is done
-        for (unsigned i = 0; i < p->nbind; i++) {
-            const unsigned mi = p->metalIndex[i];
-            switch (p->kind[i]) {
-            case RN_VK_BUFFER:
-                if (mi < 16 && d->bufs[mi]) { av[i].buffer = d->bufs[mi]->b; av[i].offset = d->offs[mi]; break; }
-                if (mi < 16 && d->bytesAt[mi]) {
-                    RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[mi].length options:0];
-                    if (!t) { [self fail:@"no memory for constant data"]; break; }
-                    memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[mi].bytes, d->bytesAt[mi].length);
-                    [temps addObject:t];
-                    av[i].buffer = t->b;
-                    break;
-                }
-                [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", mi]];
-                break;
-            case RN_VK_SAMPLED_IMAGE:
-            case RN_VK_STORAGE_IMAGE:
-                if (mi < 16 && d->texs[mi]) av[i].image = d->texs[mi]->img;
-                else [self fail:[NSString stringWithFormat:@"no texture bound at index %u", mi]];
-                break;
-            case RN_VK_SAMPLER:
-                if (mi < 16 && d->samps[mi]) av[i].sampler = d->samps[mi]->s;
-                else [self fail:[NSString stringWithFormat:@"no sampler state bound at index %u", mi]];
-                break;
-            default: break;
-            }
-            if (st == MTLCommandBufferStatusError) break;
-        }
-        if (st == MTLCommandBufferStatusError) break;
+        NSString *bad = rn_bind_args(dev, p->nbind, p->kind, p->metalIndex, d->bufs, d->offs, d->bytesAt, d->texs, d->samps, av, temps);
+        if (bad) { [self fail:bad]; break; }
         const uint32_t groups[3] = {(uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth};
         const uint32_t local[3] = {(uint32_t)d->tpt.width, (uint32_t)d->tpt.height, (uint32_t)d->tpt.depth};
         const uint32_t grid[3] = {(uint32_t)d->threads.width, (uint32_t)d->threads.height, (uint32_t)d->threads.depth};
@@ -619,6 +828,64 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
     return nil;
 }
 
+// A render pipeline state from a descriptor: both functions go to the translator (vertex module in set 0, fragment module in set 1) and the Vulkan pipeline for triangles is built.
+static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error) {
+    NSString *why = nil;
+    RedNaviMTLFunction *fn[2] = {(RedNaviMTLFunction *)desc.vertexFunction, (RedNaviMTLFunction *)desc.fragmentFunction};
+    rn_vk *vk = rn_vk_shared();
+    RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
+    if (!vk) why = @"RADV is not available";
+    else if (!fn[0] || !fn[1]) why = @"a render pipeline needs a vertex and a fragment function";
+    else for (int s = 0; s < 2 && !why; s++) {
+        if (![fn[s] isKindOfClass:[RedNaviMTLFunction class]]) { why = @"the function is not from a RedNavi library"; break; }
+        if (fn[s]->type != (s ? MTLFunctionTypeFragment : MTLFunctionTypeVertex)) { why = @"the function has the wrong type for its stage"; break; }
+        char err[300] = "";
+        uint32_t *spv = NULL;
+        size_t spvBytes = 0;
+        rn_air_kernel_info info;
+        memset(&info, 0, sizeof(info));
+        if (rn_air_translate_stage(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
+            why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
+            break;
+        }
+        p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
+        rn_air_free(spv, spvBytes);
+        unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
+        p->n[s] = n;
+        for (unsigned i = 0; i < n; i++) {
+            const rn_air_binding *ab = &info.bindings[i];
+            p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind, NULL};
+            p->kind[s][i] = ab->kind;
+            p->mi[s][i] = ab->metal_index;
+            if (ab->kind == RN_AIR_STATIC_SAMPLER) {
+                p->sampl[s][i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
+                p->binds[s][i].sampler = &p->sampl[s][i];
+            }
+        }
+    }
+    if (!why) {
+        for (NSUInteger i = 0; i < 8; i++) {
+            const MTLPixelFormat pf = desc.colorAttachments[i].pixelFormat;
+            if (pf == MTLPixelFormatInvalid) continue;
+            const int f = rn_vk_format_of(pf);
+            if (!f) { why = [NSString stringWithFormat:@"colour attachment %lu: pixel format %lu is not supported", (unsigned long)i, (unsigned long)pf]; break; }
+            if (i != p->nt) { why = @"colour attachments must be contiguous from 0"; break; }
+            p->tfmt[p->nt++] = f;
+            if (desc.colorAttachments[i].blendingEnabled) rn_log("render pipeline: blending is not implemented, ignored");
+        }
+        if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
+        if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";
+        if (!why && ![p renderForPrimitive:3]) why = @"RADV refused the pipeline";
+    }
+    if (why) {
+        rn_log("render pipeline failed: %s", why.UTF8String);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: why}];
+        return nil;
+    }
+    p->dev = dev;
+    return p;
+}
+
 // Test hook for tools/mtl_library_test.m: a library from data without a device.
 id rn_test_library(NSData *blob, NSError **error) { return [[RedNaviMTLLibrary alloc] initWithDevice:nil data:blob error:error]; }
 
@@ -678,6 +945,43 @@ void rn_compute_install(Class k, Class sup) {
         if (!rn_gate()) return o8 ? o8(self, s8, desc) : 0;
         return (uintptr_t)CFBridgingRetain(rn_new_sampler_state((id<MTLDevice>)self, desc));
     }), m8 ? method_getTypeEncoding(m8) : "@24@0:8@16");
+    // Render pipeline states. Outside the gate everything goes to the superclass.
+    typedef uintptr_t (*imp_desc_err)(id, SEL, id, NSError **);
+    typedef uintptr_t (*imp_desc_opt_refl_err)(id, SEL, id, NSUInteger, void *, NSError **);
+    typedef void (*imp_desc_handler)(id, SEL, id, id);
+    typedef void (*imp_desc_opt_handler)(id, SEL, id, NSUInteger, id);
+    SEL r1 = sel_registerName("newRenderPipelineStateWithDescriptor:error:");
+    Method rm1 = class_getInstanceMethod(sup, r1);
+    imp_desc_err ro1 = rm1 ? (imp_desc_err)method_getImplementation(rm1) : NULL;
+    class_addMethod(k, r1, imp_implementationWithBlock(^uintptr_t(id self, id desc, NSError **error) {
+        if (!rn_gate()) return ro1 ? ro1(self, r1, desc, error) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, error));
+    }), rm1 ? method_getTypeEncoding(rm1) : "@32@0:8@16^@24");
+    SEL r2 = sel_registerName("newRenderPipelineStateWithDescriptor:options:reflection:error:");
+    Method rm2 = class_getInstanceMethod(sup, r2);
+    imp_desc_opt_refl_err ro2 = rm2 ? (imp_desc_opt_refl_err)method_getImplementation(rm2) : NULL;
+    class_addMethod(k, r2, imp_implementationWithBlock(^uintptr_t(id self, id desc, NSUInteger options, void *reflection, NSError **error) {
+        if (!rn_gate()) return ro2 ? ro2(self, r2, desc, options, reflection, error) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, error));
+    }), rm2 ? method_getTypeEncoding(rm2) : "@48@0:8@16Q24^@32^@40");
+    SEL r3 = sel_registerName("newRenderPipelineStateWithDescriptor:completionHandler:");
+    Method rm3 = class_getInstanceMethod(sup, r3);
+    imp_desc_handler ro3 = rm3 ? (imp_desc_handler)method_getImplementation(rm3) : NULL;
+    class_addMethod(k, r3, imp_implementationWithBlock(^void(id self, id desc, void (^handler)(id, NSError *)) {
+        if (!rn_gate()) { if (ro3) ro3(self, r3, desc, handler); return; }
+        NSError *error = nil;
+        id p = rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, &error);
+        handler(p, error);
+    }), rm3 ? method_getTypeEncoding(rm3) : "v32@0:8@16@?24");
+    SEL r4 = sel_registerName("newRenderPipelineStateWithDescriptor:options:completionHandler:");
+    Method rm4 = class_getInstanceMethod(sup, r4);
+    imp_desc_opt_handler ro4 = rm4 ? (imp_desc_opt_handler)method_getImplementation(rm4) : NULL;
+    class_addMethod(k, r4, imp_implementationWithBlock(^void(id self, id desc, NSUInteger options, void (^handler)(id, id, NSError *)) {
+        if (!rn_gate()) { if (ro4) ro4(self, r4, desc, options, (id)handler); return; }
+        NSError *error = nil;
+        id p = rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, &error);
+        handler(p, nil, error);
+    }), rm4 ? method_getTypeEncoding(rm4) : "v40@0:8@16Q24@?32");
     // The private shader entry
     class_addMethod(k, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), imp_implementationWithBlock(^id(id self, NSData *spirv, NSUInteger nbuf, NSUInteger push) {
         rn_vk *vk = rn_gate() ? rn_vk_shared() : NULL;
