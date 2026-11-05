@@ -58,7 +58,7 @@ constexpr bool frameAdvanced(uint32_t earlier, uint32_t later) {
     return ((later - earlier) & kFrameMask) != 0u;
 }
 
-inline Error offset(const Device &d, unsigned pipe, const uint32_t (&regs)[4],
+inline Error offset(const Device &d, unsigned pipe, const uint32_t *regs,
                     uint64_t &byteOffset) {
     if (d.pciDevice != kDevice || d.dcnVersion != kDcnVersion)
         return Error::NotNavi33;
@@ -95,7 +95,7 @@ inline Error snapshot(const Device &d, const Reader &reader,
     };
     for (const ReadOne &r : regs) {
         uint64_t at=0;
-        const Error e = offset(d, pipe, *reinterpret_cast<const uint32_t (*)[4]>(r.regs), at);
+        const Error e = offset(d, pipe, r.regs, at);
         if (e != Error::Ok) return e;
         if (!reader.read32(reader.context, at, r.value)) return Error::ReadFailure;
     }
