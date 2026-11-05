@@ -75,9 +75,14 @@ int rn_vk_dispatch_threads(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, c
 uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk);
 
 // Render pipelines and render passes (docs/M6_METAL_ON_RADV.md). The vertex module is in descriptor set 0 and the fragment module in set 1 (RedNaviMTL/rn_air.h); the vertex input is
-// empty (shaders read vertices from buffers with the vertex index), no culling, no depth, no blending, one sample. The viewport is flipped to Metal's y-up clip space: the
+// empty unless the desc gives attributes (shaders may also read vertices from buffers with the vertex index), no culling, no depth, blending as the desc says, one sample. The viewport is flipped to Metal's y-up clip space: the
 // translated vertex shaders write Position as Metal has it and Vulkan's clip space is y-down, so the viewport gets a negative height.
 typedef struct rn_vk_render rn_vk_render;
+// Blend state in Vulkan's numbers (VkBlendFactor, VkBlendOp), a vertex attribute (format is a VkFormat) and a vertex buffer binding (stride 0 is not supported).
+typedef struct { int enabled; unsigned src_rgb, dst_rgb, op_rgb, src_a, dst_a, op_a, write_mask; } rn_vk_blend;
+typedef struct { unsigned location, binding, format, offset; } rn_vk_vattr;
+typedef struct { unsigned binding, stride, per_instance; } rn_vk_vlayout;
+typedef struct { rn_vk_buffer *buffer; uint64_t offset; } rn_vk_vbuf;
 typedef struct {
     const uint32_t *vs; size_t vs_bytes;
     const uint32_t *fs; size_t fs_bytes;
@@ -85,6 +90,9 @@ typedef struct {
     unsigned nfbind; const rn_vk_binding *fbinds;      // fragment module resources (set 1)
     unsigned ntargets; int target_formats[8];          // RN_VK_* of each colour attachment
     unsigned topology;                                 // 0 points, 1 lines, 2 line strip, 3 triangles, 4 triangle strip
+    rn_vk_blend blend[8];                              // per colour attachment; write_mask is Vulkan's (R 1, G 2, B 4, A 8): 15 writes all
+    unsigned nvattr; const rn_vk_vattr *vattrs;        // vertex input of [[stage_in]] functions, locations as the shader declares them
+    unsigned nvlayout; const rn_vk_vlayout *vlayouts;
 } rn_vk_render_desc;
 rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d);   // NULL: RADV refused it
 void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
@@ -96,6 +104,8 @@ typedef struct {
     int has_viewport; double viewport[6];              // x, y, width, height, znear, zfar (Metal's); default: the whole target
     int has_scissor; uint32_t scissor[4];              // x, y, width, height; default: the whole target
     uint32_t first_vertex, vertex_count, instance_count, first_instance;
+    const rn_vk_vbuf *vbufs;                           // 16 entries, by vertex buffer binding (used for the bindings the pipeline declares)
+    int has_blend_color; float blend_color[4];
 } rn_vk_draw;
 // One render pass over the targets with the draws in order, submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
 // offset is wrong). The targets' host copies are current afterwards.

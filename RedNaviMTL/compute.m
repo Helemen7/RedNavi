@@ -312,6 +312,54 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
 
 // A render pipeline: the translated modules and their bindings are kept, the Vulkan pipeline is made per primitive type (Vulkan fixes the topology in the pipeline, Metal passes it
 // with the draw); the triangle list is made at once so that a module RADV refuses is found when the state is created.
+
+// MTLVertexFormat to a VkFormat number (0: not supported). Small integer formats become the "scaled" Vulkan formats (the shader reads floats, as Metal converts them);
+// 32-bit integers stay integers.
+static unsigned rn_vk_vertex_format(MTLVertexFormat f) {
+    switch (f) {
+    case MTLVertexFormatUChar: return 11;           case MTLVertexFormatUChar2: return 18;          case MTLVertexFormatUChar3: return 25;          case MTLVertexFormatUChar4: return 39;
+    case MTLVertexFormatChar: return 12;            case MTLVertexFormatChar2: return 19;           case MTLVertexFormatChar3: return 26;           case MTLVertexFormatChar4: return 40;
+    case MTLVertexFormatUCharNormalized: return 9;  case MTLVertexFormatUChar2Normalized: return 16; case MTLVertexFormatUChar3Normalized: return 23; case MTLVertexFormatUChar4Normalized: return 37;
+    case MTLVertexFormatCharNormalized: return 10;  case MTLVertexFormatChar2Normalized: return 17; case MTLVertexFormatChar3Normalized: return 24; case MTLVertexFormatChar4Normalized: return 38;
+    case MTLVertexFormatUChar4Normalized_BGRA: return 44;
+    case MTLVertexFormatUShort: return 72;          case MTLVertexFormatUShort2: return 79;         case MTLVertexFormatUShort3: return 86;         case MTLVertexFormatUShort4: return 93;
+    case MTLVertexFormatShort: return 73;           case MTLVertexFormatShort2: return 80;          case MTLVertexFormatShort3: return 87;          case MTLVertexFormatShort4: return 94;
+    case MTLVertexFormatUShortNormalized: return 70; case MTLVertexFormatUShort2Normalized: return 77; case MTLVertexFormatUShort3Normalized: return 84; case MTLVertexFormatUShort4Normalized: return 91;
+    case MTLVertexFormatShortNormalized: return 71; case MTLVertexFormatShort2Normalized: return 78; case MTLVertexFormatShort3Normalized: return 85; case MTLVertexFormatShort4Normalized: return 92;
+    case MTLVertexFormatHalf: return 76;            case MTLVertexFormatHalf2: return 83;           case MTLVertexFormatHalf3: return 90;           case MTLVertexFormatHalf4: return 97;
+    case MTLVertexFormatFloat: return 100;          case MTLVertexFormatFloat2: return 103;         case MTLVertexFormatFloat3: return 106;         case MTLVertexFormatFloat4: return 109;
+    case MTLVertexFormatInt: return 99;             case MTLVertexFormatInt2: return 102;           case MTLVertexFormatInt3: return 105;           case MTLVertexFormatInt4: return 108;
+    case MTLVertexFormatUInt: return 98;            case MTLVertexFormatUInt2: return 101;          case MTLVertexFormatUInt3: return 104;          case MTLVertexFormatUInt4: return 107;
+    default: return 0;
+    }
+}
+
+// MTLBlendFactor / MTLBlendOperation / MTLColorWriteMask to Vulkan's values.
+static int rn_vk_blend_factor(MTLBlendFactor f, unsigned *out) {
+    switch (f) {
+    case MTLBlendFactorZero: *out = 0; return 1;                       case MTLBlendFactorOne: *out = 1; return 1;
+    case MTLBlendFactorSourceColor: *out = 2; return 1;                case MTLBlendFactorOneMinusSourceColor: *out = 3; return 1;
+    case MTLBlendFactorDestinationColor: *out = 4; return 1;           case MTLBlendFactorOneMinusDestinationColor: *out = 5; return 1;
+    case MTLBlendFactorSourceAlpha: *out = 6; return 1;                case MTLBlendFactorOneMinusSourceAlpha: *out = 7; return 1;
+    case MTLBlendFactorDestinationAlpha: *out = 8; return 1;           case MTLBlendFactorOneMinusDestinationAlpha: *out = 9; return 1;
+    case MTLBlendFactorBlendColor: *out = 10; return 1;                case MTLBlendFactorOneMinusBlendColor: *out = 11; return 1;
+    case MTLBlendFactorBlendAlpha: *out = 12; return 1;                case MTLBlendFactorOneMinusBlendAlpha: *out = 13; return 1;
+    case MTLBlendFactorSourceAlphaSaturated: *out = 14; return 1;
+    default: return 0;
+    }
+}
+static int rn_vk_blend_op(MTLBlendOperation o, unsigned *out) {
+    switch (o) {
+    case MTLBlendOperationAdd: *out = 0; return 1;                     case MTLBlendOperationSubtract: *out = 1; return 1;
+    case MTLBlendOperationReverseSubtract: *out = 2; return 1;         case MTLBlendOperationMin: *out = 3; return 1;
+    case MTLBlendOperationMax: *out = 4; return 1;
+    default: return 0;
+    }
+}
+static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
+    return ((m & MTLColorWriteMaskRed) ? 1u : 0) | ((m & MTLColorWriteMaskGreen) ? 2u : 0) | ((m & MTLColorWriteMaskBlue) ? 4u : 0) | ((m & MTLColorWriteMaskAlpha) ? 8u : 0);
+}
+
 @interface RedNaviMTLRenderPipelineState : NSObject {
 @public
     NSData *spv[2];                                 // vertex, fragment
@@ -320,6 +368,10 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     rn_vk_sampler_desc sampl[2][RN_VK_MAX_BINDINGS];
     unsigned nt;
     int tfmt[8];
+    rn_vk_blend blend[8];
+    unsigned nvattr, nvlayout;
+    rn_vk_vattr vattr[16];
+    rn_vk_vlayout vlayout[16];
     rn_vk_render *byPrim[5];
     id<MTLDevice> dev;
     NSString *label_;
@@ -346,7 +398,8 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     d.vs = spv[0].bytes; d.vs_bytes = spv[0].length; d.fs = spv[1].bytes; d.fs_bytes = spv[1].length;
     d.nvbind = n[0]; d.vbinds = binds[0]; d.nfbind = n[1]; d.fbinds = binds[1];
     d.ntargets = nt; d.topology = prim;
-    for (unsigned i = 0; i < nt; i++) d.target_formats[i] = tfmt[i];
+    for (unsigned i = 0; i < nt; i++) { d.target_formats[i] = tfmt[i]; d.blend[i] = blend[i]; }
+    d.nvattr = nvattr; d.vattrs = vattr; d.nvlayout = nvlayout; d.vlayouts = vlayout;
     byPrim[prim] = rn_vk_render_create(vk, &d);
     return byPrim[prim];
 }
@@ -361,7 +414,8 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     NSData *bytesAt[2][16];
     RedNaviMTLTexture *texs[2][16];
     RedNaviMTLSamplerState *samps[2][16];
-    BOOL hasViewport, hasScissor;
+    BOOL hasViewport, hasScissor, hasBlendColor;
+    float blendColor[4];
     double viewport[6];
     uint32_t scissor[4];
     unsigned prim, vertexStart, vertexCount, instanceCount, baseInstance;
@@ -498,7 +552,8 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     NSData *bytesAt[2][16];
     RedNaviMTLTexture *texs[2][16];
     RedNaviMTLSamplerState *samps[2][16];
-    BOOL hasViewport, hasScissor;
+    BOOL hasViewport, hasScissor, hasBlendColor;
+    float blendColor[4];
     double viewport[6];
     uint32_t scissor[4];
     NSString *label_;
@@ -540,14 +595,14 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     viewport[0] = v.originX; viewport[1] = v.originY; viewport[2] = v.width; viewport[3] = v.height; viewport[4] = v.znear; viewport[5] = v.zfar;
 }
 - (void)setScissorRect:(MTLScissorRect)r { hasScissor = YES; scissor[0] = (uint32_t)r.x; scissor[1] = (uint32_t)r.y; scissor[2] = (uint32_t)r.width; scissor[3] = (uint32_t)r.height; }
-// state that is not implemented yet is logged once and ignored: culling is off, there is no depth test and no blending
+// state that is not implemented yet is logged once and ignored: culling is off, there is no depth test
 - (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
 - (void)setCullMode:(MTLCullMode)m { if (m != MTLCullModeNone) [self ignored:"cull mode"]; }
 - (void)setFrontFacingWinding:(MTLWinding)w {}
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) [self ignored:"triangle fill mode"]; }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)s { [self ignored:"depth stencil state"]; }
 - (void)setDepthBias:(float)d slopeScale:(float)s clamp:(float)c {}
-- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { [self ignored:"blend color"]; }
+- (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { hasBlendColor = YES; blendColor[0] = r; blendColor[1] = g; blendColor[2] = b; blendColor[3] = a; }
 - (void)setStencilReferenceValue:(uint32_t)v {}
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base {
     if (!pso) { rn_log("draw without a render pipeline state"); return; }
@@ -556,6 +611,7 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     for (int s = 0; s < 2; s++) for (int i = 0; i < 16; i++) { d->bufs[s][i] = bufs[s][i]; d->offs[s][i] = offs[s][i]; d->bytesAt[s][i] = bytesAt[s][i]; d->texs[s][i] = texs[s][i]; d->samps[s][i] = samps[s][i]; }
     d->hasViewport = hasViewport; memcpy(d->viewport, viewport, sizeof(viewport));
     d->hasScissor = hasScissor; memcpy(d->scissor, scissor, sizeof(scissor));
+    d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
     d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
     [pass->draws addObject:d];
 }
@@ -623,8 +679,9 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
     rn_vk_draw *dr = calloc(nd, sizeof(*dr));
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*va));
     rn_vk_arg (*fa)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*fa));
+    rn_vk_vbuf (*vbs)[16] = calloc(nd, sizeof(*vbs));
     NSMutableArray *temps = [NSMutableArray new];
-    NSString *bad = (dr && va && fa) ? nil : @"out of memory";
+    NSString *bad = (dr && va && fa && vbs) ? nil : @"out of memory";
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
@@ -632,13 +689,27 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
         bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
         if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps);
-        dr[k] = (rn_vk_draw){.pipe = r, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
+        for (unsigned i = 0; !bad && i < p->nvlayout; i++) {              // vertex buffers of the vertex descriptor, by buffer index
+            const unsigned bi = p->vlayout[i].binding;
+            if (d->bufs[0][bi]) { vbs[k][bi] = (rn_vk_vbuf){d->bufs[0][bi]->b, d->offs[0][bi]}; continue; }
+            if (d->bytesAt[0][bi]) {
+                RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[0][bi].length options:0];
+                if (!t) { bad = @"no memory for vertex data"; break; }
+                memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[0][bi].bytes, d->bytesAt[0][bi].length);
+                [temps addObject:t];
+                vbs[k][bi] = (rn_vk_vbuf){t->b, 0};
+                continue;
+            }
+            bad = [NSString stringWithFormat:@"no vertex buffer bound at index %u", bi];
+        }
+        dr[k] = (rn_vk_draw){.pipe = r, .vbufs = vbs[k], .has_blend_color = d->hasBlendColor, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
                              .instance_count = d->instanceCount, .first_instance = d->baseInstance};
+        memcpy(dr[k].blend_color, d->blendColor, sizeof(dr[k].blend_color));
         memcpy(dr[k].viewport, d->viewport, sizeof(dr[k].viewport));
         memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
     }
     int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
-    free(dr); free(va); free(fa);
+    free(dr); free(va); free(fa); free(vbs);
     if (bad) [self fail:bad];
     else if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
     else if (rc == 5) [self fail:@"the render pipeline does not match the attachments of the pass"];
@@ -870,8 +941,38 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
             const int f = rn_vk_format_of(pf);
             if (!f) { why = [NSString stringWithFormat:@"colour attachment %lu: pixel format %lu is not supported", (unsigned long)i, (unsigned long)pf]; break; }
             if (i != p->nt) { why = @"colour attachments must be contiguous from 0"; break; }
+            MTLRenderPipelineColorAttachmentDescriptor *ca = desc.colorAttachments[i];
+            rn_vk_blend *bl = &p->blend[p->nt];
+            bl->write_mask = rn_vk_write_mask(ca.writeMask);
+            if (ca.blendingEnabled) {
+                bl->enabled = 1;
+                if (!rn_vk_blend_factor(ca.sourceRGBBlendFactor, &bl->src_rgb) || !rn_vk_blend_factor(ca.destinationRGBBlendFactor, &bl->dst_rgb) ||
+                    !rn_vk_blend_factor(ca.sourceAlphaBlendFactor, &bl->src_a) || !rn_vk_blend_factor(ca.destinationAlphaBlendFactor, &bl->dst_a) ||
+                    !rn_vk_blend_op(ca.rgbBlendOperation, &bl->op_rgb) || !rn_vk_blend_op(ca.alphaBlendOperation, &bl->op_a)) { why = @"a blend factor or operation is not supported"; break; }
+            } else {
+                bl->src_rgb = bl->src_a = 1;                       // Vulkan wants valid values even when blending is off
+            }
             p->tfmt[p->nt++] = f;
-            if (desc.colorAttachments[i].blendingEnabled) rn_log("render pipeline: blending is not implemented, ignored");
+        }
+        // The vertex descriptor of [[stage_in]] vertex functions: layouts[i] is vertex buffer index i, attribute n is the shader's [[attribute(n)]].
+        MTLVertexDescriptor *vd = desc.vertexDescriptor;
+        for (NSUInteger i = 0; vd && !why && i < 16; i++) {
+            MTLVertexAttributeDescriptor *a = vd.attributes[i];
+            if (a.format == MTLVertexFormatInvalid) continue;
+            const unsigned vf = rn_vk_vertex_format(a.format);
+            if (!vf) { why = [NSString stringWithFormat:@"vertex attribute %lu: format %lu is not supported", (unsigned long)i, (unsigned long)a.format]; break; }
+            if (a.bufferIndex >= 16) { why = @"a vertex buffer index is 16 or more"; break; }
+            p->vattr[p->nvattr++] = (rn_vk_vattr){(unsigned)i, (unsigned)a.bufferIndex, vf, (unsigned)a.offset};
+        }
+        for (NSUInteger i = 0; vd && !why && i < 16; i++) {
+            MTLVertexBufferLayoutDescriptor *l = vd.layouts[i];
+            BOOL used = NO;
+            for (unsigned k = 0; k < p->nvattr; k++) if (p->vattr[k].binding == i) used = YES;
+            if (!used) continue;
+            if (l.stepFunction != MTLVertexStepFunctionPerVertex && l.stepFunction != MTLVertexStepFunctionPerInstance) { why = @"this vertex step function is not supported"; break; }
+            if (l.stepFunction == MTLVertexStepFunctionPerInstance && l.stepRate != 1) { why = @"a vertex step rate other than 1 is not supported"; break; }
+            if (l.stride == 0) { why = @"a vertex buffer layout with stride 0 is not supported"; break; }
+            p->vlayout[p->nvlayout++] = (rn_vk_vlayout){(unsigned)i, (unsigned)l.stride, l.stepFunction == MTLVertexStepFunctionPerInstance};
         }
         if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
         if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";

@@ -13,6 +13,7 @@
 #include "../mesa-bridge/test/vk_dispatch_spv.h"
 #include "../mesa-bridge/test/vk_copy2_spv.h"
 #include <signal.h>
+#include <execinfo.h>
 #include <sys/ucontext.h>
 #include <stdio.h>
 #include <string.h>
@@ -25,6 +26,7 @@ static void handler(int sig, siginfo_t *si, void *uc_) {
     int n = snprintf(b, sizeof(b), "\nSIGNAL %d at address %p\nrip %llx rsp %llx rbp %llx\nrax %llx rbx %llx rcx %llx rdx %llx\nrsi %llx rdi %llx r8 %llx r9 %llx\nr10 %llx r11 %llx r12 %llx r13 %llx r14 %llx r15 %llx\n",
                      sig, si->si_addr, s->__rip, s->__rsp, s->__rbp, s->__rax, s->__rbx, s->__rcx, s->__rdx, s->__rsi, s->__rdi, s->__r8, s->__r9, s->__r10, s->__r11, s->__r12, s->__r13, s->__r14, s->__r15);
     write(2, b, n);
+    { void *bt[40]; int nb = backtrace(bt, 40); backtrace_symbols_fd(bt, nb, 2); }
     // regions near the fault address
     mach_vm_address_t a = (mach_vm_address_t)si->si_addr > 0x40000 ? (mach_vm_address_t)si->si_addr - 0x40000 : 0;
     for (int i = 0; i < 12; i++) {
@@ -178,6 +180,99 @@ int main(int argc, char **argv) {
                     pr = present(0, 1);
                     printf("rn_bridge_present(0) -> %d (desktop back)\n", pr);
                 }
+                return fails ? 1 : 0;
+            }
+            if (getenv("RN_QUAD_TEST")) {
+                // [[stage_in]] with a vertex descriptor, a texture sampled in the fragment function with a runtime sampler state, and alpha blending (mesa-bridge/test/vk_quad.metal).
+                // Pass 1 on a 32 x 32 target: a quad over the whole target with a 2 x 2 texture (top-left red, top-right green, bottom-left blue, bottom-right white), blending off;
+                // then a small square inside the bottom-right quadrant with its colour (0.5, 0, 0, 0.5) and the blend state One / OneMinusSourceAlpha (premultiplied): over white it
+                // gives (1, 0.5, 0.5, 1). The vertices of the quad come from an MTLBuffer, those of the square from setVertexBytes.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_QUAD_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 70; }
+                MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+                vd.attributes[0].format = MTLVertexFormatFloat2; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 0;
+                vd.attributes[1].format = MTLVertexFormatFloat2; vd.attributes[1].offset = 8;  vd.attributes[1].bufferIndex = 0;
+                vd.attributes[2].format = MTLVertexFormatFloat4; vd.attributes[2].offset = 16; vd.attributes[2].bufferIndex = 0;
+                vd.layouts[0].stride = 32;
+                id<MTLRenderPipelineState> rps[2];
+                for (int blend = 0; blend < 2; blend++) {
+                    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                    pd.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+                    pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+                    pd.vertexDescriptor = vd;
+                    pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                    if (blend) {
+                        pd.colorAttachments[0].blendingEnabled = YES;
+                        pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne;
+                        pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                        pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+                        pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                    }
+                    e = nil;
+                    rps[blend] = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                    printf("pipeline (blending %s): %p, error: %s\n", blend ? "on" : "off", (__bridge void *)rps[blend], e ? e.localizedDescription.UTF8String : "none");
+                    if (!rps[blend]) return 71;
+                }
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:2 mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead;
+                id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+                const uint8_t texels[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}};
+                [tex replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+                MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+                sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+                sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+                id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+                MTLTextureDescriptor *tt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32 height:32 mipmapped:NO];
+                tt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                id<MTLTexture> target = [d newTextureWithDescriptor:tt];
+                if (!tex || !smp || !target) { printf("no texture or sampler\n"); return 72; }
+                typedef struct { float pos[2], uv[2], color[4]; } V;
+                const V quad[6] = {{{-1, 1}, {0, 0}, {1, 1, 1, 1}}, {{-1, -1}, {0, 1}, {1, 1, 1, 1}}, {{1, 1}, {1, 0}, {1, 1, 1, 1}},
+                                   {{1, 1}, {1, 0}, {1, 1, 1, 1}}, {{-1, -1}, {0, 1}, {1, 1, 1, 1}}, {{1, -1}, {1, 1}, {1, 1, 1, 1}}};
+                const float sc[4] = {0.5f, 0, 0, 0.5f};
+                const V sq[6] = {{{0.25f, -0.25f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}}, {{0.25f, -0.75f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}}, {{0.75f, -0.25f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}},
+                                 {{0.75f, -0.25f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}}, {{0.25f, -0.75f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}}, {{0.75f, -0.75f}, {0.9f, 0.9f}, {0.5f, 0, 0, 0.5f}}};
+                (void)sc;
+                id<MTLBuffer> vb = [d newBufferWithBytes:quad length:sizeof(quad) options:MTLResourceStorageModeShared];
+                MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                rpd.colorAttachments[0].texture = target;
+                rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+                rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                [enc setFragmentTexture:tex atIndex:0];
+                [enc setFragmentSamplerState:smp atIndex:0];
+                [enc setRenderPipelineState:rps[0]];
+                [enc setVertexBuffer:vb offset:0 atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                [enc setRenderPipelineState:rps[1]];
+                [enc setVertexBytes:sq length:sizeof(sq) atIndex:0];
+                [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                [enc endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                uint8_t px[32 * 32 * 4];
+                [target getBytes:px bytesPerRow:32 * 4 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+                struct { int x, y; int want[4]; const char *what; } probes[] = {
+                    {8, 8, {255, 0, 0, 255}, "top-left texel (red)"}, {24, 8, {0, 255, 0, 255}, "top-right texel (green)"}, {8, 24, {0, 0, 255, 255}, "bottom-left texel (blue)"},
+                    {30, 30, {255, 255, 255, 255}, "bottom-right texel (white), outside the square"}, {18, 24, {255, 255, 255, 255}, "left of the square"}, {24, 18, {255, 255, 255, 255}, "above the square"},
+                    {24, 24, {255, 128, 128, 255}, "inside the square: (0.5,0,0,0.5) blended over white"}};
+                int fails = 0;
+                for (unsigned i = 0; i < sizeof(probes) / sizeof(probes[0]); i++) {
+                    const uint8_t *p = px + (probes[i].y * 32 + probes[i].x) * 4;
+                    int ok = 1;
+                    for (int c = 0; c < 4; c++) if (abs((int)p[c] - probes[i].want[c]) > 3) ok = 0;
+                    printf("  (%d,%d) %s: %u %u %u %u %s\n", probes[i].x, probes[i].y, probes[i].what, p[0], p[1], p[2], p[3], ok ? "ok" : "FAIL");
+                    if (!ok) fails++;
+                }
+                printf("status %ld, error %s\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none");
+                if (cb.status != MTLCommandBufferStatusCompleted) fails++;
+                printf("stage_in + texture + blending through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
             if (getenv("RN_TEX_TEST")) {
