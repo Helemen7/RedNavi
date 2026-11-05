@@ -41,10 +41,16 @@ Strings, not traced: QuartzCore `CoreAnimation: Failed to initialize Metal or Op
 
 ## Suggested order before WindowServer is allowed to use the plug-in
 
-1. Function constants in `newFunctionWithName:constantValues:error:` (translator side too).
+1. ~~Function constants in `newFunctionWithName:constantValues:error:` (translator side too).~~ Done 2026-11-05, see the section at the end.
 2. Shared events (`newSharedEvent`, `encodeSignalEvent:`, `encodeWaitForEvent:`), `MTLSharedEvent` listeners and `notifyListener:atValue:block:`.
 3. Texture views (`newTextureViewWithPixelFormat:...`), `setOwnerWithIdentity:`, `newFunctionWithDescriptor:error:`, `setDepthClipMode:`, `setVisibilityResultMode:offset:`, `textureBarrier`, `setThreadgroupMemoryLength:atIndex:`.
 4. Framebuffer fetch (`ColorInput`) and threadgroup memory in the translator, or the environment switches that avoid those shaders.
 5. Half-precision and 3D-texture formats in the render path (the plug-in supports RGBA8, BGRA8, R8, RG8, R16F, RGBA16F, R32F, RG32F, RGBA32F, R32U, R32I, RGBA8U), and BGRA8 / RGB10A2 / RGBA16F framebuffers for HDR paths.
 6. Registry ID check between `RedNaviFB`'s accelerator link and `-[MTLDevice registryID]`.
 7. Only then a run of WindowServer on the plug-in, from a state that can be undone over SSH.
+
+## Function constants, as built (2026-11-05)
+
+`-[MTLLibrary newFunctionWithName:constantValues:error:]` (and the completion handler variant) now keep the values with the function, and the pipeline creation hands them to the translator, which specializes the AIR as LLVM text before translating it (`translate_reflected_specialized` in the translator fork, exported to the plug-in as `rn_air_translate_stage_fc`; `RedNaviMTL/rn_air.h`). A resource that a constant switches off is not in the module's reflection, so the app does not have to bind it. Names are matched against the module's constants (the globals carry the C++ mangled name, `_Z<length><name>`). `MTLFunctionConstantValues` has no public getter: the plug-in reads the values through its internal class's `newIndexedConstantArray` and `newNamedConstantArray` (private; used only if the object answers them, otherwise the function is refused with a message rather than silently left unspecialized).
+
+Test (`tools/mtl_init_harness`, `RN_FC_TEST=<vk_fc.metallib>`, shader `mesa-bridge/test/vk_fc.metal`): an int, two bools and floats, one constant left undefined (`is_function_constant_defined`), and a texture argument that exists only when a constant says so. Three cases (by index; by name with one constant undefined and no texture bound; texture argument present) give 0 of 64 wrong each on the 7800 XT. Not tried: constants on vertex and fragment functions of a render pipeline (the same call path), vector constants, a real QuartzCore function with its real constant set, caching the specialized modules (every pipeline creation runs `llvm-dis` and the translator again).

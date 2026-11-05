@@ -6,7 +6,6 @@
 // int rn_air_translate(const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
 //   bitcode: the LLVM bitcode of one function of a metallib (RedNaviMTL/metallib.h); entry: its name. Returns 0 on success and a SPIR-V module (entry point "main", validated)
 //   in *spirv, to be released with rn_air_free(*spirv, *spirv_bytes); non-zero with a one-line reason in err otherwise.
-// void rn_air_free(uint32_t *spirv, size_t bytes);
 //
 // The module has descriptors at set 0: storage buffers, one per Metal buffer the kernel uses (info.bindings: Metal index, binding number, writable), including the ones the app fills with
 // -setBytes:length:atIndex: (a constant argument is a read-only buffer too), and the threadgroup size as specialization constants info.local_size_spec_ids (0, 1, 2). The grid is
@@ -58,6 +57,12 @@ int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const c
 // and a fragment function that are translated apart meet by their Location numbers, which the translator derives from the names. A vertex module is in descriptor set 0, a fragment
 // module in set 1 (info.set), with the same per-binding ABI as kernels; neither has the dispatch push constants.
 int rn_air_translate_stage(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
+// A function constant value (newFunctionWithName:constantValues:error:): index is the constant's index, or negative when it is given by name; size bytes at data are the value in
+// Metal's layout for its data type (bool 1 byte, int and float 4, vectors the components one after the other).
+typedef struct { int32_t index; const char *name; uint32_t size; const void *data; } rn_air_const;
+// rn_air_translate_stage for a function specialized with constants: the module is specialized before it is translated, so what a constant switches off is not in the bindings. A
+// translator library without rn_air_translate_stage_fc fails here when nconsts is not 0.
+int rn_air_translate_stage_fc(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
 void rn_air_free(uint32_t *spirv, size_t bytes);
 
 #ifdef __cplusplus

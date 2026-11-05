@@ -607,6 +607,62 @@ int main(int argc, char **argv) {
                 printf("load and store actions through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_FC_TEST")) {
+                // Function constants (mesa-bridge/test/vk_fc.metal): out[i] = i * mul (+ scale if use_add) (+ offset_c if it is defined) (+ the red of a texture when use_tex). Cases: constants by index;
+                // by name, with scale left undefined and offset_c defined; and use_tex with a texture bound (a case without use_tex binds none: the texture argument does not exist then).
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_FC_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 100; }
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+                id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+                const uint8_t texel[4] = {51, 0, 0, 255};                  // red 0.2
+                [tex replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:texel bytesPerRow:4];
+                int fails = 0;
+                for (int c = 0; c < 3; c++) {
+                    MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
+                    int mul = c == 0 ? 3 : c == 1 ? 2 : 1;
+                    bool use_add = c == 0, use_tex = c == 2;
+                    float scale = 0.5f, offc = 10.0f;
+                    if (c == 0) {                                          // by index
+                        [cv setConstantValue:&mul type:MTLDataTypeInt atIndex:0]; [cv setConstantValue:&use_add type:MTLDataTypeBool atIndex:1];
+                        [cv setConstantValue:&scale type:MTLDataTypeFloat atIndex:2]; [cv setConstantValue:&use_tex type:MTLDataTypeBool atIndex:4];
+                    } else if (c == 1) {                                   // by name; scale is not given and use_add is false; offset_c is given
+                        [cv setConstantValue:&mul type:MTLDataTypeInt withName:@"mul"]; [cv setConstantValue:&use_add type:MTLDataTypeBool withName:@"use_add"];
+                        [cv setConstantValue:&offc type:MTLDataTypeFloat withName:@"offset_c"]; [cv setConstantValue:&use_tex type:MTLDataTypeBool withName:@"use_tex"];
+                    } else {                                               // the texture argument exists
+                        [cv setConstantValue:&mul type:MTLDataTypeInt atIndex:0]; [cv setConstantValue:&use_add type:MTLDataTypeBool atIndex:1]; [cv setConstantValue:&use_tex type:MTLDataTypeBool atIndex:4];
+                    }
+                    e = nil;
+                    id<MTLFunction> fn = [lib newFunctionWithName:@"fc_kernel" constantValues:cv error:&e];
+                    id<MTLComputePipelineState> pso = fn ? [d newComputePipelineStateWithFunction:fn error:&e] : nil;
+                    printf("case %d: function %p, pipeline %p, error: %s\n", c, (__bridge void *)fn, (__bridge void *)pso, e ? e.localizedDescription.UTF8String : "none");
+                    if (!pso) { fails++; continue; }
+                    id<MTLBuffer> buf = [d newBufferWithLength:64 * 4 options:MTLResourceStorageModeShared];
+                    memset(buf.contents, 0xff, 64 * 4);
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pso];
+                    [enc setBuffer:buf offset:0 atIndex:0];
+                    if (use_tex) [enc setTexture:tex atIndex:0];
+                    [enc dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    const float *o = buf.contents;
+                    int bad = 0;
+                    for (int i = 0; i < 64; i++) {
+                        float want = (float)i * mul + (use_add ? scale : 0) + (c == 1 ? offc : 0) + (use_tex ? 0.2f : 0);
+                        if (fabsf(o[i] - want) > 0.002f) { if (bad < 3) printf("  out[%d] = %f, want %f\n", i, o[i], want); bad++; }
+                    }
+                    printf("case %d: status %ld, error %s, %d of 64 values wrong (out[5] = %f)\n", c, (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none", bad, o[5]);
+                    if (bad || cb.status != MTLCommandBufferStatusCompleted) fails++;
+                }
+                printf("function constants through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

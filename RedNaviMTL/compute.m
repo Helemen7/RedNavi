@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include <stdlib.h>
 #include "rn_vk.h"
@@ -1013,6 +1014,52 @@ static NSString *rn_run_blit(RNBlit *b) {
 
 // ---------------------------------------------------------------------------------------------------------------------------------------- libraries and functions
 
+
+// Function constants (docs/M6_WINDOWSERVER_STUDY.md: QuartzCore builds its shaders from one source with them). MTLFunctionConstantValues has no public way to read back what was set;
+// its internal class has newIndexedConstantArray and newNamedConstantArray (MTLIndexedConstantValue: index, dataType, data; MTLNamedConstantValue: the same with name). They are private,
+// so they are used only if the object answers them, and a macOS without them makes function specialization fail with a message instead of ignoring the values.
+static unsigned rn_data_type_size(MTLDataType t) {
+    switch (t) {
+    case MTLDataTypeBool: case MTLDataTypeChar: case MTLDataTypeUChar: return 1;
+    case MTLDataTypeBool2: case MTLDataTypeChar2: case MTLDataTypeUChar2: case MTLDataTypeShort: case MTLDataTypeUShort: case MTLDataTypeHalf: return 2;
+    case MTLDataTypeBool3: case MTLDataTypeChar3: case MTLDataTypeUChar3: return 3;
+    case MTLDataTypeBool4: case MTLDataTypeChar4: case MTLDataTypeUChar4: case MTLDataTypeShort2: case MTLDataTypeUShort2: case MTLDataTypeHalf2: case MTLDataTypeInt: case MTLDataTypeUInt: case MTLDataTypeFloat: return 4;
+    case MTLDataTypeShort3: case MTLDataTypeUShort3: case MTLDataTypeHalf3: return 6;
+    case MTLDataTypeShort4: case MTLDataTypeUShort4: case MTLDataTypeHalf4: case MTLDataTypeInt2: case MTLDataTypeUInt2: case MTLDataTypeFloat2: return 8;
+    case MTLDataTypeInt3: case MTLDataTypeUInt3: case MTLDataTypeFloat3: return 12;
+    case MTLDataTypeInt4: case MTLDataTypeUInt4: case MTLDataTypeFloat4: return 16;
+    default: return 0;
+    }
+}
+static NSArray<NSDictionary *> *rn_capture_constants(MTLFunctionConstantValues *values, NSString **why) {
+    if (!values) return nil;
+    SEL si = sel_registerName("newIndexedConstantArray"), sn = sel_registerName("newNamedConstantArray");
+    if (![values respondsToSelector:si] || ![values respondsToSelector:sn]) { *why = @"cannot read the function constant values on this macOS (private accessors missing)"; return nil; }
+    NSMutableArray *out = [NSMutableArray array];
+    NSArray *idx = ((id (*)(id, SEL))objc_msgSend)(values, si), *named = ((id (*)(id, SEL))objc_msgSend)(values, sn);
+    for (int k = 0; k < 2; k++) for (id v in (k ? named : idx)) {
+        if (![v respondsToSelector:@selector(dataType)] || ![v respondsToSelector:@selector(data)]) { *why = @"unexpected function constant value object"; return nil; }
+        const MTLDataType t = ((MTLDataType (*)(id, SEL))objc_msgSend)(v, @selector(dataType));
+        const unsigned n = rn_data_type_size(t);
+        const void *p = ((const void *(*)(id, SEL))objc_msgSend)(v, @selector(data));
+        if (!n || !p) { *why = [NSString stringWithFormat:@"function constant with data type %lu is not supported", (unsigned long)t]; return nil; }
+        NSData *d = [NSData dataWithBytes:p length:n];
+        if (k) [out addObject:@{@"name": ((NSString *(*)(id, SEL))objc_msgSend)(v, @selector(name)), @"data": d}];
+        else [out addObject:@{@"index": @(((NSUInteger (*)(id, SEL))objc_msgSend)(v, @selector(index))), @"data": d}];
+    }
+    return out;
+}
+// The C array rn_air_translate_stage_fc takes, for a function's constants (the strings stay owned by `fcs`).
+static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, unsigned max) {
+    unsigned n = 0;
+    for (NSDictionary *d in fcs) {
+        if (n >= max) break;
+        NSData *data = d[@"data"];
+        out[n++] = (rn_air_const){d[@"index"] ? (int32_t)[d[@"index"] intValue] : -1, d[@"name"] ? [d[@"name"] UTF8String] : NULL, (uint32_t)data.length, data.bytes};
+    }
+    return n;
+}
+
 @interface RedNaviMTLFunction : NSObject {
 @public
     NSString *name;
@@ -1020,6 +1067,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     NSData *bitcode;
     id<MTLDevice> dev;
     NSString *label_;
+    NSArray<NSDictionary *> *fcs;                    // function constants: @"index" (NSNumber) or @"name", and @"data" (NSData)
 }
 @end
 @implementation RedNaviMTLFunction
@@ -1087,7 +1135,23 @@ static NSString *rn_run_blit(RNBlit *b) {
     c->name = f->name; c->type = f->type; c->bitcode = f->bitcode; c->dev = f->dev;
     return (id)c;
 }
-- (id<MTLFunction>)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues error:(NSError **)error { return [self newFunctionWithName:functionName]; }
+- (id<MTLFunction>)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues error:(NSError **)error {
+    RedNaviMTLFunction *c = (RedNaviMTLFunction *)[self newFunctionWithName:functionName];
+    if (!c) { if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFunctionNotFound userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Function %@ was not found in the library", functionName]}]; return nil; }
+    NSString *why = nil;
+    c->fcs = rn_capture_constants(constantValues, &why);
+    if (why) {
+        rn_log("function constants of %s: %s", functionName.UTF8String, why.UTF8String);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey: why}];
+        return nil;
+    }
+    return (id)c;
+}
+- (void)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues completionHandler:(void (^)(id<MTLFunction>, NSError *))completionHandler {
+    NSError *e = nil;
+    id<MTLFunction> f = [self newFunctionWithName:functionName constantValues:constantValues error:&e];
+    completionHandler(f, e);
+}
 @end
 
 // A compute pipeline state from a function of a library: the function's bitcode goes to the translator (rn_air.h), the SPIR-V to RADV.
@@ -1104,7 +1168,9 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
         size_t spvBytes = 0;
         rn_air_kernel_info info;
         memset(&info, 0, sizeof(info));
-        if (rn_air_translate(NULL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
+        rn_air_const fcc[64];
+    const unsigned nfc = rn_fc_array(f->fcs, fcc, 64);
+    if (rn_air_translate_stage_fc(NULL, RN_AIR_KERNEL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithUTF8String:err];
         } else {
             rn_vk_binding binds[RN_VK_MAX_BINDINGS];
@@ -1151,7 +1217,9 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
         size_t spvBytes = 0;
         rn_air_kernel_info info;
         memset(&info, 0, sizeof(info));
-        if (rn_air_translate_stage(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
+        rn_air_const fcc[64];
+        const unsigned nfc = rn_fc_array(fn[s]->fcs, fcc, 64);
+        if (rn_air_translate_stage_fc(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
             break;
         }
