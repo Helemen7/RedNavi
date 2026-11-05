@@ -302,9 +302,9 @@ uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk) { return vk->storageAli
 unsigned rn_vk_format_texel_bytes(int f) {
     switch (f) {
     case RN_VK_R8: return 1;
-    case RN_VK_RG8: case RN_VK_R16F: return 2;
-    case RN_VK_RGBA8: case RN_VK_BGRA8: case RN_VK_RGBA8_SRGB: case RN_VK_BGRA8_SRGB: case RN_VK_R32F: case RN_VK_R32U: case RN_VK_R32I: case RN_VK_RGBA8U: return 4;
-    case RN_VK_RGBA16F: case RN_VK_RG32F: return 8;
+    case RN_VK_RG8: case RN_VK_R16F: case RN_VK_R16: return 2;
+    case RN_VK_RGBA8: case RN_VK_BGRA8: case RN_VK_RGBA8_SRGB: case RN_VK_BGRA8_SRGB: case RN_VK_RGB10A2: case RN_VK_BGR10A2: case RN_VK_RG16F: case RN_VK_RG16: case RN_VK_R32F: case RN_VK_R32U: case RN_VK_R32I: case RN_VK_RGBA8U: return 4;
+    case RN_VK_RGBA16F: case RN_VK_RG32F: case RN_VK_RGBA16: return 8;
     case RN_VK_RGBA32F: return 16;
     default: return 0;
     }
@@ -314,6 +314,12 @@ static VkFormat vk_format(int f) {
     case RN_VK_RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
     case RN_VK_BGRA8: return VK_FORMAT_B8G8R8A8_UNORM;
     case RN_VK_RGBA8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case RN_VK_RGB10A2: return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+    case RN_VK_BGR10A2: return VK_FORMAT_A2R10G10B10_UNORM_PACK32;
+    case RN_VK_RG16F: return VK_FORMAT_R16G16_SFLOAT;
+    case RN_VK_R16: return VK_FORMAT_R16_UNORM;
+    case RN_VK_RG16: return VK_FORMAT_R16G16_UNORM;
+    case RN_VK_RGBA16: return VK_FORMAT_R16G16B16A16_UNORM;
     case RN_VK_BGRA8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
     case RN_VK_R8: return VK_FORMAT_R8_UNORM;
     case RN_VK_RG8: return VK_FORMAT_R8G8_UNORM;

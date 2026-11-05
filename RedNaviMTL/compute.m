@@ -97,6 +97,12 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     case MTLPixelFormatRGBA8Unorm: return RN_VK_RGBA8;
     case MTLPixelFormatBGRA8Unorm: return RN_VK_BGRA8;
     case MTLPixelFormatRGBA8Unorm_sRGB: return RN_VK_RGBA8_SRGB;
+    case MTLPixelFormatRGB10A2Unorm: return RN_VK_RGB10A2;
+    case MTLPixelFormatBGR10A2Unorm: return RN_VK_BGR10A2;
+    case MTLPixelFormatRG16Float: return RN_VK_RG16F;
+    case MTLPixelFormatR16Unorm: return RN_VK_R16;
+    case MTLPixelFormatRG16Unorm: return RN_VK_RG16;
+    case MTLPixelFormatRGBA16Unorm: return RN_VK_RGBA16;
     case MTLPixelFormatBGRA8Unorm_sRGB: return RN_VK_BGRA8_SRGB;
     case MTLPixelFormatR8Unorm: return RN_VK_R8;
     case MTLPixelFormatRG8Unorm: return RN_VK_RG8;
@@ -370,6 +376,14 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
                 break;
             }
             return [NSString stringWithFormat:@"no buffer bound at index %u", m];
+        case RN_AIR_NULL_TEXTURE: {
+            // a placeholder the translator adds for a texture that is absent in this variant: a 1 x 1 texture of zeros (made once)
+            static rn_vk_image *nullImage;
+            if (!nullImage) { rn_vk *vk = rn_vk_shared(); nullImage = vk ? rn_vk_image_create(vk, RN_VK_RGBA8, 1, 1) : NULL; }
+            if (!nullImage) return @"no memory for a placeholder texture";
+            av[i].image = nullImage;
+            break;
+        }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
             if (m < 16 && texs[m]) { av[i].image = texs[m]->img; break; }
@@ -524,6 +538,51 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 @end
 @implementation RNDraw
 @end
+
+// Depth/stencil states exist so that apps get an object back; the render encoder does not test depth or stencil yet (setDepthStencilState: logs and ignores it).
+@interface RedNaviMTLDepthStencilState : NSObject {
+@public
+    id<MTLDevice> dev;
+    NSString *label_;
+}
+@end
+@implementation RedNaviMTLDepthStencilState
++ (void)load { class_addProtocol(self, @protocol(MTLDepthStencilState)); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+@end
+
+// Selectors that Metal and its clients send to the plug-in's objects and that the plug-in does not implement (private SPI of the Apple classes: -[MTLTexture protectionOptions] from
+// QuartzCore's MetalContext, found with ca_renderer_test): an unrecognized selector throws, which ends the process, so they are answered with a zero of the right kind and logged. The
+// kind comes from the Metal protocols (public and SPI) when one declares the selector, else it is an integer. Struct results are not handled (a zero in the integer registers).
+static uintptr_t rn_stub_int(id self, SEL _cmd) { return 0; }
+static float rn_stub_float(id self, SEL _cmd) { return 0; }
+static double rn_stub_double(id self, SEL _cmd) { return 0; }
+static const char *rn_selector_types(SEL sel) {
+    static const char *const protos[] = {"MTLTexture", "MTLTextureSPI", "MTLResource", "MTLResourceSPI", "MTLBuffer", "MTLBufferSPI", "MTLCommandQueue", "MTLCommandQueueSPI", "MTLCommandBuffer",
+        "MTLCommandBufferSPI", "MTLCommandEncoder", "MTLRenderCommandEncoder", "MTLRenderCommandEncoderSPI", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLLibrary", "MTLFunction",
+        "MTLRenderPipelineState", "MTLComputePipelineState", "MTLSamplerState", "MTLDepthStencilState", "MTLSharedEvent", "MTLEvent", "MTLDrawable"};
+    for (unsigned i = 0; i < sizeof(protos) / sizeof(protos[0]); i++) {
+        Protocol *p = objc_getProtocol(protos[i]);
+        if (!p) continue;
+        for (int req = 1; req >= 0; req--) {
+            struct objc_method_description d = protocol_getMethodDescription(p, sel, req, YES);
+            if (d.name && d.types) return d.types;
+        }
+    }
+    return NULL;
+}
+static BOOL rn_resolve_default(id self, SEL _cmd, SEL sel) {
+    const char *types = rn_selector_types(sel);
+    const char *r = types ? types : "Q16@0:8";
+    while (*r == 'r' || *r == 'n' || *r == 'N' || *r == 'o' || *r == 'O' || *r == 'R' || *r == 'V') r++;
+    IMP imp = (r[0] == 'f') ? (IMP)rn_stub_float : (r[0] == 'd') ? (IMP)rn_stub_double : (IMP)rn_stub_int;
+    class_addMethod((Class)self, sel, imp, types ? types : "Q16@0:8");
+    rn_log("unimplemented -[%s %s]: answering zero%s", class_getName((Class)self), sel_getName(sel), types ? "" : " (no protocol declares it)");
+    return YES;
+}
+static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c), @selector(resolveInstanceMethod:), (IMP)rn_resolve_default, "c@::"); }
 
 // A render pass: its colour attachments with their load actions and the draws, run when the command buffer is committed.
 @interface RNRenderPass : NSObject {
@@ -1261,6 +1320,19 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     if (!(self = [super init])) return nil;
     rn_mtl_func fn[512];
     unsigned cnt = 0;
+    // A fat file (QuartzCore's default.metallib: one slice of AIR and the rest GPU binaries for other targets) holds the AIR in the slice that parses
+    if (blob.length > 8 && memcmp(blob.bytes, "\xca\xfe\xba\xbe", 4) == 0) {
+        const uint8_t *b = blob.bytes;
+        const unsigned nslices = (b[4] << 24) | (b[5] << 16) | (b[6] << 8) | b[7];
+        for (unsigned i = 0; i < nslices && i < 32 && 8 + 20 * (i + 1) <= blob.length; i++) {
+            const uint8_t *e = b + 8 + 20 * i;
+            const unsigned long off = ((unsigned long)e[8] << 24) | (e[9] << 16) | (e[10] << 8) | e[11], sz = ((unsigned long)e[12] << 24) | (e[13] << 16) | (e[14] << 8) | e[15];
+            if (off + sz > blob.length || sz < 8) continue;
+            NSData *slice = [blob subdataWithRange:NSMakeRange(off, sz)];
+            unsigned c2 = 0;
+            if (rn_metallib_parse(slice.bytes, slice.length, fn, 512, &c2) == 0) { blob = slice; rn_log("library: fat file, using slice %u (%lu bytes)", i, sz); break; }
+        }
+    }
     int rc = rn_metallib_parse(blob.bytes, blob.length, fn, 512, &cnt);
     if (rc) {
         rn_log("newLibraryWithData: not a metallib this reader understands (code %d)", rc);
@@ -1290,6 +1362,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 - (NSString *)installName { return nil; }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)functionName {
     RedNaviMTLFunction *f = funcs[functionName];
+    rn_log("function requested: %s%s", functionName.UTF8String, f ? "" : " (not in the library)");
     if (!f) return nil;
     RedNaviMTLFunction *c = [RedNaviMTLFunction new];
     c->name = f->name; c->type = f->type; c->bitcode = f->bitcode; c->dev = f->dev;
@@ -1300,6 +1373,10 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     if (!c) { if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFunctionNotFound userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Function %@ was not found in the library", functionName]}]; return nil; }
     NSString *why = nil;
     c->fcs = rn_capture_constants(constantValues, &why);
+    if (getenv("RN_LOG_CONSTANTS")) for (NSDictionary *d in c->fcs) {
+        const uint8_t *p = [d[@"data"] bytes]; NSUInteger n = [d[@"data"] length]; char hex[40] = ""; for (NSUInteger i = 0; i < n && i < 16; i++) snprintf(hex + 2 * i, 3, "%02x", p[i]);
+        rn_log("  constant %s = %s", d[@"index"] ? [[d[@"index"] description] UTF8String] : [d[@"name"] UTF8String], hex);
+    }
     if (why) {
         rn_log("function constants of %s: %s", functionName.UTF8String, why.UTF8String);
         if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorCompileFailure userInfo:@{NSLocalizedDescriptionKey: why}];
@@ -1399,7 +1476,7 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
         p->n[s] = n;
         for (unsigned i = 0; i < n; i++) {
             const rn_air_binding *ab = &info.bindings[i];
-            p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind, NULL};
+            p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind == RN_AIR_NULL_TEXTURE ? RN_VK_SAMPLED_IMAGE : ab->kind, NULL};
             p->kind[s][i] = ab->kind;
             p->mi[s][i] = ab->metal_index;
             if (ab->kind == RN_AIR_STATIC_SAMPLER) {
@@ -1471,6 +1548,12 @@ typedef uintptr_t (*imp_fn_err1)(id, SEL, id);
 typedef uintptr_t (*rn_imp_bytes)(id, SEL, const void *, NSUInteger, NSUInteger);
 
 void rn_compute_install(Class k, Class sup) {
+    {
+        const char *classes[] = {"RedNaviMTLBuffer", "RedNaviMTLTexture", "RedNaviMTLSamplerState", "RedNaviMTLComputePipelineState", "RedNaviMTLRenderPipelineState", "RedNaviMTLComputeCommandEncoder",
+                                 "RedNaviMTLRenderCommandEncoder", "RedNaviMTLBlitCommandEncoder", "RedNaviMTLCommandBuffer", "RedNaviMTLCommandQueue", "RedNaviMTLFunction", "RedNaviMTLLibrary",
+                                 "RedNaviMTLDepthStencilState", "RedNaviMTLSharedEvent"};
+        for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) { Class c = objc_getClass(classes[i]); if (c) rn_add_default_resolver(c); }
+    }
     // Command queues: every newCommandQueue* method of the superclass chain (the base class would call them in a loop, see M6_ACCELERATOR_STUDY.md section 10).
     for (Class c = sup; c && c != [NSObject class]; c = class_getSuperclass(c)) {
         unsigned n = 0;
@@ -1616,6 +1699,134 @@ void rn_compute_install(Class k, Class sup) {
         (void)map;
         return (uintptr_t)CFBridgingRetain([[RedNaviMTLLibrary alloc] initWithDevice:(id<MTLDevice>)self data:blob error:error]);
     }), m3 ? method_getTypeEncoding(m3) : "@32@0:8@16^@24");
+    {
+        SEL sds = sel_registerName("newDepthStencilStateWithDescriptor:");
+        Method mds = class_getInstanceMethod(sup, sds);
+        typedef uintptr_t (*imp_ds)(id, SEL, id);
+        imp_ds ods = mds ? (imp_ds)method_getImplementation(mds) : NULL;
+        class_addMethod(k, sds, imp_implementationWithBlock(^uintptr_t(id self, id desc) {
+            if (!rn_gate()) return ods ? ods(self, sds, desc) : 0;
+            RedNaviMTLDepthStencilState *st = [RedNaviMTLDepthStencilState new];
+            st->dev = (id<MTLDevice>)self;
+            return (uintptr_t)CFBridgingRetain(st);
+        }), mds ? method_getTypeEncoding(mds) : "@24@0:8@16");
+    }
+    // Capabilities. The base class answers these from tables its own driver fills in, which a device made by this plug-in does not have (calling -supportsFamily: ended in a call through
+    // a null pointer inside QuartzCore's Metal context setup), so they are answered here: what a discrete Navi 32 on macOS supports as far as the plug-in and the translator go. The Apple
+    // GPU families, tile shaders, memoryless targets, raster order groups, SIMD-group operations and YCbCr formats are NO; native FP16 is NO so that the float variants of shaders are asked for.
+    {
+        SEL sfam = sel_registerName("supportsFamily:"), sfs = sel_registerName("supportsFeatureSet:");
+        Method mfam = class_getInstanceMethod(sup, sfam), mfs = class_getInstanceMethod(sup, sfs);
+        typedef BOOL (*imp_bool_int)(id, SEL, NSInteger);
+        imp_bool_int ofam = mfam ? (imp_bool_int)method_getImplementation(mfam) : NULL, ofs = mfs ? (imp_bool_int)method_getImplementation(mfs) : NULL;
+        class_addMethod(k, sfam, imp_implementationWithBlock(^BOOL(id self, NSInteger family) {
+            if (!rn_gate()) return ofam ? ofam(self, sfam, family) : NO;
+            // MTLGPUFamilyMac1 2001, Mac2 2002, Common1..3 3001..3003, Metal3 5001
+            const BOOL yes = family == 2001 || family == 2002 || (family >= 3001 && family <= 3003) || family == 5001;
+            rn_log("supportsFamily: %ld -> %d", (long)family, yes);
+            return yes;
+        }), mfam ? method_getTypeEncoding(mfam) : "B24@0:8q16");
+        class_addMethod(k, sfs, imp_implementationWithBlock(^BOOL(id self, NSInteger set) {
+            if (!rn_gate()) return ofs ? ofs(self, sfs, set) : NO;
+            const BOOL yes = set >= 10000 && set <= 10005;                    // macOS GPUFamily1 v1 to v4, GPUFamily2 v1
+            rn_log("supportsFeatureSet: %ld -> %d", (long)set, yes);
+            return yes;
+        }), mfs ? method_getTypeEncoding(mfs) : "B24@0:8Q16");
+        static const struct { const char *name; BOOL value; } caps[] = {
+            {"supportsBufferlessClientStorageTexture", YES}, {"supportsExtendedXR10Formats", YES}, {"supportsMemorylessRenderTargets", NO}, {"supportsNativeHardwareFP16", NO},
+            {"supportsRasterOrderGroups", NO}, {"supportsSIMDGroup", NO}, {"supportsSIMDReduction", NO}, {"supportsSIMDShuffleAndFill", NO}, {"supportsTileShaders", NO},
+            {"isFramebufferReadSupported", NO}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO}};
+        typedef BOOL (*imp_bool)(id, SEL);
+        for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
+            SEL sc = sel_registerName(caps[i].name);
+            Method mc = class_getInstanceMethod(sup, sc);
+            imp_bool oc = mc ? (imp_bool)method_getImplementation(mc) : NULL;
+            const BOOL v = caps[i].value;
+            const char *nm = caps[i].name;
+            class_addMethod(k, sc, imp_implementationWithBlock(^BOOL(id self) {
+                if (!rn_gate()) return oc ? oc(self, sc) : NO;
+                rn_log("%s -> %d", nm, v);
+                return v;
+            }), mc ? method_getTypeEncoding(mc) : "B16@0:8");
+        }
+    }
+    // Limits: the base class reads them from tables the vendor driver fills in, so a device made by this plug-in answers 0 (a 128 x 128 texture descriptor failed validation as "greater than
+    // the maximum allowed size of 0" inside QuartzCore's context setup). Values are those of a Navi 32 as far as they are known (texture sizes and binding counts of Vulkan/RADV on this
+    // card, alignments of its memory); the type of each answer is the type the base class method returns.
+    {
+        static const struct { const char *name; double value; } limits[] = {
+            {"maxTextureWidth1D", 16384}, {"maxTextureWidth2D", 16384}, {"maxTextureHeight2D", 16384}, {"maxTextureWidth3D", 2048}, {"maxTextureHeight3D", 2048}, {"maxTextureDepth3D", 2048},
+            {"maxTextureDimensionCube", 16384}, {"maxTextureLayers", 2048}, {"maxTextureBufferWidth", 134217728}, {"maxColorAttachments", 8}, {"maxVertexBuffers", 31}, {"maxFragmentBuffers", 31},
+            {"maxComputeBuffers", 31}, {"maxTileBuffers", 31}, {"maxFragmentTextures", 128}, {"maxComputeTextures", 128}, {"maxTileTextures", 128}, {"maxFragmentSamplers", 16},
+            {"maxComputeSamplers", 16}, {"maxTileSamplers", 16}, {"maxVertexAttributes", 31}, {"maxComputeAttributes", 31}, {"maxInterpolants", 32}, {"maxInterpolatedComponents", 124},
+            {"maxTotalComputeThreadsPerThreadgroup", 1024}, {"maxComputeThreadgroupMemory", 32768}, {"maxConstantBufferArguments", 31}, {"maxFunctionConstantIndices", 65536},
+            {"maxLineWidth", 1}, {"maxPointSize", 511}, {"maxBufferLength", 4294967296.0}, {"maxFramebufferStorageBits", 256}, {"maxVertexInlineDataSize", 4096}, {"maxFragmentInlineDataSize", 4096},
+            {"maxComputeInlineDataSize", 4096}, {"maxTileInlineDataSize", 4096}, {"maxCustomSamplePositions", 16}, {"maxTessellationFactor", 64},
+            {"linearTextureAlignmentBytes", 256}, {"deviceLinearTextureAlignmentBytes", 256}, {"deviceLinearReadOnlyTextureAlignmentBytes", 256}, {"linearTextureArrayAlignmentBytes", 256},
+            {"linearTextureArrayAlignmentSlice", 256}, {"iosurfaceTextureAlignmentBytes", 256}, {"iosurfaceReadOnlyTextureAlignmentBytes", 256}};
+        for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
+            SEL sl = sel_registerName(limits[i].name);
+            Method ml = class_getInstanceMethod(sup, sl);
+            if (!ml) continue;
+            char rt[8]; method_getReturnType(ml, rt, sizeof(rt));
+            typedef uintptr_t (*imp_u)(id, SEL);
+            imp_u ol = (imp_u)method_getImplementation(ml);
+            const double v = limits[i].value;
+            const char *enc = method_getTypeEncoding(ml);
+            switch (rt[0]) {
+            case 'Q': case 'q': case 'L': case 'l':
+                class_addMethod(k, sl, imp_implementationWithBlock(^uint64_t(id self) { return rn_gate() ? (uint64_t)v : (uint64_t)ol(self, sl); }), enc); break;
+            case 'I': case 'i':
+                class_addMethod(k, sl, imp_implementationWithBlock(^uint32_t(id self) { return rn_gate() ? (uint32_t)v : (uint32_t)ol(self, sl); }), enc); break;
+            case 'f':
+                class_addMethod(k, sl, imp_implementationWithBlock(^float(id self) { return (float)v; }), enc); break;
+            case 'd':
+                class_addMethod(k, sl, imp_implementationWithBlock(^double(id self) { return v; }), enc); break;
+            default: rn_log("limit %s: return type %c not handled", limits[i].name, rt[0]); break;
+            }
+        }
+        SEL smin = sel_registerName("minimumLinearTextureAlignmentForPixelFormat:");
+        Method mmin = class_getInstanceMethod(sup, smin);
+        typedef NSUInteger (*imp_align)(id, SEL, NSUInteger);
+        imp_align omin = mmin ? (imp_align)method_getImplementation(mmin) : NULL;
+        class_addMethod(k, smin, imp_implementationWithBlock(^NSUInteger(id self, NSUInteger pf) { return rn_gate() ? 256 : (omin ? omin(self, smin, pf) : 0); }), mmin ? method_getTypeEncoding(mmin) : "Q24@0:8Q16");
+    }
+    // Libraries from files: the URL or path of a metallib, the default library of the main bundle or another one (default.metallib in its resources). Outside the gate: the superclass.
+    {
+        typedef uintptr_t (*imp_url_err)(id, SEL, id, NSError **);
+        typedef uintptr_t (*imp_noerr)(id, SEL);
+        static uintptr_t (^load_file)(id, NSString *, NSError **) = ^uintptr_t(id self, NSString *path, NSError **error) {
+            NSData *blob = path ? [NSData dataWithContentsOfFile:path] : nil;
+            if (!blob) {
+                rn_log("library from %s: cannot read the file", path.UTF8String);
+                if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"cannot read %@", path]}];
+                return 0;
+            }
+            rn_log("library from %s (%lu bytes)", path.UTF8String, (unsigned long)blob.length);
+            return (uintptr_t)CFBridgingRetain([[RedNaviMTLLibrary alloc] initWithDevice:(id<MTLDevice>)self data:blob error:error]);
+        };
+        SEL su = sel_registerName("newLibraryWithURL:error:"), sf = sel_registerName("newLibraryWithFile:error:"), sd = sel_registerName("newDefaultLibrary"), sb = sel_registerName("newDefaultLibraryWithBundle:error:");
+        Method mu = class_getInstanceMethod(sup, su), mf = class_getInstanceMethod(sup, sf), md = class_getInstanceMethod(sup, sd), mb = class_getInstanceMethod(sup, sb);
+        imp_url_err ou = mu ? (imp_url_err)method_getImplementation(mu) : NULL, of = mf ? (imp_url_err)method_getImplementation(mf) : NULL, ob = mb ? (imp_url_err)method_getImplementation(mb) : NULL;
+        imp_noerr od = md ? (imp_noerr)method_getImplementation(md) : NULL;
+        class_addMethod(k, su, imp_implementationWithBlock(^uintptr_t(id self, NSURL *url, NSError **error) {
+            if (!rn_gate()) return ou ? ou(self, su, url, error) : 0;
+            return load_file(self, url.path, error);
+        }), mu ? method_getTypeEncoding(mu) : "@32@0:8@16^@24");
+        class_addMethod(k, sf, imp_implementationWithBlock(^uintptr_t(id self, NSString *path, NSError **error) {
+            if (!rn_gate()) return of ? of(self, sf, path, error) : 0;
+            return load_file(self, path, error);
+        }), mf ? method_getTypeEncoding(mf) : "@32@0:8@16^@24");
+        class_addMethod(k, sb, imp_implementationWithBlock(^uintptr_t(id self, NSBundle *bundle, NSError **error) {
+            if (!rn_gate()) return ob ? ob(self, sb, bundle, error) : 0;
+            return load_file(self, [bundle pathForResource:@"default" ofType:@"metallib"], error);
+        }), mb ? method_getTypeEncoding(mb) : "@32@0:8@16^@24");
+        class_addMethod(k, sd, imp_implementationWithBlock(^uintptr_t(id self) {
+            if (!rn_gate()) return od ? od(self, sd) : 0;
+            NSError *e = nil;
+            return load_file(self, [[NSBundle mainBundle] pathForResource:@"default" ofType:@"metallib"], &e);
+        }), md ? method_getTypeEncoding(md) : "@16@0:8");
+    }
     SEL s4 = sel_registerName("newComputePipelineStateWithFunction:error:");
     Method m4 = class_getInstanceMethod(sup, s4);
     imp_fn_err o4 = m4 ? (imp_fn_err)method_getImplementation(m4) : NULL;

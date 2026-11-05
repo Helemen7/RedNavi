@@ -862,6 +862,51 @@ int main(int argc, char **argv) {
                 printf("texture views and selectors through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_FORMAT_TEST")) {
+                // Pixel formats of the render path: a clear-only pass of (0.25, 0.5, 0.75, 1) into a texture of each format, read back as raw bytes and decoded.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                struct { MTLPixelFormat pf; const char *name; unsigned texel; } fm[] = {
+                    {MTLPixelFormatRGBA8Unorm, "RGBA8Unorm", 4}, {MTLPixelFormatBGRA8Unorm, "BGRA8Unorm", 4}, {MTLPixelFormatRGBA16Float, "RGBA16Float", 8}, {MTLPixelFormatRG16Float, "RG16Float", 4},
+                    {MTLPixelFormatRGB10A2Unorm, "RGB10A2Unorm", 4}, {MTLPixelFormatBGR10A2Unorm, "BGR10A2Unorm", 4}, {MTLPixelFormatRGBA16Unorm, "RGBA16Unorm", 8}, {MTLPixelFormatRG16Unorm, "RG16Unorm", 4},
+                    {MTLPixelFormatR16Unorm, "R16Unorm", 2}, {MTLPixelFormatRGBA8Unorm_sRGB, "RGBA8Unorm_sRGB", 4}, {MTLPixelFormatR32Float, "R32Float", 4}};
+                int fails = 0;
+                for (unsigned i = 0; i < sizeof(fm) / sizeof(fm[0]); i++) {
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fm[i].pf width:4 height:4 mipmapped:NO];
+                    td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                    id<MTLTexture> t = [d newTextureWithDescriptor:td];
+                    if (!t) { printf("%s: no texture\n", fm[i].name); fails++; continue; }
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = t; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1);
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t px[16] = {0};
+                    [t getBytes:px bytesPerRow:fm[i].texel * 4 fromRegion:MTLRegionMake2D(1, 1, 1, 1) mipmapLevel:0];
+                    char desc[96] = "";
+                    int ok = 0;
+                    const uint16_t *h = (const uint16_t *)px; const uint32_t w0 = *(uint32_t *)px;
+                    switch (fm[i].pf) {
+                    case MTLPixelFormatRGBA8Unorm: snprintf(desc, sizeof(desc), "%u %u %u %u", px[0], px[1], px[2], px[3]); ok = abs(px[0] - 64) < 3 && abs(px[1] - 128) < 3 && abs(px[2] - 191) < 3 && px[3] == 255; break;
+                    case MTLPixelFormatBGRA8Unorm: snprintf(desc, sizeof(desc), "b %u g %u r %u a %u", px[0], px[1], px[2], px[3]); ok = abs(px[2] - 64) < 3 && abs(px[1] - 128) < 3 && abs(px[0] - 191) < 3 && px[3] == 255; break;
+                    case MTLPixelFormatRGBA8Unorm_sRGB: snprintf(desc, sizeof(desc), "%u %u %u %u (encoded)", px[0], px[1], px[2], px[3]); ok = px[0] > 100 && px[0] < 150 && px[3] == 255; break;
+                    case MTLPixelFormatRGBA16Float: case MTLPixelFormatRG16Float: {
+                        _Float16 a = *(const _Float16 *)&h[0], b = *(const _Float16 *)&h[1]; snprintf(desc, sizeof(desc), "%.3f %.3f", (double)a, (double)b); ok = fabs((double)a - 0.25) < 0.002 && fabs((double)b - 0.5) < 0.002; break; }
+                    case MTLPixelFormatRGB10A2Unorm: snprintf(desc, sizeof(desc), "r %u g %u b %u a %u", w0 & 1023, (w0 >> 10) & 1023, (w0 >> 20) & 1023, w0 >> 30); ok = abs((int)(w0 & 1023) - 256) < 3 && abs((int)((w0 >> 10) & 1023) - 512) < 3 && abs((int)((w0 >> 20) & 1023) - 767) < 3 && (w0 >> 30) == 3; break;
+                    case MTLPixelFormatBGR10A2Unorm: snprintf(desc, sizeof(desc), "b %u g %u r %u a %u", w0 & 1023, (w0 >> 10) & 1023, (w0 >> 20) & 1023, w0 >> 30); ok = abs((int)(w0 & 1023) - 767) < 3 && abs((int)((w0 >> 10) & 1023) - 512) < 3 && abs((int)((w0 >> 20) & 1023) - 256) < 3 && (w0 >> 30) == 3; break;
+                    case MTLPixelFormatRGBA16Unorm: case MTLPixelFormatRG16Unorm: snprintf(desc, sizeof(desc), "%u %u", h[0], h[1]); ok = abs(h[0] - 16384) < 8 && abs(h[1] - 32768) < 8; break;
+                    case MTLPixelFormatR16Unorm: snprintf(desc, sizeof(desc), "%u", h[0]); ok = abs(h[0] - 16384) < 8; break;
+                    case MTLPixelFormatR32Float: snprintf(desc, sizeof(desc), "%.3f", (double)*(float *)px); ok = fabs(*(float *)px - 0.25) < 0.001; break;
+                    default: break;
+                    }
+                    printf("%-16s %s status %ld: %s\n", fm[i].name, desc, (long)cb.status, ok ? "ok" : "FAIL");
+                    if (!ok) fails++;
+                }
+                printf("pixel formats through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

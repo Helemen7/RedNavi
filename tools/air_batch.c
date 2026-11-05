@@ -49,6 +49,15 @@ int main(int argc, char **argv) {
     unsigned bytype[3] = {0, 0, 0}, ok[3] = {0, 0, 0}, tried = 0;
     for (unsigned i = 0; i < total; i++) if (fn[i].type < 3) bytype[fn[i].type]++;
     printf("%s: %u functions (%u vertex, %u fragment, %u kernel)\n", argv[1], total, bytype[0], bytype[1], bytype[2]);
+    if (getenv("AIR_DUMP")) {                       // AIR_DUMP=<function name>: write that function's bitcode to AIR_DUMP_OUT (default /tmp/air_dump.bc) and stop
+        for (unsigned i = 0; i < total; i++) if (!strcmp(fn[i].name, getenv("AIR_DUMP"))) {
+            FILE *o = fopen(getenv("AIR_DUMP_OUT") ? getenv("AIR_DUMP_OUT") : "/tmp/air_dump.bc", "wb");
+            fwrite(d + fn[i].bitcode_off, 1, fn[i].bitcode_size, o); fclose(o);
+            printf("wrote %s (%llu bytes)\n", fn[i].name, (unsigned long long)fn[i].bitcode_size);
+            return 0;
+        }
+        puts("no such function"); return 1;
+    }
     for (unsigned i = 0; i < total && tried < max; i += stride) {
         const unsigned t = fn[i].type < 3 ? fn[i].type : 2;
         rn_air_kernel_info info; memset(&info, 0, sizeof(info));
