@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#include <IOSurface/IOSurfaceRef.h>
 #include <stdlib.h>
 #include "rn_vk.h"
 #include "rn_air.h"
@@ -80,8 +81,8 @@ static rn_vk *rn_vk_shared(void) {
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 @end
 
-// Textures (docs/M6_METAL_ON_RADV.md): 2D, one level, one sample, in RADV memory with a host copy that is kept in step at the borders of each dispatch (rn_vk_image). Not backed by
-// an IOSurface yet: RADV cannot import host memory, so a texture made from an IOSurface would need a copy at each command buffer.
+// Textures (docs/M6_METAL_ON_RADV.md): 2D, one level, one sample, in RADV memory with a host copy that is kept in step at the borders of each dispatch (rn_vk_image). A texture made
+// from an IOSurface is a copy too, made at each command buffer: RADV cannot import host memory.
 static int rn_vk_format_of(MTLPixelFormat pf) {
     switch (pf) {
     case MTLPixelFormatRGBA8Unorm: return RN_VK_RGBA8;
@@ -109,8 +110,12 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     unsigned texel;
     MTLTextureUsage usage_;
     NSString *label_;
+    IOSurfaceRef surf;                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc;
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane;
+- (void)syncFromSurface;
+- (void)syncToSurface;
 @end
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
@@ -128,7 +133,39 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
     return self;
 }
-- (void)dealloc { if (img) rn_vk_image_destroy(rn_vk_shared(), img); }
+- (void)dealloc { if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (surf) CFRelease(surf); }
+// IOSurface-backed textures (no host memory import in the kext, so a copy): the surface's rows are copied into the host copy of the image before the command buffer runs and, for
+// what the command buffer wrote, back afterwards. The surface's row pitch is its own; the host copy is packed.
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane {
+    if (!io || plane != 0) { rn_log("texture from an IOSurface: %s", io ? "only plane 0 is supported" : "no surface"); return nil; }
+    if (IOSurfaceGetPlaneCount(io) > 1) { rn_log("texture from an IOSurface: multi-planar surfaces are not supported"); return nil; }
+    if ((self = [self initWithDevice:d descriptor:desc])) {
+        if (w > IOSurfaceGetWidth(io) || h > IOSurfaceGetHeight(io) || texel != IOSurfaceGetBytesPerElement(io)) {
+            rn_log("texture from an IOSurface: the surface is %zux%zu with %zu bytes per element, the texture %lux%lu with %u", IOSurfaceGetWidth(io), IOSurfaceGetHeight(io), IOSurfaceGetBytesPerElement(io), (unsigned long)w, (unsigned long)h, texel);
+            return nil;
+        }
+        surf = (IOSurfaceRef)CFRetain(io);
+        [self syncFromSurface];
+    }
+    return self;
+}
+- (void)syncFromSurface {
+    if (!surf || IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+    const uint8_t *src = IOSurfaceGetBaseAddress(surf);
+    const size_t pitch = IOSurfaceGetBytesPerRow(surf);
+    uint8_t *dst = rn_vk_image_staging(img);
+    for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * w * texel, src + y * pitch, w * texel);
+    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    rn_vk_image_host_wrote(img);
+}
+- (void)syncToSurface {
+    if (!surf || IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return;
+    uint8_t *dst = IOSurfaceGetBaseAddress(surf);
+    const size_t pitch = IOSurfaceGetBytesPerRow(surf);
+    const uint8_t *src = rn_vk_image_staging(img);
+    for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * pitch, src + y * w * texel, w * texel);
+    IOSurfaceUnlock(surf, 0, NULL);
+}
 - (id<MTLDevice>)device { return dev; }
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
@@ -149,7 +186,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (id<MTLBuffer>)buffer { return nil; }
 - (NSUInteger)bufferOffset { return 0; }
 - (NSUInteger)bufferBytesPerRow { return 0; }
-- (IOSurfaceRef)iosurface { return NULL; }
+- (IOSurfaceRef)iosurface { return surf; }
 - (NSUInteger)iosurfacePlane { return 0; }
 - (MTLTextureType)textureType { return MTLTextureType2D; }
 - (MTLPixelFormat)pixelFormat { return pf; }
@@ -175,12 +212,14 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     for (NSUInteger y = 0; y < region.size.height; y++)
         memcpy(dst + ((region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
+    [self syncToSurface];
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr {
     [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
     if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    [self syncFromSurface];
     const uint8_t *src = rn_vk_image_staging(img);
     for (NSUInteger y = 0; y < region.size.height; y++)
         memcpy((uint8_t *)out + y * bpr, src + ((region.origin.y + y) * w + region.origin.x) * texel, region.size.width * texel);
@@ -728,6 +767,24 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     for (MTLCommandBufferHandler h in scheduled) h((id)self);
     rn_vk *vk = rn_vk_shared();
     if (!vk) [self fail:@"RADV is not available"];
+    // IOSurface-backed textures: what the surface holds goes to the images first, what the command buffer wrote goes back to the surface afterwards
+    NSMutableOrderedSet<RedNaviMTLTexture *> *surfUsed = [NSMutableOrderedSet orderedSet], *surfWritten = [NSMutableOrderedSet orderedSet];
+    void (^note)(RedNaviMTLTexture *, BOOL) = ^(RedNaviMTLTexture *t, BOOL written) {
+        if (!t || !t->surf) return;
+        [surfUsed addObject:t];
+        if (written) [surfWritten addObject:t];
+    };
+    for (id rec in records) {
+        if ([rec isKindOfClass:[RNRenderPass class]]) {
+            RNRenderPass *rp = rec;
+            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], YES);
+            for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
+        } else {
+            RNDispatch *dp = rec;
+            for (int i = 0; i < 16; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
+        }
+    }
+    for (RedNaviMTLTexture *t in surfUsed) [t syncFromSurface];
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
         if ([rec isKindOfClass:[RNRenderPass class]]) { [self runRenderPass:rec]; continue; }
@@ -746,6 +803,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
         else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
+    if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     for (MTLCommandBufferHandler h in completed) h((id)self);
     dispatch_semaphore_signal(done);
@@ -1039,6 +1097,14 @@ void rn_compute_install(Class k, Class sup) {
         if (!rn_gate()) return o7 ? o7(self, s7, desc) : 0;
         return (uintptr_t)CFBridgingRetain([[RedNaviMTLTexture alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc]);
     }), m7 ? method_getTypeEncoding(m7) : "@24@0:8@16");
+    SEL s7b = sel_registerName("newTextureWithDescriptor:iosurface:plane:");
+    Method m7b = class_getInstanceMethod(sup, s7b);
+    typedef uintptr_t (*imp_tex_io)(id, SEL, id, IOSurfaceRef, NSUInteger);
+    imp_tex_io o7b = m7b ? (imp_tex_io)method_getImplementation(m7b) : NULL;
+    class_addMethod(k, s7b, imp_implementationWithBlock(^uintptr_t(id self, MTLTextureDescriptor *desc, IOSurfaceRef io, NSUInteger plane) {
+        if (!rn_gate()) return o7b ? o7b(self, s7b, desc, io, plane) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLTexture alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc iosurface:io plane:plane]);
+    }), m7b ? method_getTypeEncoding(m7b) : "@40@0:8@16^{__IOSurface=}24Q32");
     SEL s8 = sel_registerName("newSamplerStateWithDescriptor:");
     Method m8 = class_getInstanceMethod(sup, s8);
     imp_fn_err1 o8 = m8 ? (imp_fn_err1)method_getImplementation(m8) : NULL;

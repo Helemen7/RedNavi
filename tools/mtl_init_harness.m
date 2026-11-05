@@ -6,6 +6,7 @@
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <IOSurface/IOSurface.h>
 #include <IOKit/IOKitLib.h>
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
@@ -182,13 +183,13 @@ int main(int argc, char **argv) {
                 }
                 return fails ? 1 : 0;
             }
-            if (getenv("RN_QUAD_TEST")) {
+            if (getenv("RN_QUAD_TEST") || getenv("RN_IOSURFACE_TEST")) {
                 // [[stage_in]] with a vertex descriptor, a texture sampled in the fragment function with a runtime sampler state, and alpha blending (mesa-bridge/test/vk_quad.metal).
                 // Pass 1 on a 32 x 32 target: a quad over the whole target with a 2 x 2 texture (top-left red, top-right green, bottom-left blue, bottom-right white), blending off;
                 // then a small square inside the bottom-right quadrant with its colour (0.5, 0, 0, 0.5) and the blend state One / OneMinusSourceAlpha (premultiplied): over white it
                 // gives (1, 0.5, 0.5, 1). The vertices of the quad come from an MTLBuffer, those of the square from setVertexBytes.
                 id<MTLDevice> d = (id<MTLDevice>)r;
-                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_QUAD_TEST"))];
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_QUAD_TEST") ? getenv("RN_QUAD_TEST") : getenv("RN_IOSURFACE_TEST"))];
                 dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
                 NSError *e = nil;
                 id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
@@ -219,16 +220,35 @@ int main(int argc, char **argv) {
                 }
                 MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:2 mipmapped:NO];
                 td.usage = MTLTextureUsageShaderRead;
-                id<MTLTexture> tex = [d newTextureWithDescriptor:td];
+                // RN_IOSURFACE_TEST: the sampled 2 x 2 texture and the 32 x 32 target are both IOSurfaces (pitch padded to 256 bytes), the texels are written into the first one through its
+                // base address and the result is read from the second one's base address, with no getBytes: the copies at the command buffer's borders are what is under test.
+                const int io = getenv("RN_IOSURFACE_TEST") != NULL;
+                IOSurfaceRef surfTex = NULL, surfTarget = NULL;
                 const uint8_t texels[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}};
-                [tex replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+                id<MTLTexture> tex = nil;
+                if (io) {
+                    surfTex = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @2, (id)kIOSurfaceHeight: @2, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                    surfTarget = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @32, (id)kIOSurfaceHeight: @32, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                    if (!surfTex || !surfTarget) { printf("IOSurfaceCreate failed\n"); return 73; }
+                    printf("IOSurfaces: pitch %zu and %zu\n", IOSurfaceGetBytesPerRow(surfTex), IOSurfaceGetBytesPerRow(surfTarget));
+                    IOSurfaceLock(surfTex, 0, NULL);
+                    for (int y = 0; y < 2; y++) memcpy((uint8_t *)IOSurfaceGetBaseAddress(surfTex) + y * IOSurfaceGetBytesPerRow(surfTex), texels[y * 2], 8);
+                    IOSurfaceUnlock(surfTex, 0, NULL);
+                    IOSurfaceLock(surfTarget, 0, NULL);
+                    memset(IOSurfaceGetBaseAddress(surfTarget), 0x7f, IOSurfaceGetAllocSize(surfTarget));      // so a missing write-back shows
+                    IOSurfaceUnlock(surfTarget, 0, NULL);
+                    tex = [d newTextureWithDescriptor:td iosurface:surfTex plane:0];
+                } else {
+                    tex = [d newTextureWithDescriptor:td];
+                    [tex replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+                }
                 MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
                 sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
                 sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
                 id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
                 MTLTextureDescriptor *tt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32 height:32 mipmapped:NO];
                 tt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
-                id<MTLTexture> target = [d newTextureWithDescriptor:tt];
+                id<MTLTexture> target = io ? [d newTextureWithDescriptor:tt iosurface:surfTarget plane:0] : [d newTextureWithDescriptor:tt];
                 if (!tex || !smp || !target) { printf("no texture or sampler\n"); return 72; }
                 typedef struct { float pos[2], uv[2], color[4]; } V;
                 const V quad[6] = {{{-1, 1}, {0, 0}, {1, 1, 1, 1}}, {{-1, -1}, {0, 1}, {1, 1, 1, 1}}, {{1, 1}, {1, 0}, {1, 1, 1, 1}},
@@ -257,7 +277,11 @@ int main(int argc, char **argv) {
                 [enc endEncoding];
                 [cb commit]; [cb waitUntilCompleted];
                 uint8_t px[32 * 32 * 4];
-                [target getBytes:px bytesPerRow:32 * 4 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+                if (io) {
+                    IOSurfaceLock(surfTarget, kIOSurfaceLockReadOnly, NULL);
+                    for (int y = 0; y < 32; y++) memcpy(px + y * 128, (uint8_t *)IOSurfaceGetBaseAddress(surfTarget) + y * IOSurfaceGetBytesPerRow(surfTarget), 128);
+                    IOSurfaceUnlock(surfTarget, kIOSurfaceLockReadOnly, NULL);
+                } else [target getBytes:px bytesPerRow:32 * 4 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
                 struct { int x, y; int want[4]; const char *what; } probes[] = {
                     {8, 8, {255, 0, 0, 255}, "top-left texel (red)"}, {24, 8, {0, 255, 0, 255}, "top-right texel (green)"}, {8, 24, {0, 0, 255, 255}, "bottom-left texel (blue)"},
                     {30, 30, {255, 255, 255, 255}, "bottom-right texel (white), outside the square"}, {18, 24, {255, 255, 255, 255}, "left of the square"}, {24, 18, {255, 255, 255, 255}, "above the square"},
@@ -272,7 +296,7 @@ int main(int argc, char **argv) {
                 }
                 printf("status %ld, error %s\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none");
                 if (cb.status != MTLCommandBufferStatusCompleted) fails++;
-                printf("stage_in + texture + blending through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                printf("stage_in + texture + blending through Metal on RADV%s: %s\n", io ? " (IOSurface texture and target)" : "", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
             if (getenv("RN_TEX_TEST")) {
