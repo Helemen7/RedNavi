@@ -475,6 +475,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     unsigned nt;
     int tfmt[8];
     rn_vk_blend blend[8];
+    NSString *names[2];                              // vertex and fragment function names (for logs)
     unsigned nvattr, nvlayout;
     rn_vk_vattr vattr[16];
     rn_vk_vlayout vlayout[16];
@@ -1106,6 +1107,11 @@ static NSString *rn_run_blit(RNBlit *b) {
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
+        if (getenv("RN_LOG_DRAWS")) {
+            char tb[160] = ""; int o = 0;
+            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->texs[st][i] && o < 140) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf);
+            rn_log("draw %lu: %s + %s, prim %u, %u vertices%s, blend %d, viewport %d scissor %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->hasScissor, tb);
+        }
         rn_vk_render *r = [p renderForPrimitive:d->prim cull:d->cull clockwise:d->clockwise];
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
         bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
@@ -1470,6 +1476,7 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
             why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
             break;
         }
+        p->names[s] = fn[s]->name;
         p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
         rn_air_free(spv, spvBytes);
         unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;

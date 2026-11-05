@@ -58,21 +58,23 @@ int main(int argc, char **argv) {
         root.backgroundColor = CGColorCreateGenericRGB(0.1, 0.1, 0.3, 1);
         CALayer *a = [CALayer layer];
         a.frame = CGRectMake(20, 140, 100, 90); a.backgroundColor = CGColorCreateGenericRGB(1, 0.2, 0.2, 1); a.cornerRadius = 14; a.opacity = 0.8f;
-        [root addSublayer:a];
+        const char *only = getenv("RN_ONLY");           // RN_ONLY=a (rounded rect), g (gradient), s (shadow square), i (image): draw only those layers
+        #define WANT(c) (!only || strchr(only, c))
+        if (WANT('a')) [root addSublayer:a];
         CAGradientLayer *g = [CAGradientLayer layer];
         g.frame = CGRectMake(136, 140, 100, 90);
         g.colors = @[(__bridge_transfer id)CGColorCreateGenericRGB(0, 1, 0, 1), (__bridge_transfer id)CGColorCreateGenericRGB(1, 1, 0, 1)];
-        [root addSublayer:g];
+        if (WANT('g')) [root addSublayer:g];
         CALayer *s = [CALayer layer];
         s.frame = CGRectMake(40, 30, 80, 70); s.backgroundColor = CGColorCreateGenericRGB(1, 1, 1, 1);
         s.shadowOpacity = 0.7f; s.shadowRadius = 8; s.shadowOffset = CGSizeMake(0, -4); s.shadowColor = CGColorCreateGenericRGB(0, 0, 0, 1);
-        [root addSublayer:s];
+        if (WANT('s')) [root addSublayer:s];
         NSImage *img = [NSImage imageWithSize:NSMakeSize(64, 64) flipped:NO drawingHandler:^BOOL(NSRect r) {
             [[NSColor orangeColor] setFill]; NSRectFill(r); [[NSColor blueColor] setFill]; NSRectFill(NSMakeRect(8, 8, 24, 24)); return YES; }];
         CALayer *im = [CALayer layer];
         im.frame = CGRectMake(150, 30, 64, 64);
         im.contents = (__bridge id)[img CGImageForProposedRect:NULL context:nil hints:nil];
-        [root addSublayer:im];
+        if (WANT('i')) [root addSublayer:im];
 
         if (getenv("RN_TRACE_MSGS")) instrumentObjcMessageSends(YES);     // /tmp/msgSends-<pid>: every Objective-C message from here on
         CARenderer *r = [CARenderer rendererWithMTLTexture:tex options:@{kCARendererMetalCommandQueue: q}];
