@@ -99,7 +99,7 @@ typedef struct {
 rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d);   // NULL: RADV refused it
 void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
 
-typedef struct { rn_vk_image *image; int clear; float color[4]; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded
+typedef struct { rn_vk_image *image; int clear; float color[4]; int discard; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded; discard: the host copy is not updated afterwards (store action don't care)
 typedef struct {
     rn_vk_render *pipe;
     const rn_vk_arg *vargs, *fargs;                    // one per binding of the vertex and fragment module

@@ -673,7 +673,7 @@ static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
         memcpy(cc.float32, targets[i].color, sizeof(cc.float32));
         VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
-        out[cleared++] = targets[i].image;
+        if (!targets[i].discard) out[cleared++] = targets[i].image;
     }
     VkMemoryBarrier fromClear = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fromClear, 0, NULL, 0, NULL);
@@ -716,7 +716,7 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     VkDescriptorImageInfo *ii = calloc((size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*ii));
     if (!sets || !in || !out || !w || !bi || !ii) goto done;
     unsigned nin = 0, nout = 0, nw = 0;
-    for (unsigned i = 0; i < nt; i++) { in[nin++] = targets[i].image; out[nout++] = targets[i].image; }
+    for (unsigned i = 0; i < nt; i++) { in[nin++] = targets[i].image; if (!targets[i].discard) out[nout++] = targets[i].image; }
     // descriptor pool for every set of every draw (a set is written when the commands are recorded, so draws must not share one)
     uint32_t cnt[4] = {0, 0, 0, 0};
     for (unsigned d = 0; d < nd; d++)

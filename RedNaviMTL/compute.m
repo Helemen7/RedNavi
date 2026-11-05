@@ -475,7 +475,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 @interface RNRenderPass : NSObject {
 @public
     RedNaviMTLTexture *tex[8];
-    BOOL clear[8];
+    BOOL clear[8], store[8];
     float clearColor[8][4];
     unsigned nt;
     NSMutableArray<RNDraw *> *draws;
@@ -866,6 +866,8 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (![ca.texture isKindOfClass:[RedNaviMTLTexture class]]) { rn_log("renderCommandEncoder: attachment %lu is not a RedNavi texture", (unsigned long)i); return nil; }
         rp->tex[i] = (RedNaviMTLTexture *)ca.texture;
         rp->clear[i] = ca.loadAction == MTLLoadActionClear;
+        rp->store[i] = ca.storeAction != MTLStoreActionDontCare;
+        if (ca.storeAction == MTLStoreActionMultisampleResolve || ca.storeAction == MTLStoreActionStoreAndMultisampleResolve || ca.resolveTexture) rn_log("renderCommandEncoder: multisample resolve is not implemented, ignored");
         rp->clearColor[i][0] = (float)ca.clearColor.red; rp->clearColor[i][1] = (float)ca.clearColor.green; rp->clearColor[i][2] = (float)ca.clearColor.blue; rp->clearColor[i][3] = (float)ca.clearColor.alpha;
         rp->nt = (unsigned)i + 1;
     }
@@ -877,7 +879,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     rn_vk *vk = rn_vk_shared();
     const NSUInteger nd = rp->draws.count;
     rn_vk_target tg[8];
-    for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}}; }
+    for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}, !rp->store[i]}; }
     const NSUInteger na = nd ? nd : 1;               // a pass without draws still runs: its clears are done
     rn_vk_draw *dr = calloc(na, sizeof(*dr));
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
@@ -942,7 +944,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     for (id rec in records) {
         if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
-            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], YES);
+            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
             for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
         } else if ([rec isKindOfClass:[RNBlit class]]) {
             RNBlit *bl = rec;

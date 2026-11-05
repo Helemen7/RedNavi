@@ -481,6 +481,132 @@ int main(int argc, char **argv) {
                 printf("clear-only passes, indexed draws and culling through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_LOADSTORE_TEST")) {
+                // Load and store actions (mesa-bridge/test/vk_quad.metal). A "dirty rectangle" update: a target cleared to blue in one pass is drawn into red with a scissor rectangle in a
+                // later pass with MTLLoadActionLoad, in another command buffer and in the same one; what is outside the rectangle must stay blue. The same on an IOSurface-backed target
+                // whose surface the CPU changed between the two command buffers (the CPU's pixel must survive outside the rectangle). Store action don't care: the host copy and the
+                // surface are not updated (documented behaviour; the contents are undefined in Metal's terms).
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_LOADSTORE_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 95; }
+                MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+                vd.attributes[0].format = MTLVertexFormatFloat2; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 0;
+                vd.attributes[1].format = MTLVertexFormatFloat2; vd.attributes[1].offset = 8;  vd.attributes[1].bufferIndex = 0;
+                vd.attributes[2].format = MTLVertexFormatFloat4; vd.attributes[2].offset = 16; vd.attributes[2].bufferIndex = 0;
+                vd.layouts[0].stride = 32;
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+                pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+                pd.vertexDescriptor = vd;
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                if (!rps) { printf("no pipeline: %s\n", e.localizedDescription.UTF8String); return 96; }
+                MTLTextureDescriptor *st = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:2 mipmapped:NO];
+                id<MTLTexture> tex = [d newTextureWithDescriptor:st];
+                const uint8_t texels[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}};
+                [tex replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];      // texel (0,0) is red
+                MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+                sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+                sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+                id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+                typedef struct { float pos[2], uv[2], color[4]; } V;
+                #define RV(x, y) {{x, y}, {0.1f, 0.1f}, {1, 1, 1, 1}}
+                const V quad[6] = {RV(-1, 1), RV(-1, -1), RV(1, 1), RV(1, 1), RV(-1, -1), RV(1, -1)};      // the whole target, every pixel samples the red texel
+                id<MTLBuffer> vb = [d newBufferWithBytes:quad length:sizeof(quad) options:MTLResourceStorageModeShared];
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                MTLTextureDescriptor *tt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32 height:32 mipmapped:NO];
+                tt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                int fails = 0;
+                #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+                // one pass on `enc`'s command buffer: load/store/clear as given, optionally a red scissored draw
+                id (^pass)(id<MTLCommandBuffer>, id<MTLTexture>, MTLLoadAction, MTLStoreAction, double, double, double, int) =
+                    ^id(id<MTLCommandBuffer> cb, id<MTLTexture> target, MTLLoadAction la, MTLStoreAction sa, double cr, double cg, double cb2, int draw) {
+                        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                        rpd.colorAttachments[0].texture = target; rpd.colorAttachments[0].loadAction = la; rpd.colorAttachments[0].storeAction = sa;
+                        rpd.colorAttachments[0].clearColor = MTLClearColorMake(cr, cg, cb2, 1);
+                        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                        if (draw) {
+                            [enc setRenderPipelineState:rps];
+                            [enc setFragmentTexture:tex atIndex:0]; [enc setFragmentSamplerState:smp atIndex:0];
+                            [enc setVertexBuffer:vb offset:0 atIndex:0];
+                            [enc setScissorRect:(MTLScissorRect){4, 4, 8, 8}];
+                            [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                        }
+                        [enc endEncoding];
+                        return nil;
+                    };
+                #define PIX(buf, x, y) ((buf) + ((y) * 32 + (x)) * 4)
+                uint8_t px[32 * 32 * 4];
+                // 1. two command buffers
+                {
+                    id<MTLTexture> t = [d newTextureWithDescriptor:tt];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionClear, MTLStoreActionStore, 0, 0, 1, 0);
+                    [cb commit]; [cb waitUntilCompleted];
+                    cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionLoad, MTLStoreActionStore, 0, 0, 0, 1);
+                    [cb commit]; [cb waitUntilCompleted];
+                    [t getBytes:px bytesPerRow:128 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+                    printf("load in a second command buffer: inside the scissor %u %u %u, outside %u %u %u / %u %u %u\n", PIX(px, 6, 6)[0], PIX(px, 6, 6)[1], PIX(px, 6, 6)[2], PIX(px, 2, 2)[0], PIX(px, 2, 2)[1], PIX(px, 2, 2)[2], PIX(px, 20, 20)[0], PIX(px, 20, 20)[1], PIX(px, 20, 20)[2]);
+                    CHECK(PIX(px, 6, 6)[0] == 255 && PIX(px, 6, 6)[2] == 0, "the scissored draw is missing");
+                    CHECK(PIX(px, 2, 2)[2] == 255 && PIX(px, 20, 20)[2] == 255 && PIX(px, 12, 6)[2] == 255 && PIX(px, 3, 3)[2] == 255, "outside the scissor rectangle the blue was lost");
+                }
+                // 2. one command buffer, two passes
+                {
+                    id<MTLTexture> t = [d newTextureWithDescriptor:tt];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionClear, MTLStoreActionStore, 0, 0, 1, 0);
+                    pass(cb, t, MTLLoadActionLoad, MTLStoreActionStore, 0, 0, 0, 1);
+                    [cb commit]; [cb waitUntilCompleted];
+                    [t getBytes:px bytesPerRow:128 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+                    printf("load in the same command buffer: inside %u %u %u, outside %u %u %u\n", PIX(px, 6, 6)[0], PIX(px, 6, 6)[1], PIX(px, 6, 6)[2], PIX(px, 20, 20)[0], PIX(px, 20, 20)[1], PIX(px, 20, 20)[2]);
+                    CHECK(PIX(px, 6, 6)[0] == 255 && PIX(px, 6, 6)[2] == 0 && PIX(px, 20, 20)[2] == 255, "two passes in one command buffer");
+                }
+                // 3. IOSurface target changed by the CPU between two command buffers
+                {
+                    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @32, (id)kIOSurfaceHeight: @32, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                    id<MTLTexture> t = [d newTextureWithDescriptor:tt iosurface:surf plane:0];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionClear, MTLStoreActionStore, 0, 1, 0, 0);
+                    [cb commit]; [cb waitUntilCompleted];
+                    IOSurfaceLock(surf, 0, NULL);                  // the application draws a white pixel at (25,25)
+                    uint8_t *sb = IOSurfaceGetBaseAddress(surf) + 25 * IOSurfaceGetBytesPerRow(surf) + 25 * 4;
+                    sb[0] = sb[1] = sb[2] = sb[3] = 255;
+                    IOSurfaceUnlock(surf, 0, NULL);
+                    cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionLoad, MTLStoreActionStore, 0, 0, 0, 1);
+                    [cb commit]; [cb waitUntilCompleted];
+                    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+                    const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+                    const size_t pitch = IOSurfaceGetBytesPerRow(surf);
+                    const uint8_t *in = base + 6 * pitch + 6 * 4, *out = base + 20 * pitch + 20 * 4, *cpu = base + 25 * pitch + 25 * 4;
+                    printf("IOSurface target: inside %u %u %u, outside %u %u %u, the CPU's pixel %u %u %u\n", in[0], in[1], in[2], out[0], out[1], out[2], cpu[0], cpu[1], cpu[2]);
+                    CHECK(in[0] == 255 && in[1] == 0, "the draw is missing in the surface");
+                    CHECK(out[1] == 255 && out[0] == 0, "the cleared green was lost outside the rectangle");
+                    CHECK(cpu[0] == 255 && cpu[1] == 255 && cpu[2] == 255, "the pixel the CPU wrote between the passes was lost");
+                    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+                }
+                // 4. store action don't care: nothing is copied back to the surface
+                {
+                    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @32, (id)kIOSurfaceHeight: @32, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                    IOSurfaceLock(surf, 0, NULL); memset(IOSurfaceGetBaseAddress(surf), 0x7f, IOSurfaceGetAllocSize(surf)); IOSurfaceUnlock(surf, 0, NULL);
+                    id<MTLTexture> t = [d newTextureWithDescriptor:tt iosurface:surf plane:0];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    pass(cb, t, MTLLoadActionClear, MTLStoreActionDontCare, 1, 0, 0, 1);
+                    [cb commit]; [cb waitUntilCompleted];
+                    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+                    const uint8_t *p0 = (uint8_t *)IOSurfaceGetBaseAddress(surf) + 6 * IOSurfaceGetBytesPerRow(surf) + 6 * 4;
+                    printf("store action don't care: the surface holds %u %u %u %u (0x7f = not written back), status %ld\n", p0[0], p0[1], p0[2], p0[3], (long)cb.status);
+                    CHECK(p0[0] == 0x7f && p0[1] == 0x7f, "a don't-care store was written to the surface");
+                    CHECK(cb.status == MTLCommandBufferStatusCompleted, "command buffer status");
+                    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+                }
+                printf("load and store actions through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the
