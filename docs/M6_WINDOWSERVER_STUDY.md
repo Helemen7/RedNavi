@@ -46,7 +46,7 @@ Strings, not traced: QuartzCore `CoreAnimation: Failed to initialize Metal or Op
 3. ~~Texture views (`newTextureViewWithPixelFormat:...`), `setOwnerWithIdentity:`, `newFunctionWithDescriptor:error:`, `setDepthClipMode:`, `setVisibilityResultMode:offset:`, `textureBarrier`, `setThreadgroupMemoryLength:atIndex:`.~~ Done 2026-11-05, see the last section.
 4. Framebuffer fetch (`ColorInput`) and threadgroup memory in the translator, or the environment switches that avoid those shaders.
 5. Half-precision and 3D-texture formats in the render path (the plug-in supports RGBA8, BGRA8, R8, RG8, R16F, RGBA16F, R32F, RG32F, RGBA32F, R32U, R32I, RGBA8U), and BGRA8 / RGB10A2 / RGBA16F framebuffers for HDR paths.
-6. Registry ID check between `RedNaviFB`'s accelerator link and `-[MTLDevice registryID]`.
+6. ~~Registry ID check between `RedNaviFB`'s accelerator link and `-[MTLDevice registryID]`.~~ Checked 2026-11-05 (read-only), see the last section.
 7. Only then a run of WindowServer on the plug-in, from a state that can be undone over SSH.
 
 ## Function constants, as built (2026-11-05)
@@ -70,3 +70,13 @@ Not verified: how QuartzCore and SkyLight use handles. They may use fields of Ap
 - **`newFunctionWithDescriptor:error:`** (and the completion handler variant) looks up the name and applies the descriptor's constant values; binary archives, options and `specializedName` are ignored.
 
 Test (`tools/mtl_init_harness`, `RN_VIEW_TEST=<vk_texcopy.metallib>`), all pass on the 7800 XT: a kernel that reads a texture through a BGRA8 view, a swizzled RGBA8 view, a same-format view and a view of a view (0 of 240 texels wrong in each; the first two see red and blue swapped), a clear into a BGRA8 view of an RGBA8 texture (bytes 0 0 255 255), the refused views (8-byte format, level 1, a 2D array type), a pipeline from a function made with a descriptor, and the do-nothing calls inside a command buffer.
+
+## The registry link between display and Metal device, checked (2026-11-05, read-only)
+
+`tools/accel_registry.m` run on the test desktop (stage 3, WindowServer still on its software compositor):
+
+- `MTLCopyAllDevices()` lists one device, "Apple", `registryID` 0x1000004d7 = the registry entry ID of `RedNaviAccel2` (the IOAccelerator service, child of the PCI device `GFX0`). So the device is the accelerator's registry entry, as QuartzCore's `Could not find Metal device with registry id` lookup needs. (Verified.)
+- `RedNaviFB` (the IOFramebuffer) has `IOAccelIndex` 0, `IOAccelRevision` 2 (the accelerator has revision 2 too) and `IOAccelTypes` = `IOService:/AppleACPIPlatformExpert/PCI0@0/.../GFX0@0/RedNaviAccel2`, the service path of the accelerator. (Verified: the link the family's code reads is in place.)
+- `system_profiler SPDisplaysDataType` already lists the RX 7800 XT with `Metal Support: Metal 3` and its display under it. (Verified: the display is tied to the GPU, and Metal support is reported as present.)
+- Not known: whether CoreDisplay's own lookup (`Failed to create MetalDevice for accelerator ...`) succeeds, since it only runs when the Metal compositor is chosen. Two things differ from a real driver and might matter: `RedNaviFB` is a child of `RedNaviProbe`, which is a child of `GFX0`, where a real framebuffer is a direct child of the PCI device next to the accelerator; and there is a second framebuffer, `.Display_boot` (`IONDRVFramebuffer`, kept by `rednavi_keep_boot_fb=1`), which has no accelerator properties at all and is listed as a second, mirrored display. A Metal compositor that creates a device per display would find no accelerator for that one. Both are things to look at before enabling the Metal compositor, not things shown to be wrong.
+- No WindowServer or CoreDisplay log line about Metal, accelerators or compositors was found in the unified log of the last three hours; the compositor in use could not be read from outside (`/tmp/WindowServer.metalinfo.out` is written by a WindowServer state dump, which was not triggered).
