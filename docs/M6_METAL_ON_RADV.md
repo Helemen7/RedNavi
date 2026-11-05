@@ -116,3 +116,7 @@ Limits (what is refused or ignored; the render encoder and the command queue exi
 - Whether Core Animation, once it gets a real queue, needs render pipelines at once (it does for compositing windows): until step 4 the queue must keep answering nil to
   its `newCommandQueue` so it falls back to software (V: this is how Terminal works now).
 - Hardening: every client is an administrator today (docs/M6_PLAN.md, step 5).
+
+## Metal render target on the screen (2026-11-05)
+
+`tools/mtl_init_harness` with `RN_TRI_TEST` and `RN_PRESENT_SECONDS=N` runs the triangle test, then draws a triangle at the display's size (1920x1080 here) into a Metal texture, copies the pixels (RGBA to XRGB8888) into display surface 1 from `rn_bridge_scanout`, and calls `rn_bridge_present(1, wait)`; after N seconds it flips back to surface 0. Run on the 7800 XT: both flips returned 0, the earlier checks still pass. The copy is a CPU copy of `getBytes` rows, not a GPU blit: Metal textures cannot be imported as scanout memory yet (same limit as IOSurface). Whether the picture was on the monitor is reported by the person looking at it; the driver only knows the flip completed.

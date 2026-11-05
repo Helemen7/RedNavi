@@ -136,6 +136,48 @@ int main(int argc, char **argv) {
                 if (!(bl[0] == 51 && bl[1] == 51 && bl[2] == 51)) { printf("  FAIL: the bottom-left is not the clear colour (image flipped?)\n"); fails++; }
                 if (inTri < 100 || inTri > 140) { printf("  FAIL: the triangle covers %d pixels, not about 120\n", inTri); fails++; }
                 printf("render encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                if (!fails && getenv("RN_PRESENT_SECONDS")) {
+                    // To the screen: the same triangle, at the display's size, in a Metal texture; the pixels go to display surface 1 (rn_bridge_scanout, XRGB8888 = B G R X
+                    // in memory) and rn_bridge_present flips to it. Surface 0 stays the desktop's and comes back at the end.
+                    const char *dir = getenv("RN_VK_DIR");
+                    char lp[1024]; snprintf(lp, sizeof(lp), "%s/libvulkan_radeon.dylib", dir ? dir : ".");
+                    void *lib2 = dlopen(lp, RTLD_LAZY);
+                    int (*scanout)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = lib2 ? dlsym(lib2, "rn_bridge_scanout") : NULL;
+                    int (*present)(uint32_t, int) = lib2 ? dlsym(lib2, "rn_bridge_present") : NULL;
+                    uint32_t W = 0, H = 0, pitch = 0; void *scan = NULL; size_t slen = 0;
+                    if (!scanout || !present || scanout(1, &W, &H, &pitch, &scan, &slen)) { printf("no display surface (needs rednavi_fb=1 and the bridge)\n"); return 60; }
+                    printf("display surface 1: %ux%u, pitch %u\n", W, H, pitch);
+                    MTLTextureDescriptor *bt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:W height:H mipmapped:NO];
+                    bt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                    id<MTLTexture> big = [d newTextureWithDescriptor:bt];
+                    if (!big) { printf("no display-size texture\n"); return 61; }
+                    // a full-screen triangle (x from -1 to 1, y from -1 to 1 on the lower-left half), a dark blue background
+                    const float bpos[3][4] = {{-0.8f, -0.8f, 0, 1}, {0.8f, -0.8f, 0, 1}, {0, 0.8f, 0, 1}};
+                    rpd.colorAttachments[0].texture = big;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.05, 0.2, 1.0);
+                    cb = [q commandBuffer];
+                    enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    [enc setRenderPipelineState:rps];
+                    [enc setVertexBytes:bpos length:sizeof(bpos) atIndex:0];
+                    [enc setVertexBytes:col length:sizeof(col) atIndex:1];
+                    [enc setFragmentBytes:tint length:sizeof(tint) atIndex:0];
+                    [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t *row = malloc((size_t)W * 4);
+                    for (uint32_t y = 0; y < H; y++) {
+                        [big getBytes:row bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, y, W, 1) mipmapLevel:0];
+                        uint8_t *dst = (uint8_t *)scan + (size_t)y * pitch;
+                        for (uint32_t x = 0; x < W; x++) { dst[x*4] = row[x*4+2]; dst[x*4+1] = row[x*4+1]; dst[x*4+2] = row[x*4]; dst[x*4+3] = 255; }
+                    }
+                    free(row);
+                    int pr = present(1, 1);
+                    printf("rn_bridge_present(1) -> %d; triangle on the screen for %s s\n", pr, getenv("RN_PRESENT_SECONDS"));
+                    fflush(stdout);
+                    sleep((unsigned)atoi(getenv("RN_PRESENT_SECONDS")));
+                    pr = present(0, 1);
+                    printf("rn_bridge_present(0) -> %d (desktop back)\n", pr);
+                }
                 return fails ? 1 : 0;
             }
             if (getenv("RN_TEX_TEST")) {
