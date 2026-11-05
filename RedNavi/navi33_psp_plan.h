@@ -16,12 +16,12 @@ constexpr bool kCanSubmitToGpu = false;
 struct FileInfo { const char *name; uint32_t size; const char *sha256; };
 constexpr FileInfo kFiles[kFileCount] = {
     {"gc_11_0_2_pfp", 234944u, "9020f53788ad881fa01aa656fc082f9f8d3cdfc81f70aaac0bed6e6001491128"},
-    {"gc_11_0_2_me", 324080u, "f5fe48f97acbd3ce13b35929290bfbac01ce522631cc91dcef1ddeb3ff35c8ed"},
+    {"gc_11_0_2_me", 324080u, "f5fe48f97acbd3ce13b35929290bfbac01ce522631cc91dcef1fdeb3ff35c8ed"},
     {"gc_11_0_2_mec", 406528u, "19bf080d6e672de5ed3fb86e3fdbdda4d700d8e3bda2dbdcc923101484ad645b"},
     {"gc_11_0_2_rlc", 178848u, "b43eb2fd0600f50a1a5796bc9983d6b39b5c20960234920f5e89cb362193e0b8"},
     {"gc_11_0_2_imu", 132352u, "9befca62b0b0cfd252c3df4a9edca295526f4d43821cd99a6326454995a6ca2d"},
     {"sdma_6_0_2", 34560u, "16c374344d2894da751f7028f9ec1f7520035fa9548d8c750d99a00a4afa86c7"},
-    {"gc_11_0_2_mes_2", 263696u, "719f446830ec8766f47b9cfcfcdc60e0767d1a7"},
+    {"gc_11_0_2_mes_2", 263696u, "719f446830ec8766f47b9cfcf1dc606b77dbf720a9e868c4cfcdc60e0767d1a7"},
     {"gc_11_0_2_mes1", 221408u, "5f8f0b50b7a9f8c34f68ee516a51968ed190cb0d0fb36c99e5301799dd65097c"},
     {"smu_13_0_7", 287080u, "6046f6379f42b4d3618151eace413d8c076ea374944afb770a8871ad79fcec55"}
 };
