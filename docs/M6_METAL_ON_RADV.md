@@ -47,6 +47,16 @@ compute through Metal on RADV: 0 of 256 values wrong (v[255] = 772)
 Not done in this slice: buffer offsets, `setBuffers`, textures, blit, render, `MTLLibrary` / `MTLFunction` (the shader still comes in as SPIR-V), asynchronous execution,
 `MTLSharedEvent`, private-storage buffers in VRAM.
 
+## Buffer offsets and a real Metal kernel (done, V, 2026-11-05)
+
+Run on the RX 7800 XT through the official Metal API (`tools/mtl_init_harness`, `RN_METAL_COMPUTE=1`):
+
+- SPIR-V compute: 0 of 256 values wrong, with the rewritten `rn_vk` (binding list, specialization variants).
+- Two buffers with offsets 512 and 1024 through `setBuffers:offsets:withRange:`: 0 of 512 words wrong. A misaligned offset fails the command buffer (status 5) with an error message.
+- An AIR kernel (`dispatch_add` from a `.metallib` built by `xcrun metal`/`metallib`) goes through `newLibraryWithData:`, `newFunctionWithName:`, `librn_air2spirv.dylib` (the LGPL translator, separate repo) and RADV: 0 of 256 values wrong.
+
+The translator needs `llvm-dis` and `spirv-val` at run time. For this test they were copied next to the library: the real `llvm-dis` binary (the MacPorts `llvm-dis-mp-19` is only a wrapper script around `xcrun`) with `libLLVM.dylib` (124 MB), `spirv-val` with `libSPIRV-Tools.dylib`; the harness ran with `DYLD_LIBRARY_PATH` pointing there. Shipping libLLVM at that size is not acceptable for users: still open (options: a smaller static `llvm-dis`, or reading the bitcode in Rust without LLVM).
+
 ## Order of work
 
 1. **Queue, command buffer, compute encoder, buffer** (smallest slice that runs something). `RedNaviMTLCommandQueue` (subclass of `MTLIOAccelCommandQueue`, init by
