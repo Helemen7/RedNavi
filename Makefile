@@ -124,7 +124,7 @@ $(ACCEL2KEXT): $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o RedNaviAcce
 
 # The Metal plug-in stub (user space, docs/M6_ACCELERATOR_STUDY.md) and the program that makes Metal load it.
 MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
-$(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
+$(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c $(wildcard RedNaviMTL/*.h) RedNaviMTL/Info.plist
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
 	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -framework Foundation -framework Metal -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
 	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist

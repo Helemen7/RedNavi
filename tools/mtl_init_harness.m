@@ -74,6 +74,58 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            if (getenv("RN_TEX_TEST")) {
+                // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
+                // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the
+                // sampler written in the shader.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_TEX_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 40; }
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                int failures = 0;
+                for (int job = 0; job < 4; job++) {
+                    NSString *name = job % 2 ? @"texture_sample" : @"texture_copy";
+                    const int exact = job >= 2;                      // dispatchThreads: a grid of exactly 20 x 12 threads, so the edge threadgroups are smaller
+                    id<MTLFunction> fn = [lib newFunctionWithName:name];
+                    e = nil;
+                    id<MTLComputePipelineState> pso = fn ? [d newComputePipelineStateWithFunction:fn error:&e] : nil;
+                    printf("%s (%s): pipeline %p, error: %s\n", name.UTF8String, exact ? "dispatchThreads" : "dispatchThreadgroups", (__bridge void *)pso, e ? e.localizedDescription.UTF8String : "none");
+                    if (!pso) { failures++; continue; }
+                    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:20 height:12 mipmapped:NO];
+                    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                    id<MTLTexture> src = [d newTextureWithDescriptor:td], dst = [d newTextureWithDescriptor:td];
+                    if (!src || !dst) { printf("%s: no textures\n", name.UTF8String); failures++; continue; }
+                    uint8_t in[20 * 12 * 4], out[20 * 12 * 4];
+                    for (int y = 0; y < 12; y++) for (int x = 0; x < 20; x++) {
+                        uint8_t *px = in + (y * 20 + x) * 4;
+                        px[0] = (uint8_t)(x * 13 + y * 7); px[1] = (uint8_t)(x * 5); px[2] = (uint8_t)(y * 17); px[3] = 255 - x;
+                    }
+                    in[0] = 255;                                   // the red clamp at the top
+                    [src replaceRegion:MTLRegionMake2D(0, 0, 20, 12) mipmapLevel:0 withBytes:in bytesPerRow:20 * 4];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pso];
+                    [enc setTexture:src atIndex:0];
+                    [enc setTexture:dst atIndex:1];
+                    if (exact) [enc dispatchThreads:MTLSizeMake(20, 12, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                    else [enc dispatchThreadgroups:MTLSizeMake(3, 2, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    [dst getBytes:out bytesPerRow:20 * 4 fromRegion:MTLRegionMake2D(0, 0, 20, 12) mipmapLevel:0];
+                    unsigned bad = 0;
+                    const int add = [name isEqualToString:@"texture_copy"] ? 1 : 0;
+                    for (int i = 0; i < 20 * 12; i++) {
+                        int rr = in[i * 4] + add; if (rr > 255) rr = 255;
+                        if (out[i * 4] != rr || out[i * 4 + 1] != in[i * 4 + 1] || out[i * 4 + 2] != in[i * 4 + 2] || out[i * 4 + 3] != in[i * 4 + 3]) { if (bad < 3) printf("  texel %d: got %u %u %u %u, want %d %u %u %u\n", i, out[i*4], out[i*4+1], out[i*4+2], out[i*4+3], rr, in[i*4+1], in[i*4+2], in[i*4+3]); bad++; }
+                    }
+                    printf("%s (%s) through Metal on RADV: status %ld, error %s, %u of 240 texels wrong\n", name.UTF8String, exact ? "dispatchThreads" : "dispatchThreadgroups", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none", bad);
+                    if (bad || cb.status != MTLCommandBufferStatusCompleted) failures++;
+                }
+                return failures;
+            }
             if (getenv("RN_AIR_TEST")) {
                 // A kernel from a .metallib through the official API, no SPIR-V hook: newLibraryWithData:error:, newFunctionWithName:, newComputePipelineStateWithFunction:error:.
                 // With RN_AIR_FUNC the kernel is run like vk_dispatch.metal (buffer 0 = out, bytes at index 1 = add); without a translator the pipeline error is printed.

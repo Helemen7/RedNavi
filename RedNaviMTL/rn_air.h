@@ -9,9 +9,9 @@
 // void rn_air_free(uint32_t *spirv, size_t bytes);
 //
 // The module has descriptors at set 0: storage buffers, one per Metal buffer the kernel uses (info.bindings: Metal index, binding number, writable), including the ones the app fills with
-// -setBytes:length:atIndex: (a constant argument is a read-only buffer too), no push constants, and the threadgroup size as specialization constants
-// info.local_size_spec_ids (0, 1, 2), default info.local_size. Textures (sampled or storage images) and samplers set by the app are listed in the same array with their kind;
-// the Metal index spaces of buffers, textures and samplers are separate. Samplers written in the shader (constexpr sampler), multisampled textures and other resources are refused with an error, for now.
+// -setBytes:length:atIndex: (a constant argument is a read-only buffer too), and the threadgroup size as specialization constants info.local_size_spec_ids (0, 1, 2). The grid is
+// in push constants (info.dispatch_push_bytes at offset 0): the app's grid is split into regions of whole threadgroups and one smaller threadgroup per edge (rn_vk_dispatch_threads). Textures (sampled or storage images) and samplers set by the app are listed in the same array with their kind;
+// the Metal index spaces of buffers, textures and samplers are separate. A storage image has no format in the module (it is read and written without one). Multisampled textures and other resources are refused with an error, for now.
 //
 // The tools the translator runs: llvm-dis (bitcode to LLVM IR) and spirv-val. rn_air_translate points METAL2VULKAN_LLVM_DIS and METAL2VULKAN_SPIRV_VAL at copies in the
 // library's directory when there are some, and otherwise leaves the environment and PATH alone.
@@ -30,14 +30,20 @@ typedef struct {
     uint32_t writable;         // 0: the kernel only reads it
     uint32_t kind;             // RN_AIR_BUFFER, RN_AIR_TEXTURE (sampled), RN_AIR_STORAGE_IMAGE or RN_AIR_SAMPLER; metal_index is [[texture(n)]] or [[sampler(n)]] for the last three
     uint32_t dim;              // textures: 0 1D, 1 2D, 2 3D, 3 cube, 4 buffer; +8 when arrayed
+    // RN_AIR_STATIC_SAMPLER only (a constexpr sampler of the shader; the app does not set it): filters 0 nearest, 1 linear; mip filter 0 none, 1 nearest, 2 linear;
+    // address modes 0 clamp to zero, 1 clamp to edge, 2 repeat, 3 mirrored repeat, 4 clamp to border; pixel_coords 1: unnormalized coordinates; border 0 transparent black,
+    // 1 opaque black, 2 opaque white.
+    uint32_t min_filter, mag_filter, mip_filter, address[3], pixel_coords, border;
+    float lod_min, lod_max;
 } rn_air_binding;
-enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3 };
+enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3, RN_AIR_STATIC_SAMPLER = 4 };
 
 typedef struct {
     uint32_t binding_count;
     rn_air_binding bindings[RN_AIR_MAX_BINDINGS];
     uint32_t local_size[3];            // default threads per threadgroup of the module
     uint32_t local_size_spec_ids[3];   // specialization constant ids of the three dimensions
+    uint32_t dispatch_push_bytes;      // push constants (at offset 0) each dispatch must write: 48 = thread grid, thread base, threadgroup base, threadgroup grid (4 x uint32[3])
 } rn_air_kernel_info;
 
 // 0 on success. dir: where to look for librn_air2spirv.dylib (NULL: rn_vk_dir()).

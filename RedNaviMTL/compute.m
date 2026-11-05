@@ -80,14 +80,169 @@ static rn_vk *rn_vk_shared(void) {
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 @end
 
+// Textures (docs/M6_METAL_ON_RADV.md): 2D, one level, one sample, in RADV memory with a host copy that is kept in step at the borders of each dispatch (rn_vk_image). Not backed by
+// an IOSurface yet: RADV cannot import host memory, so a texture made from an IOSurface would need a copy at each command buffer.
+static int rn_vk_format_of(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatRGBA8Unorm: return RN_VK_RGBA8;
+    case MTLPixelFormatBGRA8Unorm: return RN_VK_BGRA8;
+    case MTLPixelFormatR8Unorm: return RN_VK_R8;
+    case MTLPixelFormatRG8Unorm: return RN_VK_RG8;
+    case MTLPixelFormatR16Float: return RN_VK_R16F;
+    case MTLPixelFormatRGBA16Float: return RN_VK_RGBA16F;
+    case MTLPixelFormatR32Float: return RN_VK_R32F;
+    case MTLPixelFormatRG32Float: return RN_VK_RG32F;
+    case MTLPixelFormatRGBA32Float: return RN_VK_RGBA32F;
+    case MTLPixelFormatR32Uint: return RN_VK_R32U;
+    case MTLPixelFormatR32Sint: return RN_VK_R32I;
+    case MTLPixelFormatRGBA8Uint: return RN_VK_RGBA8U;
+    default: return 0;
+    }
+}
+
+@interface RedNaviMTLTexture : NSObject {
+@public
+    rn_vk_image *img;
+    id<MTLDevice> dev;
+    MTLPixelFormat pf;
+    NSUInteger w, h;
+    unsigned texel;
+    MTLTextureUsage usage_;
+    NSString *label_;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc;
+@end
+@implementation RedNaviMTLTexture
++ (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
+    if (!(self = [super init])) return nil;
+    if (desc.textureType != MTLTextureType2D || desc.arrayLength > 1 || desc.sampleCount > 1 || desc.depth > 1) {
+        rn_log("texture: only plain 2D textures are supported (type %ld, array %lu, samples %lu)", (long)desc.textureType, (unsigned long)desc.arrayLength, (unsigned long)desc.sampleCount);
+        return nil;
+    }
+    if (desc.mipmapLevelCount > 1) rn_log("texture: %lu mipmap levels asked, only level 0 exists", (unsigned long)desc.mipmapLevelCount);
+    const int f = rn_vk_format_of(desc.pixelFormat);
+    rn_vk *vk = f ? rn_vk_shared() : NULL;
+    img = vk ? rn_vk_image_create(vk, f, (uint32_t)desc.width, (uint32_t)desc.height) : NULL;
+    if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat); return nil; }
+    dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
+    return self;
+}
+- (void)dealloc { if (img) rn_vk_image_destroy(rn_vk_shared(), img); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (MTLResourceOptions)resourceOptions { return 0; }
+- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
+- (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeUntracked; }
+- (NSUInteger)allocatedSize { return w * h * texel; }
+- (id<MTLHeap>)heap { return nil; }
+- (NSUInteger)heapOffset { return 0; }
+- (BOOL)isAliasable { return NO; }
+- (void)makeAliasable {}
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (id<MTLResource>)rootResource { return nil; }
+- (id<MTLTexture>)parentTexture { return nil; }
+- (NSUInteger)parentRelativeLevel { return 0; }
+- (NSUInteger)parentRelativeSlice { return 0; }
+- (id<MTLBuffer>)buffer { return nil; }
+- (NSUInteger)bufferOffset { return 0; }
+- (NSUInteger)bufferBytesPerRow { return 0; }
+- (IOSurfaceRef)iosurface { return NULL; }
+- (NSUInteger)iosurfacePlane { return 0; }
+- (MTLTextureType)textureType { return MTLTextureType2D; }
+- (MTLPixelFormat)pixelFormat { return pf; }
+- (NSUInteger)width { return w; }
+- (NSUInteger)height { return h; }
+- (NSUInteger)depth { return 1; }
+- (NSUInteger)mipmapLevelCount { return 1; }
+- (NSUInteger)sampleCount { return 1; }
+- (NSUInteger)arrayLength { return 1; }
+- (MTLTextureUsage)usage { return usage_; }
+- (BOOL)isShareable { return NO; }
+- (BOOL)isFramebufferOnly { return NO; }
+- (BOOL)allowGPUOptimizedContents { return NO; }
+- (BOOL)isSparse { return NO; }
+- (NSUInteger)firstMipmapInTail { return 0; }
+- (NSUInteger)tailSizeInBytes { return 0; }
+- (BOOL)clampRegion:(MTLRegion)r {
+    return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z == 0 && r.size.depth <= 1;
+}
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
+    if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    uint8_t *dst = rn_vk_image_staging(img);
+    for (NSUInteger y = 0; y < region.size.height; y++)
+        memcpy(dst + ((region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + y * bpr, region.size.width * texel);
+    rn_vk_image_host_wrote(img);
+}
+- (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr {
+    [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
+}
+- (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
+    if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    const uint8_t *src = rn_vk_image_staging(img);
+    for (NSUInteger y = 0; y < region.size.height; y++)
+        memcpy((uint8_t *)out + y * bpr, src + ((region.origin.y + y) * w + region.origin.x) * texel, region.size.width * texel);
+}
+- (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
+    [self getBytes:out bytesPerRow:bpr bytesPerImage:0 fromRegion:region mipmapLevel:level slice:0];
+}
+@end
+
+@interface RedNaviMTLSamplerState : NSObject {
+@public
+    rn_vk_sampler *s;
+    id<MTLDevice> dev;
+    NSString *label_;
+}
+@end
+@implementation RedNaviMTLSamplerState
++ (void)load { class_addProtocol(self, @protocol(MTLSamplerState)); }
+- (void)dealloc { if (s) rn_vk_sampler_destroy(rn_vk_shared(), s); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+@end
+
+static uint32_t rn_address_of(MTLSamplerAddressMode m) {
+    switch (m) {
+    case MTLSamplerAddressModeClampToEdge: case MTLSamplerAddressModeMirrorClampToEdge: return 1;
+    case MTLSamplerAddressModeRepeat: return 2;
+    case MTLSamplerAddressModeMirrorRepeat: return 3;
+    case MTLSamplerAddressModeClampToZero: return 0;
+    default: return 4;
+    }
+}
+static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
+    rn_vk *vk = rn_vk_shared();
+    if (!vk) return nil;
+    rn_vk_sampler_desc sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.min_filter = d.minFilter == MTLSamplerMinMagFilterLinear;
+    sd.mag_filter = d.magFilter == MTLSamplerMinMagFilterLinear;
+    sd.mip_filter = d.mipFilter == MTLSamplerMipFilterLinear ? 2 : d.mipFilter == MTLSamplerMipFilterNearest ? 1 : 0;
+    sd.address[0] = rn_address_of(d.sAddressMode); sd.address[1] = rn_address_of(d.tAddressMode); sd.address[2] = rn_address_of(d.rAddressMode);
+    sd.pixel_coords = !d.normalizedCoordinates;
+    sd.border = d.borderColor == MTLSamplerBorderColorOpaqueBlack ? 1 : d.borderColor == MTLSamplerBorderColorOpaqueWhite ? 2 : 0;
+    sd.lod_min = d.lodMinClamp; sd.lod_max = d.lodMaxClamp;
+    RedNaviMTLSamplerState *st = [RedNaviMTLSamplerState new];
+    st->s = rn_vk_sampler_create(vk, &sd);
+    st->dev = dev;
+    if (!st->s) { rn_log("sampler state: RADV refused it"); return nil; }
+    return st;
+}
+
 @interface RedNaviMTLComputePipelineState : NSObject {
 @public
     rn_vk_compute *c;
-    unsigned nbind;                  // buffers of the pipeline, in the order of its rn_vk bindings
-    unsigned metalIndex[16];         // the Metal buffer index each of them takes
+    unsigned nbind;                  // resources of the pipeline, in the order of its rn_vk bindings
+    unsigned metalIndex[RN_VK_MAX_BINDINGS];   // the Metal index each of them takes (buffer, texture or sampler index, by kind)
+    unsigned kind[RN_VK_MAX_BINDINGS];         // RN_VK_BUFFER, RN_VK_SAMPLED_IMAGE, RN_VK_STORAGE_IMAGE, RN_VK_SAMPLER or RN_VK_STATIC_SAMPLER
     unsigned push;                   // bytes of push constants (the hand-made SPIR-V path; 0 for translated kernels)
     unsigned pushIndex;              // the Metal index that setBytes fills into the push constants (0xffffffff: none: setBytes data becomes a small buffer)
     BOOL spec;                       // the threadgroup size is specialized at dispatch (translated kernels)
+    BOOL dyn;                        // translated kernel with the grid in push constants: run with rn_vk_dispatch_threads
     unsigned localSize[3];
     id<MTLDevice> dev;
     NSString *label_;
@@ -112,9 +267,11 @@ static rn_vk *rn_vk_shared(void) {
     RedNaviMTLBuffer *bufs[16];
     uint64_t offs[16];
     NSData *bytesAt[16];
+    RedNaviMTLTexture *texs[16];
+    RedNaviMTLSamplerState *samps[16];
     uint8_t push[128];
     uint32_t pushLen;
-    MTLSize groups, tpt;
+    MTLSize groups, threads, tpt;     // threads: the whole grid in threads
 }
 @end
 @implementation RNDispatch
@@ -128,6 +285,8 @@ static rn_vk *rn_vk_shared(void) {
     RedNaviMTLBuffer *bufs[16];
     uint64_t offs[16];
     NSData *bytesAt[16];
+    RedNaviMTLTexture *texs[16];
+    RedNaviMTLSamplerState *samps[16];
     uint8_t push[128];
     uint32_t pushLen;
     NSString *label_;
@@ -180,24 +339,38 @@ static rn_vk *rn_vk_shared(void) {
     bytesAt[index] = [NSData dataWithBytes:bytes length:length];
     bufs[index] = nil;
 }
-- (void)record:(MTLSize)groups threads:(MTLSize)tpt {
+- (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
+    if (index < 16) texs[index] = (RedNaviMTLTexture *)texture;
+}
+- (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])textures withRange:(NSRange)range {
+    for (NSUInteger i = 0; i < range.length; i++) [self setTexture:textures[i] atIndex:range.location + i];
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
+    if (index < 16) samps[index] = (RedNaviMTLSamplerState *)sampler;
+}
+- (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])samplers withRange:(NSRange)range {
+    for (NSUInteger i = 0; i < range.length; i++) [self setSamplerState:samplers[i] atIndex:range.location + i];
+}
+- (void)setSamplerState:(id<MTLSamplerState>)sampler lodMinClamp:(float)lodMinClamp lodMaxClamp:(float)lodMaxClamp atIndex:(NSUInteger)index { [self setSamplerState:sampler atIndex:index]; }
+- (void)record:(MTLSize)groups grid:(MTLSize)threads threads:(MTLSize)tpt {
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
     d->pso = pso;
-    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; }
+    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; d->texs[i] = texs[i]; d->samps[i] = samps[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
     d->groups = groups;
+    d->threads = threads;
     d->tpt = tpt;
     [cb->records addObject:d];
 }
-- (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt { [self record:tg threads:tpt]; }
+- (void)dispatchThreadgroups:(MTLSize)tg threadsPerThreadgroup:(MTLSize)tpt {
+    [self record:tg grid:MTLSizeMake(tg.width * tpt.width, tg.height * tpt.height, tg.depth * tpt.depth) threads:tpt];
+}
 - (void)dispatchThreads:(MTLSize)threads threadsPerThreadgroup:(MTLSize)tpt {
     NSUInteger w = tpt.width ? tpt.width : 1, h = tpt.height ? tpt.height : 1, dd = tpt.depth ? tpt.depth : 1;
-    if (threads.width % w || threads.height % h || threads.depth % dd)
-        rn_log("dispatchThreads with a grid that is not a multiple of the threadgroup: the threads past the grid run too (not handled yet)");
     MTLSize g = {(threads.width + w - 1) / w, (threads.height + h - 1) / h, (threads.depth + dd - 1) / dd};
-    [self record:g threads:tpt];
+    [self record:g grid:threads threads:tpt];
 }
 - (void)endEncoding { ended = YES; }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope {}
@@ -253,28 +426,44 @@ static rn_vk *rn_vk_shared(void) {
     for (RNDispatch *d in records) {
         if (st == MTLCommandBufferStatusError) break;
         RedNaviMTLComputePipelineState *p = d->pso;
-        rn_vk_buffer *bv[16];
-        uint64_t ov[16];
+        rn_vk_arg av[RN_VK_MAX_BINDINGS];
+        memset(av, 0, sizeof(av));
         NSMutableArray *temps = [NSMutableArray new];       // buffers made from setBytes data, alive until the dispatch is done
         for (unsigned i = 0; i < p->nbind; i++) {
             const unsigned mi = p->metalIndex[i];
-            if (d->bufs[mi]) { bv[i] = d->bufs[mi]->b; ov[i] = d->offs[mi]; continue; }
-            if (d->bytesAt[mi]) {
-                RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[mi].length options:0];
-                if (!t) { [self fail:@"no memory for constant data"]; break; }
-                memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[mi].bytes, d->bytesAt[mi].length);
-                [temps addObject:t];
-                bv[i] = t->b; ov[i] = 0;
-                continue;
+            switch (p->kind[i]) {
+            case RN_VK_BUFFER:
+                if (mi < 16 && d->bufs[mi]) { av[i].buffer = d->bufs[mi]->b; av[i].offset = d->offs[mi]; break; }
+                if (mi < 16 && d->bytesAt[mi]) {
+                    RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[mi].length options:0];
+                    if (!t) { [self fail:@"no memory for constant data"]; break; }
+                    memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[mi].bytes, d->bytesAt[mi].length);
+                    [temps addObject:t];
+                    av[i].buffer = t->b;
+                    break;
+                }
+                [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", mi]];
+                break;
+            case RN_VK_SAMPLED_IMAGE:
+            case RN_VK_STORAGE_IMAGE:
+                if (mi < 16 && d->texs[mi]) av[i].image = d->texs[mi]->img;
+                else [self fail:[NSString stringWithFormat:@"no texture bound at index %u", mi]];
+                break;
+            case RN_VK_SAMPLER:
+                if (mi < 16 && d->samps[mi]) av[i].sampler = d->samps[mi]->s;
+                else [self fail:[NSString stringWithFormat:@"no sampler state bound at index %u", mi]];
+                break;
+            default: break;
             }
-            [self fail:[NSString stringWithFormat:@"no buffer bound at index %u", mi]];
-            break;
+            if (st == MTLCommandBufferStatusError) break;
         }
         if (st == MTLCommandBufferStatusError) break;
         const uint32_t groups[3] = {(uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth};
         const uint32_t local[3] = {(uint32_t)d->tpt.width, (uint32_t)d->tpt.height, (uint32_t)d->tpt.depth};
-        int rc = rn_vk_dispatch(vk, p->c, bv, ov, d->pushLen ? d->push : NULL, groups, local);
+        const uint32_t grid[3] = {(uint32_t)d->threads.width, (uint32_t)d->threads.height, (uint32_t)d->threads.depth};
+        int rc = p->dyn ? rn_vk_dispatch_threads(vk, p->c, av, grid, local) : rn_vk_dispatch(vk, p->c, av, d->pushLen ? d->push : NULL, groups, local);
         if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
+        else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
@@ -402,16 +591,24 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
         if (rn_air_translate(NULL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithUTF8String:err];
         } else {
-            rn_vk_binding binds[16];
-            unsigned n = info.binding_count < 16 ? info.binding_count : 16;
-            for (unsigned i = 0; i < n; i++) { binds[i].binding = info.bindings[i].binding; binds[i].writable = info.bindings[i].writable; }
-            rn_vk_compute *c = n ? rn_vk_compute_create(vk, spv, spvBytes, n, binds, 0, 1) : NULL;
+            rn_vk_binding binds[RN_VK_MAX_BINDINGS];
+            rn_vk_sampler_desc sds[RN_VK_MAX_BINDINGS];
+            unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
+            for (unsigned i = 0; i < n; i++) {
+                const rn_air_binding *ab = &info.bindings[i];
+                binds[i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind, NULL};
+                if (ab->kind == RN_AIR_STATIC_SAMPLER) {
+                    sds[i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
+                    binds[i].sampler = &sds[i];
+                }
+            }
+            rn_vk_compute *c = n ? rn_vk_compute_create(vk, spv, spvBytes, n, binds, info.dispatch_push_bytes, 2) : NULL;
             rn_air_free(spv, spvBytes);
-            if (!c) why = n ? @"RADV refused the translated module" : @"the kernel uses no buffers";
+            if (!c) why = n ? @"RADV refused the translated module" : @"the kernel uses no resources";
             else {
                 RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
-                p->c = c; p->nbind = n; p->push = 0; p->pushIndex = 0xffffffffu; p->spec = YES; p->dev = dev;
-                for (unsigned i = 0; i < n; i++) p->metalIndex[i] = info.bindings[i].metal_index;
+                p->c = c; p->nbind = n; p->push = 0; p->pushIndex = 0xffffffffu; p->spec = YES; p->dyn = YES; p->dev = dev;
+                for (unsigned i = 0; i < n; i++) { p->metalIndex[i] = info.bindings[i].metal_index; p->kind[i] = info.bindings[i].kind; }
                 for (int i = 0; i < 3; i++) p->localSize[i] = info.local_size[i];
                 return p;
             }
@@ -428,6 +625,7 @@ id rn_test_library(NSData *blob, NSError **error) { return [[RedNaviMTLLibrary a
 // ---------------------------------------------------------------------------------------------------------------------------------------- installation on the device class
 
 typedef uintptr_t (*rn_imp_len_opt)(id, SEL, NSUInteger, NSUInteger);
+typedef uintptr_t (*imp_fn_err1)(id, SEL, id);
 typedef uintptr_t (*rn_imp_bytes)(id, SEL, const void *, NSUInteger, NSUInteger);
 
 void rn_compute_install(Class k, Class sup) {
@@ -465,18 +663,33 @@ void rn_compute_install(Class k, Class sup) {
         if (b && bytes) memcpy(rn_vk_buffer_contents(b->b), bytes, length);
         return (uintptr_t)CFBridgingRetain(b);
     }), m2 ? method_getTypeEncoding(m2) : "@40@0:8r^v16Q24Q32");
+    // Textures and sampler states
+    SEL s7 = sel_registerName("newTextureWithDescriptor:");
+    Method m7 = class_getInstanceMethod(sup, s7);
+    imp_fn_err1 o7 = m7 ? (imp_fn_err1)method_getImplementation(m7) : NULL;
+    class_addMethod(k, s7, imp_implementationWithBlock(^uintptr_t(id self, MTLTextureDescriptor *desc) {
+        if (!rn_gate()) return o7 ? o7(self, s7, desc) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLTexture alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc]);
+    }), m7 ? method_getTypeEncoding(m7) : "@24@0:8@16");
+    SEL s8 = sel_registerName("newSamplerStateWithDescriptor:");
+    Method m8 = class_getInstanceMethod(sup, s8);
+    imp_fn_err1 o8 = m8 ? (imp_fn_err1)method_getImplementation(m8) : NULL;
+    class_addMethod(k, s8, imp_implementationWithBlock(^uintptr_t(id self, MTLSamplerDescriptor *desc) {
+        if (!rn_gate()) return o8 ? o8(self, s8, desc) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_new_sampler_state((id<MTLDevice>)self, desc));
+    }), m8 ? method_getTypeEncoding(m8) : "@24@0:8@16");
     // The private shader entry
     class_addMethod(k, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), imp_implementationWithBlock(^id(id self, NSData *spirv, NSUInteger nbuf, NSUInteger push) {
         rn_vk *vk = rn_gate() ? rn_vk_shared() : NULL;
         if (!vk) return nil;
         if (nbuf == 0 || nbuf > 16) return nil;
         rn_vk_binding binds[16];
-        for (unsigned i = 0; i < nbuf; i++) { binds[i].binding = i; binds[i].writable = 1; }
+        for (unsigned i = 0; i < nbuf; i++) binds[i] = (rn_vk_binding){(uint32_t)i, 1, RN_VK_BUFFER, NULL};
         rn_vk_compute *c = rn_vk_compute_create(vk, spirv.bytes, spirv.length, (unsigned)nbuf, binds, (unsigned)push, 0);
         if (!c) { rn_log("compute pipeline from SPIR-V failed"); return nil; }
         RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
         p->c = c; p->nbind = (unsigned)nbuf; p->push = (unsigned)push; p->pushIndex = (unsigned)nbuf; p->spec = NO; p->dev = (id<MTLDevice>)self;
-        for (unsigned i = 0; i < nbuf; i++) p->metalIndex[i] = i;
+        for (unsigned i = 0; i < nbuf; i++) { p->metalIndex[i] = i; p->kind[i] = RN_VK_BUFFER; }
         return p;
     }), "@40@0:8@16Q24Q32");
 
