@@ -582,6 +582,145 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 @end
 
 
+// ---------------------------------------------------------------------------------------------------------------------------------------- blit encoder
+// Copies and fills are done on the CPU at commit, in order with the passes and dispatches: buffers are host memory and a texture's host copy is current after every pass (the
+// render and compute paths copy what the GPU wrote back into it), so a blit between them is a memcpy and the destination texture is marked as written by the host (it is uploaded
+// before its next use on the GPU). Textures are 2D with one level, so slices and levels other than 0 are errors.
+@interface RNBlit : NSObject {
+@public
+    int kind;                                        // 0 buffer to texture, 1 texture to buffer, 2 texture to texture, 3 buffer to buffer, 4 fill
+    RedNaviMTLBuffer *sb, *db;
+    RedNaviMTLTexture *st, *dt;
+    NSUInteger soff, doff, sbpr, dbpr, size;
+    MTLOrigin so, dorg;
+    MTLSize sz;
+    uint8_t value;
+}
+@end
+@implementation RNBlit
+@end
+
+static NSString *rn_run_blit(RNBlit *b) {
+    switch (b->kind) {
+    case 0: case 1: {
+        RedNaviMTLTexture *t = b->kind == 0 ? b->dt : b->st;
+        RedNaviMTLBuffer *bf = b->kind == 0 ? b->sb : b->db;
+        const MTLOrigin o = b->kind == 0 ? b->dorg : b->so;
+        const NSUInteger bpr = b->kind == 0 ? b->sbpr : b->dbpr, off = b->kind == 0 ? b->soff : b->doff;
+        if (!t || !bf) return @"blit: a texture or buffer is missing";
+        if (o.z || b->sz.depth > 1 || o.x + b->sz.width > t->w || o.y + b->sz.height > t->h) return @"blit: the region is outside the texture";
+        if (!b->sz.width || !b->sz.height) return nil;
+        if (bpr < b->sz.width * t->texel) return @"blit: bytesPerRow is smaller than a row of the region";
+        if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
+        uint8_t *tex = rn_vk_image_staging(t->img), *buf = (uint8_t *)rn_vk_buffer_contents(bf->b) + off;
+        for (NSUInteger y = 0; y < b->sz.height; y++) {
+            uint8_t *tp = tex + ((o.y + y) * t->w + o.x) * t->texel, *bp = buf + y * bpr;
+            if (b->kind == 0) memcpy(tp, bp, b->sz.width * t->texel); else memcpy(bp, tp, b->sz.width * t->texel);
+        }
+        if (b->kind == 0) rn_vk_image_host_wrote(t->img);
+        return nil;
+    }
+    case 2: {
+        RedNaviMTLTexture *s2 = b->st, *d2 = b->dt;
+        if (!s2 || !d2) return @"blit: a texture is missing";
+        if (s2->texel != d2->texel) return @"blit: the textures have different texel sizes";
+        if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > s2->w || b->so.y + b->sz.height > s2->h || b->dorg.x + b->sz.width > d2->w || b->dorg.y + b->sz.height > d2->h)
+            return @"blit: the region is outside a texture";
+        const uint8_t *sp = rn_vk_image_staging(s2->img);
+        uint8_t *dp = rn_vk_image_staging(d2->img);
+        for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + ((b->dorg.y + y) * d2->w + b->dorg.x) * d2->texel, sp + ((b->so.y + y) * s2->w + b->so.x) * s2->texel, b->sz.width * s2->texel);
+        rn_vk_image_host_wrote(d2->img);
+        return nil;
+    }
+    case 3:
+        if (!b->sb || !b->db || b->soff + b->size > b->sb->len || b->doff + b->size > b->db->len) return @"blit: a buffer range is outside its buffer";
+        memmove((uint8_t *)rn_vk_buffer_contents(b->db->b) + b->doff, (uint8_t *)rn_vk_buffer_contents(b->sb->b) + b->soff, b->size);
+        return nil;
+    case 4:
+        if (!b->db || b->doff + b->size > b->db->len) return @"fillBuffer: the range is outside the buffer";
+        memset((uint8_t *)rn_vk_buffer_contents(b->db->b) + b->doff, b->value, b->size);
+        return nil;
+    }
+    return @"blit: unknown operation";
+}
+
+@interface RedNaviMTLBlitCommandEncoder : NSObject {
+    RedNaviMTLCommandBuffer *cb;
+    NSString *label_;
+    BOOL ended;
+}
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c;
+@end
+@implementation RedNaviMTLBlitCommandEncoder
++ (void)load { class_addProtocol(self, @protocol(MTLBlitCommandEncoder)); class_addProtocol(self, @protocol(MTLCommandEncoder)); }
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c { if ((self = [super init])) cb = c; return self; }
+- (id<MTLDevice>)device { return cb->dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (RNBlit *)add:(int)kind {
+    RNBlit *b = [RNBlit new];
+    b->kind = kind;
+    [cb->records addObject:b];
+    return b;
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)tex
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin {
+    RNBlit *b = [self add:0];
+    b->sb = (RedNaviMTLBuffer *)buf; b->soff = so; b->sbpr = bpr; b->dt = (RedNaviMTLTexture *)tex; b->dorg = origin; b->sz = size;
+    if (slice || level) b->dt = nil;                  // reported as an error at commit
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)tex
+      destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin options:(MTLBlitOption)options {
+    [self copyFromBuffer:buf sourceOffset:so sourceBytesPerRow:bpr sourceBytesPerImage:bpi sourceSize:size toTexture:tex destinationSlice:slice destinationLevel:level destinationOrigin:origin];
+}
+- (void)copyFromTexture:(id<MTLTexture>)tex sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)buf
+      destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi {
+    RNBlit *b = [self add:1];
+    b->st = (RedNaviMTLTexture *)tex; b->so = origin; b->sz = size; b->db = (RedNaviMTLBuffer *)buf; b->doff = doff; b->dbpr = bpr;
+    if (slice || level) b->st = nil;
+}
+- (void)copyFromTexture:(id<MTLTexture>)tex sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)buf
+      destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi options:(MTLBlitOption)options {
+    [self copyFromTexture:tex sourceSlice:slice sourceLevel:level sourceOrigin:origin sourceSize:size toBuffer:buf destinationOffset:doff destinationBytesPerRow:bpr destinationBytesPerImage:bpi];
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl sourceOrigin:(MTLOrigin)so sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)dst
+       destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
+    RNBlit *b = [self add:2];
+    b->st = (RedNaviMTLTexture *)src; b->so = so; b->sz = size; b->dt = (RedNaviMTLTexture *)dst; b->dorg = dorg;
+    if (ss || sl || ds || dl) b->dt = nil;
+}
+- (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst {
+    [self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+}
+- (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)n levelCount:(NSUInteger)lc {
+    if (ss || sl || ds || dl || n != 1 || lc != 1) { RNBlit *b = [self add:2]; b->st = nil; return; }
+    [self copyFromTexture:src toTexture:dst];
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)doff size:(NSUInteger)size {
+    RNBlit *b = [self add:3];
+    b->sb = (RedNaviMTLBuffer *)src; b->soff = so; b->db = (RedNaviMTLBuffer *)dst; b->doff = doff; b->size = size;
+}
+- (void)fillBuffer:(id<MTLBuffer>)buf range:(NSRange)range value:(uint8_t)value {
+    RNBlit *b = [self add:4];
+    b->db = (RedNaviMTLBuffer *)buf; b->doff = range.location; b->size = range.length; b->value = value;
+}
+// nothing to do: there are no mipmap levels, and host and device copies are kept in step by the command buffer
+- (void)generateMipmapsForTexture:(id<MTLTexture>)texture {}
+- (void)synchronizeResource:(id<MTLResource>)resource {}
+- (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture {}
+- (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture {}
+- (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
+- (void)updateFence:(id<MTLFence>)fence {}
+- (void)waitForFence:(id<MTLFence>)fence {}
+- (void)endEncoding { ended = YES; }
+- (void)insertDebugSignpost:(NSString *)string {}
+- (void)pushDebugGroup:(NSString *)string {}
+- (void)popDebugGroup {}
+@end
+
+
 @interface RedNaviMTLRenderCommandEncoder : NSObject {
     RedNaviMTLCommandBuffer *cb;
     RNRenderPass *pass;
@@ -692,7 +831,8 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 - (void)popDebugGroup {}
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder { return (id)[[RedNaviMTLComputeCommandEncoder alloc] initWithCommandBuffer:self]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t { return [self computeCommandEncoder]; }
-- (id<MTLBlitCommandEncoder>)blitCommandEncoder { rn_log("blitCommandEncoder: not implemented, nil"); return nil; }
+- (id<MTLBlitCommandEncoder>)blitCommandEncoder { return (id)[[RedNaviMTLBlitCommandEncoder alloc] initWithCommandBuffer:self]; }
+- (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d { return [self blitCommandEncoder]; }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
     RNRenderPass *rp = [RNRenderPass new];
     rp->draws = [NSMutableArray new];
@@ -779,6 +919,10 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
             RNRenderPass *rp = rec;
             for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], YES);
             for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
+        } else if ([rec isKindOfClass:[RNBlit class]]) {
+            RNBlit *bl = rec;
+            note(bl->st, NO);
+            note(bl->dt, YES);
         } else {
             RNDispatch *dp = rec;
             for (int i = 0; i < 16; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
@@ -788,6 +932,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
         if ([rec isKindOfClass:[RNRenderPass class]]) { [self runRenderPass:rec]; continue; }
+        if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; continue; }
         RNDispatch *d = rec;
         RedNaviMTLComputePipelineState *p = d->pso;
         rn_vk_arg av[RN_VK_MAX_BINDINGS];

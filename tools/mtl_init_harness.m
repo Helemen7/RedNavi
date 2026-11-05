@@ -299,6 +299,61 @@ int main(int argc, char **argv) {
                 printf("stage_in + texture + blending through Metal on RADV%s: %s\n", io ? " (IOSurface texture and target)" : "", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_BLIT_TEST")) {
+                // The blit encoder through the official API: buffer to texture (row pitch 80 bytes for a 64-byte row), texture to texture (a sub-rectangle at an offset), texture to
+                // buffer (pitch 96, offset 32), fillBuffer, buffer to buffer, and a copy into an IOSurface-backed texture (pitch 256) checked through the surface's base address.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:16 height:8 mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                id<MTLTexture> A = [d newTextureWithDescriptor:td], B = [d newTextureWithDescriptor:td];
+                uint8_t zeros[16 * 8 * 4] = {0};
+                [B replaceRegion:MTLRegionMake2D(0, 0, 16, 8) mipmapLevel:0 withBytes:zeros bytesPerRow:64];
+                uint8_t srcData[80 * 8], expA[16 * 8 * 4], expB[16 * 8 * 4];
+                for (int i = 0; i < 80 * 8; i++) srcData[i] = (uint8_t)(i * 7 + 3);
+                for (int y = 0; y < 8; y++) memcpy(expA + y * 64, srcData + y * 80, 64);
+                memset(expB, 0, sizeof(expB));
+                for (int y = 0; y < 4; y++) memcpy(expB + ((3 + y) * 16 + 5) * 4, expA + ((1 + y) * 16 + 2) * 4, 8 * 4);
+                id<MTLBuffer> sb = [d newBufferWithBytes:srcData length:sizeof(srcData) options:MTLResourceStorageModeShared];
+                id<MTLBuffer> out = [d newBufferWithLength:96 * 8 + 32 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> f1 = [d newBufferWithLength:64 options:MTLResourceStorageModeShared], f2 = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+                memset(out.contents, 0x55, out.length); memset(f1.contents, 0x11, 64); memset(f2.contents, 0x22, 64);
+                IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @16, (id)kIOSurfaceHeight: @8, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                IOSurfaceLock(surf, 0, NULL); memset(IOSurfaceGetBaseAddress(surf), 0x7f, IOSurfaceGetAllocSize(surf)); IOSurfaceUnlock(surf, 0, NULL);
+                id<MTLTexture> S = surf ? [d newTextureWithDescriptor:td iosurface:surf plane:0] : nil;
+                if (!A || !B || !sb || !out || !S) { printf("no resources\n"); return 80; }
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+                if (!be) { printf("no blit encoder\n"); return 81; }
+                [be copyFromBuffer:sb sourceOffset:0 sourceBytesPerRow:80 sourceBytesPerImage:80 * 8 sourceSize:MTLSizeMake(16, 8, 1) toTexture:A destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [be copyFromTexture:A sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(2, 1, 0) sourceSize:MTLSizeMake(8, 4, 1) toTexture:B destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(5, 3, 0)];
+                [be copyFromTexture:B sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(16, 8, 1) toBuffer:out destinationOffset:32 destinationBytesPerRow:96 destinationBytesPerImage:96 * 8];
+                [be fillBuffer:f1 range:NSMakeRange(8, 32) value:0xAB];
+                [be copyFromBuffer:f1 sourceOffset:4 toBuffer:f2 destinationOffset:8 size:16];
+                [be copyFromTexture:A toTexture:S];
+                [be endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                int fails = 0;
+                printf("status %ld, error %s\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none");
+                if (cb.status != MTLCommandBufferStatusCompleted) fails++;
+                const uint8_t *o = out.contents;
+                int bad = 0;
+                for (int i = 0; i < 32; i++) if (o[i] != 0x55) bad++;
+                for (int y = 0; y < 8; y++) { for (int x = 0; x < 64; x++) if (o[32 + y * 96 + x] != expB[y * 64 + x]) bad++; for (int x = 64; x < 96; x++) if (o[32 + y * 96 + x] != 0x55) bad++; }
+                printf("buffer -> texture -> texture -> buffer: %d bytes wrong\n", bad); fails += bad != 0;
+                const uint8_t *g1 = f1.contents, *g2 = f2.contents;
+                bad = 0;
+                for (int i = 0; i < 64; i++) { if (g1[i] != ((i >= 8 && i < 40) ? 0xAB : 0x11)) bad++; }
+                for (int i = 0; i < 64; i++) { uint8_t want = (i >= 8 && i < 24) ? g1[4 + i - 8] : 0x22; if (g2[i] != want) bad++; }
+                printf("fillBuffer and buffer -> buffer: %d bytes wrong\n", bad); fails += bad != 0;
+                bad = 0;
+                IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+                for (int y = 0; y < 8; y++) for (int x = 0; x < 64; x++) if (((uint8_t *)IOSurfaceGetBaseAddress(surf))[y * IOSurfaceGetBytesPerRow(surf) + x] != expA[y * 64 + x]) bad++;
+                IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+                printf("texture -> IOSurface texture: %d bytes wrong\n", bad); fails += bad != 0;
+                printf("blit encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the
