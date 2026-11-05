@@ -1,0 +1,36 @@
+name: Navi33 P2 RADV and DCN321 host tests
+
+on:
+  push:
+    branches:
+      - feature/navi33-p2-port
+  pull_request:
+    paths:
+      - 'RedNavi/navi33_dcn321.h'
+      - 'mesa-bridge/include/rn_navi33_radv_admission.h'
+      - 'tests/host/navi33_p2_test.cpp'
+      - '.github/workflows/navi33-p2.yml'
+      - 'Makefile'
+
+jobs:
+  p2-host:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile and execute with sanitizers
+        run: |
+          mkdir -p build
+          ${{ matrix.cxx }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -IRedNavi -Imesa-bridge/include \
+            tests/host/navi33_p2_test.cpp -o build/navi33_p2_test
+          ./build/navi33_p2_test
+      - name: Re-run P1 regression
+        run: |
+          ${{ matrix.cxx }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -IRedNavi tests/host/navi33_p1_test.cpp -o build/navi33_p1_test
+          ./build/navi33_p1_test
