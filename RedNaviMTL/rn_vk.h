@@ -90,6 +90,8 @@ typedef struct {
     unsigned nfbind; const rn_vk_binding *fbinds;      // fragment module resources (set 1)
     unsigned ntargets; int target_formats[8];          // RN_VK_* of each colour attachment
     unsigned topology;                                 // 0 points, 1 lines, 2 line strip, 3 triangles, 4 triangle strip
+    unsigned cull_mode;                                // VkCullModeFlags: 0 none, 1 front, 2 back
+    int front_clockwise;                               // front-facing triangles wind clockwise on the screen (Metal's default)
     rn_vk_blend blend[8];                              // per colour attachment; write_mask is Vulkan's (R 1, G 2, B 4, A 8): 15 writes all
     unsigned nvattr; const rn_vk_vattr *vattrs;        // vertex input of [[stage_in]] functions, locations as the shader declares them
     unsigned nvlayout; const rn_vk_vlayout *vlayouts;
@@ -106,8 +108,9 @@ typedef struct {
     uint32_t first_vertex, vertex_count, instance_count, first_instance;
     const rn_vk_vbuf *vbufs;                           // 16 entries, by vertex buffer binding (used for the bindings the pipeline declares)
     int has_blend_color; float blend_color[4];
+    rn_vk_buffer *index_buffer; uint64_t index_offset; int index32; int32_t base_vertex;   // indexed draw: vertex_count is the index count
 } rn_vk_draw;
-// One render pass over the targets with the draws in order, submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
+// One render pass over the targets with the draws in order (no draws: only the clears are done), submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
 // offset is wrong). The targets' host copies are current afterwards.
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_draw *draws, unsigned ndraws);
 

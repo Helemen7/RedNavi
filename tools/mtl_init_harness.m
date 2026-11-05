@@ -354,6 +354,133 @@ int main(int argc, char **argv) {
                 printf("blit encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_RASTER_TEST")) {
+                // Passes without draws (the clears must still happen, on a plain texture and on an IOSurface-backed one), indexed draws (uint16 with an index buffer offset and a base
+                // vertex, and uint32) and culling (mesa-bridge/test/vk_quad.metal; its quad winds counter-clockwise on the screen, so with Metal's default of clockwise front faces
+                // cullMode back must hide it, cullMode front show it, and setFrontFacingWinding: counter-clockwise swaps that).
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_RASTER_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 90; }
+                MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+                vd.attributes[0].format = MTLVertexFormatFloat2; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 0;
+                vd.attributes[1].format = MTLVertexFormatFloat2; vd.attributes[1].offset = 8;  vd.attributes[1].bufferIndex = 0;
+                vd.attributes[2].format = MTLVertexFormatFloat4; vd.attributes[2].offset = 16; vd.attributes[2].bufferIndex = 0;
+                vd.layouts[0].stride = 32;
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [lib newFunctionWithName:@"quad_vertex"];
+                pd.fragmentFunction = [lib newFunctionWithName:@"quad_fragment"];
+                pd.vertexDescriptor = vd;
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                if (!rps) { printf("no pipeline: %s\n", e.localizedDescription.UTF8String); return 91; }
+                MTLTextureDescriptor *st = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:2 height:2 mipmapped:NO];
+                id<MTLTexture> tex = [d newTextureWithDescriptor:st];
+                const uint8_t texels[4][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 255}, {255, 255, 255, 255}};
+                [tex replaceRegion:MTLRegionMake2D(0, 0, 2, 2) mipmapLevel:0 withBytes:texels bytesPerRow:8];
+                MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
+                sd.minFilter = sd.magFilter = MTLSamplerMinMagFilterNearest;
+                sd.sAddressMode = sd.tAddressMode = MTLSamplerAddressModeClampToEdge;
+                id<MTLSamplerState> smp = [d newSamplerStateWithDescriptor:sd];
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                MTLTextureDescriptor *tt = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32 height:32 mipmapped:NO];
+                tt.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                int fails = 0;
+                #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+                // 1. clears without draws
+                {
+                    id<MTLTexture> t1 = [d newTextureWithDescriptor:tt];
+                    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)@{(id)kIOSurfaceWidth: @32, (id)kIOSurfaceHeight: @32, (id)kIOSurfaceBytesPerElement: @4, (id)kIOSurfaceBytesPerRow: @256, (id)kIOSurfacePixelFormat: @('RGBA')});
+                    IOSurfaceLock(surf, 0, NULL); memset(IOSurfaceGetBaseAddress(surf), 0x7f, IOSurfaceGetAllocSize(surf)); IOSurfaceUnlock(surf, 0, NULL);
+                    id<MTLTexture> t2 = [d newTextureWithDescriptor:tt iosurface:surf plane:0];
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = t1; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.25, 0.5, 0.75, 1.0);
+                    rpd.colorAttachments[1].texture = t2; rpd.colorAttachments[1].loadAction = MTLLoadActionClear; rpd.colorAttachments[1].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[1].clearColor = MTLClearColorMake(1, 0, 0, 1);
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t px[4];
+                    [t1 getBytes:px bytesPerRow:128 fromRegion:MTLRegionMake2D(5, 7, 1, 1) mipmapLevel:0];
+                    printf("clear without draws, texture: %u %u %u %u (want 64 128 191 255), status %ld\n", px[0], px[1], px[2], px[3], (long)cb.status);
+                    CHECK(abs(px[0] - 64) < 3 && abs(px[1] - 128) < 3 && abs(px[2] - 191) < 3 && px[3] == 255, "the clear of a pass without draws did not happen");
+                    IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+                    const uint8_t *sp = (uint8_t *)IOSurfaceGetBaseAddress(surf) + 20 * IOSurfaceGetBytesPerRow(surf) + 9 * 4;
+                    printf("clear without draws, IOSurface-backed attachment: %u %u %u %u (want 255 0 0 255)\n", sp[0], sp[1], sp[2], sp[3]);
+                    CHECK(sp[0] == 255 && sp[1] == 0 && sp[2] == 0 && sp[3] == 255, "the IOSurface did not get the clear");
+                    IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+                }
+                typedef struct { float pos[2], uv[2], color[4]; } V;
+                #define VTX(x, y, u, v) {{x, y}, {u, v}, {1, 1, 1, 1}}
+                const V tl = VTX(-1, 1, 0, 0), tr = VTX(1, 1, 1, 0), bl = VTX(-1, -1, 0, 1), br = VTX(1, -1, 1, 1);
+                const V dummy = VTX(0, 0, 0, 0);
+                // 2. indexed draws: vertices [dummy, TL, TR, BL, BR], indices relative to baseVertex 1, 8 bytes of padding before them in the index buffer
+                {
+                    const V verts[5] = {dummy, tl, tr, bl, br};
+                    id<MTLBuffer> vb = [d newBufferWithBytes:verts length:sizeof(verts) options:MTLResourceStorageModeShared];
+                    const uint16_t idx16[4 + 6] = {9, 9, 9, 9, 0, 2, 1, 1, 2, 3};
+                    const uint32_t idx32[2 + 6] = {9, 9, 0, 2, 1, 1, 2, 3};
+                    id<MTLBuffer> ib16 = [d newBufferWithBytes:idx16 length:sizeof(idx16) options:MTLResourceStorageModeShared];
+                    id<MTLBuffer> ib32 = [d newBufferWithBytes:idx32 length:sizeof(idx32) options:MTLResourceStorageModeShared];
+                    for (int v32 = 0; v32 < 2; v32++) {
+                        id<MTLTexture> target = [d newTextureWithDescriptor:tt];
+                        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                        rpd.colorAttachments[0].texture = target; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                        id<MTLCommandBuffer> cb = [q commandBuffer];
+                        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                        [enc setRenderPipelineState:rps];
+                        [enc setFragmentTexture:tex atIndex:0]; [enc setFragmentSamplerState:smp atIndex:0];
+                        [enc setVertexBuffer:vb offset:0 atIndex:0];
+                        [enc drawIndexedPrimitives:MTLPrimitiveTypeTriangle indexCount:6 indexType:v32 ? MTLIndexTypeUInt32 : MTLIndexTypeUInt16 indexBuffer:v32 ? ib32 : ib16
+                                 indexBufferOffset:v32 ? 8 : 8 instanceCount:1 baseVertex:1 baseInstance:0];
+                        [enc endEncoding];
+                        [cb commit]; [cb waitUntilCompleted];
+                        uint8_t px[32 * 32 * 4];
+                        [target getBytes:px bytesPerRow:128 fromRegion:MTLRegionMake2D(0, 0, 32, 32) mipmapLevel:0];
+                        const struct { int x, y; uint8_t want[4]; } pr[] = {{8, 8, {255, 0, 0, 255}}, {24, 8, {0, 255, 0, 255}}, {8, 24, {0, 0, 255, 255}}, {24, 24, {255, 255, 255, 255}}};
+                        int bad = 0;
+                        for (int i = 0; i < 4; i++) { const uint8_t *p = px + (pr[i].y * 32 + pr[i].x) * 4; for (int c = 0; c < 4; c++) if (p[c] != pr[i].want[c]) bad++; }
+                        printf("indexed draw, %s indices at offset 8, base vertex 1: status %ld, %d values wrong\n", v32 ? "uint32" : "uint16", (long)cb.status, bad);
+                        CHECK(bad == 0 && cb.status == MTLCommandBufferStatusCompleted, "indexed draw (%s)", v32 ? "uint32" : "uint16");
+                    }
+                }
+                // 3. culling, non-indexed: a quad of two counter-clockwise triangles
+                {
+                    const V quad[6] = {tl, bl, tr, tr, bl, br};
+                    id<MTLBuffer> vb = [d newBufferWithBytes:quad length:sizeof(quad) options:MTLResourceStorageModeShared];
+                    const struct { MTLCullMode cull; MTLWinding w; int drawn; const char *what; } cases[] = {
+                        {MTLCullModeNone, MTLWindingClockwise, 1, "no culling"}, {MTLCullModeBack, MTLWindingClockwise, 0, "cull back, clockwise front (the quad is counter-clockwise)"},
+                        {MTLCullModeFront, MTLWindingClockwise, 1, "cull front, clockwise front"}, {MTLCullModeBack, MTLWindingCounterClockwise, 1, "cull back, counter-clockwise front"},
+                        {MTLCullModeFront, MTLWindingCounterClockwise, 0, "cull front, counter-clockwise front"}};
+                    for (unsigned c = 0; c < 5; c++) {
+                        id<MTLTexture> target = [d newTextureWithDescriptor:tt];
+                        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                        rpd.colorAttachments[0].texture = target; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                        rpd.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+                        id<MTLCommandBuffer> cb = [q commandBuffer];
+                        id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                        [enc setRenderPipelineState:rps];
+                        [enc setFragmentTexture:tex atIndex:0]; [enc setFragmentSamplerState:smp atIndex:0];
+                        [enc setVertexBuffer:vb offset:0 atIndex:0];
+                        [enc setCullMode:cases[c].cull]; [enc setFrontFacingWinding:cases[c].w];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
+                        [enc endEncoding];
+                        [cb commit]; [cb waitUntilCompleted];
+                        uint8_t px[4];
+                        [target getBytes:px bytesPerRow:128 fromRegion:MTLRegionMake2D(8, 8, 1, 1) mipmapLevel:0];
+                        const int drawn = px[3] != 0;
+                        printf("culling, %s: %s (want %s)\n", cases[c].what, drawn ? "drawn" : "hidden", cases[c].drawn ? "drawn" : "hidden");
+                        CHECK(drawn == cases[c].drawn, "culling: %s", cases[c].what);
+                    }
+                }
+                printf("clear-only passes, indexed draws and culling through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

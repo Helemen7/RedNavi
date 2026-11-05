@@ -411,15 +411,16 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     unsigned nvattr, nvlayout;
     rn_vk_vattr vattr[16];
     rn_vk_vlayout vlayout[16];
-    rn_vk_render *byPrim[5];
+    rn_vk_render *byKey[5 * 6];                     // by primitive type, cull mode and winding
+
     id<MTLDevice> dev;
     NSString *label_;
 }
-- (rn_vk_render *)renderForPrimitive:(unsigned)prim;
+- (rn_vk_render *)renderForPrimitive:(unsigned)prim cull:(unsigned)cull clockwise:(BOOL)cw;
 @end
 @implementation RedNaviMTLRenderPipelineState
 + (void)load { class_addProtocol(self, @protocol(MTLRenderPipelineState)); }
-- (void)dealloc { for (int i = 0; i < 5; i++) if (byPrim[i]) rn_vk_render_destroy(rn_vk_shared(), byPrim[i]); }
+- (void)dealloc { for (int i = 0; i < 5 * 6; i++) if (byKey[i]) rn_vk_render_destroy(rn_vk_shared(), byKey[i]); }
 - (id<MTLDevice>)device { return dev; }
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
@@ -427,20 +428,21 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 - (BOOL)threadgroupSizeMatchesTileSize { return NO; }
 - (NSUInteger)imageblockSampleLength { return 0; }
 - (BOOL)supportsIndirectCommandBuffers { return NO; }
-- (rn_vk_render *)renderForPrimitive:(unsigned)prim {
-    if (prim > 4) return NULL;
-    if (byPrim[prim]) return byPrim[prim];
+- (rn_vk_render *)renderForPrimitive:(unsigned)prim cull:(unsigned)cull clockwise:(BOOL)cw {
+    if (prim > 4 || cull > 2) return NULL;
+    const unsigned key = prim * 6 + cull * 2 + (cw ? 1 : 0);
+    if (byKey[key]) return byKey[key];
     rn_vk *vk = rn_vk_shared();
     if (!vk) return NULL;
     rn_vk_render_desc d;
     memset(&d, 0, sizeof(d));
     d.vs = spv[0].bytes; d.vs_bytes = spv[0].length; d.fs = spv[1].bytes; d.fs_bytes = spv[1].length;
     d.nvbind = n[0]; d.vbinds = binds[0]; d.nfbind = n[1]; d.fbinds = binds[1];
-    d.ntargets = nt; d.topology = prim;
+    d.ntargets = nt; d.topology = prim; d.cull_mode = cull; d.front_clockwise = cw;
     for (unsigned i = 0; i < nt; i++) { d.target_formats[i] = tfmt[i]; d.blend[i] = blend[i]; }
     d.nvattr = nvattr; d.vattrs = vattr; d.nvlayout = nvlayout; d.vlayouts = vlayout;
-    byPrim[prim] = rn_vk_render_create(vk, &d);
-    return byPrim[prim];
+    byKey[key] = rn_vk_render_create(vk, &d);
+    return byKey[key];
 }
 @end
 
@@ -458,6 +460,12 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     double viewport[6];
     uint32_t scissor[4];
     unsigned prim, vertexStart, vertexCount, instanceCount, baseInstance;
+    unsigned cull;                                   // MTLCullMode
+    BOOL clockwise;
+    RedNaviMTLBuffer *indexBuf;                      // indexed draws: vertexCount is the index count
+    uint64_t indexOffset;
+    BOOL index32;
+    int32_t baseVertex;
 }
 @end
 @implementation RNDraw
@@ -734,6 +742,8 @@ static NSString *rn_run_blit(RNBlit *b) {
     float blendColor[4];
     double viewport[6];
     uint32_t scissor[4];
+    unsigned cullMode;                               // MTLCullMode, default none
+    BOOL counterClockwise;                           // MTLWinding, default clockwise
     NSString *label_;
     BOOL ended;
 }
@@ -773,10 +783,10 @@ static NSString *rn_run_blit(RNBlit *b) {
     viewport[0] = v.originX; viewport[1] = v.originY; viewport[2] = v.width; viewport[3] = v.height; viewport[4] = v.znear; viewport[5] = v.zfar;
 }
 - (void)setScissorRect:(MTLScissorRect)r { hasScissor = YES; scissor[0] = (uint32_t)r.x; scissor[1] = (uint32_t)r.y; scissor[2] = (uint32_t)r.width; scissor[3] = (uint32_t)r.height; }
-// state that is not implemented yet is logged once and ignored: culling is off, there is no depth test
+// state that is not implemented yet is logged once and ignored: there is no depth test
 - (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
-- (void)setCullMode:(MTLCullMode)m { if (m != MTLCullModeNone) [self ignored:"cull mode"]; }
-- (void)setFrontFacingWinding:(MTLWinding)w {}
+- (void)setCullMode:(MTLCullMode)m { cullMode = (unsigned)m; }
+- (void)setFrontFacingWinding:(MTLWinding)w { counterClockwise = w == MTLWindingCounterClockwise; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) [self ignored:"triangle fill mode"]; }
 - (void)setDepthStencilState:(id<MTLDepthStencilState>)s { [self ignored:"depth stencil state"]; }
 - (void)setDepthBias:(float)d slopeScale:(float)s clamp:(float)c {}
@@ -791,7 +801,21 @@ static NSString *rn_run_blit(RNBlit *b) {
     d->hasScissor = hasScissor; memcpy(d->scissor, scissor, sizeof(scissor));
     d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
     d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
+    d->cull = cullMode; d->clockwise = !counterClockwise;
     [pass->draws addObject:d];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset
+                instanceCount:(NSUInteger)instances baseVertex:(NSInteger)baseVertex baseInstance:(NSUInteger)base {
+    if (!pso) { rn_log("indexed draw without a render pipeline state"); return; }
+    [self drawPrimitives:type vertexStart:0 vertexCount:count instanceCount:instances baseInstance:base];
+    RNDraw *d = pass->draws.lastObject;
+    d->indexBuf = (RedNaviMTLBuffer *)indexBuffer; d->indexOffset = offset; d->index32 = indexType == MTLIndexTypeUInt32; d->baseVertex = (int32_t)baseVertex;
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset instanceCount:(NSUInteger)instances {
+    [self drawIndexedPrimitives:type indexCount:count indexType:indexType indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:instances baseVertex:0 baseInstance:0];
+}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset {
+    [self drawIndexedPrimitives:type indexCount:count indexType:indexType indexBuffer:indexBuffer indexBufferOffset:offset instanceCount:1 baseVertex:0 baseInstance:0];
 }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances { [self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:instances baseInstance:0]; }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count { [self drawPrimitives:type vertexStart:start vertexCount:count instanceCount:1 baseInstance:0]; }
@@ -852,19 +876,19 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)runRenderPass:(RNRenderPass *)rp {
     rn_vk *vk = rn_vk_shared();
     const NSUInteger nd = rp->draws.count;
-    if (!nd) { rn_log("render pass without draws: its clears are not applied (not implemented)"); return; }
     rn_vk_target tg[8];
     for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}}; }
-    rn_vk_draw *dr = calloc(nd, sizeof(*dr));
-    rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*va));
-    rn_vk_arg (*fa)[RN_VK_MAX_BINDINGS] = calloc(nd, sizeof(*fa));
-    rn_vk_vbuf (*vbs)[16] = calloc(nd, sizeof(*vbs));
+    const NSUInteger na = nd ? nd : 1;               // a pass without draws still runs: its clears are done
+    rn_vk_draw *dr = calloc(na, sizeof(*dr));
+    rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
+    rn_vk_arg (*fa)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*fa));
+    rn_vk_vbuf (*vbs)[16] = calloc(na, sizeof(*vbs));
     NSMutableArray *temps = [NSMutableArray new];
     NSString *bad = (dr && va && fa && vbs) ? nil : @"out of memory";
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
-        rn_vk_render *r = [p renderForPrimitive:d->prim];
+        rn_vk_render *r = [p renderForPrimitive:d->prim cull:d->cull clockwise:d->clockwise];
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
         bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
         if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps);
@@ -883,6 +907,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         }
         dr[k] = (rn_vk_draw){.pipe = r, .vbufs = vbs[k], .has_blend_color = d->hasBlendColor, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
                              .instance_count = d->instanceCount, .first_instance = d->baseInstance};
+        if (d->indexBuf) { dr[k].index_buffer = d->indexBuf->b; dr[k].index_offset = d->indexOffset; dr[k].index32 = d->index32; dr[k].base_vertex = d->baseVertex; }
         memcpy(dr[k].blend_color, d->blendColor, sizeof(dr[k].blend_color));
         memcpy(dr[k].viewport, d->viewport, sizeof(dr[k].viewport));
         memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
@@ -1179,7 +1204,7 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
         }
         if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
         if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";
-        if (!why && ![p renderForPrimitive:3]) why = @"RADV refused the pipeline";
+        if (!why && ![p renderForPrimitive:3 cull:0 clockwise:YES]) why = @"RADV refused the pipeline";
     }
     if (why) {
         rn_log("render pipeline failed: %s", why.UTF8String);
