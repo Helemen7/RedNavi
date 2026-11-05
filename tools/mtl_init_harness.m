@@ -663,6 +663,94 @@ int main(int argc, char **argv) {
                 printf("function constants through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_EVENT_TEST")) {
+                // Shared events: the value and a listener, a command buffer that signals and one that waits (committed on another thread, released by the main thread), and a second process
+                // that opens the event from its archived handle (this program run again with RN_EVENT_CHILD) and changes its value.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                if (getenv("RN_EVENT_CHILD")) {
+                    NSData *arc = [NSData dataWithContentsOfFile:@(getenv("RN_EVENT_CHILD"))];
+                    NSError *ce = nil;
+                    MTLSharedEventHandle *h = [NSKeyedUnarchiver unarchivedObjectOfClass:[MTLSharedEventHandle class] fromData:arc error:&ce];
+                    if (!h) { printf("child: cannot decode the handle: %s\n", ce.localizedDescription.UTF8String); return 3; }
+                    id<MTLSharedEvent> ev = [d newSharedEventWithHandle:h];
+                    if (!ev) { printf("child: no event from the handle\n"); return 4; }
+                    printf("child: event value %llu, setting %llu\n", ev.signaledValue, ev.signaledValue + 100);
+                    ev.signaledValue = ev.signaledValue + 100;
+                    return 0;
+                }
+                int fails = 0;
+                #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+                id<MTLSharedEvent> ev = [d newSharedEvent];
+                if (!ev) { printf("no shared event\n"); return 110; }
+                printf("shared event %p, class %s, value %llu\n", (__bridge void *)ev, class_getName(object_getClass(ev)), ev.signaledValue);
+                CHECK(ev.signaledValue == 0, "initial value");
+                ev.signaledValue = 5;
+                CHECK(ev.signaledValue == 5, "set and read");
+                // 1. listener
+                {
+                    dispatch_queue_t lq = dispatch_queue_create("listener", DISPATCH_QUEUE_SERIAL);
+                    MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] initWithDispatchQueue:lq];
+                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                    __block uint64_t seen = 0;
+                    [ev notifyListener:listener atValue:7 block:^(id<MTLSharedEvent> e, uint64_t v) { seen = v; dispatch_semaphore_signal(sem); }];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC), dispatch_get_global_queue(0, 0), ^{ ev.signaledValue = 7; });
+                    const long timedOut = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+                    printf("listener at 7: %s, value seen %llu\n", timedOut ? "not called" : "called", seen);
+                    CHECK(!timedOut && seen >= 7, "the listener was not called");
+                    CHECK([ev waitUntilSignaledValue:7 timeoutMS:200], "wait for a value that is reached");
+                    CHECK(![ev waitUntilSignaledValue:8 timeoutMS:100], "wait for a value that is not reached");
+                }
+                // 2. command buffers
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                {
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    [cb encodeSignalEvent:ev value:10];
+                    [cb commit]; [cb waitUntilCompleted];
+                    printf("encodeSignalEvent 10: value %llu, status %ld\n", ev.signaledValue, (long)cb.status);
+                    CHECK(ev.signaledValue == 10 && cb.status == MTLCommandBufferStatusCompleted, "signal from a command buffer");
+                    id<MTLBuffer> buf = [d newBufferWithLength:64 options:MTLResourceStorageModeShared];
+                    memset(buf.contents, 0, 64);
+                    id<MTLCommandBuffer> cb2 = [q commandBuffer];
+                    [cb2 encodeWaitForEvent:ev value:11];
+                    id<MTLBlitCommandEncoder> be = [cb2 blitCommandEncoder];
+                    [be fillBuffer:buf range:NSMakeRange(0, 64) value:0xAB];
+                    [be endEncoding];
+                    [cb2 encodeSignalEvent:ev value:12];
+                    dispatch_semaphore_t done = dispatch_semaphore_create(0);
+                    dispatch_async(dispatch_get_global_queue(0, 0), ^{ [cb2 commit]; [cb2 waitUntilCompleted]; dispatch_semaphore_signal(done); });
+                    usleep(300 * 1000);
+                    const uint8_t before = ((uint8_t *)buf.contents)[0];
+                    const uint64_t vbefore = ev.signaledValue;
+                    ev.signaledValue = 11;
+                    const long timedOut = dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC));
+                    printf("wait for 11: before the signal the buffer held %u and the event %llu; after: buffer %u, event %llu, status %ld\n", before, vbefore, ((uint8_t *)buf.contents)[0], ev.signaledValue, (long)cb2.status);
+                    CHECK(!timedOut && before == 0 && vbefore == 10 && ((uint8_t *)buf.contents)[0] == 0xAB && ev.signaledValue == 12, "wait in a command buffer");
+                }
+                // 3. a second process
+                {
+                    ev.signaledValue = 1000;
+                    MTLSharedEventHandle *h = [ev newSharedEventHandle];
+                    NSError *ae = nil;
+                    NSData *arc = [NSKeyedArchiver archivedDataWithRootObject:h requiringSecureCoding:YES error:&ae];
+                    if (!arc) { printf("cannot archive the handle: %s\n", ae.localizedDescription.UTF8String); fails++; }
+                    else {
+                        NSString *path = [NSString stringWithFormat:@"/tmp/rnev-handle-%d", getpid()];
+                        [arc writeToFile:path atomically:YES];
+                        NSString *cmd = [NSString stringWithFormat:@"RN_EVENT_TEST=1 RN_EVENT_CHILD=%@ '%s' '%s' 2>&1 | grep child", path, argv[0], argv[1]];
+                        printf("second process:\n"); fflush(stdout);
+                        system(cmd.UTF8String);
+                        printf("after the second process: value %llu (want 1100)\n", ev.signaledValue);
+                        CHECK(ev.signaledValue == 1100, "the second process did not change the shared value");
+                        [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+                    }
+                    // the same handle opened in this process
+                    id<MTLSharedEvent> ev2 = [d newSharedEventWithHandle:[NSKeyedUnarchiver unarchivedObjectOfClass:[MTLSharedEventHandle class] fromData:arc error:nil]];
+                    ev2.signaledValue = 2000;
+                    CHECK(ev.signaledValue == 2000, "two objects of one event");
+                }
+                printf("events through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

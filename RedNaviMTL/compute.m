@@ -14,6 +14,11 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <stdatomic.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include "rn_vk.h"
 #include "rn_air.h"
@@ -503,6 +508,94 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 - (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c;
 @end
 
+
+// ---------------------------------------------------------------------------------------------------------------------------------------- events
+// MTLEvent / MTLSharedEvent (docs/M6_WINDOWSERVER_STUDY.md: SkyLight and QuartzCore order GPU work with them). The value is a 64-bit integer in a POSIX shared memory object, so that a
+// second process that gets the event's handle sees the same value; waiting and listeners poll it. A command buffer runs synchronously at commit, so encodeSignalEvent:value: sets the
+// value at its place in the order of the work and encodeWaitForEvent:value: blocks the thread that commits until the value is reached (10 s at most, then the command buffer fails).
+@interface RedNaviSharedEventHandle : MTLSharedEventHandle <NSSecureCoding> {
+@public
+    NSString *shmName;
+    NSString *label_;
+}
+@end
+@implementation RedNaviSharedEventHandle
++ (BOOL)supportsSecureCoding { return YES; }
+- (NSString *)label { return label_; }
+- (void)encodeWithCoder:(NSCoder *)c { [c encodeObject:shmName forKey:@"shm"]; [c encodeObject:label_ forKey:@"label"]; }
+- (instancetype)initWithCoder:(NSCoder *)c {
+    if ((self = [super init])) { shmName = [c decodeObjectOfClass:[NSString class] forKey:@"shm"]; label_ = [c decodeObjectOfClass:[NSString class] forKey:@"label"]; }
+    return self;
+}
+@end
+
+@interface RedNaviMTLSharedEvent : NSObject {
+@public
+    id<MTLDevice> dev;
+    NSString *label_;
+    NSString *shmName;
+    _Atomic uint64_t *val;
+    BOOL owner;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)d shmName:(NSString *)name create:(BOOL)create;
+- (BOOL)waitFor:(uint64_t)value timeoutMS:(uint64_t)ms;
+@end
+@implementation RedNaviMTLSharedEvent
++ (void)load { class_addProtocol(self, @protocol(MTLSharedEvent)); class_addProtocol(self, @protocol(MTLEvent)); }
+- (instancetype)initWithDevice:(id<MTLDevice>)d shmName:(NSString *)name create:(BOOL)create {
+    if (!(self = [super init])) return nil;
+    static _Atomic unsigned counter;
+    if (create) name = [NSString stringWithFormat:@"/rnev.%d.%u", getpid(), atomic_fetch_add(&counter, 1)];
+    const int fd = shm_open(name.UTF8String, create ? (O_CREAT | O_EXCL | O_RDWR) : O_RDWR, 0600);
+    if (fd < 0) { rn_log("shared event %s: shm_open failed (%d)", name.UTF8String, errno); return nil; }
+    if (create && ftruncate(fd, 4096) != 0) { close(fd); shm_unlink(name.UTF8String); return nil; }
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (p == MAP_FAILED) { if (create) shm_unlink(name.UTF8String); return nil; }
+    val = p; shmName = name; owner = create; dev = d;
+    return self;
+}
+- (void)dealloc { if (val) munmap((void *)val, 4096); if (owner) shm_unlink(shmName.UTF8String); }
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (uint64_t)signaledValue { return atomic_load(val); }
+- (void)setSignaledValue:(uint64_t)v { atomic_store(val, v); }
+- (BOOL)waitFor:(uint64_t)value timeoutMS:(uint64_t)ms {
+    const uint64_t deadline = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + ms * 1000000ull;
+    while (atomic_load(val) < value) {
+        if (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) >= deadline) return NO;
+        usleep(200);
+    }
+    return YES;
+}
+- (BOOL)waitUntilSignaledValue:(uint64_t)value timeoutMS:(uint64_t)milliseconds { return [self waitFor:value timeoutMS:milliseconds]; }
+- (void)notifyListener:(MTLSharedEventListener *)listener atValue:(uint64_t)value block:(MTLSharedEventNotificationBlock)block {
+    dispatch_queue_t q = listener.dispatchQueue ?: dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0);
+    MTLSharedEventNotificationBlock b = [block copy];
+    // a polling thread per notification; it ends when the value is reached or after a minute
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if ([self waitFor:value timeoutMS:60000]) dispatch_async(q, ^{ b((id<MTLSharedEvent>)self, atomic_load(self->val)); });
+    });
+}
+- (MTLSharedEventHandle *)newSharedEventHandle {
+    RedNaviSharedEventHandle *h = [RedNaviSharedEventHandle new];
+    h->shmName = shmName; h->label_ = label_;
+    return h;
+}
+@end
+
+// A record of a command buffer: signal an event or wait for it.
+@interface RNEventOp : NSObject {
+@public
+    RedNaviMTLSharedEvent *event;
+    uint64_t value;
+    BOOL wait;
+}
+@end
+@implementation RNEventOp
+@end
+
 @interface RedNaviMTLCommandBuffer : NSObject {
 @public
     id<MTLCommandQueue> queue;
@@ -854,6 +947,12 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block { [completed addObject:[block copy]]; }
 - (void)waitUntilScheduled {}
 // The first version runs everything at commit, so a drawable is presented at the end of commit.
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
+    RNEventOp *o = [RNEventOp new]; o->event = (RedNaviMTLSharedEvent *)event; o->value = value; [records addObject:o];
+}
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value {
+    RNEventOp *o = [RNEventOp new]; o->event = (RedNaviMTLSharedEvent *)event; o->value = value; o->wait = YES; [records addObject:o];
+}
 - (void)presentDrawable:(id<MTLDrawable>)drawable { if (drawable) [presents addObject:drawable]; }
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime { [self presentDrawable:drawable]; }
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [self presentDrawable:drawable]; }
@@ -952,6 +1051,8 @@ static NSString *rn_run_blit(RNBlit *b) {
             RNRenderPass *rp = rec;
             for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
             for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
+        } else if ([rec isKindOfClass:[RNEventOp class]]) {
+            // no textures
         } else if ([rec isKindOfClass:[RNBlit class]]) {
             RNBlit *bl = rec;
             note(bl->st, NO);
@@ -966,6 +1067,13 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (st == MTLCommandBufferStatusError) break;
         if ([rec isKindOfClass:[RNRenderPass class]]) { [self runRenderPass:rec]; continue; }
         if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; continue; }
+        if ([rec isKindOfClass:[RNEventOp class]]) {
+            RNEventOp *o = rec;
+            if (![o->event isKindOfClass:[RedNaviMTLSharedEvent class]]) { [self fail:@"an event that is not from RedNavi"]; break; }
+            if (!o->wait) { if (o->event.signaledValue < o->value) o->event.signaledValue = o->value; }
+            else if (![o->event waitFor:o->value timeoutMS:10000]) [self fail:[NSString stringWithFormat:@"waiting for an event to reach %llu timed out after 10 s (it is at %llu)", o->value, o->event.signaledValue]];
+            continue;
+        }
         RNDispatch *d = rec;
         RedNaviMTLComputePipelineState *p = d->pso;
         rn_vk_arg av[RN_VK_MAX_BINDINGS];
@@ -1343,6 +1451,25 @@ void rn_compute_install(Class k, Class sup) {
         if (!rn_gate()) return o7 ? o7(self, s7, desc) : 0;
         return (uintptr_t)CFBridgingRetain([[RedNaviMTLTexture alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc]);
     }), m7 ? method_getTypeEncoding(m7) : "@24@0:8@16");
+    // Events (the first one of this process's plug-in creates a shared memory object per event)
+    SEL se1 = sel_registerName("newSharedEvent"), se2 = sel_registerName("newEvent"), se3 = sel_registerName("newSharedEventWithHandle:");
+    Method me1 = class_getInstanceMethod(sup, se1), me2 = class_getInstanceMethod(sup, se2), me3 = class_getInstanceMethod(sup, se3);
+    typedef uintptr_t (*imp_noarg)(id, SEL);
+    typedef uintptr_t (*imp_onearg)(id, SEL, id);
+    imp_noarg oe1 = me1 ? (imp_noarg)method_getImplementation(me1) : NULL, oe2 = me2 ? (imp_noarg)method_getImplementation(me2) : NULL;
+    imp_onearg oe3 = me3 ? (imp_onearg)method_getImplementation(me3) : NULL;
+    class_addMethod(k, se1, imp_implementationWithBlock(^uintptr_t(id self) {
+        if (!rn_gate()) return oe1 ? oe1(self, se1) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLSharedEvent alloc] initWithDevice:(id<MTLDevice>)self shmName:nil create:YES]);
+    }), me1 ? method_getTypeEncoding(me1) : "@16@0:8");
+    class_addMethod(k, se2, imp_implementationWithBlock(^uintptr_t(id self) {
+        if (!rn_gate()) return oe2 ? oe2(self, se2) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLSharedEvent alloc] initWithDevice:(id<MTLDevice>)self shmName:nil create:YES]);
+    }), me2 ? method_getTypeEncoding(me2) : "@16@0:8");
+    class_addMethod(k, se3, imp_implementationWithBlock(^uintptr_t(id self, id handle) {
+        if (!rn_gate() || ![handle isKindOfClass:[RedNaviSharedEventHandle class]]) return oe3 ? oe3(self, se3, handle) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLSharedEvent alloc] initWithDevice:(id<MTLDevice>)self shmName:((RedNaviSharedEventHandle *)handle)->shmName create:NO]);
+    }), me3 ? method_getTypeEncoding(me3) : "@24@0:8@16");
     SEL s7b = sel_registerName("newTextureWithDescriptor:iosurface:plane:");
     Method m7b = class_getInstanceMethod(sup, s7b);
     typedef uintptr_t (*imp_tex_io)(id, SEL, id, IOSurfaceRef, NSUInteger);
