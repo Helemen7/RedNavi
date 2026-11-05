@@ -1,0 +1,33 @@
+name: Navi33 P1 host-only tests
+on:
+  push:
+    branches:
+      - feature/navi33-p1-port
+  pull_request:
+    paths:
+      - 'RedNavi/navi33_*.h'
+      - 'tests/host/navi33_*.cpp'
+      - '.github/workflows/navi33-p1.yml'
+      - 'Makefile'
+
+jobs:
+  compile-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile with warnings as errors
+        run: |
+          mkdir -p build
+          ${{ matrix.compiler }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic -IRedNavi \
+            tests/host/navi33_p1_test.cpp -o build/navi33_p1_test
+      - name: Run host-only regression
+        run: ./build/navi33_p1_test
+      - name: Compile and run identity regression
+        run: |
+          ${{ matrix.compiler }} -std=c++17 -O1 -Wall -Wextra -Werror -pedantic -IRedNavi \
+            tests/host/navi33_facts_test.cpp -o build/navi33_facts_test
+          ./build/navi33_facts_test
