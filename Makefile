@@ -153,5 +153,7 @@ test:
 	./build/mode_regs_test
 	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_facts_test.cpp -o build/navi33_facts_test
 	./build/navi33_facts_test
+	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_p1_test.cpp -o build/navi33_p1_test
+	./build/navi33_p1_test
 
 .PHONY: all clean test mtl
