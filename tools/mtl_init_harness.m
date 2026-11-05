@@ -751,6 +751,117 @@ int main(int argc, char **argv) {
                 printf("events through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
+            if (getenv("RN_VIEW_TEST")) {
+                // Texture views and the other selectors the system frameworks reference (mesa-bridge/test/vk_texcopy.metal). texture_copy reads texture 0 and writes it to texture 1 with 1 added to
+                // the red channel it sees. Read through a BGRA8 view of an RGBA8 texture, or through an RGBA8 view with swizzle (blue, green, red, alpha), the red it sees is the stored blue:
+                // the output is (b + 1, g, r, a). Also a texture view of a view, an sRGB view, the refused views, a function made from a descriptor, and the calls that do nothing.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_VIEW_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 120; }
+                int fails = 0;
+                #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); fails++; } } while (0)
+                MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+                fd.name = @"texture_copy";
+                id<MTLFunction> fn = [lib newFunctionWithDescriptor:fd error:&e];
+                id<MTLComputePipelineState> pso = fn ? [d newComputePipelineStateWithFunction:fn error:&e] : nil;
+                printf("newFunctionWithDescriptor: function %p, pipeline %p\n", (__bridge void *)fn, (__bridge void *)pso);
+                CHECK(pso != nil, "no pipeline from a function made with a descriptor");
+                if (!pso) return 121;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:20 height:12 mipmapped:NO];
+                td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
+                id<MTLTexture> base = [d newTextureWithDescriptor:td];
+                uint8_t in[20 * 12 * 4];
+                for (int i = 0; i < 20 * 12; i++) { in[i * 4] = (uint8_t)(i * 3); in[i * 4 + 1] = (uint8_t)(i * 5 + 1); in[i * 4 + 2] = (uint8_t)(i * 7 + 2); in[i * 4 + 3] = 255 - (uint8_t)i; }
+                [base replaceRegion:MTLRegionMake2D(0, 0, 20, 12) mipmapLevel:0 withBytes:in bytesPerRow:80];
+                id<MTLTexture> viewBGRA = [base newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+                id<MTLTexture> viewSwz = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)
+                                                                    swizzle:(MTLTextureSwizzleChannels){MTLTextureSwizzleBlue, MTLTextureSwizzleGreen, MTLTextureSwizzleRed, MTLTextureSwizzleAlpha}];
+                id<MTLTexture> viewSame = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+                id<MTLTexture> viewSrgb = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm_sRGB];
+                id<MTLTexture> viewOfView = [viewBGRA newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+                printf("views: bgra %p, swizzle %p, same %p, srgb %p, view of a view %p; parent of the first %p (base %p), pixel format %lu\n", (__bridge void *)viewBGRA, (__bridge void *)viewSwz, (__bridge void *)viewSame,
+                       (__bridge void *)viewSrgb, (__bridge void *)viewOfView, (__bridge void *)viewBGRA.parentTexture, (__bridge void *)base, (unsigned long)viewBGRA.pixelFormat);
+                CHECK(viewBGRA && viewSwz && viewSame && viewSrgb && viewOfView, "a view is missing");
+                CHECK(viewBGRA.parentTexture == base && viewBGRA.pixelFormat == MTLPixelFormatBGRA8Unorm, "parentTexture or pixelFormat of a view");
+                // refused: other texel size (RG32Float is 8 bytes, the texture 4), a level and slice range outside the texture, another texture type
+                id<MTLTexture> bad1 = [base newTextureViewWithPixelFormat:MTLPixelFormatRG32Float];
+                id<MTLTexture> bad2 = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D levels:NSMakeRange(1, 1) slices:NSMakeRange(0, 1)];
+                id<MTLTexture> bad3 = [base newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2DArray levels:NSMakeRange(0, 1) slices:NSMakeRange(0, 1)];
+                CHECK(!bad1 && !bad2 && !bad3, "a view that cannot exist was made (%p %p %p)", (__bridge void *)bad1, (__bridge void *)bad2, (__bridge void *)bad3);
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                struct { id<MTLTexture> src; const char *what; int swapRB; } jobs[] = {{viewBGRA, "BGRA8 view", 1}, {viewSwz, "swizzled view", 1}, {viewSame, "RGBA8 view (same format)", 0}, {viewOfView, "view of a BGRA8 view", 0}};
+                for (unsigned j = 0; j < 4; j++) {
+                    MTLTextureDescriptor *od = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:20 height:12 mipmapped:NO];
+                    od.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+                    id<MTLTexture> dst = [d newTextureWithDescriptor:od];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:pso];
+                    [enc setTexture:jobs[j].src atIndex:0];
+                    [enc setTexture:dst atIndex:1];
+                    [enc dispatchThreads:MTLSizeMake(20, 12, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t out[20 * 12 * 4];
+                    [dst getBytes:out bytesPerRow:80 fromRegion:MTLRegionMake2D(0, 0, 20, 12) mipmapLevel:0];
+                    int bad = 0;
+                    for (int i = 0; i < 20 * 12; i++) {
+                        // the kernel adds 1 to the red it sees, clamped: for a view that swaps red and blue the red it sees is the stored blue, and the output has the two swapped
+                        const uint8_t r0 = in[i * 4], g0 = in[i * 4 + 1], b0 = in[i * 4 + 2], a0 = in[i * 4 + 3];
+                        uint8_t want[4];
+                        if (jobs[j].swapRB) { want[0] = b0 == 255 ? 255 : b0 + 1; want[1] = g0; want[2] = r0; }
+                        else { want[0] = r0 == 255 ? 255 : r0 + 1; want[1] = g0; want[2] = b0; }
+                        want[3] = a0;
+                        if (memcmp(out + i * 4, want, 4)) { if (bad < 2) printf("  %s texel %d: got %u %u %u %u, want %u %u %u %u\n", jobs[j].what, i, out[i*4], out[i*4+1], out[i*4+2], out[i*4+3], want[0], want[1], want[2], want[3]); bad++; }
+                    }
+                    printf("%s read by a kernel: status %ld, %d of 240 texels wrong\n", jobs[j].what, (long)cb.status, bad);
+                    CHECK(!bad && cb.status == MTLCommandBufferStatusCompleted, "%s", jobs[j].what);
+                }
+                // a render pass into a BGRA8 view of an RGBA8 texture: clear (1, 0, 0) is stored as bytes (0, 0, 255)
+                {
+                    MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+                    rd.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+                    id<MTLTexture> rt = [d newTextureWithDescriptor:rd];
+                    id<MTLTexture> rv = [rt newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm];
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = rv; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t px[4];
+                    [rt getBytes:px bytesPerRow:32 fromRegion:MTLRegionMake2D(3, 3, 1, 1) mipmapLevel:0];
+                    printf("clear into a BGRA8 view: the RGBA8 texture holds %u %u %u %u (want 0 0 255 255), status %ld\n", px[0], px[1], px[2], px[3], (long)cb.status);
+                    CHECK(px[0] == 0 && px[1] == 0 && px[2] == 255 && px[3] == 255, "render target view");
+                }
+                // selectors that do nothing or answer simply
+                {
+                    MTLTextureDescriptor *rd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+                    rd.usage = MTLTextureUsageRenderTarget;
+                    id<MTLTexture> rt = [d newTextureWithDescriptor:rd];
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = rt; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    [enc setDepthClipMode:MTLDepthClipModeClip];
+                    [enc setVisibilityResultMode:MTLVisibilityResultModeDisabled offset:0];
+                    [enc textureBarrier];
+                    [enc endEncoding];
+                    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                    [ce setThreadgroupMemoryLength:64 atIndex:0];
+                    [ce endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    id<MTLBuffer> b = [d newBufferWithLength:16 options:MTLResourceStorageModeShared];
+                    printf("no-op selectors: status %ld; setOwnerWithIdentity %d, texture gpuResourceID %llu, swizzle of a view %lu\n", (long)cb.status, (int)[rt setOwnerWithIdentity:0], rt.gpuResourceID._impl, (unsigned long)viewSwz.swizzle.red);
+                    CHECK(cb.status == MTLCommandBufferStatusCompleted && [b setOwnerWithIdentity:0] == 0 && viewSwz.swizzle.red == MTLTextureSwizzleBlue, "no-op selectors");
+                }
+                printf("texture views and selectors through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
             if (getenv("RN_TEX_TEST")) {
                 // Texture kernels from a .metallib (mesa-bridge/test/vk_texcopy.metal) through the official API: a 20 x 12 RGBA8 texture, a grid of 3 x 2 threadgroups of 8 x 8 (bigger
                 // than the texture: the kernels check the bounds). texture_copy adds 1 to the red channel (storage image written without format), texture_sample copies through the

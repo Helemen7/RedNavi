@@ -38,7 +38,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h; unsigned texel; int storage, color, initialized, dirty; };
+struct rn_vk_image { rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h; unsigned texel; int storage, color, initialized, dirty; };
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -303,7 +303,7 @@ unsigned rn_vk_format_texel_bytes(int f) {
     switch (f) {
     case RN_VK_R8: return 1;
     case RN_VK_RG8: case RN_VK_R16F: return 2;
-    case RN_VK_RGBA8: case RN_VK_BGRA8: case RN_VK_R32F: case RN_VK_R32U: case RN_VK_R32I: case RN_VK_RGBA8U: return 4;
+    case RN_VK_RGBA8: case RN_VK_BGRA8: case RN_VK_RGBA8_SRGB: case RN_VK_BGRA8_SRGB: case RN_VK_R32F: case RN_VK_R32U: case RN_VK_R32I: case RN_VK_RGBA8U: return 4;
     case RN_VK_RGBA16F: case RN_VK_RG32F: return 8;
     case RN_VK_RGBA32F: return 16;
     default: return 0;
@@ -313,6 +313,8 @@ static VkFormat vk_format(int f) {
     switch (f) {
     case RN_VK_RGBA8: return VK_FORMAT_R8G8B8A8_UNORM;
     case RN_VK_BGRA8: return VK_FORMAT_B8G8R8A8_UNORM;
+    case RN_VK_RGBA8_SRGB: return VK_FORMAT_R8G8B8A8_SRGB;
+    case RN_VK_BGRA8_SRGB: return VK_FORMAT_B8G8R8A8_SRGB;
     case RN_VK_R8: return VK_FORMAT_R8_UNORM;
     case RN_VK_RG8: return VK_FORMAT_R8G8_UNORM;
     case RN_VK_R16F: return VK_FORMAT_R16_SFLOAT;
@@ -342,6 +344,7 @@ rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) {
     im->color = (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
     VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                                .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                              .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0)};
     if (vk->CreateImage(vk->dev, &ici, NULL, &im->img) != VK_SUCCESS) goto fail;
     VkMemoryRequirements mr;
@@ -365,10 +368,36 @@ fail:
     rn_vk_image_destroy(vk, im);
     return NULL;
 }
+// A view of an image with another format of the same texel size and optionally swizzled components: an alias that shares the image, its memory and its host copy with the root
+// (state that changes - dirty, initialized - is the root's). The root must outlive its views.
+rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const unsigned swizzle[4]) {
+    rn_vk_image *root = base->base ? base->base : base;
+    if (rn_vk_format_texel_bytes(format) != root->texel) return NULL;
+    VkFormatProperties fp;
+    const VkFormat vf = vk_format(format);
+    vk->GetPhysicalDeviceFormatProperties(vk->pd, vf, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) return NULL;
+    rn_vk_image *v = calloc(1, sizeof(*v));
+    if (!v) return NULL;
+    *v = *root;
+    v->base = root; v->fmt = vf; v->view = VK_NULL_HANDLE; v->initialized = v->dirty = 0;
+    v->storage = root->storage && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+    v->color = root->color && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = vf,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (swizzle) vci.components = (VkComponentMapping){swizzle[0], swizzle[1], swizzle[2], swizzle[3]};
+    if (vk->CreateImageView(vk->dev, &vci, NULL, &v->view) != VK_SUCCESS) { free(v); return NULL; }
+    return v;
+}
 void *rn_vk_image_staging(rn_vk_image *im) { return rn_vk_buffer_contents(im->stage); }
-void rn_vk_image_host_wrote(rn_vk_image *im) { im->dirty = 1; }
+void rn_vk_image_host_wrote(rn_vk_image *im) { (im->base ? im->base : im)->dirty = 1; }
 void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *im) {
     if (!im) return;
+    if (im->base) {                                                  // a view: only its own image view
+        if (im->view) vk->DestroyImageView(vk->dev, im->view, NULL);
+        free(im);
+        return;
+    }
     if (im->view) vk->DestroyImageView(vk->dev, im->view, NULL);
     if (im->img) vk->DestroyImage(vk->dev, im->img, NULL);
     if (im->mem) vk->FreeMemory(vk->dev, im->mem, NULL);
@@ -417,20 +446,21 @@ static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsig
 // The images of a submission: the first use takes an image out of UNDEFINED (its layout stays GENERAL, which sampling, storage and attachment use all accept) and what the host wrote goes in.
 static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, unsigned n) {
     for (unsigned i = 0; i < n; i++) {
+        rn_vk_image *r = im[i]->base ? im[i]->base : im[i];
         int seen = 0;
-        for (unsigned j = 0; j < i; j++) seen |= im[j] == im[i];
+        for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
         if (seen) continue;
-        if (!im[i]->initialized) {
+        if (!r->initialized) {
             VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                                       .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = im[i]->img,
+                                       .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = r->img,
                                        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
             vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
-            im[i]->initialized = 1;
+            r->initialized = 1;
         }
-        if (im[i]->dirty) {
-            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im[i]->w, im[i]->h, 1}};
-            vk->CmdCopyBufferToImage(cb, im[i]->stage->buf, im[i]->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
-            im[i]->dirty = 0;
+        if (r->dirty) {
+            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, 1}};
+            vk->CmdCopyBufferToImage(cb, r->stage->buf, r->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
+            r->dirty = 0;
         }
     }
 }
@@ -438,11 +468,12 @@ static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, uns
 static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, unsigned n) {
     unsigned done = 0;
     for (unsigned i = 0; i < n; i++) {
+        rn_vk_image *r = im[i]->base ? im[i]->base : im[i];
         int seen = 0;
-        for (unsigned j = 0; j < i; j++) seen |= im[j] == im[i];
+        for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
         if (seen) continue;
-        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im[i]->w, im[i]->h, 1}};
-        vk->CmdCopyImageToBuffer(cb, im[i]->img, VK_IMAGE_LAYOUT_GENERAL, im[i]->stage->buf, 1, &bc);
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, 1}};
+        vk->CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_GENERAL, r->stage->buf, 1, &bc);
         done++;
     }
     if (done) {
@@ -648,6 +679,15 @@ void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r) {
     free(r);
 }
 
+// vkCmdClearColorImage works in the format of the image, not of the view the pass uses: for a view whose red-blue order differs from the image's (BGRA8 over RGBA8) the two colour
+// components are swapped here so that the clear colour means what the view says. (sRGB views over UNORM images, or the reverse, are not corrected.)
+static void clear_value(const rn_vk_image *im, const float c[4], VkClearColorValue *out) {
+    memcpy(out->float32, c, sizeof(out->float32));
+    if (!im->base) return;
+    const int vb = im->fmt == VK_FORMAT_B8G8R8A8_UNORM || im->fmt == VK_FORMAT_B8G8R8A8_SRGB, rb = im->base->fmt == VK_FORMAT_B8G8R8A8_UNORM || im->base->fmt == VK_FORMAT_B8G8R8A8_SRGB;
+    if (vb != rb) { out->float32[0] = c[2]; out->float32[2] = c[0]; }
+}
+
 // A pass without draws: only its clears. They are done outside a render pass (vkCmdClearColorImage) and the images' host copies are brought up to date.
 static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
     rn_vk_image *im[8];
@@ -670,7 +710,7 @@ static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
     for (unsigned i = 0; i < nt; i++) {
         if (!targets[i].clear) continue;
         VkClearColorValue cc;
-        memcpy(cc.float32, targets[i].color, sizeof(cc.float32));
+        clear_value(targets[i].image, targets[i].color, &cc);
         VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
         vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
         if (!targets[i].discard) out[cleared++] = targets[i].image;
@@ -762,7 +802,7 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         for (unsigned i = 0; i < nt; i++) {
             if (!targets[i].clear) continue;
             VkClearColorValue cc;
-            memcpy(cc.float32, targets[i].color, sizeof(cc.float32));
+            clear_value(targets[i].image, targets[i].color, &cc);
             VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
         }

@@ -10,6 +10,7 @@
 // id<MTLComputePipelineState> built from raw SPIR-V (entry point "main"). Buffers are bound at indices 0..bufferCount-1 with -setBuffer:offset:atIndex: (offset must be 0),
 // -setBytes:length:atIndex: with an index >= bufferCount fills the push constants.
 #import <Foundation/Foundation.h>
+#pragma clang diagnostic ignored "-Wunguarded-availability-new"   // protocol methods newer than the deployment target are answered when Metal asks
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -57,6 +58,8 @@ static rn_vk *rn_vk_shared(void) {
 @end
 
 @implementation RedNaviMTLBuffer
+- (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
+- (kern_return_t)setOwnerWithIdentity:(task_id_token_t)token { return 0; }
 + (void)load { class_addProtocol(self, @protocol(MTLBuffer)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o {
     if ((self = [super init])) {
@@ -93,6 +96,8 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     switch (pf) {
     case MTLPixelFormatRGBA8Unorm: return RN_VK_RGBA8;
     case MTLPixelFormatBGRA8Unorm: return RN_VK_BGRA8;
+    case MTLPixelFormatRGBA8Unorm_sRGB: return RN_VK_RGBA8_SRGB;
+    case MTLPixelFormatBGRA8Unorm_sRGB: return RN_VK_BGRA8_SRGB;
     case MTLPixelFormatR8Unorm: return RN_VK_R8;
     case MTLPixelFormatRG8Unorm: return RN_VK_RG8;
     case MTLPixelFormatR16Float: return RN_VK_R16F;
@@ -117,11 +122,14 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     MTLTextureUsage usage_;
     NSString *label_;
     IOSurfaceRef surf;                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
+    RedNaviMTLTexture *parent;                       // a texture view: the texture it is a view of (it shares its image, memory and host copy)
+    MTLTextureSwizzleChannels swz;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc;
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane;
 - (void)syncFromSurface;
 - (void)syncToSurface;
+- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)pf swizzle:(const MTLTextureSwizzleChannels *)sw;
 @end
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
@@ -186,7 +194,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (void)makeAliasable {}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (id<MTLResource>)rootResource { return nil; }
-- (id<MTLTexture>)parentTexture { return nil; }
+- (id<MTLTexture>)parentTexture { return (id)parent; }
 - (NSUInteger)parentRelativeLevel { return 0; }
 - (NSUInteger)parentRelativeSlice { return 0; }
 - (id<MTLBuffer>)buffer { return nil; }
@@ -194,6 +202,43 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (NSUInteger)bufferBytesPerRow { return 0; }
 - (IOSurfaceRef)iosurface { return surf; }
 - (NSUInteger)iosurfacePlane { return 0; }
+// Texture views: another pixel format of the same texel size and/or swizzled components over the same storage. Only the whole of a 2D, one-level texture can be viewed.
+- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)newPf swizzle:(const MTLTextureSwizzleChannels *)sw {
+    const int f = rn_vk_format_of(newPf);
+    rn_vk *vk = f ? rn_vk_shared() : NULL;
+    if (!vk) { rn_log("texture view: pixel format %lu is not supported", (unsigned long)newPf); return nil; }
+    unsigned comp[4], *cp = NULL;
+    if (sw) {
+        const MTLTextureSwizzle in[4] = {sw->red, sw->green, sw->blue, sw->alpha};
+        static const unsigned map[6] = {1, 2, 3, 4, 5, 6};               // VkComponentSwizzle: ZERO ONE R G B A for Zero One Red Green Blue Alpha
+        for (int i = 0; i < 4; i++) comp[i] = in[i] < 6 ? map[in[i]] : 0;
+        cp = comp;
+    }
+    rn_vk_image *v = rn_vk_image_view(vk, parent ? parent->img : img, f, cp);
+    if (!v) { rn_log("texture view: pixel format %lu does not fit the texture (texel size) or cannot be sampled", (unsigned long)newPf); return nil; }
+    RedNaviMTLTexture *t = [[RedNaviMTLTexture alloc] init];
+    t->img = v; t->dev = dev; t->pf = newPf; t->w = w; t->h = h; t->texel = texel; t->usage_ = usage_;
+    t->parent = parent ? parent : self;
+    t->surf = t->parent->surf ? (IOSurfaceRef)CFRetain(t->parent->surf) : NULL;
+    t->swz = sw ? *sw : (MTLTextureSwizzleChannels){MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
+    return t;
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf { return (id)[self viewWithPixelFormat:newPf swizzle:NULL]; }
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
+    if (type != MTLTextureType2D || levels.location != 0 || levels.length != 1 || slices.location != 0 || slices.length != 1) { rn_log("texture view: only the whole of a 2D texture of one level can be viewed"); return nil; }
+    return [self newTextureViewWithPixelFormat:newPf];
+}
+- (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
+    if (type != MTLTextureType2D || levels.location != 0 || levels.length != 1 || slices.location != 0 || slices.length != 1) { rn_log("texture view: only the whole of a 2D texture of one level can be viewed"); return nil; }
+    return (id)[self viewWithPixelFormat:newPf swizzle:&swizzle];
+}
+- (MTLTextureSwizzleChannels)swizzle { return swz.red == swz.green && swz.green == swz.blue && swz.blue == swz.alpha && swz.red == 0 && !parent ? (MTLTextureSwizzleChannels){MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha} : swz; }
+- (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
+- (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
+- (kern_return_t)setOwnerWithIdentity:(task_id_token_t)token { return 0; }
+- (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device { rn_log("newRemoteTextureViewForDevice: not supported"); return nil; }
+- (MTLSharedTextureHandle *)newSharedTextureHandle { rn_log("newSharedTextureHandle: not supported (an IOSurface-backed texture is shared through its IOSurface)"); return nil; }
+- (id<MTLTexture>)remoteStorageTexture { return nil; }
 - (MTLTextureType)textureType { return MTLTextureType2D; }
 - (MTLPixelFormat)pixelFormat { return pf; }
 - (NSUInteger)width { return w; }
@@ -243,6 +288,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 }
 @end
 @implementation RedNaviMTLSamplerState
+- (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
 + (void)load { class_addProtocol(self, @protocol(MTLSamplerState)); }
 - (void)dealloc { if (s) rn_vk_sampler_destroy(rn_vk_shared(), s); }
 - (id<MTLDevice>)device { return dev; }
@@ -294,6 +340,7 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 }
 @end
 @implementation RedNaviMTLComputePipelineState
+- (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
 + (void)load { class_addProtocol(self, @protocol(MTLComputePipelineState)); }
 - (void)dealloc { if (c) rn_vk_compute_destroy(rn_vk_shared(), c); }
 - (id<MTLDevice>)device { return dev; }
@@ -434,6 +481,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 - (BOOL)threadgroupSizeMatchesTileSize { return NO; }
 - (NSUInteger)imageblockSampleLength { return 0; }
 - (BOOL)supportsIndirectCommandBuffers { return NO; }
+- (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
 - (rn_vk_render *)renderForPrimitive:(unsigned)prim cull:(unsigned)cull clockwise:(BOOL)cw {
     if (prim > 4 || cull > 2) return NULL;
     const unsigned key = prim * 6 + cull * 2 + (cw ? 1 : 0);
@@ -646,6 +694,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
     if (index < 16) texs[index] = (RedNaviMTLTexture *)texture;
 }
+- (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index { rn_log("setThreadgroupMemoryLength: not implemented, ignored (kernels with threadgroup memory arguments are refused by the translator)"); }
 - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])textures withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setTexture:textures[i] atIndex:range.location + i];
 }
@@ -880,6 +929,9 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)setScissorRect:(MTLScissorRect)r { hasScissor = YES; scissor[0] = (uint32_t)r.x; scissor[1] = (uint32_t)r.y; scissor[2] = (uint32_t)r.width; scissor[3] = (uint32_t)r.height; }
 // state that is not implemented yet is logged once and ignored: there is no depth test
 - (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
+- (void)setDepthClipMode:(MTLDepthClipMode)m { if (m != MTLDepthClipModeClip) [self ignored:"depth clip mode (clamp)"]; }
+- (void)setVisibilityResultMode:(MTLVisibilityResultMode)m offset:(NSUInteger)o { if (m != MTLVisibilityResultModeDisabled) [self ignored:"visibility result mode (occlusion queries)"]; }
+- (void)textureBarrier { [self ignored:"textureBarrier"]; }
 - (void)setCullMode:(MTLCullMode)m { cullMode = (unsigned)m; }
 - (void)setFrontFacingWinding:(MTLWinding)w { counterClockwise = w == MTLWindingCounterClockwise; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) [self ignored:"triangle fill mode"]; }
@@ -1254,6 +1306,16 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
         return nil;
     }
     return (id)c;
+}
+- (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error {
+    if (descriptor.binaryArchives.count || descriptor.options) rn_log("newFunctionWithDescriptor: binary archives and options are ignored");
+    if (descriptor.specializedName) rn_log("newFunctionWithDescriptor: specializedName is ignored");
+    return [self newFunctionWithName:descriptor.name constantValues:descriptor.constantValues error:error];
+}
+- (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor completionHandler:(void (^)(id<MTLFunction>, NSError *))completionHandler {
+    NSError *e = nil;
+    id<MTLFunction> f = [self newFunctionWithDescriptor:descriptor error:&e];
+    completionHandler(f, e);
 }
 - (void)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues completionHandler:(void (^)(id<MTLFunction>, NSError *))completionHandler {
     NSError *e = nil;

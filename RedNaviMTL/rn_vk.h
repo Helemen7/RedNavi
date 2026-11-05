@@ -31,11 +31,14 @@ void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b);
 // This is the first version of Metal textures (docs/M6_METAL_ON_RADV.md): an IOSurface or any host memory cannot be imported by RADV yet (the kext has no userptr).
 typedef struct rn_vk_image rn_vk_image;
 typedef struct rn_vk_sampler rn_vk_sampler;
-enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA16F, RN_VK_R32F, RN_VK_RG32F, RN_VK_RGBA32F, RN_VK_R32U, RN_VK_R32I, RN_VK_RGBA8U };
+enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA16F, RN_VK_R32F, RN_VK_RG32F, RN_VK_RGBA32F, RN_VK_R32U, RN_VK_R32I, RN_VK_RGBA8U, RN_VK_RGBA8_SRGB, RN_VK_BGRA8_SRGB };
 unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknown format
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
 void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows packed (width * texel bytes)
 void rn_vk_image_host_wrote(rn_vk_image *img);
+// A view with another format of the same texel size (RN_VK_* as in rn_vk_image_create), components swizzled by VkComponentSwizzle values (NULL: as they are). It shares the image, its
+// memory and its host copy with `base`, which must outlive it; destroy it with rn_vk_image_destroy. NULL: sizes differ or the card cannot sample that format.
+rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const unsigned swizzle[4]);
 void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *img);
 
 // Sampler state as the translator reports it for a sampler written in the shader (RedNaviMTL/rn_air.h) and as MTLSamplerDescriptor has it.
