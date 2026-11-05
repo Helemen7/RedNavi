@@ -4,8 +4,9 @@
 // is: an aperture over BAR0, which macOS maps as 256 MB, so the surface lives in the first 256 MB of VRAM. It lists
 // the modes of the monitor's EDID (fb-modes, published by the probe) and a mode change is a platform function call
 // to the probe ("rednavi-set-mode"), which reprograms the pipe. There is no cursor plane, no gamma and no vertical
-// blank interrupt yet. The firmware boot framebuffer (IONDRVFramebuffer) on the same PCI device stays: macOS lists it as a
-// second display (see docs/DP_BRINGUP.md); terminating it panics inside Apple's AppleUpstreamUserClient.
+// blank interrupt yet. The firmware boot framebuffer (IONDRVFramebuffer) on the same PCI device would be listed by macOS as a
+// second display (see docs/DP_BRINGUP.md); it is removed by default (rednavi_kill_boot_fb, mode 4 below; =0 keeps it). IOFramebuffer::terminate panics
+// inside Apple's AppleUpstreamUserClient, so the removal bypasses it.
 //
 // This is a separate kext because IOGraphicsFamily sits in the system kernel collection and OpenCore can only
 // link injected kexts against the boot collection. It matches the property RedNaviProbe sets after the replay
@@ -131,12 +132,44 @@ class RedNaviFB : public IOFramebuffer {
         return asked;
     }
 
+    // What the panic report of 2026-10-29 and 2026-11-05 show, and what IOGraphics' source says (IOFramebuffer::terminate): the override calls IOService::terminate first, which
+    // starts tearing down the framebuffer's children (among them its AppleUpstreamUserClientDriver), and only then delivers kIOFBNotifyTerminated to the registered notifiers. The
+    // notifier of that driver is still registered, its target is gone, and fbNotificationOccurred dereferences null. Terminating the child first (mode 3) did not help: the same crash,
+    // so the registration outlives the driver. Modes 4 to 6 call IOService::terminate directly, which skips the override and with it the notification:
+    //   4 = IOService::terminate(kIOServiceRequired)   5 = the AppleUpstreamUserClientDriver first, then 4   6 = 4 with kIOServiceSynchronous
+    // The panic report of 2026-10-29 (earlier, mode 1):: IOFramebuffer::terminate delivers kIOFBNotifyTerminated, and AppleUpstreamUserClientDriver::fbNotificationOccurred
+    // of the stock framebuffer's own AppleUpstreamUserClientDriver child dereferences a null pointer (CR2 0, 0x1e bytes into the function). It is the termination notification
+    // that crashes, not the removal of the display. rednavi_kill_boot_fb=3 terminates that child first, so that nothing is registered for the notification when the framebuffer goes.
+    unsigned terminateUpstreamClients(IOService *fb) {
+        OSArray *victims = OSArray::withCapacity(2);
+        OSIterator *kids = fb->getChildIterator(gIOServicePlane);
+        if (kids && victims) {
+            OSObject *k;
+            while ((k = kids->getNextObject())) {
+                IOService *kid = OSDynamicCast(IOService, k);
+                if (kid && strcmp(kid->getMetaClass()->getClassName(), "AppleUpstreamUserClientDriver") == 0) victims->setObject(kid);
+            }
+        }
+        if (kids) kids->release();
+        unsigned done = 0;
+        for (unsigned i = 0; victims && i < victims->getCount(); i++) {
+            IOService *kid = OSDynamicCast(IOService, victims->getObject(i));
+            if (!kid) continue;
+            IOLog("RedNaviFB: terminating the stock framebuffer's AppleUpstreamUserClientDriver first\n");
+            if (kid->terminate(kIOServiceRequired | kIOServiceSynchronous)) done++;
+        }
+        if (victims) victims->release();
+        return done;
+    }
+
     unsigned removeBootFramebuffer(IOService *probe) {
-        // Off by default: terminating the stock IOFramebuffer makes IOGraphics notify AppleUpstreamUserClient, which dereferences a
-        // null pointer in fbNotificationOccurred and panics (seen on macOS 15.8.2). Kept for experiments with boot-arg
-        // rednavi_kill_boot_fb=1 (2 = only its display connect).
-        uint32_t kill = 0;
-        if (!PE_parse_boot_argn("rednavi_kill_boot_fb", &kill, sizeof(kill)) || !kill) return 0;
+        // On by default, in mode 4 (verified on macOS 15.8.2: one display, no panic, the accelerator registers as before). Terminating the stock IOFramebuffer through
+        // IOFramebuffer::terminate (mode 1, also 3) makes IOGraphics notify AppleUpstreamUserClient, which dereferences a null pointer in fbNotificationOccurred and panics.
+        // rednavi_kill_boot_fb=0 keeps the firmware framebuffer (it is then a second display); 2 = only its display connect (the second display stays), 3 = its
+        // AppleUpstreamUserClientDriver first and then IOFramebuffer::terminate (panics too), 4 = IOService::terminate (the default), 5 = 3's first step and then 4, 6 = 4 synchronous.
+        uint32_t kill = 4;
+        PE_parse_boot_argn("rednavi_kill_boot_fb", &kill, sizeof(kill));
+        if (!kill) return 0;
         IOService *pci = probe ? probe->getProvider() : nullptr;
         if (!pci) return 0;
         if (kill == 2) return removeBootDisplayConnect(pci);
@@ -150,8 +183,18 @@ class RedNaviFB : public IOFramebuffer {
                 if (!svc) continue;
                 found++;
                 if (svc->getProvider() == pci) {
-                    IOLog("RedNaviFB: terminating the firmware boot framebuffer\n");
-                    if (svc->terminate(kIOServiceRequired)) asked++;     // required: the clients (WindowServer) must let go
+                    if (kill == 3) {
+                        const unsigned n = terminateUpstreamClients(svc);
+                        OSNumber *cn = OSNumber::withNumber(n, 32);
+                        if (cn) { setProperty("boot-fb-upstream-clients-terminated", cn); cn->release(); }
+                    }
+                    if (kill == 5) terminateUpstreamClients(svc);
+                    IOLog("RedNaviFB: terminating the firmware boot framebuffer (mode %u)\n", kill);
+                    bool ok;
+                    if (kill == 4 || kill == 5) ok = svc->IOService::terminate(kIOServiceRequired);                      // not IOFramebuffer::terminate: no kIOFBNotifyTerminated
+                    else if (kill == 6) ok = svc->IOService::terminate(kIOServiceRequired | kIOServiceSynchronous);
+                    else ok = svc->terminate(kIOServiceRequired);
+                    if (ok) asked++;     // required: the clients (WindowServer) must let go
                 } else {
                     other++;
                 }
