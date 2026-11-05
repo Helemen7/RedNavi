@@ -508,6 +508,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     id<MTLDevice> dev;
     NSMutableArray *records;                    // RNDispatch and RNRenderPass in the order they were encoded
     NSMutableArray *completed, *scheduled;
+    NSMutableArray *presents;                   // drawables to present once the command buffer is done (CAMetalLayer)
     MTLCommandBufferStatus st;
     NSError *err;
     NSString *label_;
@@ -830,7 +831,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d {
     if ((self = [super init])) {
-        queue = q; dev = d; records = [NSMutableArray new]; completed = [NSMutableArray new]; scheduled = [NSMutableArray new];
+        queue = q; dev = d; records = [NSMutableArray new]; completed = [NSMutableArray new]; scheduled = [NSMutableArray new]; presents = [NSMutableArray new];
         st = MTLCommandBufferStatusNotEnqueued;
         done = dispatch_semaphore_create(0);
     }
@@ -851,6 +852,10 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block { [scheduled addObject:[block copy]]; }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block { [completed addObject:[block copy]]; }
 - (void)waitUntilScheduled {}
+// The first version runs everything at commit, so a drawable is presented at the end of commit.
+- (void)presentDrawable:(id<MTLDrawable>)drawable { if (drawable) [presents addObject:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)presentationTime { [self presentDrawable:drawable]; }
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration { [self presentDrawable:drawable]; }
 - (void)pushDebugGroup:(NSString *)string {}
 - (void)popDebugGroup {}
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder { return (id)[[RedNaviMTLComputeCommandEncoder alloc] initWithCommandBuffer:self]; }
@@ -978,6 +983,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     for (MTLCommandBufferHandler h in completed) h((id)self);
+    for (id<MTLDrawable> dr in presents) [dr present];
     dispatch_semaphore_signal(done);
 }
 - (void)waitUntilCompleted {
