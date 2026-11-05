@@ -22,7 +22,7 @@ int main(int argc, char **argv) {
         if (rc) return 1;
         printf("SPIR-V %zu bytes, %u bindings, local size %u %u %u (spec ids %u %u %u)\n", bytes, info.binding_count, info.local_size[0], info.local_size[1], info.local_size[2],
                info.local_size_spec_ids[0], info.local_size_spec_ids[1], info.local_size_spec_ids[2]);
-        for (unsigned b = 0; b < info.binding_count; b++) printf("  Metal buffer(%u) -> binding %u, %s\n", info.bindings[b].metal_index, info.bindings[b].binding, info.bindings[b].writable ? "writable" : "read-only");
+        for (unsigned b = 0; b < info.binding_count; b++) printf("  Metal %s(%u) -> binding %u, %s, dim %u\n", (const char *[]){"buffer", "texture", "storage image", "sampler"}[info.bindings[b].kind & 3], info.bindings[b].metal_index, info.bindings[b].binding, info.bindings[b].writable ? "writable" : "read-only", info.bindings[b].dim);
         FILE *o = fopen(argv[4], "wb"); fwrite(spv, 1, bytes, o); fclose(o);
         rn_air_free(spv, bytes);
         return 0;

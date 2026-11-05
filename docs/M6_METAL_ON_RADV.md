@@ -57,6 +57,14 @@ Run on the RX 7800 XT through the official Metal API (`tools/mtl_init_harness`, 
 
 The translator needs `llvm-dis` and `spirv-val` at run time. For this test they were copied next to the library: the real `llvm-dis` binary (the MacPorts `llvm-dis-mp-19` is only a wrapper script around `xcrun`) with `libLLVM.dylib` (124 MB), `spirv-val` with `libSPIRV-Tools.dylib`; the harness ran with `DYLD_LIBRARY_PATH` pointing there. Shipping libLLVM at that size is not acceptable for users: still open (options: a smaller static `llvm-dis`, or reading the bitcode in Rust without LLVM).
 
+## Textures: where it stands (2026-11-05)
+
+- Memory: a Metal texture from an IOSurface cannot be imported by RADV today. `ac_drm_create_bo_from_user_mem` only accepts the display surfaces, because the kext has no userptr. A copy-in/copy-out texture (VkImage in RADV memory, synchronized with the IOSurface at command-buffer boundaries) works without touching the kernel and comes first; importing host memory (a user-client selector that wires the pages and maps them in the GART) is an optimization for later.
+- Interface: `rn_air_binding` now carries `kind` (buffer, sampled texture, storage image, sampler) and `dim`. The kernels `texture_copy` and `texture_sample` (`mesa-bridge/test/vk_texcopy.metal`) are the first test cases.
+- Open finding: for `texture_copy` the translator reports a sampled texture at binding 32 and a storage image at 481, but the module it emits reads the source texture through a runtime array of sampled images in set 2 (indexed from a table in a storage buffer at binding 640, `BufferAddressTable`) and declares the storage image as `R32f`. That is not the per-binding ABI of its own `docs/REFLECTION.md`. Until this is understood (a translator limitation for sampled reads in kernels, or an ABI the plug-in has to implement with `descriptor_indexing`), texture kernels are refused by the plug-in. `texture_sample` is refused because of the `constexpr sampler`.
+
+Distribution debt: `llvm-dis` and `libLLVM.dylib` (124 MB) must go before release; options are a bitcode reader in Rust or a static subset of LLVM.
+
 ## Order of work
 
 1. **Queue, command buffer, compute encoder, buffer** (smallest slice that runs something). `RedNaviMTLCommandQueue` (subclass of `MTLIOAccelCommandQueue`, init by

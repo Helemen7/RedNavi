@@ -8,9 +8,10 @@
 //   in *spirv, to be released with rn_air_free(*spirv, *spirv_bytes); non-zero with a one-line reason in err otherwise.
 // void rn_air_free(uint32_t *spirv, size_t bytes);
 //
-// The module has storage buffers at set 0, one per Metal buffer the kernel uses (info.bindings: Metal index, binding number, writable), including the ones the app fills with
+// The module has descriptors at set 0: storage buffers, one per Metal buffer the kernel uses (info.bindings: Metal index, binding number, writable), including the ones the app fills with
 // -setBytes:length:atIndex: (a constant argument is a read-only buffer too), no push constants, and the threadgroup size as specialization constants
-// info.local_size_spec_ids (0, 1, 2), default info.local_size. Kernels that use textures, samplers or other resources are refused with an error, for now.
+// info.local_size_spec_ids (0, 1, 2), default info.local_size. Textures (sampled or storage images) and samplers set by the app are listed in the same array with their kind;
+// the Metal index spaces of buffers, textures and samplers are separate. Samplers written in the shader (constexpr sampler), multisampled textures and other resources are refused with an error, for now.
 //
 // The tools the translator runs: llvm-dis (bitcode to LLVM IR) and spirv-val. rn_air_translate points METAL2VULKAN_LLVM_DIS and METAL2VULKAN_SPIRV_VAL at copies in the
 // library's directory when there are some, and otherwise leaves the environment and PATH alone.
@@ -27,7 +28,10 @@ typedef struct {
     uint32_t metal_index;      // [[buffer(n)]]
     uint32_t binding;          // the descriptor binding in set 0
     uint32_t writable;         // 0: the kernel only reads it
+    uint32_t kind;             // RN_AIR_BUFFER, RN_AIR_TEXTURE (sampled), RN_AIR_STORAGE_IMAGE or RN_AIR_SAMPLER; metal_index is [[texture(n)]] or [[sampler(n)]] for the last three
+    uint32_t dim;              // textures: 0 1D, 1 2D, 2 3D, 3 cube, 4 buffer; +8 when arrayed
 } rn_air_binding;
+enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3 };
 
 typedef struct {
     uint32_t binding_count;
