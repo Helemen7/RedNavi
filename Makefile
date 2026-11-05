@@ -151,5 +151,7 @@ test:
 	./build/edid_test
 	clang++ -std=c++17 -Wall tests/host/mode_regs_test.cpp RedNavi/mode_regs.cpp RedNavi/edid.cpp -o build/mode_regs_test
 	./build/mode_regs_test
+	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_facts_test.cpp -o build/navi33_facts_test
+	./build/navi33_facts_test
 
 .PHONY: all clean test mtl
