@@ -9,6 +9,8 @@
 // Private entry for the shader bypass (until the AIR to SPIR-V translator exists): -[RedNaviMTLDevice rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:] returns an
 // id<MTLComputePipelineState> built from raw SPIR-V (entry point "main"). Buffers are bound at indices 0..bufferCount-1 with -setBuffer:offset:atIndex: (offset must be 0),
 // -setBytes:length:atIndex: with an index >= bufferCount fills the push constants.
+#include <mach/mach_time.h>
+#include <os/lock.h>
 #import <Foundation/Foundation.h>
 #pragma clang diagnostic ignored "-Wunguarded-availability-new"   // protocol methods newer than the deployment target are answered when Metal asks
 #import <Metal/Metal.h>
@@ -143,6 +145,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     case MTLPixelFormatRGBA16Unorm: return RN_VK_RGBA16;
     case MTLPixelFormatBGRA8Unorm_sRGB: return RN_VK_BGRA8_SRGB;
     case MTLPixelFormatR8Unorm: return RN_VK_R8;
+    case MTLPixelFormatA8Unorm: return RN_VK_A8;
     case MTLPixelFormatRG8Unorm: return RN_VK_RG8;
     case MTLPixelFormatR16Float: return RN_VK_R16F;
     case MTLPixelFormatRGBA16Float: return RN_VK_RGBA16F;
@@ -165,7 +168,9 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     unsigned texel;
     MTLTextureUsage usage_;
     NSString *label_;
-    IOSurfaceRef surf;                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
+    IOSurfaceRef surf;
+    uint32_t surfSeed;                            // the surface's seed when the image and the surface last agreed: an unchanged surface is not copied again
+    NSUInteger surfPlane;                         // the plane of a multi-planar surface this texture shows (0 for the others)                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
     RedNaviMTLTexture *parent;                       // a texture view: the texture it is a view of (it shares its image, memory and host copy)
     MTLTextureSwizzleChannels swz;
 }
@@ -196,34 +201,44 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 // IOSurface-backed textures (no host memory import in the kext, so a copy): the surface's rows are copied into the host copy of the image before the command buffer runs and, for
 // what the command buffer wrote, back afterwards. The surface's row pitch is its own; the host copy is packed.
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane {
-    if (!io || plane != 0) { rn_log("texture from an IOSurface: %s", io ? "only plane 0 is supported" : "no surface"); return nil; }
-    if (IOSurfaceGetPlaneCount(io) > 1) { rn_log("texture from an IOSurface: multi-planar surfaces are not supported"); return nil; }
+    if (!io) { rn_log("texture from an IOSurface: no surface"); return nil; }
+    const size_t planes = IOSurfaceGetPlaneCount(io);
+    if (plane >= (planes ? planes : 1)) { rn_log("texture from an IOSurface: plane %lu of a surface with %zu", (unsigned long)plane, planes); return nil; }
     if ((self = [self initWithDevice:d descriptor:desc])) {
-        if (w > IOSurfaceGetWidth(io) || h > IOSurfaceGetHeight(io) || texel != IOSurfaceGetBytesPerElement(io)) {
-            rn_log("texture from an IOSurface: the surface is %zux%zu with %zu bytes per element, the texture %lux%lu with %u", IOSurfaceGetWidth(io), IOSurfaceGetHeight(io), IOSurfaceGetBytesPerElement(io), (unsigned long)w, (unsigned long)h, texel);
+        const size_t sw = planes ? IOSurfaceGetWidthOfPlane(io, plane) : IOSurfaceGetWidth(io), sh = planes ? IOSurfaceGetHeightOfPlane(io, plane) : IOSurfaceGetHeight(io);
+        const size_t sb = planes ? IOSurfaceGetBytesPerElementOfPlane(io, plane) : IOSurfaceGetBytesPerElement(io);
+        if (w > sw || h > sh || texel != sb) {
+            rn_log("texture from an IOSurface: plane %lu is %zux%zu with %zu bytes per element, the texture %lux%lu with %u", (unsigned long)plane, sw, sh, sb, (unsigned long)w, (unsigned long)h, texel);
             return nil;
         }
+        surfPlane = planes ? plane : 0;
         surf = (IOSurfaceRef)CFRetain(io);
         [self syncFromSurface];
     }
     return self;
 }
 - (void)syncFromSurface {
-    if (!surf || IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
-    const uint8_t *src = IOSurfaceGetBaseAddress(surf);
-    const size_t pitch = IOSurfaceGetBytesPerRow(surf);
+    if (!surf) return;
+    if (surfSeed && IOSurfaceGetSeed(surf) == surfSeed) return;
+    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+    const bool planar = IOSurfaceGetPlaneCount(surf) > 0;
+    const uint8_t *src = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
+    const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surf, surfPlane) : IOSurfaceGetBytesPerRow(surf);
     uint8_t *dst = rn_vk_image_staging(img);
     for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * w * texel, src + y * pitch, w * texel);
     IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+    surfSeed = IOSurfaceGetSeed(surf);
     rn_vk_image_host_wrote(img);
 }
 - (void)syncToSurface {
     if (!surf || IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return;
-    uint8_t *dst = IOSurfaceGetBaseAddress(surf);
-    const size_t pitch = IOSurfaceGetBytesPerRow(surf);
+    const bool planar = IOSurfaceGetPlaneCount(surf) > 0;
+    uint8_t *dst = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
+    const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surf, surfPlane) : IOSurfaceGetBytesPerRow(surf);
     const uint8_t *src = rn_vk_image_staging(img);
     for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * pitch, src + y * w * texel, w * texel);
     IOSurfaceUnlock(surf, 0, NULL);
+    surfSeed = IOSurfaceGetSeed(surf);
 }
 - (id<MTLDevice>)device { return dev; }
 - (NSString *)label { return label_; }
@@ -246,7 +261,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (NSUInteger)bufferOffset { return 0; }
 - (NSUInteger)bufferBytesPerRow { return 0; }
 - (IOSurfaceRef)iosurface { return surf; }
-- (NSUInteger)iosurfacePlane { return 0; }
+- (NSUInteger)iosurfacePlane { return surfPlane; }
 // Texture views: another pixel format of the same texel size and/or swizzled components over the same storage. Only the whole of a 2D, one-level texture can be viewed.
 - (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)newPf swizzle:(const MTLTextureSwizzleChannels *)sw {
     const int f = rn_vk_format_of(newPf);
@@ -766,6 +781,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d;
 - (void)runRenderPass:(RNRenderPass *)rp;
 - (void)fail:(NSString *)why;
+- (void)commitBody;
 @end
 
 @implementation RedNaviMTLComputeCommandEncoder
@@ -1103,6 +1119,23 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)popDebugGroup {}
 @end
 
+// Time spent in -commit (the work runs on the caller's thread): a line every five seconds, to see where a slow client waits.
+static void rn_commit_stats(uint64_t ticks) {
+    static mach_timebase_info_data_t tb;
+    static uint64_t sum, worst, count, since;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    if (!tb.denom) mach_timebase_info(&tb);
+    os_unfair_lock_lock(&lock);
+    sum += ticks; count++; if (ticks > worst) worst = ticks;
+    const uint64_t now = mach_absolute_time();
+    if (!since) since = now;
+    if ((now - since) * tb.numer / tb.denom > 5000000000ull) {
+        rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6);
+        sum = worst = count = 0; since = now;
+    }
+    os_unfair_lock_unlock(&lock);
+}
+
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
 - (NSMutableDictionary *)userDictionary { @synchronized (self) { if (!userDict_) userDict_ = [NSMutableDictionary new]; return userDict_; } }
@@ -1261,6 +1294,11 @@ static NSString *rn_run_blit(RNBlit *b) {
 }
 // The first version runs the recorded dispatches synchronously on the calling thread.
 - (void)commit {
+    const uint64_t t0 = mach_absolute_time();
+    [self commitBody];
+    rn_commit_stats(mach_absolute_time() - t0);
+}
+- (void)commitBody {
     if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
     if (st >= MTLCommandBufferStatusCommitted) return;
     st = MTLCommandBufferStatusCommitted;
