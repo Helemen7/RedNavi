@@ -77,6 +77,43 @@ int main(int argc, char **argv) {
         if (r) {
             printf("class %s, conforms to MTLDevice: %d\n", class_getName(object_getClass(r)), [r conformsToProtocol:@protocol(MTLDevice)]);
             printf("name: %s\n", [[r name] UTF8String]);
+            if (getenv("RN_STITCH_TEST")) {
+                // CoreImage builds stitched libraries (iconservicesagent crashed in the base class's newLibraryWithStitchedDescriptor:error: on this device). The plug-in cannot stitch yet:
+                // the call must return nil and a filled NSError, for the synchronous and the asynchronous form, with and without functions in the descriptor, and not crash.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                MTLFunctionStitchingFunctionNode *fn = [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"f" arguments:@[] controlDependencies:@[]];
+                MTLFunctionStitchingGraph *g = [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"stitched" nodes:@[] outputNode:fn attributes:@[]];
+                MTLStitchedLibraryDescriptor *sd = [MTLStitchedLibraryDescriptor new];
+                sd.functionGraphs = @[g];
+                int bad = 0;
+                for (int pass = 0; pass < 2; pass++) {
+                    if (pass == 1 && getenv("RN_STITCH_TEST") && strlen(getenv("RN_STITCH_TEST")) > 1) {       // a path: functions from that library go into the descriptor
+                        NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_STITCH_TEST"))];
+                        dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                        id<MTLLibrary> lib = [d newLibraryWithData:dd error:nil];
+                        NSMutableArray *fs = [NSMutableArray new];
+                        for (NSString *n in lib.functionNames) { id<MTLFunction> f = [lib newFunctionWithName:n]; if (f) [fs addObject:f]; }
+                        sd.functions = fs;
+                        if (fs.count) {                              // a graph made of a function that exists, as CoreImage's are
+                            NSString *fname = lib.functionNames.firstObject;
+                            MTLFunctionStitchingFunctionNode *rn = [[MTLFunctionStitchingFunctionNode alloc] initWithName:fname arguments:@[] controlDependencies:@[]];
+                            sd.functionGraphs = @[[[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"stitched" nodes:@[] outputNode:rn attributes:@[]]];
+                        }
+                    }
+                    NSError *e = nil;
+                    id<MTLLibrary> l = [d newLibraryWithStitchedDescriptor:sd error:&e];
+                    printf("stitched library (%s): %s, error %s\n", pass ? "with functions" : "no functions", l ? "a library" : "nil", e ? e.localizedDescription.UTF8String : "none");
+                    if (!l && !e) bad++;
+                    __block BOOL called = NO; __block BOOL gotErr = NO;
+                    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+                    [d newLibraryWithStitchedDescriptor:sd completionHandler:^(id<MTLLibrary> lib2, NSError *err2) { called = YES; gotErr = lib2 == nil && err2 != nil; dispatch_semaphore_signal(sem); }];
+                    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+                    printf("  asynchronous: handler called %d, nil with an error %d\n", called, gotErr);
+                    if (!called || !gotErr) bad++;
+                }
+                printf("stitched libraries through Metal on RADV: %s\n", bad ? "FAILED" : "all checks passed");
+                return bad;
+            }
             if (getenv("RN_TRI_TEST")) {
                 // A render pipeline from a .metallib (mesa-bridge/test/vk_tri.metal) through the official API: a 40 x 24 RGBA8 target cleared to grey, one triangle in the top-left
                 // quadrant of Metal's clip space (x from -1 to 0, y from 0 to 1: pixels x < 20, y < 12, a different colour at each corner). The asserts catch a flipped image (the bottom-left

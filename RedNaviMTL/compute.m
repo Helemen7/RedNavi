@@ -1856,6 +1856,32 @@ void rn_compute_install(Class k, Class sup) {
             return (uintptr_t)CFBridgingRetain(st);
         }), mds ? method_getTypeEncoding(mds) : "@24@0:8@16");
     }
+    // Stitched libraries (CoreImage compiles a whole filter graph into one compute pipeline with them; iconservicesagent and mediaanalysisd crashed on the first one): the base class reads
+    // the private data of the functions it is given, which a function of this plug-in does not have, and dereferenced a null script. The plug-in cannot stitch AIR functions yet, so the
+    // call fails with an error, which CoreImage handles.
+    {
+        SEL ss = sel_registerName("newLibraryWithStitchedDescriptor:error:"), sa = sel_registerName("newLibraryWithStitchedDescriptor:completionHandler:");
+        Method ms = class_getInstanceMethod(sup, ss), ma = class_getInstanceMethod(sup, sa);
+        typedef uintptr_t (*imp_stitch)(id, SEL, id, NSError **);
+        typedef void (*imp_stitch_async)(id, SEL, id, id);
+        imp_stitch os = ms ? (imp_stitch)method_getImplementation(ms) : NULL;
+        imp_stitch_async oa = ma ? (imp_stitch_async)method_getImplementation(ma) : NULL;
+        static NSError *(^unsupported)(void) = ^NSError *{
+            return [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: @"stitched libraries are not supported by the RedNavi Metal plug-in"}];
+        };
+        class_addMethod(k, ss, imp_implementationWithBlock(^uintptr_t(id self, id desc, NSError **error) {
+            if (!rn_gate()) return os ? os(self, ss, desc, error) : 0;
+            rn_log("newLibraryWithStitchedDescriptor: not supported, answering an error");
+            if (error) *error = unsupported();
+            return 0;
+        }), ms ? method_getTypeEncoding(ms) : "@32@0:8@16^@24");
+        class_addMethod(k, sa, imp_implementationWithBlock(^(id self, id desc, id handler) {
+            if (!rn_gate()) { if (oa) oa(self, sa, desc, handler); return; }
+            rn_log("newLibraryWithStitchedDescriptor (asynchronous): not supported, answering an error");
+            NSError *e = unsupported();
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ ((void (^)(id, NSError *))handler)(nil, e); });
+        }), ma ? method_getTypeEncoding(ma) : "v32@0:8@16@?24");
+    }
     // Capabilities. The base class answers these from tables its own driver fills in, which a device made by this plug-in does not have (calling -supportsFamily: ended in a call through
     // a null pointer inside QuartzCore's Metal context setup), so they are answered here: what a discrete Navi 32 on macOS supports as far as the plug-in and the translator go. The Apple
     // GPU families, tile shaders, memoryless targets, raster order groups, SIMD-group operations and YCbCr formats are NO; native FP16 is NO so that the float variants of shaders are asked for.

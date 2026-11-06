@@ -19,6 +19,14 @@ static int load(const char *dir, char *err, size_t errlen) {
     if (!dir) dir = rn_vk_dir();
     char path[1024];
     snprintf(path, sizeof(path), "%s/librn_air2spirv.dylib", dir);
+    // The translator runs llvm-dis and spirv-val from DIR; they find their libraries (libLLVM, libSPIRV-Tools) there only through the library path, which a child process takes from the
+    // environment (inside a process that did not start with it, such as WindowServer, it is only for the children).
+    {
+        const char *old = getenv("DYLD_LIBRARY_PATH");
+        char lp[2048];
+        snprintf(lp, sizeof(lp), "%s%s%s", dir, old && *old ? ":" : "", old && *old ? old : "");
+        setenv("DYLD_LIBRARY_PATH", lp, 1);
+    }
     g_lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!g_lib) { snprintf(err, errlen, "no AIR translator: %s", dlerror()); return 1; }
     // tools next to the library, if any
