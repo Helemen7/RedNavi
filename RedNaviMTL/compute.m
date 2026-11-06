@@ -15,11 +15,13 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <ImageIO/ImageIO.h>                    // RN_DUMP_PASSES
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <stdatomic.h>
 #include <unistd.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include "rn_vk.h"
 #include "rn_air.h"
@@ -53,6 +55,8 @@ static rn_vk *rn_vk_shared(void) {
     NSUInteger len;
     NSUInteger options;
     NSString *label_;
+    void *userPtr;                                   // newBufferWithBytesNoCopy: the caller's memory, copied in before and out after each command buffer
+    void (^userDealloc)(void *, NSUInteger);
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o;
 @end
@@ -68,11 +72,21 @@ static rn_vk *rn_vk_shared(void) {
         if (!b) { rn_log("buffer of %lu bytes: allocation failed", (unsigned long)l); return nil; }
         dev = d; len = l; options = o;
         memset(rn_vk_buffer_contents(b), 0, l ? l : 1);
+        if (getenv("RN_LOG_BUFFERS")) rn_log("new buffer %p: %lu bytes, options 0x%lx, contents %p", self, (unsigned long)l, (unsigned long)o, rn_vk_buffer_contents(b));
     }
     return self;
 }
-- (void)dealloc { if (b) rn_vk_buffer_destroy(rn_vk_shared(), b); }
-- (void *)contents { return rn_vk_buffer_contents(b); }
+- (void)dealloc {
+    if (userPtr) { @synchronized([RedNaviMTLBuffer class]) { [[RedNaviMTLBuffer noCopyBuffers] removeObject:self]; } if (userDealloc) userDealloc(userPtr, len); }
+    if (b) rn_vk_buffer_destroy(rn_vk_shared(), b);
+}
++ (NSHashTable *)noCopyBuffers { static NSHashTable *t; static dispatch_once_t o; dispatch_once(&o, ^{ t = [NSHashTable weakObjectsHashTable]; }); return t; }
+// The buffers made over the caller's memory: what the caller wrote goes into the RADV buffer before a command buffer runs, what the GPU wrote comes back after it.
++ (void)syncNoCopyIn:(BOOL)in {
+    NSArray *all; @synchronized([RedNaviMTLBuffer class]) { all = [[RedNaviMTLBuffer noCopyBuffers] allObjects]; }
+    for (RedNaviMTLBuffer *x in all) { if (!x->userPtr || !x->b) continue; if (in) memcpy(rn_vk_buffer_contents(x->b), x->userPtr, x->len); else memcpy(x->userPtr, rn_vk_buffer_contents(x->b), x->len); }
+}
+- (void *)contents { return userPtr ? userPtr : rn_vk_buffer_contents(b); }
 - (NSUInteger)length { return len; }
 - (id<MTLDevice>)device { return dev; }
 - (MTLResourceOptions)resourceOptions { return options; }
@@ -123,7 +137,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     rn_vk_image *img;
     id<MTLDevice> dev;
     MTLPixelFormat pf;
-    NSUInteger w, h;
+    NSUInteger w, h, d;                              // d: depth of a 3D texture, else 1
     unsigned texel;
     MTLTextureUsage usage_;
     NSString *label_;
@@ -141,16 +155,17 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
     if (!(self = [super init])) return nil;
-    if (desc.textureType != MTLTextureType2D || desc.arrayLength > 1 || desc.sampleCount > 1 || desc.depth > 1) {
+    const BOOL is3d = desc.textureType == MTLTextureType3D;
+    if ((desc.textureType != MTLTextureType2D && !is3d) || desc.arrayLength > 1 || desc.sampleCount > 1 || (!is3d && desc.depth > 1)) {
         rn_log("texture: only plain 2D textures are supported (type %ld, array %lu, samples %lu)", (long)desc.textureType, (unsigned long)desc.arrayLength, (unsigned long)desc.sampleCount);
         return nil;
     }
     if (desc.mipmapLevelCount > 1) rn_log("texture: %lu mipmap levels asked, only level 0 exists", (unsigned long)desc.mipmapLevelCount);
     const int f = rn_vk_format_of(desc.pixelFormat);
     rn_vk *vk = f ? rn_vk_shared() : NULL;
-    img = vk ? rn_vk_image_create(vk, f, (uint32_t)desc.width, (uint32_t)desc.height) : NULL;
+    img = vk ? rn_vk_image_create3d(vk, f, (uint32_t)desc.width, (uint32_t)desc.height, is3d ? (uint32_t)desc.depth : 1) : NULL;
     if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat); return nil; }
-    dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
+    dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; self->d = is3d ? desc.depth : 1; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
     return self;
 }
 - (void)dealloc { if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (surf) CFRelease(surf); }
@@ -193,7 +208,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (MTLStorageMode)storageMode { return MTLStorageModeShared; }
 - (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeUntracked; }
-- (NSUInteger)allocatedSize { return w * h * texel; }
+- (NSUInteger)allocatedSize { return w * h * d * texel; }
 - (id<MTLHeap>)heap { return nil; }
 - (NSUInteger)heapOffset { return 0; }
 - (BOOL)isAliasable { return NO; }
@@ -223,7 +238,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     rn_vk_image *v = rn_vk_image_view(vk, parent ? parent->img : img, f, cp);
     if (!v) { rn_log("texture view: pixel format %lu does not fit the texture (texel size) or cannot be sampled", (unsigned long)newPf); return nil; }
     RedNaviMTLTexture *t = [[RedNaviMTLTexture alloc] init];
-    t->img = v; t->dev = dev; t->pf = newPf; t->w = w; t->h = h; t->texel = texel; t->usage_ = usage_;
+    t->img = v; t->dev = dev; t->pf = newPf; t->w = w; t->h = h; t->d = d; t->texel = texel; t->usage_ = usage_;
     t->parent = parent ? parent : self;
     t->surf = t->parent->surf ? (IOSurfaceRef)CFRetain(t->parent->surf) : NULL;
     t->swz = sw ? *sw : (MTLTextureSwizzleChannels){MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha};
@@ -245,11 +260,11 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device { rn_log("newRemoteTextureViewForDevice: not supported"); return nil; }
 - (MTLSharedTextureHandle *)newSharedTextureHandle { rn_log("newSharedTextureHandle: not supported (an IOSurface-backed texture is shared through its IOSurface)"); return nil; }
 - (id<MTLTexture>)remoteStorageTexture { return nil; }
-- (MTLTextureType)textureType { return MTLTextureType2D; }
+- (MTLTextureType)textureType { return d > 1 ? MTLTextureType3D : MTLTextureType2D; }
 - (MTLPixelFormat)pixelFormat { return pf; }
 - (NSUInteger)width { return w; }
 - (NSUInteger)height { return h; }
-- (NSUInteger)depth { return 1; }
+- (NSUInteger)depth { return d; }
 - (NSUInteger)mipmapLevelCount { return 1; }
 - (NSUInteger)sampleCount { return 1; }
 - (NSUInteger)arrayLength { return 1; }
@@ -261,13 +276,15 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (NSUInteger)firstMipmapInTail { return 0; }
 - (NSUInteger)tailSizeInBytes { return 0; }
 - (BOOL)clampRegion:(MTLRegion)r {
-    return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z == 0 && r.size.depth <= 1;
+    return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z + r.size.depth <= d;
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
     if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     uint8_t *dst = rn_vk_image_staging(img);
-    for (NSUInteger y = 0; y < region.size.height; y++)
-        memcpy(dst + ((region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + y * bpr, region.size.width * texel);
+    if (!bpi) bpi = bpr * region.size.height;
+    for (NSUInteger z = 0; z < region.size.depth; z++)
+        for (NSUInteger y = 0; y < region.size.height; y++)
+            memcpy(dst + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
     [self syncToSurface];
 }
@@ -278,8 +295,10 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     [self syncFromSurface];
     const uint8_t *src = rn_vk_image_staging(img);
-    for (NSUInteger y = 0; y < region.size.height; y++)
-        memcpy((uint8_t *)out + y * bpr, src + ((region.origin.y + y) * w + region.origin.x) * texel, region.size.width * texel);
+    if (!bpi) bpi = bpr * region.size.height;
+    for (NSUInteger z = 0; z < region.size.depth; z++)
+        for (NSUInteger y = 0; y < region.size.height; y++)
+            memcpy((uint8_t *)out + z * bpi + y * bpr, src + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, region.size.width * texel);
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
     [self getBytes:out bytesPerRow:bpr bytesPerImage:0 fromRegion:region mipmapLevel:level slice:0];
@@ -364,7 +383,7 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
                               RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps) {
     for (unsigned i = 0; i < n; i++) {
         const unsigned m = mi[i];
-        switch (kind[i]) {
+        switch (kind[i] & 0xff) {
         case RN_VK_BUFFER:
             if (m < 16 && bufs[m]) { av[i].buffer = bufs[m]->b; av[i].offset = offs[m]; break; }
             if (m < 16 && bytesAt[m]) {
@@ -377,16 +396,17 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
             }
             return [NSString stringWithFormat:@"no buffer bound at index %u", m];
         case RN_AIR_NULL_TEXTURE: {
-            // a placeholder the translator adds for a texture that is absent in this variant: a 1 x 1 texture of zeros (made once)
-            static rn_vk_image *nullImage;
-            if (!nullImage) { rn_vk *vk = rn_vk_shared(); nullImage = vk ? rn_vk_image_create(vk, RN_VK_RGBA8, 1, 1) : NULL; }
-            if (!nullImage) return @"no memory for a placeholder texture";
-            av[i].image = nullImage;
+            // a placeholder the translator adds for a texture that is absent in this variant: a texture of zeros of the dimension the shader declares (2D 1 x 1, or 3D 1 x 1 x 2), made once
+            static rn_vk_image *nullImage[2];
+            const int is3d = (kind[i] >> 8) == 2;
+            if (!nullImage[is3d]) { rn_vk *vk = rn_vk_shared(); nullImage[is3d] = vk ? rn_vk_image_create3d(vk, RN_VK_RGBA8, 1, 1, is3d ? 2 : 1) : NULL; }
+            if (!nullImage[is3d]) return @"no memory for a placeholder texture";
+            av[i].image = nullImage[is3d];
             break;
         }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
-            if (m < 16 && texs[m]) { av[i].image = texs[m]->img; break; }
+            if (m < 16 && texs[m]) { av[i].image = texs[m]->img; if (getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
             return [NSString stringWithFormat:@"no texture bound at index %u", m];
         case RN_VK_SAMPLER:
             if (m < 16 && samps[m]) { av[i].sampler = samps[m]->s; break; }
@@ -960,19 +980,19 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { pso = (RedNaviMTLRenderPipelineState *)state; }
-- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (i < 16) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
+- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: set%sBuffer %p off %lu idx %lu", st ? "Fragment" : "Vertex", b, (unsigned long)o, (unsigned long)i); if (i < 16) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
 - (void)bindBytes:(const void *)bytes length:(NSUInteger)len index:(NSUInteger)i stage:(int)st { if (i < 16) { bytesAt[st][i] = [NSData dataWithBytes:bytes length:len]; bufs[st][i] = nil; } }
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:0]; }
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:0];
 }
-- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (index < 16) offs[0][index] = offset; }
+- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setVertexBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < 16) offs[0][index] = offset; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:0]; }
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:1]; }
 - (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:1];
 }
-- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (index < 16) offs[1][index] = offset; }
+- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < 16) offs[1][index] = offset; }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:1]; }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[0][i] = (RedNaviMTLTexture *)t; }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[1][i] = (RedNaviMTLTexture *)t; }
@@ -1009,6 +1029,29 @@ static NSString *rn_run_blit(RNBlit *b) {
     d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
     d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
     d->cull = cullMode; d->clockwise = !counterClockwise;
+    if (getenv("RN_LOG_BUFFERS")) {                                 // does anything rewrite the vertex data of the earlier draws while the rest is encoded?
+        static NSMutableArray *snaps; if (!snaps) snaps = [NSMutableArray new];
+        static unsigned drawNo;
+        for (NSMutableDictionary *sn in snaps) {
+            RedNaviMTLBuffer *sb = sn[@"buf"];
+            if (!sb || !sb->b) continue;
+            NSData *old = sn[@"data"]; const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(sb->b) + [sn[@"off"] unsignedLongValue];
+            if (memcmp(bp, old.bytes, old.length)) {
+                rn_log("  REWRITTEN: draw #%u's vertex data (buffer %p offset %lu) changed before draw #%u was encoded", [sn[@"n"] unsignedIntValue], sb, [sn[@"off"] unsignedLongValue], drawNo);
+                sn[@"data"] = [NSData dataWithBytes:bp length:old.length];
+            }
+        }
+        if (d->bufs[0][1]) [snaps addObject:[@{@"buf": d->bufs[0][1], @"off": @(d->offs[0][1]), @"n": @(drawNo), @"data": [NSData dataWithBytes:(const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1] length:96]} mutableCopy]];
+        drawNo++;
+        char bl[400] = ""; int o2 = 0;
+        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) { if (d->bufs[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=%p+%lu", st ? 'f' : 'v', i, d->bufs[st][i], (unsigned long)d->offs[st][i]); else if (d->bytesAt[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=bytes(%lu)", st ? 'f' : 'v', i, (unsigned long)d->bytesAt[st][i].length); }
+        rn_log("  encode: draw #%u binds:%s", drawNo - 1, bl);
+    }
+    if (getenv("RN_LOG_BUFFERS") && d->bufs[0][1]) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
+        const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1];
+        char hx[100] = ""; for (int j = 0; j < 32; j++) snprintf(hx + 2 * j, 4, "%02x", bp[j]);
+        rn_log("  encode: draw %lu of the pass, v buffer 1 %p offset %lu: %s", (unsigned long)pass->draws.count, d->bufs[0][1], (unsigned long)d->offs[0][1], hx);
+    }
     [pass->draws addObject:d];
 }
 - (void)drawIndexedPrimitives:(MTLPrimitiveType)type indexCount:(NSUInteger)count indexType:(MTLIndexType)indexType indexBuffer:(id<MTLBuffer>)indexBuffer indexBufferOffset:(NSUInteger)offset
@@ -1075,6 +1118,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder { return (id)[[RedNaviMTLBlitCommandEncoder alloc] initWithCommandBuffer:self]; }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d { return [self blitCommandEncoder]; }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
+    if (getenv("RN_LOG_BUFFERS")) rn_log("render pass encoder on command buffer %p, thread %p", self, (void *)pthread_self());
     RNRenderPass *rp = [RNRenderPass new];
     rp->draws = [NSMutableArray new];
     for (NSUInteger i = 0; i < 8; i++) {
@@ -1094,9 +1138,12 @@ static NSString *rn_run_blit(RNBlit *b) {
 }
 - (void)runRenderPass:(RNRenderPass *)rp {
     rn_vk *vk = rn_vk_shared();
-    const NSUInteger nd = rp->draws.count;
+    NSUInteger nd = rp->draws.count;
+    if (getenv("RN_MAX_DRAWS") && nd > (NSUInteger)atoi(getenv("RN_MAX_DRAWS"))) nd = (NSUInteger)atoi(getenv("RN_MAX_DRAWS"));   // debugging: only the first n draws of every pass
     rn_vk_target tg[8];
     for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}, !rp->store[i]}; }
+    if (getenv("RN_LOG_DRAWS"))
+        for (unsigned i = 0; i < rp->nt; i++) rn_log("pass: target %u %lux%lu/%lu %s %s clear (%.2f %.2f %.2f %.2f), %lu draws", i, (unsigned long)rp->tex[i]->w, (unsigned long)rp->tex[i]->h, (unsigned long)rp->tex[i]->pf, rp->tex[i]->parent ? "view" : "texture", rp->clear[i] ? "with" : "no", rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3], (unsigned long)nd);
     const NSUInteger na = nd ? nd : 1;               // a pass without draws still runs: its clears are done
     rn_vk_draw *dr = calloc(na, sizeof(*dr));
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
@@ -1108,9 +1155,20 @@ static NSString *rn_run_blit(RNBlit *b) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
         if (getenv("RN_LOG_DRAWS")) {
-            char tb[160] = ""; int o = 0;
-            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->texs[st][i] && o < 140) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf);
-            rn_log("draw %lu: %s + %s, prim %u, %u vertices%s, blend %d, viewport %d scissor %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->hasScissor, tb);
+            char tb[400] = ""; int o = 0;
+            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
+            rn_log("draw %lu: %s + %s, prim %u, %u vertices%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
+        }
+        if (getenv("RN_LOG_BUFFERS")) {                       // debugging: what is bound at every buffer index, with the first bytes
+            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                const uint8_t *bp = NULL; NSUInteger len = 0;
+                if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
+                if (!bp) continue;
+                char hx[400] = ""; for (NSUInteger j = 0; j < len && j < 96; j++) snprintf(hx + 2 * j + j / 4, 4, "%02x ", bp[j]);
+                char *sp; while ((sp = strchr(hx, ' '))) *sp = '_';
+                rn_log("  %c buffer %d (offset %lu, %lu bytes left, %s): %s", st ? 'f' : 'v', i, (unsigned long)d->offs[st][i], (unsigned long)len, d->bufs[st][i] ? "buffer" : "setBytes", hx);
+            }
         }
         rn_vk_render *r = [p renderForPrimitive:d->prim cull:d->cull clockwise:d->clockwise];
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
@@ -1137,6 +1195,24 @@ static NSString *rn_run_blit(RNBlit *b) {
         memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
     }
     int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
+    if (!bad && !rc && getenv("RN_DUMP_PASSES") && rp->nt && rp->tex[0]->texel == 4 && rp->store[0]) {   // debugging: every pass's first target as a PNG in the directory named by the variable
+        static unsigned seq;
+        RedNaviMTLTexture *t = rp->tex[0];
+        const uint8_t *src = rn_vk_image_staging(t->img);
+        const size_t n = t->w * t->h;
+        uint8_t *px = malloc(n * 4);
+        for (size_t i = 0; i < n; i++) {                                // to RGBA; BGRA8 formats (80, 81) are swapped
+            const BOOL bgra = t->pf == MTLPixelFormatBGRA8Unorm || t->pf == MTLPixelFormatBGRA8Unorm_sRGB;
+            px[4 * i] = src[4 * i + (bgra ? 2 : 0)]; px[4 * i + 1] = src[4 * i + 1]; px[4 * i + 2] = src[4 * i + (bgra ? 0 : 2)]; px[4 * i + 3] = src[4 * i + 3];
+        }
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, n * 4, NULL);
+        CGImageRef im = CGImageCreate(t->w, t->h, 8, 32, t->w * 4, cs, kCGImageAlphaLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+        NSString *path = [NSString stringWithFormat:@"%s/pass%02u_%lux%lu.png", getenv("RN_DUMP_PASSES"), seq++, (unsigned long)t->w, (unsigned long)t->h];
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL((__bridge CFURLRef)[NSURL fileURLWithPath:path], CFSTR("public.png"), 1, NULL);
+        if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); }
+        CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs); free(px);
+    }
     free(dr); free(va); free(fa); free(vbs);
     if (bad) [self fail:bad];
     else if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
@@ -1151,6 +1227,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 }
 // The first version runs the recorded dispatches synchronously on the calling thread.
 - (void)commit {
+    if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
     if (st >= MTLCommandBufferStatusCommitted) return;
     st = MTLCommandBufferStatusCommitted;
     for (MTLCommandBufferHandler h in scheduled) h((id)self);
@@ -1180,6 +1257,16 @@ static NSString *rn_run_blit(RNBlit *b) {
         }
     }
     for (RedNaviMTLTexture *t in surfUsed) [t syncFromSurface];
+    if (getenv("RN_LOG_BUFFERS"))
+        for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) {
+            RNRenderPass *rp = rec;
+            for (RNDraw *dw in rp->draws) if (dw->bufs[0][1]) {
+                const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(dw->bufs[0][1]->b) + dw->offs[0][1];
+                char hx[100] = ""; for (int j = 0; j < 32; j++) snprintf(hx + 2 * j, 4, "%02x", bp[j]);
+                rn_log("  commit start: buffer %p offset %lu: %s", dw->bufs[0][1], (unsigned long)dw->offs[0][1], hx);
+            }
+        }
+    [RedNaviMTLBuffer syncNoCopyIn:YES];
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
         if ([rec isKindOfClass:[RNRenderPass class]]) { [self runRenderPass:rec]; continue; }
@@ -1207,6 +1294,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
+    [RedNaviMTLBuffer syncNoCopyIn:NO];
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     for (MTLCommandBufferHandler h in completed) h((id)self);
     for (id<MTLDrawable> dr in presents) [dr present];
@@ -1478,13 +1566,18 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
         }
         p->names[s] = fn[s]->name;
         p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
+        if (getenv("RN_DUMP_SPV")) {                         // debugging: the SPIR-V of every translated stage, to read with spirv-dis
+            static unsigned spvSeq;
+            NSString *f = [NSString stringWithFormat:@"%s/%02u_%s_%s.spv", getenv("RN_DUMP_SPV"), spvSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String];
+            [p->spv[s] writeToFile:f atomically:NO];
+        }
         rn_air_free(spv, spvBytes);
         unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
         p->n[s] = n;
         for (unsigned i = 0; i < n; i++) {
             const rn_air_binding *ab = &info.bindings[i];
             p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind == RN_AIR_NULL_TEXTURE ? RN_VK_SAMPLED_IMAGE : ab->kind, NULL};
-            p->kind[s][i] = ab->kind;
+            p->kind[s][i] = ab->kind == RN_AIR_NULL_TEXTURE ? (RN_AIR_NULL_TEXTURE | (ab->dim << 8)) : ab->kind;   // the dimension of a placeholder texture rides in the upper bits
             p->mi[s][i] = ab->metal_index;
             if (ab->kind == RN_AIR_STATIC_SAMPLER) {
                 p->sampl[s][i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
@@ -1595,6 +1688,20 @@ void rn_compute_install(Class k, Class sup) {
         if (b && bytes) memcpy(rn_vk_buffer_contents(b->b), bytes, length);
         return (uintptr_t)CFBridgingRetain(b);
     }), m2 ? method_getTypeEncoding(m2) : "@40@0:8r^v16Q24Q32");
+    SEL s2b = sel_registerName("newBufferWithBytesNoCopy:length:options:deallocator:");
+    Method m2b = class_getInstanceMethod(sup, s2b);
+    typedef uintptr_t (*rn_imp_nocopy)(id, SEL, void *, NSUInteger, NSUInteger, id);
+    rn_imp_nocopy o2b = m2b ? (rn_imp_nocopy)method_getImplementation(m2b) : NULL;
+    class_addMethod(k, s2b, imp_implementationWithBlock(^uintptr_t(id self, void *bytes, NSUInteger length, NSUInteger options, void (^dealloc)(void *, NSUInteger)) {
+        if (!rn_gate()) return o2b ? o2b(self, s2b, bytes, length, options, dealloc) : 0;
+        RedNaviMTLBuffer *b = [[RedNaviMTLBuffer alloc] initWithDevice:(id<MTLDevice>)self length:length options:options];
+        if (!b) return 0;
+        b->userPtr = bytes; b->userDealloc = [dealloc copy];
+        memcpy(rn_vk_buffer_contents(b->b), bytes, length);
+        @synchronized([RedNaviMTLBuffer class]) { [[RedNaviMTLBuffer noCopyBuffers] addObject:b]; }
+        rn_log("buffer over caller memory: %lu bytes at %p", (unsigned long)length, bytes);
+        return (uintptr_t)CFBridgingRetain(b);
+    }), m2b ? method_getTypeEncoding(m2b) : "@48@0:8^v16Q24Q32@?40");
     // Textures and sampler states
     SEL s7 = sel_registerName("newTextureWithDescriptor:");
     Method m7 = class_getInstanceMethod(sup, s7);
@@ -1740,9 +1847,16 @@ void rn_compute_install(Class k, Class sup) {
             return yes;
         }), mfs ? method_getTypeEncoding(mfs) : "B24@0:8Q16");
         static const struct { const char *name; BOOL value; } caps[] = {
-            {"supportsBufferlessClientStorageTexture", YES}, {"supportsExtendedXR10Formats", YES}, {"supportsMemorylessRenderTargets", NO}, {"supportsNativeHardwareFP16", NO},
+            {"supportsBufferlessClientStorageTexture", YES}, {"supportsExtendedXR10Formats", NO}, {"supportsMemorylessRenderTargets", NO}, {"supportsNativeHardwareFP16", NO},
             {"supportsRasterOrderGroups", NO}, {"supportsSIMDGroup", NO}, {"supportsSIMDReduction", NO}, {"supportsSIMDShuffleAndFill", NO}, {"supportsTileShaders", NO},
-            {"isFramebufferReadSupported", NO}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO}};
+            {"isFramebufferReadSupported", NO}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO},
+            // what a real device answers and RADV on Navi 32 can do too (tools/mtl_limits.m lists them): QuartzCore chooses data formats and shader variants from these
+            {"supports32BitFloatFiltering", YES}, {"supportsFloat16InfNanFiltering", YES}, {"supportsTextureSwizzle", YES}, {"supportsQueryTextureLOD", YES}, {"supportsInt64", YES},
+            {"supportsBaseVertexInstanceDrawing", YES}, {"supportsFragmentBufferWrites", YES}, {"supportsRenderTextureWrites", YES}, {"supportsExtendedVertexFormats", YES},
+            {"supportsInvariantVertexPosition", YES}, {"supportsNonUniformThreadgroupSize", YES}, {"supportsShaderMinLODClamp", YES}, {"supportsSamplerReductionMode", YES},
+            {"supportsSamplerCompareFunction", YES}, {"supportsMirrorClampToEdgeSamplerMode", YES}, {"supportsBlackOrWhiteSamplerBorderColors", YES}, {"supportsFastMathInfNaNPropagation", YES},
+            {"supportsFixedLinePointFillDepthGradient", YES}, {"supportsRelaxedTextureViewRequirements", YES}, {"supportsTextureOutOfBoundsReads", YES}, {"supportsLinearTextureFromSharedBuffer", YES},
+            {"supportsPullModelInterpolation", YES}, {"supportsSharedTextureHandles", YES}, {"supportsDynamicAttributeStride", YES}, {"supportsCountingOcclusionQuery", YES}};
         typedef BOOL (*imp_bool)(id, SEL);
         for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
             SEL sc = sel_registerName(caps[i].name);
@@ -1767,10 +1881,12 @@ void rn_compute_install(Class k, Class sup) {
             {"maxComputeBuffers", 31}, {"maxTileBuffers", 31}, {"maxFragmentTextures", 128}, {"maxComputeTextures", 128}, {"maxTileTextures", 128}, {"maxFragmentSamplers", 16},
             {"maxComputeSamplers", 16}, {"maxTileSamplers", 16}, {"maxVertexAttributes", 31}, {"maxComputeAttributes", 31}, {"maxInterpolants", 32}, {"maxInterpolatedComponents", 124},
             {"maxTotalComputeThreadsPerThreadgroup", 1024}, {"maxComputeThreadgroupMemory", 32768}, {"maxConstantBufferArguments", 31}, {"maxFunctionConstantIndices", 65536},
-            {"maxLineWidth", 1}, {"maxPointSize", 511}, {"maxBufferLength", 4294967296.0}, {"maxFramebufferStorageBits", 256}, {"maxVertexInlineDataSize", 4096}, {"maxFragmentInlineDataSize", 4096},
+            {"maxLineWidth", 1}, {"maxPointSize", 511}, {"maxBufferLength", 2147483648.0}, {"maxFramebufferStorageBits", 256}, {"maxVertexInlineDataSize", 4096}, {"maxFragmentInlineDataSize", 4096},
             {"maxComputeInlineDataSize", 4096}, {"maxTileInlineDataSize", 4096}, {"maxCustomSamplePositions", 16}, {"maxTessellationFactor", 64},
-            {"linearTextureAlignmentBytes", 256}, {"deviceLinearTextureAlignmentBytes", 256}, {"deviceLinearReadOnlyTextureAlignmentBytes", 256}, {"linearTextureArrayAlignmentBytes", 256},
-            {"linearTextureArrayAlignmentSlice", 256}, {"iosurfaceTextureAlignmentBytes", 256}, {"iosurfaceReadOnlyTextureAlignmentBytes", 256}};
+            {"linearTextureAlignmentBytes", 256}, {"deviceLinearTextureAlignmentBytes", 256}, {"deviceLinearReadOnlyTextureAlignmentBytes", 256}, {"linearTextureArrayAlignmentBytes", 0},
+            {"linearTextureArrayAlignmentSlice", 0}, {"iosurfaceTextureAlignmentBytes", 16}, {"iosurfaceReadOnlyTextureAlignmentBytes", 16},
+            // the same ones on a real device (tools/mtl_limits.m): QuartzCore lays its vertex/constant arena out with the constant buffer alignment
+            {"minConstantBufferAlignmentBytes", 32}, {"minBufferNoCopyAlignmentBytes", 4096}, {"maxComputeThreadgroupMemoryAlignmentBytes", 16}};
         for (unsigned i = 0; i < sizeof(limits) / sizeof(limits[0]); i++) {
             SEL sl = sel_registerName(limits[i].name);
             Method ml = class_getInstanceMethod(sup, sl);
@@ -1792,6 +1908,14 @@ void rn_compute_install(Class k, Class sup) {
             default: rn_log("limit %s: return type %c not handled", limits[i].name, rt[0]); break;
             }
         }
+        SEL shb = sel_registerName("heapBufferSizeAndAlignWithLength:options:");
+        Method mhb = class_getInstanceMethod(sup, shb);
+        typedef MTLSizeAndAlign (*imp_hb)(id, SEL, NSUInteger, NSUInteger);
+        imp_hb ohb = mhb ? (imp_hb)method_getImplementation(mhb) : NULL;
+        class_addMethod(k, shb, imp_implementationWithBlock(^MTLSizeAndAlign(id self, NSUInteger len, NSUInteger opt) {
+            if (!rn_gate() && ohb) return ohb(self, shb, len, opt);
+            return (MTLSizeAndAlign){len, 32};                      // as a real device answers
+        }), mhb ? method_getTypeEncoding(mhb) : "{?=QQ}32@0:8Q16Q24");
         SEL smin = sel_registerName("minimumLinearTextureAlignmentForPixelFormat:");
         Method mmin = class_getInstanceMethod(sup, smin);
         typedef NSUInteger (*imp_align)(id, SEL, NSUInteger);

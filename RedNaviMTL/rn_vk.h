@@ -34,6 +34,7 @@ typedef struct rn_vk_sampler rn_vk_sampler;
 enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA16F, RN_VK_R32F, RN_VK_RG32F, RN_VK_RGBA32F, RN_VK_R32U, RN_VK_R32I, RN_VK_RGBA8U, RN_VK_RGBA8_SRGB, RN_VK_BGRA8_SRGB, RN_VK_RGB10A2, RN_VK_BGR10A2, RN_VK_RG16F, RN_VK_R16, RN_VK_RG16, RN_VK_RGBA16 };
 unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknown format
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
+rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth);   // depth > 1: a 3D image (sampled only); staging is depth slices of width * height texels
 void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows packed (width * texel bytes)
 void rn_vk_image_host_wrote(rn_vk_image *img);
 // A view with another format of the same texel size (RN_VK_* as in rn_vk_image_create), components swizzled by VkComponentSwizzle values (NULL: as they are). It shares the image, its

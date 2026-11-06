@@ -38,7 +38,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h; unsigned texel; int storage, color, initialized, dirty; };
+struct rn_vk_image { rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; };
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -335,20 +335,21 @@ static VkFormat vk_format(int f) {
     }
 }
 
-rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) {
+rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) { return rn_vk_image_create3d(vk, format, w, h, 1); }
+rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h, uint32_t d) {
     const unsigned texel = rn_vk_format_texel_bytes(format);
-    if (!texel || !w || !h) return NULL;
+    if (!texel || !w || !h || !d) return NULL;
     rn_vk_image *im = calloc(1, sizeof(*im));
     if (!im) return NULL;
-    im->fmt = vk_format(format); im->w = w; im->h = h; im->texel = texel;
+    im->fmt = vk_format(format); im->w = w; im->h = h; im->d = d; im->texel = texel;
     VkFormatProperties fp;
     vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
     const VkFormatFeatureFlags f = fp.optimalTilingFeatures;
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     if ((f & need) != need) goto fail;
     im->storage = (f & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
-    im->color = (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+    im->color = d == 1 && (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;   // a 3D texture is never a render target here
+    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = d > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, d}, .mipLevels = 1, .arrayLayers = 1,
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                                 .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                              .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0)};
@@ -362,12 +363,12 @@ rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) {
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
     if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) goto fail;
     if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) goto fail;
-    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
                                  .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view) != VK_SUCCESS) goto fail;
-    im->stage = rn_vk_buffer_create(vk, (size_t)w * h * texel);
+    im->stage = rn_vk_buffer_create(vk, (size_t)w * h * d * texel);
     if (!im->stage) goto fail;
-    memset(rn_vk_buffer_contents(im->stage), 0, (size_t)w * h * texel);
+    memset(rn_vk_buffer_contents(im->stage), 0, (size_t)w * h * d * texel);
     im->dirty = 1;                              // the zeroes reach the image at its first use
     return im;
 fail:
@@ -389,7 +390,7 @@ rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const un
     v->base = root; v->fmt = vf; v->view = VK_NULL_HANDLE; v->initialized = v->dirty = 0;
     v->storage = root->storage && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     v->color = root->color && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = vf,
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = root->d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = vf,
                                  .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (swizzle) vci.components = (VkComponentMapping){swizzle[0], swizzle[1], swizzle[2], swizzle[3]};
     if (vk->CreateImageView(vk->dev, &vci, NULL, &v->view) != VK_SUCCESS) { free(v); return NULL; }
@@ -464,7 +465,7 @@ static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, uns
             r->initialized = 1;
         }
         if (r->dirty) {
-            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, 1}};
+            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
             vk->CmdCopyBufferToImage(cb, r->stage->buf, r->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
             r->dirty = 0;
         }
@@ -478,7 +479,7 @@ static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, un
         int seen = 0;
         for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
         if (seen) continue;
-        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, 1}};
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
         vk->CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_GENERAL, r->stage->buf, 1, &bc);
         done++;
     }
@@ -736,6 +737,21 @@ done:
     return rc;
 }
 
+// Does a draw sample one of the pass's own render targets (QuartzCore reads the destination as a texture when the device has no framebuffer fetch, and relies on Metal's texture
+// barrier between draws)? Such a draw needs the earlier draws' writes made visible first, and the next draw must not overtake its reads.
+static int samples_target(const rn_vk_draw *dr, const rn_vk_target *targets, unsigned nt) {
+    for (int s = 0; s < 2; s++) {
+        const rn_vk_arg *args = s ? dr->fargs : dr->vargs;
+        if (!args) continue;
+        for (unsigned i = 0; i < dr->pipe->n[s]; i++) {
+            if (dr->pipe->kinds[s][i] != RN_VK_SAMPLED_IMAGE || !args[i].image) continue;
+            const rn_vk_image *r = args[i].image->base ? args[i].image->base : args[i].image;
+            for (unsigned t = 0; t < nt; t++) if ((targets[t].image->base ? targets[t].image->base : targets[t].image) == r) return 1;
+        }
+    }
+    return 0;
+}
+
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_draw *draws, unsigned nd) {
     if (!nt || nt > 8) return 6;
     if (!nd) return clear_targets(vk, targets, nt);
@@ -819,8 +835,19 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
                            0, 1, &toGfx, 0, NULL, 0, NULL);
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = p0->rp, .framebuffer = fb, .renderArea = {{0, 0}, {W, H}}};
     vk->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+    int prevFeedback = 0;
     for (unsigned d = 0; d < nd; d++) {
         const rn_vk_draw *dr = &draws[d];
+        const int feedback = samples_target(dr, targets, nt);
+        if (d && (feedback || prevFeedback)) {          // the render pass is restarted (LOAD) around a draw that reads the target, with the writes made visible
+            vk->CmdEndRenderPass(cb);
+            VkMemoryBarrier fb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+            vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                   0, 1, &fb2, 0, NULL, 0, NULL);
+            vk->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
+        }
+        prevFeedback = feedback;
         vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pipe);
         vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 0, 2, &sets[2 * d], 0, NULL);
         // Metal's clip space is y-up, Vulkan's y-down: the viewport is flipped (origin at the bottom, negative height)
