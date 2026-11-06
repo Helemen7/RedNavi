@@ -64,6 +64,9 @@ static rn_vk *rn_vk_shared(void) {
     return vk;
 }
 
+// YES when this process is let in and RADV opens. A process that is not let in gets no device at all: with the native path a client sees an accelerator it cannot make a command queue on (WindowServer aborts and restarts forever).
+BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
+
 #pragma clang diagnostic ignored "-Wprotocol"
 #pragma clang diagnostic ignored "-Wincomplete-implementation"
 
@@ -757,7 +760,9 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     NSError *err;
     NSString *label_;
     dispatch_semaphore_t done;
+    NSMutableDictionary *userDict_;             // MPS keeps its per-command-buffer state here
 }
+- (NSMutableDictionary *)userDictionary;
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d;
 - (void)runRenderPass:(RNRenderPass *)rp;
 - (void)fail:(NSString *)why;
@@ -1100,6 +1105,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
+- (NSMutableDictionary *)userDictionary { @synchronized (self) { if (!userDict_) userDict_ = [NSMutableDictionary new]; return userDict_; } }
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d {
     if ((self = [super init])) {
         queue = q; dev = d; records = [NSMutableArray new]; completed = [NSMutableArray new]; scheduled = [NSMutableArray new]; presents = [NSMutableArray new];
@@ -1441,7 +1447,10 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 - (instancetype)initWithDevice:(id<MTLDevice>)d data:(NSData *)blob error:(NSError **)error {
     if (error) *error = nil;                         // callers (CoreDisplay) leave it uninitialised and read it after a success
     if (!(self = [super init])) return nil;
-    rn_mtl_func fn[512];
+    // MPSImage's library has 1837 functions (MPS asks for them by name and asserts when one is missing): the list lives on the heap and is big enough for any system library
+    enum { RN_MAX_LIB_FUNCS = 8192 };
+    NSMutableData *fnStore = [NSMutableData dataWithLength:sizeof(rn_mtl_func) * RN_MAX_LIB_FUNCS];
+    rn_mtl_func *fn = (rn_mtl_func *)fnStore.mutableBytes;
     unsigned cnt = 0;
     // A fat file (QuartzCore's default.metallib: one slice of AIR and the rest GPU binaries for other targets) holds the AIR in the slice that parses
     if (blob.length > 8 && memcmp(blob.bytes, "\xca\xfe\xba\xbe", 4) == 0) {
@@ -1453,10 +1462,10 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
             if (off + sz > blob.length || sz < 8) continue;
             NSData *slice = [blob subdataWithRange:NSMakeRange(off, sz)];
             unsigned c2 = 0;
-            if (rn_metallib_parse(slice.bytes, slice.length, fn, 512, &c2) == 0) { blob = slice; rn_log("library: fat file, using slice %u (%lu bytes)", i, sz); break; }
+            if (rn_metallib_parse(slice.bytes, slice.length, fn, RN_MAX_LIB_FUNCS, &c2) == 0) { blob = slice; rn_log("library: fat file, using slice %u (%lu bytes)", i, sz); break; }
         }
     }
-    int rc = rn_metallib_parse(blob.bytes, blob.length, fn, 512, &cnt);
+    int rc = rn_metallib_parse(blob.bytes, blob.length, fn, RN_MAX_LIB_FUNCS, &cnt);
     if (rc) {
         rn_log("newLibraryWithData: not a metallib this reader understands (code %d)", rc);
         if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"unreadable metallib (%d)", rc]}];
@@ -1464,7 +1473,8 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     }
     dev = d; data = blob; funcs = [NSMutableDictionary new];
     NSMutableArray *nm = [NSMutableArray new];
-    for (unsigned i = 0; i < cnt && i < 512; i++) {
+    if (cnt > RN_MAX_LIB_FUNCS) { rn_log("library: %u functions, only the first %d are kept", cnt, RN_MAX_LIB_FUNCS); cnt = RN_MAX_LIB_FUNCS; }
+    for (unsigned i = 0; i < cnt; i++) {
         RedNaviMTLFunction *f = [RedNaviMTLFunction new];
         f->name = @(fn[i].name);
         f->type = (MTLFunctionType)(fn[i].type + 1);       // the container has 0 vertex, 1 fragment, 2 kernel
@@ -1581,6 +1591,7 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
     RedNaviMTLFunction *fn[2] = {(RedNaviMTLFunction *)desc.vertexFunction, (RedNaviMTLFunction *)desc.fragmentFunction};
     rn_vk *vk = rn_vk_shared();
     RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
+    rn_log("render pipeline asked: vertex %s, fragment %s", fn[0] ? [(NSString *)((RedNaviMTLFunction *)fn[0])->name UTF8String] : "-", fn[1] ? [(NSString *)((RedNaviMTLFunction *)fn[1])->name UTF8String] : "-");
     if (!vk) why = @"RADV is not available";
     else if (!fn[0] || !fn[1]) why = @"a render pipeline needs a vertex and a fragment function";
     else for (int s = 0; s < 2 && !why; s++) {
@@ -2053,4 +2064,31 @@ void rn_compute_install(Class k, Class sup) {
         id p = rn_pso_from_function((id<MTLDevice>)self, fn, &error);
         handler(p, error);
     }), m6 ? method_getTypeEncoding(m6) : "v32@0:8@16@?24");
+    // MPS (WindowServer's blur) and others build compute pipelines from a descriptor, or with options and a handler
+    typedef void (*imp_fn_opt_handler)(id, SEL, id, NSUInteger, id);
+    SEL cs7 = sel_registerName("newComputePipelineStateWithFunction:options:completionHandler:");
+    Method cm7 = class_getInstanceMethod(sup, cs7);
+    imp_fn_opt_handler o7p = cm7 ? (imp_fn_opt_handler)method_getImplementation(cm7) : NULL;
+    class_addMethod(k, cs7, imp_implementationWithBlock(^void(id self, id fn, NSUInteger options, void (^handler)(id, id, NSError *)) {
+        if (!rn_gate()) { if (o7p) o7p(self, cs7, fn, options, (id)handler); return; }
+        NSError *error = nil;
+        id p = rn_pso_from_function((id<MTLDevice>)self, fn, &error);
+        handler(p, nil, error);
+    }), cm7 ? method_getTypeEncoding(cm7) : "v40@0:8@16Q24@?32");
+    SEL cs8 = sel_registerName("newComputePipelineStateWithDescriptor:options:reflection:error:");
+    Method cm8 = class_getInstanceMethod(sup, cs8);
+    imp_fn_opt_refl_err o8p = cm8 ? (imp_fn_opt_refl_err)method_getImplementation(cm8) : NULL;
+    class_addMethod(k, cs8, imp_implementationWithBlock(^uintptr_t(id self, MTLComputePipelineDescriptor *desc, NSUInteger options, void *reflection, NSError **error) {
+        if (!rn_gate()) return o8p ? o8p(self, cs8, (id)desc, options, reflection, error) : 0;
+        return (uintptr_t)CFBridgingRetain(rn_pso_from_function((id<MTLDevice>)self, desc.computeFunction, error));
+    }), cm8 ? method_getTypeEncoding(cm8) : "@48@0:8@16Q24^@32^@40");
+    SEL cs9 = sel_registerName("newComputePipelineStateWithDescriptor:options:completionHandler:");
+    Method cm9 = class_getInstanceMethod(sup, cs9);
+    imp_fn_opt_handler o9p = cm9 ? (imp_fn_opt_handler)method_getImplementation(cm9) : NULL;
+    class_addMethod(k, cs9, imp_implementationWithBlock(^void(id self, MTLComputePipelineDescriptor *desc, NSUInteger options, void (^handler)(id, id, NSError *)) {
+        if (!rn_gate()) { if (o9p) o9p(self, cs9, (id)desc, options, (id)handler); return; }
+        NSError *error = nil;
+        id p = rn_pso_from_function((id<MTLDevice>)self, desc.computeFunction, &error);
+        handler(p, nil, error);
+    }), cm9 ? method_getTypeEncoding(cm9) : "v40@0:8@16Q24@?32");
 }

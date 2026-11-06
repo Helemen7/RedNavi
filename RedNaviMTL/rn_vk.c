@@ -1,6 +1,7 @@
 // See rn_vk.h. Plain Vulkan 1.1, loaded by hand: the process may be any Metal client, so nothing here links against a Vulkan library.
 #include "rn_vk.h"
 #include <dlfcn.h>
+#include <unistd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,9 +53,27 @@ struct rn_vk_compute {
 
 static void seterr(char *err, size_t n, const char *what, long v) { if (err && n) snprintf(err, n, "%s (%ld)", what, v); }
 
+// Where RADV and its libraries are: RN_VK_DIR, else Contents/Resources/vk of the bundle this code is in (WindowServer's sandbox maps code only from /Library/GPUBundles), else the shared folder.
 const char *rn_vk_dir(void) {
+    static char path[1024];
+    if (path[0]) return path;
     const char *d = getenv("RN_VK_DIR");
-    return d ? d : "/Library/Application Support/RedNavi/vk";
+    if (d) { snprintf(path, sizeof(path), "%s", d); return path; }
+    Dl_info info;
+    if (dladdr((void *)rn_vk_dir, &info) && info.dli_fname) {
+        char probe[1024];
+        snprintf(probe, sizeof(probe), "%s", info.dli_fname);
+        char *slash = strstr(probe, "/Contents/MacOS/");
+        if (slash) {
+            *slash = 0;
+            snprintf(path, sizeof(path), "%s/Contents/Resources/vk", probe);
+            char lib[1100];
+            snprintf(lib, sizeof(lib), "%s/libvulkan_radeon.dylib", path);
+            if (access(lib, R_OK) == 0) return path;
+        }
+    }
+    snprintf(path, sizeof(path), "/Library/Application Support/RedNavi/vk");
+    return path;
 }
 
 rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {

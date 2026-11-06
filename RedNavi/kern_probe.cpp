@@ -261,7 +261,7 @@ static void rnPublishOne(OSDictionary *d, const char *key, uint64_t v) {
     if (n) { d->setObject(key, n); n->release(); }
 }
 
-class RedNaviClient;
+class IOAccelRedNaviClient;
 
 class RedNaviProbe : public IOService {
     OSDeclareDefaultStructors(RedNaviProbe)
@@ -352,13 +352,13 @@ class RedNaviProbe : public IOService {
     uint32_t queueResets {0};
     uint32_t gfxQueueResets {0};
     uint32_t hangMs {8000};                        // a wait this long without the fence moving resets the queue (rednavi_hang_ms)
-    RedNaviClient *vmClient[8] {};                 // the connection of each VMID
+    IOAccelRedNaviClient *vmClient[8] {};                 // the connection of each VMID
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     int resetGfxQueue(uint32_t info[4]);           // the same for the graphics queue
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
     int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true);
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
-    friend class RedNaviClient;
+    friend class IOAccelRedNaviClient;
 public:
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 private:
@@ -1788,8 +1788,8 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // through the GART, a way to hand the compute queue a command buffer, and a fence wait. Every buffer belongs to the connection that
 // created it and goes away with it; command buffers and fences must lie inside the connection's own buffers. The caller is still trusted
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
-class RedNaviClient : public IOUserClient {
-    OSDeclareDefaultStructors(RedNaviClient)
+class IOAccelRedNaviClient : public IOUserClient {
+    OSDeclareDefaultStructors(IOAccelRedNaviClient)
     static constexpr uint32_t kMaxHandles = 1024;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
@@ -2443,7 +2443,7 @@ public:
         return rc;
     }
 };
-OSDefineMetaClassAndStructors(RedNaviClient, IOUserClient)
+OSDefineMetaClassAndStructors(IOAccelRedNaviClient, IOUserClient)
 
 // The queue is shared by every connection, so a reset drops everybody's work. Each connection's numbers from the last fence value it saw to the last it
 // submitted are lost; the fence then jumps to the last submitted number so that no wait is left hanging (the work that finished before keeps its result).
@@ -2454,7 +2454,7 @@ int RedNaviProbe::resetQueue(uint32_t info[4]) {
     queueResets++;
     if (rr != 0) return rr;
     for (int v = 1; v <= 7; v++) {
-        RedNaviClient *c = vmClient[v];
+        IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->lostFrom = before[v] + 1;
         c->lostTo = c->seqSubmitted;
@@ -2471,7 +2471,7 @@ int RedNaviProbe::resetGfxQueue(uint32_t info[4]) {
     gfxQueueResets++;
     if (rr != 0) return rr;
     for (int v = 1; v <= 7; v++) {
-        RedNaviClient *c = vmClient[v];
+        IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->gfxLostFrom = (before[v] + 1) | 0x80000000u;
         c->gfxLostTo = c->gfxSeqSubmitted;
@@ -2486,7 +2486,7 @@ IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32
     if (!(PE_parse_boot_argn("rednavi_uc_anyone", &anyone, sizeof(anyone)) && anyone == 1) &&
         IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
         return kIOReturnNotPrivileged;
-    RedNaviClient *c = OSTypeAlloc(RedNaviClient);
+    IOAccelRedNaviClient *c = OSTypeAlloc(IOAccelRedNaviClient);
     if (!c) return kIOReturnNoMemory;
     if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this) || !c->start(this)) {
         c->detach(this);

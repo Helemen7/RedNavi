@@ -150,6 +150,7 @@ DYLD_INTERPOSE(rn_IOConnectSetNotificationPort, IOConnectSetNotificationPort)
 
 // Every init* method the plug-in class inherits, wrapped. The wrapper passes three more integer-class arguments through (enough for the init methods of a device).
 // Object pointers travel as integers: an init method consumes self and returns a +1 object, which ARC would get wrong through a plain function pointer.
+extern BOOL rn_compute_usable(void);
 typedef uintptr_t (*rn_init3)(uintptr_t, SEL, uintptr_t, uintptr_t, uintptr_t);
 static void rn_wrap_init(Class k, Class from) {
     unsigned n = 0;
@@ -173,6 +174,9 @@ static void rn_wrap_init(Class k, Class from) {
             id ro = (__bridge id)(void *)r;
             rn_log("-[RedNaviMTLDevice %s] end: result 0x%lx class %s, conforms to MTLDevice: %s", sel_getName(sel), (unsigned long)r,
                    r ? class_getName(object_getClass(ro)) : "-", r && p && [ro conformsToProtocol:p] ? "yes" : "no");
+            // A process that is not let in, or cannot open RADV (its sandbox refuses the mapping, say), gets no device at all: its clients fall back to the software path, instead of a device
+            // whose every pipeline fails and is retried forever.
+            if (r && !rn_compute_usable()) { rn_log("the plug-in is not let in or RADV is not usable in this process: no Metal device"); return 0; }
             return r;
         }), enc);
     }
