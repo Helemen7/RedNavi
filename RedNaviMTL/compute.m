@@ -1140,6 +1140,32 @@ static void rn_commit_stats(uint64_t ticks) {
     os_unfair_lock_unlock(&lock);
 }
 
+// Trace aid (only with /Users/Shared/rednavi-trace): the picture a big render pass left in its IOSurface, as /private/var/tmp/rednavi-trace-<n>.png, at most one every three seconds.
+static void rn_trace_dump(RedNaviMTLTexture *t, unsigned draws) {
+    static uint64_t last; static unsigned seq;
+    const uint64_t now = mach_absolute_time();
+    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    if (last && (now - last) * tb.numer / tb.denom < 3000000000ull) return;
+    if (!t->surf || draws < 20 || t->pf != MTLPixelFormatBGRA8Unorm) return;
+    last = now;
+    if (IOSurfaceLock(t->surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+    const size_t pitch = IOSurfaceGetBytesPerRow(t->surf);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef cg = CGBitmapContextCreate(IOSurfaceGetBaseAddress(t->surf), t->w, t->h, 8, pitch, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+    CGImageRef img = cg ? CGBitmapContextCreateImage(cg) : NULL;
+    if (img) {
+        char path[128]; snprintf(path, sizeof(path), "/private/var/tmp/rednavi-trace-%u.png", seq++ % 8);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+        if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+        CFRelease(url); CGImageRelease(img);
+        rn_log("trace: wrote %s (%lux%lu, %u draws)", path, (unsigned long)t->w, (unsigned long)t->h, draws);
+    }
+    if (cg) CGContextRelease(cg);
+    CGColorSpaceRelease(cs);
+    IOSurfaceUnlock(t->surf, kIOSurfaceLockReadOnly, NULL);
+}
+
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
 - (NSMutableDictionary *)userDictionary { @synchronized (self) { if (!userDict_) userDict_ = [NSMutableDictionary new]; return userDict_; } }
@@ -1333,6 +1359,21 @@ static void rn_commit_stats(uint64_t ticks) {
         }
     }
     for (RedNaviMTLTexture *t in surfUsed) [t syncFromSurface];
+    {   // /Users/Shared/rednavi-trace: what each command buffer draws (a client such as WindowServer has no environment to set)
+        struct stat tst;
+        if (stat("/Users/Shared/rednavi-trace", &tst) == 0)
+            for (id rec in records) {
+                if ([rec isKindOfClass:[RNRenderPass class]]) {
+                    RNRenderPass *rp = rec;
+                    for (unsigned i = 0; i < rp->nt; i++) {
+                        RedNaviMTLTexture *t = rp->tex[i];
+                        rn_log("trace: pass target %u: %lux%lu format %lu%s, %lu draws, %s%s, clear %.2f %.2f %.2f %.2f", i, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)t->pf, t->surf ? " (IOSurface)" : "",
+                               (unsigned long)rp->draws.count, rp->clear[i] ? "cleared" : "loaded", rp->store[i] ? ", stored" : "", rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]);
+                    }
+                } else if ([rec isKindOfClass:[RNBlit class]]) rn_log("trace: blit");
+                else if ([rec isKindOfClass:[RNDispatch class]]) rn_log("trace: compute dispatch");
+            }
+    }
     if (getenv("RN_LOG_BUFFERS"))
         for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
@@ -1370,6 +1411,10 @@ static void rn_commit_stats(uint64_t ticks) {
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
+    {   struct stat tst2;
+        if (stat("/Users/Shared/rednavi-trace", &tst2) == 0)
+            for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
+    }
     [RedNaviMTLBuffer syncNoCopyIn:NO];
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     for (MTLCommandBufferHandler h in completed) h((id)self);

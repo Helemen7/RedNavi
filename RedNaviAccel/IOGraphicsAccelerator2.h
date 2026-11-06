@@ -54,7 +54,7 @@ public:
     virtual void scrubEvents();   // slot 286
     virtual void createDrawable(IOAccelSurface*, IOAccelShared2*, bool);   // slot 287
     virtual void resourceTypeForIOSurface(IOSurface*);   // slot 288
-    virtual void createDisplayPipe(IOFramebuffer*, unsigned int);   // slot 289
+    virtual void * createDisplayPipe(IOFramebuffer*, unsigned int);   // slot 289 (the return type is not known; a pointer is read back to log it)
     virtual void createMemoryDescriptorWithAddressRange(unsigned long long, unsigned long long, unsigned int, task*);   // slot 290
     virtual void createMemoryDescriptorWithPersistentMemoryDescriptor(IOMemoryDescriptor*);   // slot 291
     virtual void createBufferMemoryDescriptorWithOptions(unsigned int, unsigned long, unsigned long);   // slot 292
@@ -94,7 +94,7 @@ public:
     virtual void * newSurface() = 0;   // slot 326
     virtual void * new2DContext() = 0;   // slot 327
     virtual void * newVideoContext() = 0;   // slot 328
-    virtual void newDisplayPipe();   // slot 329
+    virtual void * newDisplayPipe();   // slot 329
     virtual void newDrawable();   // slot 330
     virtual void newContext(unsigned int);   // slot 331
     virtual void * newSysMemory() = 0;   // slot 332

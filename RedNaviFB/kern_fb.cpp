@@ -31,6 +31,7 @@ class RedNaviFB : public IOFramebuffer {
     ModeEntry modes[kRNFbMaxModes] {};
     uint32_t modeCount {0};
     uint32_t ghostTries {0};
+    uint32_t pmTries {0};
     bool ghostGone {false};
     uint32_t curMode {0};              // index into modes[]; the mode id WindowServer sees is index + 1
 
@@ -235,6 +236,12 @@ public:
             modeCount = 1;
         }
         removeBootFramebuffer(provider);
+        {   // CoreDisplay maps a framebuffer to a GPU pipe by this property (a real AppleIntelFramebuffer has 0 here for its first display; 0xffff for an offline one): without it WindowServer logs
+            // "Unable to find display pipe for IOFB service" and its Metal compositor has no destination for the display ("Unsupported sw composite destination").
+            const uint32_t pipe = 0;
+            OSData *pd = OSData::withBytes(&pipe, sizeof(pipe));
+            if (pd) { setProperty("AAPL,DisplayPipe", pd); pd->release(); }
+        }
         if (!IOFramebuffer::start(provider)) return false;
         IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(scanoutPhys, fbPitch * fbHeight, kIODirectionInOut);
         if (md) { diagMap = md->map(kIOMapInhibitCache); md->release(); }
@@ -247,31 +254,81 @@ public:
         IOFramebuffer::stop(provider);
     }
 
+    // Every distinct (kind, selector) WindowServer uses on the framebuffer with the last answer and value, published as attr-table (24 bytes each: kind, selector, result, count, value):
+    // the 16-entry ring of fb-diag only keeps the last calls. Selectors are four characters, read in memory order (the bytes "dpac" are the number 0x63617064).
+    struct AttrRec { uint32_t kind, sel; int32_t result; uint32_t count; uint64_t value; };
+    AttrRec attrTable[48] {};
+    uint32_t attrTableN {0};
+    void record(uint32_t kind, uint32_t sel, IOReturn r, uint64_t value) {
+        AttrRec *e = nullptr;
+        for (uint32_t i = 0; i < attrTableN; i++) if (attrTable[i].kind == kind && attrTable[i].sel == sel) { e = &attrTable[i]; break; }
+        if (!e && attrTableN < 48) { e = &attrTable[attrTableN++]; e->kind = kind; e->sel = sel; }
+        if (!e) return;
+        e->result = static_cast<int32_t>(r); e->count++; e->value = value;
+        OSData *d = OSData::withBytes(attrTable, sizeof(AttrRec) * attrTableN);
+        if (d) { setProperty("attr-table", d); d->release(); }
+    }
+
+    // Experiments without a reboot: the property "attr-override" (OSData, 24-byte entries: kind, selector, result, unused, value as in attr-table) set from user space replaces the answer of
+    // that (kind, selector); an empty OSData clears them. tools/rn_fbknob.c writes it.
+    AttrRec overrides[16] {};
+    uint32_t overrideN {0};
+    const AttrRec *overrideFor(uint32_t kind, uint32_t sel) const {
+        for (uint32_t i = 0; i < overrideN; i++) if (overrides[i].kind == kind && overrides[i].sel == sel) return &overrides[i];
+        return nullptr;
+    }
+    IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE {
+        OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+        OSData *o = d ? OSDynamicCast(OSData, d->getObject("attr-override")) : nullptr;
+        if (!o) return IOFramebuffer::setProperties(properties);
+        const uint32_t n = static_cast<uint32_t>(o->getLength() / sizeof(AttrRec));
+        overrideN = n > 16 ? 16 : n;
+        if (overrideN) memcpy(overrides, o->getBytesNoCopy(), overrideN * sizeof(AttrRec));
+        setProperty("attr-override", o);
+        return kIOReturnSuccess;
+    }
+
     IOReturn setAttribute(IOSelect attr, uintptr_t value) APPLE_KEXT_OVERRIDE {
         note(1, attr);
-        return IOFramebuffer::setAttribute(attr, value);
+        const AttrRec *ov = overrideFor(1, attr);
+        IOReturn r = ov ? static_cast<IOReturn>(ov->result) : IOFramebuffer::setAttribute(attr, value);
+        record(1, attr, r, value);
+        return r;
     }
     IOReturn getAttribute(IOSelect attr, uintptr_t *value) APPLE_KEXT_OVERRIDE {
         note(2, attr);
-        return IOFramebuffer::getAttribute(attr, value);
+        const AttrRec *ov = overrideFor(2, attr);
+        IOReturn r;
+        if (ov) { if (value) *value = static_cast<uintptr_t>(ov->value); r = static_cast<IOReturn>(ov->result); }
+        else r = IOFramebuffer::getAttribute(attr, value);
+        record(2, attr, r, value ? *value : 0);
+        return r;
     }
     IOReturn setAttributeForConnection(IOIndex c, IOSelect attr, uintptr_t value) APPLE_KEXT_OVERRIDE {
         note(3, attr);
-        return IOFramebuffer::setAttributeForConnection(c, attr, value);
+        const AttrRec *ov3 = overrideFor(3, attr);
+        IOReturn r = ov3 ? static_cast<IOReturn>(ov3->result) : IOFramebuffer::setAttributeForConnection(c, attr, value);
+        record(3, attr, r, value);
+        return r;
     }
     IOReturn getAttributeForConnection(IOIndex c, IOSelect attr, uintptr_t *value) APPLE_KEXT_OVERRIDE {
         note(4, attr);
         // IODisplay::readFramebufferEDID passes a null value pointer to ask only whether the attribute is supported.
         uintptr_t scratch;
         if (!value) value = &scratch;
+        IOReturn r;
+        const AttrRec *ov4 = overrideFor(4, attr);
+        if (ov4) { *value = static_cast<uintptr_t>(ov4->value); r = static_cast<IOReturn>(ov4->result); record(4, attr, r, *value); return r; }
         switch (attr) {
-        case kConnectionFlags:             *value = 0; return kIOReturnSuccess;
-        case kConnectionEnable:            *value = 1; return kIOReturnSuccess;
+        case kConnectionFlags:             *value = 0; r = kIOReturnSuccess; break;
+        case kConnectionEnable:            *value = 1; r = kIOReturnSuccess; break;
         case kConnectionSupportsHLDDCSense:
-        case kConnectionSupportsLLDDCSense: *value = 1; return kIOReturnSuccess;
-        case kConnectionSupportsAppleSense: return kIOReturnUnsupported;
-        default: return IOFramebuffer::getAttributeForConnection(c, attr, value);
+        case kConnectionSupportsLLDDCSense: *value = 1; r = kIOReturnSuccess; break;
+        case kConnectionSupportsAppleSense: r = kIOReturnUnsupported; break;
+        default: r = IOFramebuffer::getAttributeForConnection(c, attr, value); break;
         }
+        record(4, attr, r, *value);
+        return r;
     }
 
     // The EDID the probe read through AUX is a property of the probe node ("edid", 128-byte blocks).
@@ -299,6 +356,20 @@ public:
                     if (self->removeBootFramebuffer(self->getProvider())) self->ghostGone = true;
                 }
                 self->publishDiag();
+                // Power: a framebuffer at power state 0 never tells the accelerator's display machine it is on ("isFramebufferActive" false: the display pipe is inactive and
+                // WindowServer's request for it, client type 4, is refused). A real framebuffer sits at its top state (2). The state is published and, while it is not 2, raised
+                // (rednavi_fb_pm=0 leaves it alone).
+                const uint32_t pm = static_cast<uint32_t>(self->getPowerState());
+                OSNumber *pn = OSNumber::withNumber(pm, 32);
+                if (pn) { self->setProperty("pm-state", pn); pn->release(); }
+                static uint32_t pmArg = 1, pmRead;
+                if (!pmRead) { pmRead = 1; PE_parse_boot_argn("rednavi_fb_pm", &pmArg, sizeof(pmArg)); }
+                if (pmArg && pm < 2 && self->pmTries < 30) {
+                    self->pmTries++;
+                    IOReturn pr = self->changePowerStateTo(2);
+                    OSNumber *rn = OSNumber::withNumber(static_cast<uint64_t>(static_cast<uint32_t>(pr)), 32);
+                    if (rn) { self->setProperty("pm-raise-result", rn); rn->release(); }
+                }
                 t->setTimeoutMS(1000);
             });
             if (diagTimer && wl->addEventSource(diagTimer) == kIOReturnSuccess) diagTimer->setTimeoutMS(1000);

@@ -40,6 +40,7 @@ static uint32_t gStage;
 
 static IOService *gProv;
 class RedNaviAccel2;
+static class RedNaviDisplayMachine *gMachine;   // the display machine the family was given, for the power-on notification
 static IOService *gSelf;     // the accelerator, retained, for the delayed registerService()       // the PCI device, set in probe(); it outlives every object of this kext
 
 // A line of the log, to IOLog and to the provider's property. Safe from any thread that may sleep.
@@ -163,6 +164,13 @@ long RedNaviDisplayMachine::displayModeWillChange() { rnNote("display machine di
 long RedNaviDisplayMachine::displayModeDidChange() { rnNote("display machine displayModeDidChange"); return 1; }
 
 
+// The family's display pipe client, as far as it is called from here: only the function the family exports as IOAccelDisplayPipeUserClient2::init(OSDictionary*, task*) (docs/M6_ACCEL_ABI.md). No
+// vtable and no metaclass are emitted for this declaration; an instance comes from the family's metaclass by name.
+class IOAccelDisplayPipeUserClient2 : public IOUserClient {
+public:
+    bool init(OSDictionary *, task_t);
+};
+
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
     void *allocByName(const char *hook, const char *cls);
@@ -178,6 +186,12 @@ class RedNaviAccel2 : public IOGraphicsAccelerator2 {
 public:
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+    // The display pipe (docs/M6_ACCELERATOR_STUDY.md, section 3): WindowServer opens client type 4 of the accelerator and the family answers kIOReturnUnsupported when no pipe exists for the framebuffer.
+    // Both hooks log and call the family; start() calls createDisplayPipe for the framebuffer when it appears.
+    void *newDisplayPipe() override;
+    void *createDisplayPipe(IOFramebuffer *fb, unsigned int index) override;
+    // Logged only: which client types the clients ask for (the display pipe's among them) and what the family answers.
+    IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
     // The 17 pure virtuals, written out because each one logs its own arguments.
     void *getStampMemory(unsigned int *size) override;
     void *newEventMachine() override;
@@ -245,6 +259,22 @@ bool RedNaviAccel2::start(IOService *provider) {
     bool ok = IOGraphicsAccelerator2::start(provider);
     rnNote("family start -> %s", ok ? "true" : "false");
     if (!ok || gStage < 3) return ok;
+    // What the Intel accelerator publishes and the family leaves to the subclass (docs/M6_ACCELERATOR_STUDY.md, section 3): WindowServer looks for the display pipe of each
+    // framebuffer through these ("Unable to find display pipe for IOFB service" otherwise, and the display has no Metal composite destination). Boot-arg rednavi_accel2_pipe=0 leaves them out.
+    uint32_t pipe = 1;
+    PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
+    if (pipe) {
+        OSDictionary *caps = OSDictionary::withCapacity(2);
+        if (caps) {
+            caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
+            caps->setObject("TransactionsSupported", kOSBooleanTrue);
+            setProperty("IOAccelDisplayPipeCapabilities", caps);
+            caps->release();
+        }
+        OSNumber *ac = OSNumber::withNumber(15ULL, 32);
+        if (ac) { setProperty("AccelCaps", ac); ac->release(); }
+        rnNote("published IOAccelDisplayPipeCapabilities and AccelCaps 15");
+    }
     // Boot-arg rednavi_accel2_delay=<seconds>: register later, so that a panic after the registration comes when SSH is up and tools/accel2_watch.sh can follow the log
     // (a panic loses the property; registration at once crashed 17 s into the boot, before SSH answers).
     uint32_t delay = 0;
@@ -257,12 +287,73 @@ bool RedNaviAccel2::start(IOService *provider) {
         rnNote("registerService after the delay");
         gSelf->registerService();
         rnNote("registerService returned");
+        // The family made the display pipe when the framebuffer appeared (createDisplayPipe in the log) but the pipe is inactive ("isFramebufferActive" false) while the framebuffer
+        // has not told the display machine it is powered on, and WindowServer's request for the pipe (client type 4) is refused until it is. RedNaviFB stays at power state 0
+        // (no MaxPowerState in its IOPowerManagement: it never registers a power driver), so the notification is made here (rednavi_accel2_pipe=0 skips it).
+        uint32_t pipe = 1;
+        PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
+        if (pipe && gMachine) {
+            gMachine->framebuffer_did_power_on(0);
+            rnNote("framebuffer_did_power_on(0) told to the display machine %p", (void *)gMachine);
+        }
     }, nullptr);
     uint64_t deadline;
     clock_interval_to_deadline(delay, NSEC_PER_SEC, &deadline);
     thread_call_enter_delayed(call, deadline);
     rnNote("registerService in %u s", delay);
     return ok;
+}
+
+IOReturn RedNaviAccel2::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
+    IOReturn r;
+    if (type == 4 && gStage >= 3 && handler) {
+        // Client type 4 is the display pipe. The family's newUserClient has no case for it (the dtrace of 2026-11-06: it counts the process's clients and answers kIOReturnUnsupported), so the
+        // accelerator's own subclass makes it, as the Intel and AMD ones do: an IOAccelDisplayPipeUserClient2, init, attach, start. WindowServer then selects the pipe with its
+        // set_pipe_index method. rednavi_accel2_pipe=0 leaves type 4 to the family.
+        uint32_t pipe = 1;
+        PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
+        r = kIOReturnUnsupported;
+        if (pipe) {
+            const OSSymbol *sym = OSSymbol::withCString("IOAccelDisplayPipeUserClient2");
+            const OSMetaClass *mc = sym ? OSMetaClass::getMetaClassWithName(sym) : nullptr;
+            if (sym) sym->release();
+            OSObject *o = mc ? mc->alloc() : nullptr;
+            IOAccelDisplayPipeUserClient2 *uc = o ? static_cast<IOAccelDisplayPipeUserClient2 *>(OSDynamicCast(IOUserClient, o)) : nullptr;
+            if (uc) {
+                bool ok = uc->init(nullptr, owningTask);
+                rnNote("display pipe client %p: init -> %d", (void *)uc, ok);
+                ok = ok && uc->attach(this);
+                rnNote("display pipe client: attach -> %d", ok);
+                ok = ok && uc->start(this);
+                rnNote("display pipe client: start -> %d", ok);
+                if (ok) { *handler = uc; r = kIOReturnSuccess; }
+                else { uc->detach(this); uc->release(); r = kIOReturnError; }
+            } else if (o) o->release();
+        }
+    } else
+        r = IOGraphicsAccelerator2::newUserClient(owningTask, securityID, type, properties, handler);
+    static uint32_t seen;
+    if (seen < 200) {                                  // the log keeps 256 lines: the first clients are enough
+        seen++;
+        rnNote("newUserClient(type %u, properties %p) -> 0x%x, client %p (%s)", (unsigned)type, properties, (unsigned)r, handler ? (void *)*handler : nullptr, handler && *handler ? (*handler)->getMetaClass()->getClassName() : "-");
+    }
+    return r;
+}
+
+void *RedNaviAccel2::newDisplayPipe() {
+    void *p = IOGraphicsAccelerator2::newDisplayPipe();
+    rnNote("newDisplayPipe -> %p (family)", p);
+    if (!p) {
+        p = allocByName("newDisplayPipe", "IOAccelDisplayPipe");
+        rnNote("newDisplayPipe -> %p (IOAccelDisplayPipe by name)", p);
+    }
+    return p;
+}
+void *RedNaviAccel2::createDisplayPipe(IOFramebuffer *fb, unsigned int index) {
+    rnNote("createDisplayPipe(%p %s, %u)", (void *)fb, fb ? fb->getName() : "-", index);
+    void *r = IOGraphicsAccelerator2::createDisplayPipe(fb, index);
+    rnNote("createDisplayPipe -> %p", r);
+    return r;
 }
 
 void *RedNaviAccel2::getStampMemory(unsigned int *size) {
@@ -306,6 +397,7 @@ void *RedNaviAccel2::createKernelGPUTask() { return makeTask("createKernelGPUTas
 void *RedNaviAccel2::newDisplayMachine() {
     if (gStage < 2) { rnNote("newDisplayMachine called (stage %u: refused)", gStage); return nullptr; }
     RedNaviDisplayMachine *m = OSTypeAlloc(RedNaviDisplayMachine);
+    gMachine = m;
     rnNote("newDisplayMachine: RedNaviDisplayMachine size %u -> %p", (unsigned)sizeof(RedNaviDisplayMachine), (void *)m);
     return m;
 }

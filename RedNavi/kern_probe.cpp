@@ -2398,6 +2398,24 @@ public:
                 rc = kIOReturnSuccess;
             }
             break;
+        case RN_UC_FB_OVERRIDE: {
+            if (args->structureInputSize % 24 != 0 || args->structureInputSize > 24 * 16) break;
+            IOService *fb = nullptr;
+            if (OSIterator *it = gpuOwner->getClientIterator()) {
+                while (OSObject *o = it->getNextObject()) {
+                    IOService *c = OSDynamicCast(IOService, o);
+                    if (c && !strcmp(c->getMetaClass()->getClassName(), "RedNaviFB")) { fb = c; break; }
+                }
+                it->release();
+            }
+            if (!fb) { rc = kIOReturnNotFound; break; }
+            OSData *d = OSData::withBytes(args->structureInput, args->structureInputSize);
+            OSDictionary *dict = OSDictionary::withCapacity(1);
+            if (d && dict) { dict->setObject("attr-override", d); rc = fb->setProperties(dict); }
+            if (d) d->release();
+            if (dict) dict->release();
+            break;
+        }
         case RN_UC_QUEUE_RESET:
             if ((sized(args, 0, sizeof(rn_uc_reset_result)) || sized(args, sizeof(uint32_t), sizeof(rn_uc_reset_result))) && fenceIdx >= 0) {
                 const bool gfx = args->structureInputSize != 0 && *static_cast<const uint32_t *>(args->structureInput) == 1;   // the optional input names the queue: 1 graphics, otherwise compute
