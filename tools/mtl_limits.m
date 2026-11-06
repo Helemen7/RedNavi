@@ -63,6 +63,10 @@ int main(int argc, char **argv) {
             }
             free(ms);
         }
+        // GPU families (MTLGPUFamily raw values: Apple1-9 1001-1009, Mac1/2 2001/2002, Common1-3 3001-3003, MacCatalyst 4001/4002, Metal3 5001) and the macOS feature sets
+        for (NSInteger fam = 1001; fam <= 5002; fam++) { if (fam > 1010 && fam < 2001) fam = 2001; if (fam > 2002 && fam < 3001) fam = 3001; if (fam > 3003 && fam < 4001) fam = 4001; if (fam > 4002 && fam < 5001) fam = 5001;
+            printf("family %ld %d\n", (long)fam, (int)[dev supportsFamily:(MTLGPUFamily)fam]); }
+        for (NSUInteger fs = 10000; fs <= 10005; fs++) printf("featureSet %lu %d\n", (unsigned long)fs, (int)[dev supportsFeatureSet:(MTLFeatureSet)fs]);
         // buffer sizes and alignments
         const NSUInteger lens[] = {6144, 12288, 262144, 1};
         for (int i = 0; i < 4; i++) for (NSUInteger opt = 0; opt <= 0x10; opt += 0x10) {

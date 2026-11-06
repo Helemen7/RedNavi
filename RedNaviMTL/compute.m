@@ -38,7 +38,16 @@ static BOOL rn_gate(void) {
     dispatch_once(&once, ^{
         struct stat st;
         if (stat("/Users/Shared/rednavi-off", &st) == 0) { on = NO; return; }
-        on = getenv("RN_METAL_COMPUTE") != NULL || stat("/Users/Shared/rednavi-on", &st) == 0;
+        if (getenv("RN_METAL_COMPUTE") != NULL) { on = YES; return; }
+        // rednavi-on empty: every process; with lines in it: only the processes with these names (one per line), so a test can start with WindowServer alone
+        FILE *f = fopen("/Users/Shared/rednavi-on", "r");
+        if (!f) return;
+        char line[128], name[64]; extern const char *getprogname(void);
+        strlcpy(name, getprogname(), sizeof(name));
+        BOOL listed = NO, any = NO;
+        while (fgets(line, sizeof(line), f)) { line[strcspn(line, "\r\n")] = 0; if (!line[0]) continue; any = YES; if (!strcmp(line, name)) listed = YES; }
+        fclose(f);
+        on = !any || listed;
     });
     return on;
 }
@@ -1899,7 +1908,7 @@ void rn_compute_install(Class k, Class sup) {
         }), mfam ? method_getTypeEncoding(mfam) : "B24@0:8q16");
         class_addMethod(k, sfs, imp_implementationWithBlock(^BOOL(id self, NSInteger set) {
             if (!rn_gate()) return ofs ? ofs(self, sfs, set) : NO;
-            const BOOL yes = set >= 10000 && set <= 10005;                    // macOS GPUFamily1 v1 to v4, GPUFamily2 v1
+            const BOOL yes = set >= 10000 && set <= 10005 && set != 10002;     // as the real Intel GPU answers: macOS GPUFamily1 v1, v2, v4, GPUFamily2 v1, v2 (10002 is not one of them)
             rn_log("supportsFeatureSet: %ld -> %d", (long)set, yes);
             return yes;
         }), mfs ? method_getTypeEncoding(mfs) : "B24@0:8Q16");
