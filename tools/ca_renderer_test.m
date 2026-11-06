@@ -63,6 +63,7 @@ static void trace_install(id<MTLDevice> dev, id<MTLCommandQueue> q) {
     rn_hook(ec, @selector(drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:), ^(id self, MTLPrimitiveType ty, NSUInteger n, MTLIndexType it, id ib, NSUInteger io) {
         char hx[100] = ""; if (g_vb[1]) HEX((const uint8_t *)[(id<MTLBuffer>)g_vb[1] contents] + g_vo[1], 32, hx);
         printf("trace: drawIndexed count %lu, v1 %p+%lu: %s\n", (unsigned long)n, g_vb[1], (unsigned long)g_vo[1], hx);
+        if (g_vb[0]) for (int i = 0; i < 6; i++) if (g_vb[i] && i != 1) { char vx[200] = ""; HEX((const uint8_t *)[(id<MTLBuffer>)g_vb[i] contents] + g_vo[i], 48, vx); printf("trace:   v%d+%lu: %s\n", i, (unsigned long)g_vo[i], vx); }
         if (g_vb[0]) for (int i = 0; i < 10; i++) if (g_fb[i]) { char fx[200] = ""; HEX((const uint8_t *)[(id<MTLBuffer>)g_fb[i] contents] + g_fo[i], 64, fx); printf("trace:   f%d+%lu: %s\n", i, (unsigned long)g_fo[i], fx); }
         if (g_vb[1]) [g_draws addObject:@[g_vb[1], @(g_vo[1]), [NSData dataWithBytes:(const uint8_t *)[(id<MTLBuffer>)g_vb[1] contents] + g_vo[1] length:32], @(g_draws.count)]];
         ((void (*)(id, SEL, MTLPrimitiveType, NSUInteger, MTLIndexType, id, NSUInteger))oDI)(self, @selector(drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:), ty, n, it, ib, io);

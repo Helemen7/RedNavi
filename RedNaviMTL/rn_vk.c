@@ -61,6 +61,8 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     if (!dir) dir = rn_vk_dir();
     char path[1024];
     snprintf(path, sizeof(path), "%s/libvulkan_radeon.dylib", dir);
+    // RADV's on-disk shader cache returned wrong code for a pipeline compiled before (a QuartzCore scene drew differently on every run after the first, and right with the cache off): off.
+    setenv("MESA_SHADER_CACHE_DISABLE", "true", 0);
     rn_vk *vk = calloc(1, sizeof(*vk));
     if (!vk) return NULL;
     vk->lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);

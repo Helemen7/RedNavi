@@ -1567,12 +1567,24 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
         memset(&info, 0, sizeof(info));
         rn_air_const fcc[64];
         const unsigned nfc = rn_fc_array(fn[s]->fcs, fcc, 64);
+        if (getenv("RN_DUMP_SPV")) {                         // debugging: the specialized LLVM module next to the SPIR-V (the translator writes it where RN_AIR_DEBUG_LL says)
+            static unsigned llSeq;
+            setenv("RN_AIR_DEBUG_LL", [NSString stringWithFormat:@"%s/%02u_%s_%s.ll", getenv("RN_DUMP_SPV"), llSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String].UTF8String, 1);
+        }
         if (rn_air_translate_stage_fc(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
             break;
         }
         p->names[s] = fn[s]->name;
         p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
+        if (getenv("RN_SPV_OVERRIDE_DIR") || getenv("RN_DUMP_SPV")) {              // debugging: a module is known by the FNV-1a hash of its SPIR-V; a file <hash>.spv in the override directory replaces it
+            uint32_t h = 2166136261u; for (size_t b = 0; b < spvBytes; b++) h = (h ^ ((const uint8_t *)spv)[b]) * 16777619u;
+            if (getenv("RN_DUMP_SPV")) rn_log("spv hash %08x: %s %s (%lu bytes)", h, s ? "fragment" : "vertex", fn[s]->name.UTF8String, (unsigned long)spvBytes);
+            if (getenv("RN_SPV_OVERRIDE_DIR")) {
+                NSData *o = [NSData dataWithContentsOfFile:[NSString stringWithFormat:@"%s/%08x.spv", getenv("RN_SPV_OVERRIDE_DIR"), h]];
+                if (o) { p->spv[s] = o; rn_log("spv hash %08x replaced by the override file (%lu bytes)", h, (unsigned long)o.length); }
+            }
+        }
         if (getenv("RN_DUMP_SPV")) {                         // debugging: the SPIR-V of every translated stage, to read with spirv-dis
             static unsigned spvSeq;
             NSString *f = [NSString stringWithFormat:@"%s/%02u_%s_%s.spv", getenv("RN_DUMP_SPV"), spvSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String];
