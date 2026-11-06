@@ -358,8 +358,11 @@ static VkFormat vk_format(int f) {
 }
 
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) { return rn_vk_image_create3d(vk, format, w, h, 1); }
+static __thread const char *g_image_err = "";
+const char *rn_vk_image_last_error(void) { return g_image_err; }
 rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h, uint32_t d) {
     const unsigned texel = rn_vk_format_texel_bytes(format);
+    g_image_err = "bad size or format";
     if (!texel || !w || !h || !d) return NULL;
     rn_vk_image *im = calloc(1, sizeof(*im));
     if (!im) return NULL;
@@ -368,32 +371,32 @@ rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h,
     vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
     const VkFormatFeatureFlags f = fp.optimalTilingFeatures;
     const VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
-    if ((f & need) != need) goto fail;
+    if ((f & need) != need) { g_image_err = "format features"; goto fail; }
     im->storage = (f & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     im->color = d == 1 && (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;   // a 3D texture is never a render target here
     VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = d > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, d}, .mipLevels = 1, .arrayLayers = 1,
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                                 .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                              .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0)};
-    if (vk->CreateImage(vk->dev, &ici, NULL, &im->img) != VK_SUCCESS) goto fail;
+    if (vk->CreateImage(vk->dev, &ici, NULL, &im->img) != VK_SUCCESS) { g_image_err = "vkCreateImage"; goto fail; }
     VkMemoryRequirements mr;
     vk->GetImageMemoryRequirements(vk->dev, im->img, &mr);
     int mt = -1;
     for (uint32_t i = 0; i < vk->mp.memoryTypeCount; i++)
         if ((mr.memoryTypeBits & (1u << i)) && (vk->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { mt = (int)i; break; }
-    if (mt < 0) goto fail;
+    if (mt < 0) { g_image_err = "no device-local memory type"; goto fail; }
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
-    if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) goto fail;
-    if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) goto fail;
+    if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) { g_image_err = "vkAllocateMemory of the image (out of device memory?)"; goto fail; }
+    if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) { g_image_err = "vkBindImageMemory"; goto fail; }
     VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
                                  .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (format == RN_VK_A8) {                   // Metal's A8Unorm samples as (0, 0, 0, a); Vulkan has no such format, so the R8 view puts the texel in alpha. Not a render target (an attachment view must not swizzle).
         vci.components = (VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};
         im->color = 0;
     }
-    if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view) != VK_SUCCESS) goto fail;
+    if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view) != VK_SUCCESS) { g_image_err = "vkCreateImageView"; goto fail; }
     im->stage = rn_vk_buffer_create(vk, (size_t)w * h * d * texel);
-    if (!im->stage) goto fail;
+    if (!im->stage) { g_image_err = "the host copy of the image (buffer allocation failed)"; goto fail; }
     memset(rn_vk_buffer_contents(im->stage), 0, (size_t)w * h * d * texel);
     im->dirty = 1;                              // the zeroes reach the image at its first use
     return im;

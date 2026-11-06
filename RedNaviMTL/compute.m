@@ -54,6 +54,8 @@ static BOOL rn_gate(void) {
     return on;
 }
 
+static _Atomic long g_tex_live, g_tex_made; static _Atomic unsigned long g_tex_bytes;      // live textures and their bytes (the host copy and the image each take that much), for the log
+
 static rn_vk *rn_vk_shared(void) {
     static rn_vk *vk;
     static dispatch_once_t once;
@@ -169,6 +171,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     MTLTextureUsage usage_;
     NSString *label_;
     IOSurfaceRef surf;
+    BOOL counted_;
     uint32_t surfSeed;                            // the surface's seed when the image and the surface last agreed: an unchanged surface is not copied again
     NSUInteger surfPlane;                         // the plane of a multi-planar surface this texture shows (0 for the others)                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
     RedNaviMTLTexture *parent;                       // a texture view: the texture it is a view of (it shares its image, memory and host copy)
@@ -193,11 +196,12 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     const int f = rn_vk_format_of(desc.pixelFormat);
     rn_vk *vk = f ? rn_vk_shared() : NULL;
     img = vk ? rn_vk_image_create3d(vk, f, (uint32_t)desc.width, (uint32_t)desc.height, is3d ? (uint32_t)desc.depth : 1) : NULL;
-    if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat); return nil; }
+    if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported (%s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, f ? (vk ? rn_vk_image_last_error() : "RADV is not available") : "no Vulkan format for it"); return nil; }
     dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; self->d = is3d ? desc.depth : 1; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
+    counted_ = YES; atomic_fetch_add(&g_tex_live, 1); atomic_fetch_add(&g_tex_made, 1); atomic_fetch_add(&g_tex_bytes, (unsigned long)w * h * self->d * texel);
     return self;
 }
-- (void)dealloc { if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (surf) CFRelease(surf); }
+- (void)dealloc { if (counted_) { atomic_fetch_sub(&g_tex_live, 1); atomic_fetch_sub(&g_tex_bytes, (unsigned long)w * h * self->d * texel); } if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (surf) CFRelease(surf); }
 // IOSurface-backed textures (no host memory import in the kext, so a copy): the surface's rows are copied into the host copy of the image before the command buffer runs and, for
 // what the command buffer wrote, back afterwards. The surface's row pitch is its own; the host copy is packed.
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane {
@@ -1130,7 +1134,7 @@ static void rn_commit_stats(uint64_t ticks) {
     const uint64_t now = mach_absolute_time();
     if (!since) since = now;
     if ((now - since) * tb.numer / tb.denom > 5000000000ull) {
-        rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6);
+        rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst; textures alive %ld (%lu MB), made so far %ld", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6, (long)g_tex_live, (unsigned long)g_tex_bytes >> 20, (long)g_tex_made);
         sum = worst = count = 0; since = now;
     }
     os_unfair_lock_unlock(&lock);

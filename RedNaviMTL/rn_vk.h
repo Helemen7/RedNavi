@@ -17,6 +17,7 @@ typedef struct rn_vk_compute rn_vk_compute;
 rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen);
 // The directory the libraries are looked for in: $RN_VK_DIR, else /Library/Application Support/RedNavi/vk.
 const char *rn_vk_dir(void);
+const char *rn_vk_image_last_error(void);          // why the last rn_vk_image_create failed on this thread
 void rn_vk_close(rn_vk *vk);
 const char *rn_vk_device_name(const rn_vk *vk);
 

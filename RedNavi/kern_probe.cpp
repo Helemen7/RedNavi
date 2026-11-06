@@ -322,7 +322,7 @@ class RedNaviProbe : public IOService {
     uint64_t scanoutOff(uint32_t surface) const { return kRNScanoutVramOff + static_cast<uint64_t>(surface) * scanoutStride(); }
     uint32_t frontSurface {0};                     // the one the display was last told to scan out
     int present(uint32_t surface, bool wait);      // HUBP0 page flip at the next vertical blank; 0 ok, 1 still pending, <0 error                         // an alias of the display surface (fixed VRAM offset, never given back)
-    static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
+    static constexpr uint32_t kBoCap = 16384;             // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
     uint64_t boBytes {0};                                 // host memory wired for buffers now
@@ -1790,13 +1790,13 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
 class IOAccelRedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(IOAccelRedNaviClient)
-    static constexpr uint32_t kMaxHandles = 1024;
+    static constexpr uint32_t kMaxHandles = 8192;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
     int *boIdx {nullptr};                          // handle - 1 -> index in the probe's buffer table, -1 for a free handle
     uint32_t boUsed {0};
     struct Map { uint64_t va; uint64_t size; uint32_t handle; bool used; };
-    static constexpr uint32_t kMaxMaps = 2048;
+    static constexpr uint32_t kMaxMaps = 16384;
     Map *maps {nullptr};                           // what is mapped in this connection's address space
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
