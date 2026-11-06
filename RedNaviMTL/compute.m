@@ -29,7 +29,19 @@
 
 extern void rn_log(const char *fmt, ...);
 
-static BOOL rn_gate(void) { return getenv("RN_METAL_COMPUTE") != NULL; }
+// Which processes get the plug-in's queues, textures and the rest. Until now only the ones started with RN_METAL_COMPUTE in their environment, so WindowServer kept its software
+// compositor. The environment variable still works; for every process (WindowServer included) the files /Users/Shared/rednavi-on (switch it on) and /Users/Shared/rednavi-off (wins
+// over everything, the way back: it can be created over SSH without a password and is read at the next start of a process, or of the machine) decide. Both are looked at once per process.
+static BOOL rn_gate(void) {
+    static BOOL on;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        struct stat st;
+        if (stat("/Users/Shared/rednavi-off", &st) == 0) { on = NO; return; }
+        on = getenv("RN_METAL_COMPUTE") != NULL || stat("/Users/Shared/rednavi-on", &st) == 0;
+    });
+    return on;
+}
 
 static rn_vk *rn_vk_shared(void) {
     static rn_vk *vk;
