@@ -395,6 +395,7 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
                 break;
             }
             return [NSString stringWithFormat:@"no buffer bound at index %u", m];
+        case RN_AIR_COLOR_INPUT: break;                      // framebuffer fetch: the render target, set by the pass (runRenderPass)
         case RN_AIR_NULL_TEXTURE: {
             // a placeholder the translator adds for a texture that is absent in this variant: a texture of zeros of the dimension the shader declares (2D 1 x 1, or 3D 1 x 1 x 2), made once
             static rn_vk_image *nullImage[2];
@@ -1174,6 +1175,12 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
         bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
         if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps);
+        for (unsigned i = 0; !bad && i < p->n[1]; i++)                    // [[color(n)]] inputs read the pass's render target n
+            if ((p->kind[1][i] & 0xff) == RN_AIR_COLOR_INPUT) {
+                const unsigned m = p->mi[1][i];
+                if (m >= rp->nt) bad = [NSString stringWithFormat:@"the fragment function reads colour attachment %u, the pass has %u", m, rp->nt];
+                else fa[k][i].image = rp->tex[m]->img;
+            }
         for (unsigned i = 0; !bad && i < p->nvlayout; i++) {              // vertex buffers of the vertex descriptor, by buffer index
             const unsigned bi = p->vlayout[i].binding;
             if (d->bufs[0][bi]) { vbs[k][bi] = (rn_vk_vbuf){d->bufs[0][bi]->b, d->offs[0][bi]}; continue; }
@@ -1849,7 +1856,7 @@ void rn_compute_install(Class k, Class sup) {
         static const struct { const char *name; BOOL value; } caps[] = {
             {"supportsBufferlessClientStorageTexture", YES}, {"supportsExtendedXR10Formats", NO}, {"supportsMemorylessRenderTargets", NO}, {"supportsNativeHardwareFP16", NO},
             {"supportsRasterOrderGroups", NO}, {"supportsSIMDGroup", NO}, {"supportsSIMDReduction", NO}, {"supportsSIMDShuffleAndFill", NO}, {"supportsTileShaders", NO},
-            {"isFramebufferReadSupported", NO}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO},
+            {"isFramebufferReadSupported", YES}, {"supportsProgrammableBlending", YES}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO},
             // what a real device answers and RADV on Navi 32 can do too (tools/mtl_limits.m lists them): QuartzCore chooses data formats and shader variants from these
             {"supports32BitFloatFiltering", YES}, {"supportsFloat16InfNanFiltering", YES}, {"supportsTextureSwizzle", YES}, {"supportsQueryTextureLOD", YES}, {"supportsInt64", YES},
             {"supportsBaseVertexInstanceDrawing", YES}, {"supportsFragmentBufferWrites", YES}, {"supportsRenderTextureWrites", YES}, {"supportsExtendedVertexFormats", YES},

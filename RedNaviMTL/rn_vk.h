@@ -59,7 +59,7 @@ void rn_vk_sampler_destroy(rn_vk *vk, rn_vk_sampler *s);
 // the AIR translator emits) and a pipeline is built for each local size that is dispatched; without it the module's own local size is used. specialize_local_size 2: the
 // translator's threads-dynamic kernels, which also take 48 bytes of push constants (push_bytes) per dispatch region and are run with rn_vk_dispatch_threads.
 #define RN_VK_MAX_BINDINGS 32
-enum { RN_VK_BUFFER = 0, RN_VK_SAMPLED_IMAGE = 1, RN_VK_STORAGE_IMAGE = 2, RN_VK_SAMPLER = 3, RN_VK_STATIC_SAMPLER = 4 };    // the numbers of rn_air.h
+enum { RN_VK_BUFFER = 0, RN_VK_SAMPLED_IMAGE = 1, RN_VK_STORAGE_IMAGE = 2, RN_VK_SAMPLER = 3, RN_VK_STATIC_SAMPLER = 4, RN_VK_INPUT_ATTACHMENT = 6 };    // the numbers of rn_air.h
 typedef struct { uint32_t binding; uint32_t writable; uint32_t kind; const rn_vk_sampler_desc *sampler; } rn_vk_binding;   // sampler: for RN_VK_STATIC_SAMPLER
 rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t bytes, unsigned nbind, const rn_vk_binding *binds, unsigned push_bytes, int specialize_local_size);
 void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c);

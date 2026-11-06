@@ -35,7 +35,7 @@ typedef struct {
     uint32_t min_filter, mag_filter, mip_filter, address[3], pixel_coords, border;
     float lod_min, lod_max;
 } rn_air_binding;
-enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3, RN_AIR_STATIC_SAMPLER = 4, RN_AIR_NULL_TEXTURE = 5 };   // 5: a texture the translator adds where the real one is absent in this variant: the plug-in binds a 1 x 1 texture
+enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3, RN_AIR_STATIC_SAMPLER = 4, RN_AIR_NULL_TEXTURE = 5, RN_AIR_COLOR_INPUT = 6 };   // 5: a texture the translator adds where the real one is absent in this variant: the plug-in binds a 1 x 1 texture; 6: a [[color(n)]] framebuffer-fetch input (metal_index n): an input attachment of the fragment stage, descriptor set 3, the plug-in binds render target n
 
 typedef struct {
     uint32_t binding_count;

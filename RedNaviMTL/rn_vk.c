@@ -208,6 +208,7 @@ static VkDescriptorType desc_type(unsigned kind) {
     switch (kind) {
     case RN_VK_SAMPLED_IMAGE: return VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     case RN_VK_STORAGE_IMAGE: return VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    case RN_VK_INPUT_ATTACHMENT: return VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT;
     case RN_VK_SAMPLER: case RN_VK_STATIC_SAMPLER: return VK_DESCRIPTOR_TYPE_SAMPLER;
     default: return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     }
@@ -416,7 +417,7 @@ typedef struct { uint32_t local[3], groups[3], pc[12]; } region;
 
 // Fills the descriptor writes of one set from the resources of a dispatch or a draw. Every image goes into `in` (it must be current on the card before the work), the ones the shader
 // may write into `out` (copied back afterwards). 0, or 4 (buffer offset) or 6 (resource missing or unusable).
-static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsigned *binds, const VkSampler *statics, const rn_vk_arg *args, VkDescriptorSet set, VkDescriptorBufferInfo *bi,
+static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsigned *binds, const VkSampler *statics, const rn_vk_arg *args, VkDescriptorSet set, VkDescriptorSet inset, VkDescriptorBufferInfo *bi,
                        VkDescriptorImageInfo *ii, VkWriteDescriptorSet *w, rn_vk_image **in, unsigned *nin, rn_vk_image **out, unsigned *nout) {
     for (unsigned i = 0; i < n; i++) {
         w[i] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = binds[i], .descriptorCount = 1, .descriptorType = desc_type(kinds[i])};
@@ -435,6 +436,12 @@ static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsig
             w[i].pImageInfo = &ii[i];
             in[(*nin)++] = a->image;
             if (kinds[i] == RN_VK_STORAGE_IMAGE) out[(*nout)++] = a->image;
+            break;
+        case RN_VK_INPUT_ATTACHMENT:                              // framebuffer fetch: the render target itself (already part of the pass), in the input attachment set
+            if (!a->image || !inset) return 6;
+            w[i].dstSet = inset;
+            ii[i] = (VkDescriptorImageInfo){.imageView = a->image->view, .imageLayout = VK_IMAGE_LAYOUT_GENERAL};
+            w[i].pImageInfo = &ii[i];
             break;
         case RN_VK_SAMPLER:
             if (!a->sampler) return 6;
@@ -495,7 +502,7 @@ static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, 
     VkWriteDescriptorSet w[RN_VK_MAX_BINDINGS];
     rn_vk_image *up[RN_VK_MAX_BINDINGS], *down[RN_VK_MAX_BINDINGS];
     unsigned nup = 0, ndown = 0;
-    int fr = fill_writes(vk, c->nbind, c->kinds, c->binds, c->statics, args, c->ds, bi, ii, w, up, &nup, down, &ndown);
+    int fr = fill_writes(vk, c->nbind, c->kinds, c->binds, c->statics, args, c->ds, VK_NULL_HANDLE, bi, ii, w, up, &nup, down, &ndown);
     if (fr) return fr;
     VkPipeline pipes[8];
     if (nregs > 8) return 5;
@@ -572,7 +579,8 @@ int rn_vk_dispatch_threads(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, c
 
 struct rn_vk_render {
     VkShaderModule vs, fs;
-    VkDescriptorSetLayout dsl[2];
+    VkDescriptorSetLayout dsl[2], dsl_empty, dsl_in;     // the pipeline layout has four sets: vertex 0, fragment 1, none 2, input attachments 3 (the translator's own set for [[color(n)]])
+    unsigned n_in;                                       // input attachment bindings of the fragment stage (framebuffer fetch)
     VkPipelineLayout pl;
     VkRenderPass rp;
     VkPipeline pipe;
@@ -587,11 +595,13 @@ struct rn_vk_render {
 static int make_layout(rn_vk *vk, unsigned n, const rn_vk_binding *binds, VkShaderStageFlags stage, unsigned *kinds, unsigned *bn, VkSampler *statics, uint32_t count[4], VkDescriptorSetLayout *out) {
     if (n > RN_VK_MAX_BINDINGS) return 0;
     VkDescriptorSetLayoutBinding b[RN_VK_MAX_BINDINGS];
+    unsigned nb = 0;
     for (unsigned i = 0; i < n; i++) {
         kinds[i] = binds[i].kind;
         bn[i] = binds[i].binding;
+        if (binds[i].kind == RN_VK_INPUT_ATTACHMENT) continue;          // lives in set 3, see rn_vk_render_create
         const VkDescriptorType t = desc_type(binds[i].kind);
-        b[i] = (VkDescriptorSetLayoutBinding){.binding = binds[i].binding, .descriptorType = t, .descriptorCount = 1, .stageFlags = stage};
+        b[nb++] = (VkDescriptorSetLayoutBinding){.binding = binds[i].binding, .descriptorType = t, .descriptorCount = 1, .stageFlags = stage};
         count[t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ? 0 : t == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ? 1 : t == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? 2 : 3]++;
         if (binds[i].kind == RN_VK_STATIC_SAMPLER) {
             if (!binds[i].sampler) return 0;
@@ -599,7 +609,7 @@ static int make_layout(rn_vk *vk, unsigned n, const rn_vk_binding *binds, VkShad
             if (vk->CreateSampler(vk->dev, &si, NULL, &statics[i]) != VK_SUCCESS) return 0;
         }
     }
-    VkDescriptorSetLayoutCreateInfo dsl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = n, .pBindings = n ? b : NULL};
+    VkDescriptorSetLayoutCreateInfo dsl = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = nb, .pBindings = nb ? b : NULL};
     return vk->CreateDescriptorSetLayout(vk->dev, &dsl, NULL, out) == VK_SUCCESS;
 }
 
@@ -618,7 +628,18 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
     r->n[0] = d->nvbind; r->n[1] = d->nfbind;
     if (!make_layout(vk, d->nvbind, d->vbinds, VK_SHADER_STAGE_VERTEX_BIT, r->kinds[0], r->binds[0], r->statics[0], count, &r->dsl[0])) goto fail;
     if (!make_layout(vk, d->nfbind, d->fbinds, VK_SHADER_STAGE_FRAGMENT_BIT, r->kinds[1], r->binds[1], r->statics[1], count, &r->dsl[1])) goto fail;
-    VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 2, .pSetLayouts = r->dsl};
+    {   // sets 2 (empty) and 3 (the input attachments of a framebuffer-fetch fragment shader, bindings as the translator numbers them)
+        VkDescriptorSetLayoutBinding ib[RN_VK_MAX_BINDINGS];
+        unsigned ni = 0;
+        for (unsigned i = 0; i < d->nfbind; i++)
+            if (d->fbinds[i].kind == RN_VK_INPUT_ATTACHMENT) ib[ni++] = (VkDescriptorSetLayoutBinding){.binding = d->fbinds[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT};
+        r->n_in = ni;
+        VkDescriptorSetLayoutCreateInfo e = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO}, in = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = ni, .pBindings = ni ? ib : NULL};
+        if (vk->CreateDescriptorSetLayout(vk->dev, &e, NULL, &r->dsl_empty) != VK_SUCCESS) goto fail;
+        if (vk->CreateDescriptorSetLayout(vk->dev, &in, NULL, &r->dsl_in) != VK_SUCCESS) goto fail;
+    }
+    VkDescriptorSetLayout all[4] = {r->dsl[0], r->dsl[1], r->dsl_empty, r->dsl_in};
+    VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 4, .pSetLayouts = all};
     if (vk->CreatePipelineLayout(vk->dev, &plci, NULL, &r->pl) != VK_SUCCESS) goto fail;
     // The pass the pipeline is made for: every attachment is loaded and stored and stays in GENERAL (clears are done by the caller before the pass).
     VkAttachmentDescription att[8];
@@ -635,8 +656,11 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
         cba[i] = (VkPipelineColorBlendAttachmentState){.blendEnable = bl->enabled ? VK_TRUE : VK_FALSE, .srcColorBlendFactor = bl->src_rgb, .dstColorBlendFactor = bl->dst_rgb, .colorBlendOp = bl->op_rgb,
                                                        .srcAlphaBlendFactor = bl->src_a, .dstAlphaBlendFactor = bl->dst_a, .alphaBlendOp = bl->op_a, .colorWriteMask = bl->write_mask};
     }
-    VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .colorAttachmentCount = r->nt, .pColorAttachments = ref};
-    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub};
+    // every colour attachment is also an input attachment (framebuffer fetch), with a self dependency so a draw sees what the earlier draws of the pass wrote at the same pixel
+    VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = r->nt, .pInputAttachments = ref, .colorAttachmentCount = r->nt, .pColorAttachments = ref};
+    VkSubpassDependency selfdep = {.srcSubpass = 0, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                   .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT};
+    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 1, .pDependencies = &selfdep};
     if (vk->CreateRenderPass(vk->dev, &rpi, NULL, &r->rp) != VK_SUCCESS) goto fail;
     static const VkPrimitiveTopology topo[5] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
@@ -681,6 +705,8 @@ void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r) {
         for (unsigned i = 0; i < r->n[s]; i++) if (r->statics[s][i]) vk->DestroySampler(vk->dev, r->statics[s][i], NULL);
         if (r->dsl[s]) vk->DestroyDescriptorSetLayout(vk->dev, r->dsl[s], NULL);
     }
+    if (r->dsl_empty) vk->DestroyDescriptorSetLayout(vk->dev, r->dsl_empty, NULL);
+    if (r->dsl_in) vk->DestroyDescriptorSetLayout(vk->dev, r->dsl_in, NULL);
     if (r->vs) vk->DestroyShaderModule(vk->dev, r->vs, NULL);
     if (r->fs) vk->DestroyShaderModule(vk->dev, r->fs, NULL);
     free(r);
@@ -770,7 +796,7 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     VkFramebuffer fb = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     VkCommandBuffer cb = VK_NULL_HANDLE;
-    VkDescriptorSet *sets = calloc(2 * (size_t)nd, sizeof(*sets));
+    VkDescriptorSet *sets = calloc(3 * (size_t)nd, sizeof(*sets));      // per draw: vertex, fragment, input attachments
     rn_vk_image **in = calloc(8 + (size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*in));
     rn_vk_image **out = calloc(8 + (size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*out));
     VkWriteDescriptorSet *w = calloc((size_t)nd * 2 * RN_VK_MAX_BINDINGS, sizeof(*w));
@@ -780,28 +806,32 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     unsigned nin = 0, nout = 0, nw = 0;
     for (unsigned i = 0; i < nt; i++) { in[nin++] = targets[i].image; if (!targets[i].discard) out[nout++] = targets[i].image; }
     // descriptor pool for every set of every draw (a set is written when the commands are recorded, so draws must not share one)
-    uint32_t cnt[4] = {0, 0, 0, 0};
+    uint32_t cnt[5] = {0, 0, 0, 0, 0};
     for (unsigned d = 0; d < nd; d++)
         for (int s = 0; s < 2; s++)
             for (unsigned i = 0; i < draws[d].pipe->n[s]; i++) {
                 const unsigned k = draws[d].pipe->kinds[s][i];
-                cnt[k == RN_VK_BUFFER ? 0 : k == RN_VK_SAMPLED_IMAGE ? 1 : k == RN_VK_STORAGE_IMAGE ? 2 : 3]++;
+                cnt[k == RN_VK_BUFFER ? 0 : k == RN_VK_SAMPLED_IMAGE ? 1 : k == RN_VK_STORAGE_IMAGE ? 2 : k == RN_VK_INPUT_ATTACHMENT ? 4 : 3]++;
             }
-    VkDescriptorPoolSize ps[4];
-    static const VkDescriptorType ty[4] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER};
+    VkDescriptorPoolSize ps[5];
+    static const VkDescriptorType ty[5] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT};
     uint32_t nps = 0;
-    for (int k = 0; k < 4; k++) if (cnt[k]) ps[nps++] = (VkDescriptorPoolSize){ty[k], cnt[k]};
-    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 2 * nd, .poolSizeCount = nps, .pPoolSizes = nps ? ps : NULL};
+    for (int k = 0; k < 5; k++) if (cnt[k]) ps[nps++] = (VkDescriptorPoolSize){ty[k], cnt[k]};
+    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 3 * nd, .poolSizeCount = nps, .pPoolSizes = nps ? ps : NULL};
     if (vk->CreateDescriptorPool(vk->dev, &dpi, NULL, &pool) != VK_SUCCESS) goto done;
     for (unsigned d = 0; d < nd; d++) {
+        const rn_vk_render *p = draws[d].pipe;
+        if (p->n_in) {
+            VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl_in};
+            if (vk->AllocateDescriptorSets(vk->dev, &dsa, &sets[3 * d + 2]) != VK_SUCCESS) goto done;
+        }
         for (int s = 0; s < 2; s++) {
-            const rn_vk_render *p = draws[d].pipe;
             VkDescriptorSetAllocateInfo dsa = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = pool, .descriptorSetCount = 1, .pSetLayouts = &p->dsl[s]};
-            if (vk->AllocateDescriptorSets(vk->dev, &dsa, &sets[2 * d + s]) != VK_SUCCESS) goto done;
+            if (vk->AllocateDescriptorSets(vk->dev, &dsa, &sets[3 * d + s]) != VK_SUCCESS) goto done;
             if (!p->n[s]) continue;
             const rn_vk_arg *args = s ? draws[d].fargs : draws[d].vargs;
             if (!args) { rc = 6; goto done; }
-            const int fr = fill_writes(vk, p->n[s], p->kinds[s], p->binds[s], p->statics[s], args, sets[2 * d + s], bi + nw, ii + nw, w + nw, in, &nin, out, &nout);
+            const int fr = fill_writes(vk, p->n[s], p->kinds[s], p->binds[s], p->statics[s], args, sets[3 * d + s], sets[3 * d + 2], bi + nw, ii + nw, w + nw, in, &nin, out, &nout);
             if (fr) { rc = fr; goto done; }
             nw += p->n[s];
         }
@@ -849,7 +879,14 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         }
         prevFeedback = feedback;
         vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pipe);
-        vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 0, 2, &sets[2 * d], 0, NULL);
+        vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 0, 2, &sets[3 * d], 0, NULL);
+        if (dr->pipe->n_in) {                           // framebuffer fetch: the earlier draws' colour writes at this pixel are made visible to the input attachment read (same-subpass self dependency)
+            if (d) {
+                VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT};
+                vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+            }
+            vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 3, 1, &sets[3 * d + 2], 0, NULL);
+        }
         // Metal's clip space is y-up, Vulkan's y-down: the viewport is flipped (origin at the bottom, negative height)
         const double *v = dr->viewport;
         VkViewport vp = dr->has_viewport ? (VkViewport){(float)v[0], (float)(v[1] + v[3]), (float)v[2], (float)-v[3], (float)v[4], (float)v[5]} : (VkViewport){0, (float)H, (float)W, -(float)H, 0.0f, 1.0f};
