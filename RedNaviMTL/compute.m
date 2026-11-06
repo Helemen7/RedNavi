@@ -1439,6 +1439,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 @implementation RedNaviMTLLibrary
 + (void)load { class_addProtocol(self, @protocol(MTLLibrary)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d data:(NSData *)blob error:(NSError **)error {
+    if (error) *error = nil;                         // callers (CoreDisplay) leave it uninitialised and read it after a success
     if (!(self = [super init])) return nil;
     rn_mtl_func fn[512];
     unsigned cnt = 0;
@@ -1491,6 +1492,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     return (id)c;
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues error:(NSError **)error {
+    if (error) *error = nil;                         // CoreDisplay leaves it uninitialised and tests it after a success: a stale value crashed WindowServer
     RedNaviMTLFunction *c = (RedNaviMTLFunction *)[self newFunctionWithName:functionName];
     if (!c) { if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorFunctionNotFound userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Function %@ was not found in the library", functionName]}]; return nil; }
     NSString *why = nil;
@@ -1507,6 +1509,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     return (id)c;
 }
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error {
+    if (error) *error = nil;
     if (descriptor.binaryArchives.count || descriptor.options) rn_log("newFunctionWithDescriptor: binary archives and options are ignored");
     if (descriptor.specializedName) rn_log("newFunctionWithDescriptor: specializedName is ignored");
     return [self newFunctionWithName:descriptor.name constantValues:descriptor.constantValues error:error];
@@ -1525,6 +1528,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 
 // A compute pipeline state from a function of a library: the function's bitcode goes to the translator (rn_air.h), the SPIR-V to RADV.
 static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
+    if (error) *error = nil;
     RedNaviMTLFunction *f = (RedNaviMTLFunction *)fobj;
     NSString *why = nil;
     if (![f isKindOfClass:[RedNaviMTLFunction class]]) why = @"the function is not from a RedNavi library";
@@ -1572,6 +1576,7 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
 
 // A render pipeline state from a descriptor: both functions go to the translator (vertex module in set 0, fragment module in set 1) and the Vulkan pipeline for triangles is built.
 static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error) {
+    if (error) *error = nil;
     NSString *why = nil;
     RedNaviMTLFunction *fn[2] = {(RedNaviMTLFunction *)desc.vertexFunction, (RedNaviMTLFunction *)desc.fragmentFunction};
     rn_vk *vk = rn_vk_shared();
@@ -1993,6 +1998,7 @@ void rn_compute_install(Class k, Class sup) {
         typedef uintptr_t (*imp_url_err)(id, SEL, id, NSError **);
         typedef uintptr_t (*imp_noerr)(id, SEL);
         static uintptr_t (^load_file)(id, NSString *, NSError **) = ^uintptr_t(id self, NSString *path, NSError **error) {
+            if (error) *error = nil;
             NSData *blob = path ? [NSData dataWithContentsOfFile:path] : nil;
             if (!blob) {
                 rn_log("library from %s: cannot read the file", path.UTF8String);
