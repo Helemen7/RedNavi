@@ -288,10 +288,26 @@ public:
         return kIOReturnSuccess;
     }
 
+    // IOFramebuffer.h: a subclass calls handleEvent when it changes power state, kIOFBNotifyWillPowerOff before it leaves the maximum state and kIOFBNotifyDidPowerOn after it enters it; that is
+    // what tells the accelerator's display machine the framebuffer is on. Boot-arg rednavi_fb_notify=1.
+    static bool notifyOn() { static uint32_t v = 0, rd = 0; if (!rd) { rd = 1; PE_parse_boot_argn("rednavi_fb_notify", &v, sizeof(v)); } return v != 0; }
+    uint32_t notifySent {0};
+    void notePower(const char *what, IOReturn r) {
+        OSString *str = OSString::withCString(what);
+        OSNumber *rn = OSNumber::withNumber(static_cast<uint64_t>(static_cast<uint32_t>(r)), 32);
+        char key[24]; snprintf(key, sizeof(key), "notify-%u", notifySent++);
+        if (str && notifySent < 8) setProperty(key, str);
+        if (rn) setProperty("notify-last-result", rn);
+        if (str) str->release();
+        if (rn) rn->release();
+    }
+
     IOReturn setAttribute(IOSelect attr, uintptr_t value) APPLE_KEXT_OVERRIDE {
         note(1, attr);
+        if (attr == kIOPowerAttribute && notifyOn() && value == 0) notePower("WillPowerOff (powr 0)", handleEvent(kIOFBNotifyWillPowerOff));
         const AttrRec *ov = overrideFor(1, attr);
         IOReturn r = ov ? static_cast<IOReturn>(ov->result) : IOFramebuffer::setAttribute(attr, value);
+        if (attr == kIOPowerAttribute && notifyOn() && value != 0) notePower("DidPowerOn (powr)", handleEvent(kIOFBNotifyDidPowerOn));
         record(1, attr, r, value);
         return r;
     }
@@ -359,6 +375,14 @@ public:
                 // Power: a framebuffer at power state 0 never tells the accelerator's display machine it is on ("isFramebufferActive" false: the display pipe is inactive and
                 // WindowServer's request for it, client type 4, is refused). A real framebuffer sits at its top state (2). The state is published and, while it is not 2, raised
                 // (rednavi_fb_pm=0 leaves it alone).
+                if (notifyOn()) {
+                    static uint32_t ticks = 0;
+                    ticks++;
+                    if (ticks == 45 || ticks == 130) {     // after the accelerator's display machine has started (about 20 s after boot); the second one after its registration (90 s later)
+                        self->notePower("WillPowerOn (timer)", self->handleEvent(kIOFBNotifyWillPowerOn));
+                        self->notePower("DidPowerOn (timer)", self->handleEvent(kIOFBNotifyDidPowerOn));
+                    }
+                }
                 const uint32_t pm = static_cast<uint32_t>(self->getPowerState());
                 OSNumber *pn = OSNumber::withNumber(pm, 32);
                 if (pn) { self->setProperty("pm-state", pn); pn->release(); }
@@ -410,6 +434,11 @@ public:
         info->refreshRate = m.refresh << 16;
         info->maxDepthIndex = 0;
         info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (mode == 1 ? kDisplayModeDefaultFlag : 0);
+        // Experiment (boot-arg rednavi_fb_accbacked=1): a mode the accelerator scans out carries kDisplayModeAcceleratorBackedFlag (IOGraphicsTypes.h); the accelerator's display machine
+        // says "framebuffer active" (and its pipe accepts transactions) only for such a mode, if the guess of 2026-11-07 holds. Neither Intel's registry entry nor ours had it.
+        static uint32_t accBacked = 0, accRead = 0;
+        if (!accRead) { accRead = 1; PE_parse_boot_argn("rednavi_fb_accbacked", &accBacked, sizeof(accBacked)); }
+        if (accBacked) info->flags |= kDisplayModeAcceleratorBackedFlag;
         return kIOReturnSuccess;
     }
 

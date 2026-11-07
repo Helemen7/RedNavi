@@ -19,6 +19,7 @@
 #include "../RedNaviAccel/IOGraphicsAccelerator2.h"
 #include "IOAccelEventMachineFast2.h"
 #include "IOAccelDisplayMachine.h"
+#include "IOAccelDisplayPipe.h"
 #include "IOAccelClasses.h"
 #include <IOKit/IORangeAllocator.h>
 #include "IOAccelTask.h"
@@ -171,6 +172,38 @@ public:
     bool init(OSDictionary *, task_t);
 };
 
+// The display pipe of this driver, as the real AMD pipe is built (AMDRadeonX5000_AMDAccelDisplayPipe derives from IOAccelDisplayPipe and redefines init, the framebuffer resource,
+// the transaction interrupts and validate/perform/isTransactionComplete/submitTransaction, per tools/accel_vtable.py). First step: init and initFramebufferResource, logged; the rest is the
+// family's. Boot-arg rednavi_accel2_pipe_class=1 makes newDisplayPipe hand this class to the family; rednavi_accel2_pipe_nores=1 makes initFramebufferResource not register a resource
+// (what the family gets today is a stub IOAccelResource2, 384 bytes, which is not a scanout buffer).
+class RedNaviDisplayPipe : public IOAccelDisplayPipe {
+    OSDeclareDefaultStructors(RedNaviDisplayPipe)
+public:
+    bool init(IOGraphicsAccelerator2 *accel, IOAccelDisplayMachine *machine, IOFramebuffer *fb, unsigned int index) override;
+    long initFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
+    long destroyFramebufferResource(unsigned int index, IOAccelResource2 *res) override;
+    virtual void rnPadP0(); virtual void rnPadP1(); virtual void rnPadP2(); virtual void rnPadP3();
+};
+static_assert(sizeof(RedNaviDisplayPipe) == 792, "IOAccelDisplayPipe is 792 bytes in the registry");
+OSDefineMetaClassAndStructors(RedNaviDisplayPipe, IOAccelDisplayPipe)
+void RedNaviDisplayPipe::rnPadP0() {} void RedNaviDisplayPipe::rnPadP1() {} void RedNaviDisplayPipe::rnPadP2() {} void RedNaviDisplayPipe::rnPadP3() {}
+bool RedNaviDisplayPipe::init(IOGraphicsAccelerator2 *accel, IOAccelDisplayMachine *machine, IOFramebuffer *fb, unsigned int index) {
+    bool ok = IOAccelDisplayPipe::init(accel, machine, fb, index);
+    rnNote("RedNaviDisplayPipe::init(%p, %p, %p, %u) -> %d", (void *)accel, (void *)machine, (void *)fb, index, ok);
+    return ok;
+}
+long RedNaviDisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res) {
+    uint32_t nores = 0;
+    PE_parse_boot_argn("rednavi_accel2_pipe_nores", &nores, sizeof(nores));
+    rnNote("RedNaviDisplayPipe::initFramebufferResource(%u, %p), %s", index, (void *)res, nores ? "no resource registered" : "family registers it");
+    if (nores) return 0;
+    return IOAccelDisplayPipe::initFramebufferResource(index, res);
+}
+long RedNaviDisplayPipe::destroyFramebufferResource(unsigned int index, IOAccelResource2 *res) {
+    rnNote("RedNaviDisplayPipe::destroyFramebufferResource(%u, %p)", index, (void *)res);
+    return IOAccelDisplayPipe::destroyFramebufferResource(index, res);
+}
+
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
     void *allocByName(const char *hook, const char *cls);
@@ -181,9 +214,8 @@ class RedNaviAccel2 : public IOGraphicsAccelerator2 {
         rnNote("%s: %u bytes -> %p", hook, (unsigned)sizeof(T), (void *)o);
         return o;
     }
-    void dumpWords(const char *what, const void *p, uint32_t bytes);
-
 public:
+    void dumpWords(const char *what, const void *p, uint32_t bytes);
     IOService *probe(IOService *provider, SInt32 *score) APPLE_KEXT_OVERRIDE;
     bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
     // The display pipe (docs/M6_ACCELERATOR_STUDY.md, section 3): WindowServer opens client type 4 of the accelerator and the family answers kIOReturnUnsupported when no pipe exists for the framebuffer.
@@ -293,8 +325,33 @@ bool RedNaviAccel2::start(IOService *provider) {
         uint32_t pipe = 1;
         PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
         if (pipe && gMachine) {
+            RedNaviAccel2 *self = static_cast<RedNaviAccel2 *>(gSelf);
+            rnNote("display machine before: framebuffers %u, active(0) %d, deferred(0) %d", gMachine->getFramebufferCount(), gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
             gMachine->framebuffer_did_power_on(0);
             rnNote("framebuffer_did_power_on(0) told to the display machine %p", (void *)gMachine);
+            rnNote("display machine after: active(0) %d, deferred(0) %d", gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
+            // The pipe has its own hooks for the same event (IOAccelDisplayPipe virtual slots 304 framebuffer_did_power_on and 292 didPowerOn, docs/M6_ACCEL_ABI.md); the call goes through
+            // the vtable because the class is not declared here.
+            // Experiment (boot-arg rednavi_accel2_wsaa=1): the machine's own WindowServer-active transitions, in the order a framebuffer goes accelerated, the activity read after each.
+            uint32_t wsaa = 0;
+            PE_parse_boot_argn("rednavi_accel2_wsaa", &wsaa, sizeof(wsaa));
+            if (wsaa) {
+                for (int arg = 1; arg >= 0; arg--) {
+                    gMachine->wsaa_will_enter_defer(0, arg);  rnNote("wsaa_will_enter_defer(0,%d): active %d deferred %d", arg, gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
+                    gMachine->wsaa_did_enter_defer(0, arg);   rnNote("wsaa_did_enter_defer(0,%d): active %d deferred %d", arg, gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
+                    gMachine->wsaa_will_exit_defer(0, arg);   rnNote("wsaa_will_exit_defer(0,%d): active %d deferred %d", arg, gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
+                    gMachine->wsaa_did_exit_defer(0, arg);    rnNote("wsaa_did_exit_defer(0,%d): active %d deferred %d", arg, gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
+                }
+            }
+            IOAccelDisplayPipe *p = gMachine->getDisplayPipe(0);
+            rnNote("display pipe %p: machine active(0) %d", (void *)p, gMachine->isFramebufferActive(0));
+            if (p) {
+                void **vt = *reinterpret_cast<void ***>(p);
+                reinterpret_cast<void (*)(void *)>(vt[304])(p);
+                rnNote("after pipe framebuffer_did_power_on: machine active(0) %d", gMachine->isFramebufferActive(0));
+                reinterpret_cast<void (*)(void *)>(vt[292])(p);
+                rnNote("after pipe didPowerOn: machine active(0) %d", gMachine->isFramebufferActive(0));
+            }
         }
     }, nullptr);
     uint64_t deadline;
@@ -326,6 +383,13 @@ IOReturn RedNaviAccel2::newUserClient(task_t owningTask, void *securityID, UInt3
                 rnNote("display pipe client: attach -> %d", ok);
                 ok = ok && uc->start(this);
                 rnNote("display pipe client: start -> %d", ok);
+                rnNote("display pipe client: retain count %d", uc->getRetainCount());
+                // The kernel panicked when WindowServer died and the client was stopped: "A kext releasing a(n) IOAccelDisplayPipeUserClient2 has corrupted the registry" (OSObject.cpp:224,
+                // IOService::actionStop, 2026-11-07): the family's stop releases the client once more than this hand-over leaves it holding. One extra retain here (a leak of one object per
+                // open, the price of an experiment) tells whether that is the difference; rednavi_accel2_pipe_retain=0 leaves it out.
+                uint32_t extra = 1;
+                PE_parse_boot_argn("rednavi_accel2_pipe_retain", &extra, sizeof(extra));
+                if (ok && extra) uc->retain();
                 if (ok) { *handler = uc; r = kIOReturnSuccess; }
                 else { uc->detach(this); uc->release(); r = kIOReturnError; }
             } else if (o) o->release();
@@ -341,8 +405,28 @@ IOReturn RedNaviAccel2::newUserClient(task_t owningTask, void *securityID, UInt3
 }
 
 void *RedNaviAccel2::newDisplayPipe() {
+    // Boot-arg rednavi_accel2_legacy_pipe=1 hands the family an IOAccelLegacyDisplayPipe (896 bytes, a family class: the scanout and "accelerator backed" side of the pipe) instead of what the
+    // family's own newDisplayPipe makes; the class of what it makes is logged. The measurement of 2026-11-07: the family stores the accelerator at +0x88, the display machine at +0x90
+    // and the framebuffer at +0x98 of whichever pipe it is given. The family's own factory is NOT called when the legacy pipe is asked for and the object it makes is never released here:
+    // an uninitialised pipe panics in IOAccelDisplayPipe::free (releaseLiveTransaction reads a null member; the first version of this did that, 2026-11-07).
+    uint32_t ours = 0;
+    PE_parse_boot_argn("rednavi_accel2_pipe_class", &ours, sizeof(ours));
+    if (ours) {
+        RedNaviDisplayPipe *rp = OSTypeAlloc(RedNaviDisplayPipe);
+        rnNote("newDisplayPipe -> %p (RedNaviDisplayPipe, %u bytes)", (void *)rp, (unsigned)sizeof(RedNaviDisplayPipe));
+        return rp;
+    }
+    uint32_t legacy = 0;
+    PE_parse_boot_argn("rednavi_accel2_legacy_pipe", &legacy, sizeof(legacy));
+    if (legacy) {
+        void *p = allocByName("newDisplayPipe", "IOAccelLegacyDisplayPipe");
+        OSObject *po = static_cast<OSObject *>(p);
+        rnNote("newDisplayPipe -> %p (IOAccelLegacyDisplayPipe by name), class %s", p, po ? po->getMetaClass()->getClassName() : "-");
+        return p;
+    }
     void *p = IOGraphicsAccelerator2::newDisplayPipe();
-    rnNote("newDisplayPipe -> %p (family)", p);
+    OSObject *po = static_cast<OSObject *>(p);
+    rnNote("newDisplayPipe -> %p (family), class %s", p, po ? po->getMetaClass()->getClassName() : "-");
     if (!p) {
         p = allocByName("newDisplayPipe", "IOAccelDisplayPipe");
         rnNote("newDisplayPipe -> %p (IOAccelDisplayPipe by name)", p);
@@ -353,6 +437,17 @@ void *RedNaviAccel2::createDisplayPipe(IOFramebuffer *fb, unsigned int index) {
     rnNote("createDisplayPipe(%p %s, %u)", (void *)fb, fb ? fb->getName() : "-", index);
     void *r = IOGraphicsAccelerator2::createDisplayPipe(fb, index);
     rnNote("createDisplayPipe -> %p", r);
+    // Measurement: where, in the pipe object (792 bytes for IOAccelDisplayPipe, 896 for the legacy one), the family keeps the framebuffer, the display machine and the accelerator.
+    if (r) {
+        const uint64_t *w = static_cast<const uint64_t *>(r);
+        const uint64_t want[3] = {reinterpret_cast<uint64_t>(fb), reinterpret_cast<uint64_t>(gMachine), reinterpret_cast<uint64_t>(this)};
+        static const char *const nm[3] = {"framebuffer", "display machine", "accelerator"};
+        for (uint32_t i = 0; i < 112; i++)
+            for (int k = 0; k < 3; k++)
+                if (want[k] && w[i] == want[k]) rnNote("pipe %p +0x%x holds the %s", r, i * 8, nm[k]);
+        rnNote("pipe words +0x70: %llx %llx %llx %llx %llx %llx %llx %llx", w[14], w[15], w[16], w[17], w[18], w[19], w[20], w[21]);
+        rnNote("pipe words +0xb0: %llx %llx %llx %llx %llx %llx %llx %llx", w[22], w[23], w[24], w[25], w[26], w[27], w[28], w[29]);
+    }
     return r;
 }
 
