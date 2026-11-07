@@ -11,8 +11,10 @@ static_assert(sizeof(RedNaviVidMemory) == 272, "IOAccelVidMemory is 272 bytes in
 OSDefineMetaClassAndStructors(RedNaviVidMemory, IOAccelVidMemory)
 void RedNaviVidMemory::rnPad0() {} void RedNaviVidMemory::rnPad1() {} void RedNaviVidMemory::rnPad2() {} void RedNaviVidMemory::rnPad3() {}
 long RedNaviVidMemory::getPhysicalSegment(unsigned long long, unsigned long long*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::getPhysicalSegment called (stub, returns 0)"); } return 0; }
-long RedNaviVidMemory::allocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::allocPhysical called (stub, returns 0)"); } return 0; }
-long RedNaviVidMemory::deallocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::deallocPhysical called (stub, returns 0)"); } return 0; }
+// allocPhysical and deallocPhysical say success without allocating anything: the memory of a plane's surface has to be wired for the transaction end (IOAccelVidMemory::wire answered
+// failure, freeToPrepareMapping gave up and transactionEnd returned kIOReturnNoResources); the pixels are read by the CPU in performTransaction, the GPU never touches this memory.
+long RedNaviVidMemory::allocPhysical() { static unsigned seen; if (seen++ < 5) rnNote("RedNaviVidMemory::allocPhysical called (answers success, nothing allocated)"); return 1; }
+long RedNaviVidMemory::deallocPhysical() { return 1; }
 
 class RedNaviResource2 : public IOAccelResource2 {
     OSDeclareDefaultStructors(RedNaviResource2)
@@ -29,13 +31,6 @@ public:
 static_assert(sizeof(RedNaviResource2) == 384, "IOAccelResource2 is 384 bytes in the registry");
 OSDefineMetaClassAndStructors(RedNaviResource2, IOAccelResource2)
 void RedNaviResource2::rnPad0() {} void RedNaviResource2::rnPad1() {} void RedNaviResource2::rnPad2() {} void RedNaviResource2::rnPad3() {}
-long RedNaviResource2::rebuildPagingBuffer() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::rebuildPagingBuffer called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::getLevelOffset(unsigned char, unsigned char, int*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::getLevelOffset called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::getBackingLevelOffset(unsigned char, unsigned char, int*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::getBackingLevelOffset called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::calculateIOSurfaceDeviceCacheVRAMBytes(unsigned long long*, unsigned long long*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::calculateIOSurfaceDeviceCacheVRAMBytes called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::addToAperture() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::addToAperture called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::removeFromAperture() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::removeFromAperture called (stub, returns 0)"); } return 0; }
-long RedNaviResource2::getApertureMemoryDescriptor(unsigned long long*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviResource2::getApertureMemoryDescriptor called (stub, returns 0)"); } return 0; }
 
 class RedNaviMemoryMap : public IOAccelMemoryMap {
     OSDeclareDefaultStructors(RedNaviMemoryMap)
@@ -48,9 +43,6 @@ public:
 static_assert(sizeof(RedNaviMemoryMap) == 280, "IOAccelMemoryMap is 280 bytes in the registry");
 OSDefineMetaClassAndStructors(RedNaviMemoryMap, IOAccelMemoryMap)
 void RedNaviMemoryMap::rnPad0() {} void RedNaviMemoryMap::rnPad1() {} void RedNaviMemoryMap::rnPad2() {} void RedNaviMemoryMap::rnPad3() {}
-long RedNaviMemoryMap::commitIntoGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::commitIntoGPUPageTable called (stub, returns 0)"); } return 0; }
-long RedNaviMemoryMap::releaseFromGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::releaseFromGPUPageTable called (stub, returns 0)"); } return 0; }
-long RedNaviMemoryMap::updateGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::updateGPUPageTable called (stub, returns 0)"); } return 0; }
 
 class RedNaviGLContext2 : public IOAccelGLContext2 {
     OSDeclareDefaultStructors(RedNaviGLContext2)

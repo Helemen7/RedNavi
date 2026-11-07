@@ -45,9 +45,9 @@ public:
     virtual void logCommandSubmission(int) = 0;   // slot 63
     virtual void stampIsIncremented() = 0;   // slot 64
     virtual void getStamp(int) = 0;   // slot 65
-    virtual void checkGPUProgress() = 0;   // slot 66
-    virtual void checkChannelProgress(int) = 0;   // slot 67
-    virtual void eventTimeout(int) = 0;   // slot 68
+    virtual bool checkGPUProgress() = 0;   // slot 66
+    virtual bool checkChannelProgress(int) = 0;   // slot 67
+    virtual void * eventTimeout(int) = 0;   // slot 68
     virtual void signalStamp(int, unsigned int);   // slot 69
     virtual void collectAllLiveEventIfNeeded();   // slot 70
     virtual void waitForStamp(int, unsigned int, unsigned int*);   // slot 71
@@ -97,9 +97,9 @@ public:
     virtual void logCommandSubmission(int);   // slot 63
     virtual void stampIsIncremented();   // slot 64
     virtual void getStamp(int);   // slot 65
-    virtual void checkGPUProgress();   // slot 66
-    virtual void checkChannelProgress(int);   // slot 67
-    virtual void eventTimeout(int);   // slot 68
+    virtual bool checkGPUProgress();   // slot 66
+    virtual bool checkChannelProgress(int);   // slot 67
+    virtual void * eventTimeout(int);   // slot 68
     virtual void deviceTerminatedUnlocked();   // slot 74
     virtual void enableEventStampInterrupts(IOAccelEvent const*);   // slot 75
     virtual void disableEventStampInterrupts(IOAccelEvent const*);   // slot 76

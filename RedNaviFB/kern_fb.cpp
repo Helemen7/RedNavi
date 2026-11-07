@@ -12,6 +12,7 @@
 // link injected kexts against the boot collection. It matches the property RedNaviProbe sets after the replay
 // (rednavi-fb-ready, only with the boot-arg rednavi_fb=1) and reads the surface location from the same node.
 
+#include <stdarg.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOTimerEventSource.h>
@@ -21,8 +22,19 @@
 
 #define kRNFbMaxModes 32
 
-class RedNaviFB : public IOFramebuffer {
-    OSDeclareDefaultStructors(RedNaviFB)
+// Experiments that can be switched without reinstalling the kext: boot-arg rednavi_fb_exp=<bit mask> (the boot-args line has a 1024 character limit, one mask is shorter than one name
+// each). Bit 0: getTimingInfoForDisplayMode, bit 1: connectFlags, bit 2: IOFBDependentID/Index (also rednavi_fb_dependent=1), bit 3: the attribute answers of the reference
+// driver ('wsrv' 1, power through handleEvent, colour and display attributes of the connection), bit 4: vertical blank interrupts with a 60 Hz timer, bit 5: getVRAMRange gives the
+// whole aperture and setApertureEnable succeeds.
+static uint32_t fbExp() {
+    static uint32_t v, read;
+    if (!read) { read = 1; PE_parse_boot_argn("rednavi_fb_exp", &v, sizeof(v)); }
+    return v;
+}
+// The class name has to contain "AMD": CoreDisplay classifies the GPU of a framebuffer by substrings of its class name (Intel, AMD, AppleParavirt, NVDA); any other name counts as an unknown
+// vendor, GetSystemGPUVendors then finds no GPU it knows and CoreDisplay does not use IOPresentment (the display surface has no IOSurface and WindowServer composes in software).
+class AMDRedNaviFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(AMDRedNaviFB)
 
     uint64_t scanoutPhys {0};          // CPU physical address of the surface (BAR0 + offset)
     uint32_t fbWidth {1920}, fbHeight {1080}, fbPitch {7680}, fbRefresh {60};   // the mode on the wire
@@ -39,6 +51,9 @@ class RedNaviFB : public IOFramebuffer {
 
     // Diagnostics, published as the fb-diag property: what WindowServer asks and whether the surface changes.
     IOTimerEventSource *diagTimer {nullptr};
+    IOTimerEventSource *vblTimer {nullptr};                          // 60 Hz while a vertical blank procedure is registered (bit 4)
+    IOFBInterruptProc vblProc {nullptr}; OSObject *vblTarget {nullptr}; void *vblRef {nullptr};
+    IOFBInterruptProc connProc {nullptr}; OSObject *connTarget {nullptr}; void *connRef {nullptr};
     IOMemoryMap *diagMap {nullptr};
     uint32_t calls[8] {};              // 0 aperture, 1 setAttr, 2 getAttr, 3 setConnAttr, 4 getConnAttr, 5 setMode, 6 cursor, 7 other
     uint32_t attrLog[16] {};           // ring of "kind << 28 | low 28 bits of selector"; selectors are fourcc, see attrRaw
@@ -242,7 +257,29 @@ public:
             OSData *pd = OSData::withBytes(&pipe, sizeof(pipe));
             if (pd) { setProperty("AAPL,DisplayPipe", pd); pd->release(); }
         }
+        {   // A real framebuffer names the controller it depends on and its head: AppleIntelFramebuffer@0..2 all have the registry ID of one AppleIntelFramebufferController as IOFBDependentID and
+            // 0, 1, 2 as IOFBDependentIndex (dev Mac, 2026-11-07). Here the object above is the probe. Boot-arg rednavi_fb_dependent=1.
+            uint32_t dep = 0;
+            PE_parse_boot_argn("rednavi_fb_dependent", &dep, sizeof(dep));
+            if (provider) {    // always, like the reference driver (rednavi_fb_dependent and bit 2 are no longer needed)
+                OSNumber *di = OSNumber::withNumber(static_cast<uint64_t>(0), 32);
+                OSNumber *dn = OSNumber::withNumber(provider->getRegistryEntryID(), 64);
+                if (di) { setProperty("IOFBDependentIndex", di); di->release(); }
+                if (dn) { setProperty("IOFBDependentID", dn); dn->release(); }
+            }
+        }
         if (!IOFramebuffer::start(provider)) return false;
+        if (pmregOn()) {
+            // No power driver is registered for this framebuffer (IOPowerManagement has no MaxPowerState, CurrentPowerState stays 0, changePowerStateTo does nothing), so the accelerator's
+            // display machine never sees it powered on. Two states: off, and on (usable, powered). Boot-arg rednavi_fb_pmreg=1.
+            static IOPMPowerState states[2] = {
+                {kIOPMPowerStateVersion1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
+                {kIOPMPowerStateVersion1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
+            };
+            IOReturn pr = registerPowerDriver(this, states, 2);
+            OSNumber *rn = OSNumber::withNumber(static_cast<uint64_t>(static_cast<uint32_t>(pr)), 32);
+            if (rn) { setProperty("pm-register-result", rn); rn->release(); }
+        }
         IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(scanoutPhys, fbPitch * fbHeight, kIODirectionInOut);
         if (md) { diagMap = md->map(kIOMapInhibitCache); md->release(); }
         return true;
@@ -250,6 +287,7 @@ public:
 
     void stop(IOService *provider) APPLE_KEXT_OVERRIDE {
         if (diagTimer) { diagTimer->cancelTimeout(); getWorkLoop()->removeEventSource(diagTimer); diagTimer->release(); diagTimer = nullptr; }
+        if (vblTimer) { vblTimer->cancelTimeout(); getWorkLoop()->removeEventSource(vblTimer); vblTimer->release(); vblTimer = nullptr; }
         if (diagMap) { diagMap->release(); diagMap = nullptr; }
         IOFramebuffer::stop(provider);
     }
@@ -290,6 +328,53 @@ public:
 
     // IOFramebuffer.h: a subclass calls handleEvent when it changes power state, kIOFBNotifyWillPowerOff before it leaves the maximum state and kIOFBNotifyDidPowerOn after it enters it; that is
     // what tells the accelerator's display machine the framebuffer is on. Boot-arg rednavi_fb_notify=1.
+    // What the base class does about power (boot-arg rednavi_fb_pmtrace=1): the IOService power virtuals are redefined only to note each call, with arguments, in the property pm-trace (the
+    // newest 24), and then call IOFramebuffer. docs 2026-11-07: IOPowerManagement of this node has no MaxPowerState, so registerPowerDriver is suspected never to be called.
+    static bool pmtraceOn() { static uint32_t v = 0, rd = 0; if (!rd) { rd = 1; PE_parse_boot_argn("rednavi_fb_pmtrace", &v, sizeof(v)); } return v != 0; }
+    char pmLines[24][72] {};
+    uint32_t pmCount {0};
+    void pmNote(const char *fmt, ...) __attribute__((format(printf, 2, 3))) {
+        if (!pmtraceOn()) return;
+        va_list ap; va_start(ap, fmt);
+        char *dst = pmLines[pmCount % 24];
+        vsnprintf(dst, 72, fmt, ap);
+        va_end(ap);
+        pmCount++;
+        OSArray *a = OSArray::withCapacity(24);
+        if (!a) return;
+        for (uint32_t i = pmCount > 24 ? pmCount - 24 : 0; i < pmCount; i++) { OSString *l = OSString::withCString(pmLines[i % 24]); if (l) { a->setObject(l); l->release(); } }
+        setProperty("pm-trace", a);
+        a->release();
+    }
+    void PMinit() APPLE_KEXT_OVERRIDE { pmNote("%u PMinit", pmCount); IOFramebuffer::PMinit(); }
+    void PMstop() APPLE_KEXT_OVERRIDE { pmNote("%u PMstop", pmCount); IOFramebuffer::PMstop(); }
+    void joinPMtree(IOService *driver) APPLE_KEXT_OVERRIDE { pmNote("%u joinPMtree(%p)", pmCount, (void *)driver); IOFramebuffer::joinPMtree(driver); }
+    IOReturn registerPowerDriver(IOService *controllingDriver, IOPMPowerState *powerStates, unsigned long numberOfStates) APPLE_KEXT_OVERRIDE {
+        IOReturn r = IOFramebuffer::registerPowerDriver(controllingDriver, powerStates, numberOfStates);
+        pmNote("%u registerPowerDriver(%p, %lu states) -> 0x%x", pmCount, (void *)controllingDriver, numberOfStates, (unsigned)r);
+        return r;
+    }
+    unsigned long initialPowerStateForDomainState(IOPMPowerFlags f) APPLE_KEXT_OVERRIDE { unsigned long r = IOFramebuffer::initialPowerStateForDomainState(f); pmNote("%u initialPowerStateForDomainState(0x%lx) -> %lu", pmCount, (unsigned long)f, r); return r; }
+    unsigned long powerStateForDomainState(IOPMPowerFlags f) APPLE_KEXT_OVERRIDE { unsigned long r = IOFramebuffer::powerStateForDomainState(f); pmNote("%u powerStateForDomainState(0x%lx) -> %lu", pmCount, (unsigned long)f, r); return r; }
+    IOReturn powerStateWillChangeTo(IOPMPowerFlags c, unsigned long o, IOService *w) APPLE_KEXT_OVERRIDE { IOReturn r = 0; /* base derefs its controller (null here, CR2 0x120): panic */ pmNote("%u powerStateWillChangeTo(0x%lx, %lu) -> %d", pmCount, (unsigned long)c, o, (int)r); return r; }
+    IOReturn powerStateDidChangeTo(IOPMPowerFlags c, unsigned long o, IOService *w) APPLE_KEXT_OVERRIDE { IOReturn r = 0; /* same: base needs the controller */ pmNote("%u powerStateDidChangeTo(0x%lx, %lu) -> %d", pmCount, (unsigned long)c, o, (int)r); return r; }
+
+    static uint32_t pmregMode() { static uint32_t v = 0, rd = 0; if (!rd) { rd = 1; PE_parse_boot_argn("rednavi_fb_pmreg", &v, sizeof(v)); } return v; }
+    static bool pmregOn() { return pmregMode() != 0; }
+    volatile int32_t pmPending {-1};      // -1 nothing, else the power state setPowerState was asked for, to be announced from the timer (handleEvent from the power thread hung the boot: mode 1)
+    IOReturn setPowerState(unsigned long ordinal, IOService *device) APPLE_KEXT_OVERRIDE {
+        if (!pmregOn()) { pmNote("%u setPowerState(%lu)", pmCount, ordinal); return IOFramebuffer::setPowerState(ordinal, device); }
+        // IOFramebuffer.h: call handleEvent on power state changes (WillPowerOff before leaving the maximum state, DidPowerOn after entering it). Mode 1 does it here (the first try: the boot
+        // stopped at the splash); mode 2 only notes the state and lets the timer do it.
+        pmNote("%u setPowerState(%lu), mode %u", pmCount, ordinal, pmregMode());
+        if (pmregMode() == 1) {
+            if (ordinal > 0) handleEvent(kIOFBNotifyDidPowerOn);
+            else handleEvent(kIOFBNotifyWillPowerOff);
+        } else pmPending = static_cast<int32_t>(ordinal);
+        OSNumber *on = OSNumber::withNumber(static_cast<uint64_t>(ordinal), 32);
+        if (on) { setProperty("pm-set-state", on); on->release(); }
+        return kIOPMAckImplied;
+    }
     static bool notifyOn() { static uint32_t v = 0, rd = 0; if (!rd) { rd = 1; PE_parse_boot_argn("rednavi_fb_notify", &v, sizeof(v)); } return v != 0; }
     uint32_t notifySent {0};
     void notePower(const char *what, IOReturn r) {
@@ -304,10 +389,18 @@ public:
 
     IOReturn setAttribute(IOSelect attr, uintptr_t value) APPLE_KEXT_OVERRIDE {
         note(1, attr);
-        if (attr == kIOPowerAttribute && notifyOn() && value == 0) notePower("WillPowerOff (powr 0)", handleEvent(kIOFBNotifyWillPowerOff));
+        if (attr == kIOPowerAttribute && notifyOn() && value == 0 && !(fbExp() & 8)) notePower("WillPowerOff (powr 0)", handleEvent(kIOFBNotifyWillPowerOff));
         const AttrRec *ov = overrideFor(1, attr);
-        IOReturn r = ov ? static_cast<IOReturn>(ov->result) : IOFramebuffer::setAttribute(attr, value);
-        if (attr == kIOPowerAttribute && notifyOn() && value != 0) notePower("DidPowerOn (powr)", handleEvent(kIOFBNotifyDidPowerOn));
+        IOReturn r;
+        if (ov) r = static_cast<IOReturn>(ov->result);
+        else if ((fbExp() & 8) && attr == kIOWindowServerActiveAttribute) r = kIOReturnSuccess;            // swallowed, as the reference driver does
+        else if ((fbExp() & 8) && attr == kIOPowerAttribute) {                                             // power: the base first, then the event, and the base's "unsupported" is success
+            if (value != 0) { r = IOFramebuffer::setAttribute(attr, value); notePower("DidPowerOn (powr, rednavi_fb_exp 8)", handleEvent(kIOFBNotifyDidPowerOn)); }
+            else { notePower("WillPowerOff (powr 0, rednavi_fb_exp 8)", handleEvent(kIOFBNotifyWillPowerOff)); r = IOFramebuffer::setAttribute(attr, value); }
+            if (r == kIOReturnUnsupported) r = kIOReturnSuccess;
+        }
+        else r = IOFramebuffer::setAttribute(attr, value);
+        if (attr == kIOPowerAttribute && notifyOn() && value != 0 && !(fbExp() & 8)) notePower("DidPowerOn (powr)", handleEvent(kIOFBNotifyDidPowerOn));
         record(1, attr, r, value);
         return r;
     }
@@ -316,6 +409,7 @@ public:
         const AttrRec *ov = overrideFor(2, attr);
         IOReturn r;
         if (ov) { if (value) *value = static_cast<uintptr_t>(ov->value); r = static_cast<IOReturn>(ov->result); }
+        else if ((fbExp() & 8) && attr == kIOWindowServerActiveAttribute) { if (value) *value = 1; r = kIOReturnSuccess; }     // as the reference driver does
         else r = IOFramebuffer::getAttribute(attr, value);
         record(2, attr, r, value ? *value : 0);
         return r;
@@ -323,7 +417,7 @@ public:
     IOReturn setAttributeForConnection(IOIndex c, IOSelect attr, uintptr_t value) APPLE_KEXT_OVERRIDE {
         note(3, attr);
         const AttrRec *ov3 = overrideFor(3, attr);
-        IOReturn r = ov3 ? static_cast<IOReturn>(ov3->result) : IOFramebuffer::setAttributeForConnection(c, attr, value);
+        IOReturn r = ov3 ? static_cast<IOReturn>(ov3->result) : (fbExp() & 8) && attr == kConnectionPower ? kIOReturnSuccess : IOFramebuffer::setAttributeForConnection(c, attr, value);
         record(3, attr, r, value);
         return r;
     }
@@ -335,6 +429,23 @@ public:
         IOReturn r;
         const AttrRec *ov4 = overrideFor(4, attr);
         if (ov4) { *value = static_cast<uintptr_t>(ov4->value); r = static_cast<IOReturn>(ov4->result); record(4, attr, r, *value); return r; }
+        if (fbExp() & 8) {      // the answers of the reference driver; the base's for the rest
+            switch (attr) {
+            case kConnectionColorModesSupported:       *value = 1; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionColorDepthsSupported:      *value = 2; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionControllerColorDepth:      *value = 2; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionControllerDepthsSupported: *value = 2; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionColorMode:                 *value = 1; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionCheckEnable:               *value = 1; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionDisplayFlags:              *value = 0; record(4, attr, kIOReturnSuccess, *value); return kIOReturnSuccess;
+            case kConnectionSupportsHLDDCSense:        r = hasDDCConnect(c) ? kIOReturnSuccess : kIOReturnUnsupported; *value = 1; record(4, attr, r, *value); return r;
+            case kConnectionSupportsLLDDCSense:
+            case kConnectionSupportsAppleSense:
+            case kConnectionDisplayParameterCount:
+            case kConnectionDisplayParameters:         record(4, attr, kIOReturnUnsupported, 0); return kIOReturnUnsupported;
+            default: break;
+            }
+        }
         switch (attr) {
         case kConnectionFlags:             *value = 0; r = kIOReturnSuccess; break;
         case kConnectionEnable:            *value = 1; r = kIOReturnSuccess; break;
@@ -366,7 +477,7 @@ public:
         IOWorkLoop *wl = getWorkLoop();
         if (wl) {
             diagTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
-                RedNaviFB *self = static_cast<RedNaviFB *>(o);
+                AMDRedNaviFB *self = static_cast<AMDRedNaviFB *>(o);
                 if (!self->ghostGone && self->ghostTries < 300) {
                     self->ghostTries++;
                     if (self->removeBootFramebuffer(self->getProvider())) self->ghostGone = true;
@@ -375,6 +486,11 @@ public:
                 // Power: a framebuffer at power state 0 never tells the accelerator's display machine it is on ("isFramebufferActive" false: the display pipe is inactive and
                 // WindowServer's request for it, client type 4, is refused). A real framebuffer sits at its top state (2). The state is published and, while it is not 2, raised
                 // (rednavi_fb_pm=0 leaves it alone).
+                if (self->pmPending >= 0) {
+                    const int32_t st = self->pmPending;
+                    self->pmPending = -1;
+                    self->notePower(st > 0 ? "DidPowerOn (setPowerState, timer)" : "WillPowerOff (setPowerState, timer)", self->handleEvent(st > 0 ? kIOFBNotifyDidPowerOn : kIOFBNotifyWillPowerOff));
+                }
                 if (notifyOn()) {
                     static uint32_t ticks = 0;
                     ticks++;
@@ -396,10 +512,44 @@ public:
                 }
                 t->setTimeoutMS(1000);
             });
+            if (fbExp() & 16) {
+                vblTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
+                    AMDRedNaviFB *self = static_cast<AMDRedNaviFB *>(o);
+                    static uint32_t ticks;
+                    if (self->vblProc) { ticks++; self->vblProc(self->vblTarget, self->vblRef); if (ticks == 1 || ticks % 3600 == 0) IOLog("RedNaviFB: vertical blank tick %u\n", ticks); }
+                    t->setTimeout(16667, kMicrosecondScale);
+                });
+                if (vblTimer) { wl->addEventSource(vblTimer); vblTimer->setTimeout(16667, kMicrosecondScale); }
+            }
             if (diagTimer && wl->addEventSource(diagTimer) == kIOReturnSuccess) diagTimer->setTimeoutMS(1000);
         }
         publishDiag();
         IOLog("RedNaviFB: enabled, %ux%u at physical 0x%llx\n", fbWidth, fbHeight, scanoutPhys);
+        return kIOReturnSuccess;
+    }
+
+    // Interrupts (bit 4): the reference driver accepts the vertical blank and the connection-changed types and calls the vertical blank procedure from a 60 Hz timer; the other types are
+    // unsupported. The reference it is a handle only, so is this one (not a pointer to anything).
+    IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 16)) return IOFramebuffer::registerForInterruptType(type, proc, target, ref, interruptRef);
+        IOLog("RedNaviFB: registerForInterruptType('%c%c%c%c')\n", (char)(type >> 24), (char)(type >> 16), (char)(type >> 8), (char)type);
+        if (type == kIOFBVBLInterruptType) { vblProc = proc; vblTarget = target; vblRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(1)); return kIOReturnSuccess; }
+        if (type == kIOFBConnectInterruptType) { connProc = proc; connTarget = target; connRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(2)); return kIOReturnSuccess; }
+        return kIOReturnUnsupported;
+    }
+    IOReturn unregisterInterrupt(void *interruptRef) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 16)) return IOFramebuffer::unregisterInterrupt(interruptRef);
+        const uintptr_t h = reinterpret_cast<uintptr_t>(interruptRef);
+        if (h == 1) { vblProc = nullptr; vblTarget = nullptr; vblRef = nullptr; }
+        else if (h == 2) { connProc = nullptr; connTarget = nullptr; connRef = nullptr; }
+        return kIOReturnSuccess;
+    }
+    IOReturn setInterruptState(void *interruptRef, UInt32 state) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 16)) return IOFramebuffer::setInterruptState(interruptRef, state);
+        return kIOReturnSuccess;
+    }
+    IOReturn setApertureEnable(IOPixelAperture aperture, IOOptionBits enable) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 32)) return IOFramebuffer::setApertureEnable(aperture, enable);
         return kIOReturnSuccess;
     }
 
@@ -413,6 +563,11 @@ public:
     }
 
     IODeviceMemory *getVRAMRange() APPLE_KEXT_OVERRIDE {
+        if (fbExp() & 32) {      // the reference returns the whole BAR that holds the scanout, not the sub-range of it (the 256 MB the machine maps; the scanout sits at the start of the visible VRAM)
+            IODeviceMemory *m = IODeviceMemory::withRange(scanoutPhys & ~0x0fffffffULL, 0x10000000);
+            if (m) m->setTag(kIOMapWriteCombineCache);
+            return m;
+        }
         return getApertureRange(kIOFBSystemAperture);
     }
 
@@ -439,6 +594,23 @@ public:
         static uint32_t accBacked = 0, accRead = 0;
         if (!accRead) { accRead = 1; PE_parse_boot_argn("rednavi_fb_accbacked", &accBacked, sizeof(accBacked)); }
         if (accBacked) info->flags |= kDisplayModeAcceleratorBackedFlag;
+        return kIOReturnSuccess;
+    }
+
+    // The shipped framebuffer drivers answer these two; the base says unsupported. WindowServer asks getTimingInfoForDisplayMode twice while it starts (dtrace, 2026-11-07). The
+    // answer is a zeroed structure with kIOTimingIDInvalid and no flags (the timing itself is in the EDID and the mode list, not here); connectFlags gives the same flags as
+    // getInformationForDisplayMode. Unverified on hardware until the log shows what WindowServer does next.
+    IOReturn getTimingInfoForDisplayMode(IODisplayModeID mode, IOTimingInformation *info) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 1)) return IOFramebuffer::getTimingInfoForDisplayMode(mode, info);
+        if (!info || mode < 1 || static_cast<uint32_t>(mode) > modeCount) return kIOReturnUnsupportedMode;
+        bzero(info, sizeof(*info));
+        info->appleTimingID = kIOTimingIDInvalid;
+        info->flags = 0;
+        return kIOReturnSuccess;
+    }
+    IOReturn connectFlags(IOIndex index, IODisplayModeID mode, IOOptionBits *flags) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 2)) return IOFramebuffer::connectFlags(index, mode, flags);
+        if (flags) *flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | kDisplayModeDefaultFlag;
         return kIOReturnSuccess;
     }
 
@@ -497,4 +669,4 @@ public:
     }
 };
 
-OSDefineMetaClassAndStructors(RedNaviFB, IOFramebuffer)
+OSDefineMetaClassAndStructors(AMDRedNaviFB, IOFramebuffer)

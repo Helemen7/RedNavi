@@ -84,7 +84,7 @@ public:
     virtual void systemDidWake();   // slot 316
     virtual void systemWillChangeSpeed();   // slot 317
     virtual void systemDidChangeSpeed();   // slot 318
-    virtual void configIsHeadless();   // slot 319
+    virtual bool configIsHeadless();   // slot 319
     virtual void * newDisplayMachine() = 0;   // slot 320
     virtual void newShared();   // slot 321
     virtual void newSharedUserClient();   // slot 322
@@ -117,4 +117,6 @@ public:
     virtual void ktraceStateChanged();   // slot 349
     bool start(IOService *) APPLE_KEXT_OVERRIDE;
     void stop(IOService *) APPLE_KEXT_OVERRIDE;
+    // exported, not virtual: sets the enabled bit (0x02 of the byte at +0xc78) that the display pipe operations check
+    void enableAccelerator();
 };

@@ -5,7 +5,7 @@ int main(void) {
     @autoreleasepool {
         NSArray<id<MTLDevice>> *all = MTLCopyAllDevices();
         printf("%lu Metal devices\n", (unsigned long)all.count);
-        for (id<MTLDevice> d in all) printf("  %s (registryID 0x%llx, lowPower %d, removable %d)\n", d.name.UTF8String, d.registryID, d.isLowPower, d.isRemovable);
+        for (id<MTLDevice> d in all) printf("  %s (registryID 0x%llx, lowPower %d, removable %d, headless %d)\n", d.name.UTF8String, d.registryID, d.isLowPower, d.isRemovable, d.isHeadless);
         id<MTLDevice> def = MTLCreateSystemDefaultDevice();
         printf("default device: %s\n", def ? def.name.UTF8String : "none");
     }

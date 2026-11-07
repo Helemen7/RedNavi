@@ -147,7 +147,7 @@ def write_header(outdir):
     print('%d virtuals, %d pure, forward declared: %s' % (len(rows), sum(1 for r in rows if r[4]), ' '.join(fwd)))
 
 # return types of the event machine slots that are known (35 init: OSObject::init is bool; 39 getStampOffset: the offset in the stamp memory, an unsigned int)
-EVENT_RET = {35: 'bool', 39: 'unsigned int'}
+EVENT_RET = {35: 'bool', 39: 'unsigned int', 66: 'bool', 67: 'bool', 68: 'void *'}   # 66-68: checkGPUProgress, checkChannelProgress, eventTimeout (what the reference driver returns)
 
 def write_event_header(path):
     """IOAccelEventMachine2 (240 bytes, parent OSObject, own virtuals from slot 35) and IOAccelEventMachineFast2 (3376 bytes, 95 slots, its 4 pure virtuals at 84-87)
@@ -260,6 +260,7 @@ def write_chain(hpath, spath):
             sl += ['class %s : public %s {' % (sname, cls), '    OSDeclareDefaultStructors(%s)' % sname, 'public:']
             for i in pures:
                 name, args, const, ret, _ = mine[i]
+                if sname in ('RedNaviMemoryMap', 'RedNaviResource2'): continue     # defined by hand in kern_accel2.cpp: the scanout's memory map has to report success, the resource has real answers
                 sl.append('    %s %s(%s)%s override;' % (ret, name, args, ' const' if const else ''))
             sl += ['    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3();', '};',
                    'static_assert(sizeof(%s) == %d, "%s is %d bytes in the registry");' % (sname, size, cls, size),

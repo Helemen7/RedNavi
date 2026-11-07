@@ -322,7 +322,7 @@ class RedNaviProbe : public IOService {
     uint64_t scanoutOff(uint32_t surface) const { return kRNScanoutVramOff + static_cast<uint64_t>(surface) * scanoutStride(); }
     uint32_t frontSurface {0};                     // the one the display was last told to scan out
     int present(uint32_t surface, bool wait);      // HUBP0 page flip at the next vertical blank; 0 ok, 1 still pending, <0 error                         // an alias of the display surface (fixed VRAM offset, never given back)
-    static constexpr uint32_t kBoCap = 16384;             // buffers of the whole kext, the connections' and the kernel's
+    static constexpr uint32_t kBoCap = 65536;             // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
     uint64_t boBytes {0};                                 // host memory wired for buffers now
@@ -1071,6 +1071,7 @@ void RedNaviProbe::publishFramebuffer() {
     setProperty("fb-height", selMode.vactive, 32);
     setProperty("fb-pitch", selPitch * 4, 32);
     setProperty("fb-refresh", selMode.refresh_hz, 32);
+    { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }   // struct rn_mode of the mode in use: the graphics control answers (command 0x921) read it
     setProperty("fb-scanout-phys", phys + kRNScanoutVramOff, 64);
     fbReady = true;
     setProperty("rednavi-fb-ready", kOSBooleanTrue);
@@ -1390,6 +1391,7 @@ IOReturn RedNaviProbe::setModeLive(uint32_t index) {
         setProperty("fb-height", selMode.vactive, 32);
         setProperty("fb-pitch", selPitch * 4, 32);
         setProperty("fb-refresh", selMode.refresh_hz, 32);
+        { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }
         setProperty("fb-current-mode", static_cast<uint64_t>(selIndex < 0 ? 0 : selIndex), 32);
     }
     IOLockUnlock(modeLock);
@@ -1790,13 +1792,13 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
 class IOAccelRedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(IOAccelRedNaviClient)
-    static constexpr uint32_t kMaxHandles = 8192;
+    static constexpr uint32_t kMaxHandles = 32768;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
     int *boIdx {nullptr};                          // handle - 1 -> index in the probe's buffer table, -1 for a free handle
     uint32_t boUsed {0};
     struct Map { uint64_t va; uint64_t size; uint32_t handle; bool used; };
-    static constexpr uint32_t kMaxMaps = 16384;
+    static constexpr uint32_t kMaxMaps = 65536;
     Map *maps {nullptr};                           // what is mapped in this connection's address space
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
@@ -2404,7 +2406,7 @@ public:
             if (OSIterator *it = gpuOwner->getClientIterator()) {
                 while (OSObject *o = it->getNextObject()) {
                     IOService *c = OSDynamicCast(IOService, o);
-                    if (c && !strcmp(c->getMetaClass()->getClassName(), "RedNaviFB")) { fb = c; break; }
+                    if (c && !strcmp(c->getMetaClass()->getClassName(), "AMDRedNaviFB")) { fb = c; break; }
                 }
                 it->release();
             }
