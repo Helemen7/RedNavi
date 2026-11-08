@@ -168,5 +168,7 @@ test:
 	./build/navi33_p2_test
 	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_runtime_test.cpp -o build/navi33_runtime_test
 	./build/navi33_runtime_test
+	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_bootstrap_test.cpp -o build/navi33_bootstrap_test
+	./build/navi33_bootstrap_test
 
 .PHONY: all clean test mtl
