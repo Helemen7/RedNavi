@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
+#include <mach/mach_time.h>
 #include <vulkan/vulkan.h>
 
 #define FUNCS(X) \
@@ -15,9 +17,9 @@
     X(CreateShaderModule) X(DestroyShaderModule) X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) X(CreatePipelineLayout) X(DestroyPipelineLayout) \
     X(CreateComputePipelines) X(DestroyPipeline) X(CreateDescriptorPool) X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CreateCommandPool) \
     X(DestroyCommandPool) X(AllocateCommandBuffers) X(FreeCommandBuffers) X(BeginCommandBuffer) X(EndCommandBuffer) X(CmdBindPipeline) X(CmdBindDescriptorSets) \
-    X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(WaitForFences) X(QueueSubmit) X(ResetDescriptorPool) \
-    X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) X(CreateImageView) X(DestroyImageView) X(CreateSampler) X(DestroySampler) \
-    X(CmdCopyBufferToImage) X(CmdCopyImageToBuffer) X(CmdClearColorImage) X(CreateRenderPass) X(DestroyRenderPass) X(CreateFramebuffer) X(DestroyFramebuffer) \
+    X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(WaitForFences) X(QueueSubmit) X(ResetDescriptorPool) X(ResetFences) X(ResetCommandBuffer) \
+    X(GetImageSubresourceLayout) X(GetMemoryHostPointerPropertiesEXT) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) X(CreateImageView) X(DestroyImageView) X(CreateSampler) X(DestroySampler) \
+    X(CmdCopyBufferToImage) X(CmdCopyImage) X(CmdCopyImageToBuffer) X(CmdClearColorImage) X(CreateRenderPass) X(DestroyRenderPass) X(CreateFramebuffer) X(DestroyFramebuffer) \
     X(CreateGraphicsPipelines) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdSetViewport) X(CmdSetScissor) X(CmdDraw) X(CmdBindVertexBuffers) X(CmdSetBlendConstants) X(CmdBindIndexBuffer) X(CmdDrawIndexed)
 
 struct rn_vk {
@@ -32,6 +34,9 @@ struct rn_vk {
     VkQueue queue;
     uint32_t family;
     VkCommandPool pool;
+    VkDescriptorPool rpool; uint32_t rpoolSets, rpoolCnt[5];   // the render pass's descriptor pool, kept and reset (a pool owns a buffer object: creating one per pass cost kernel calls each time)
+    VkCommandBuffer rcb; VkFence rfence;                      // and its command buffer and fence
+    int hostimport;                            // the device has VK_EXT_external_memory_host: host memory (an IOSurface's) can back an image
 #define X(n) PFN_vk##n n;
     FUNCS(X)
     DFUNCS(X)
@@ -39,7 +44,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; };
+struct rn_vk_image { rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; };   // gpudirty: a render pass wrote the image and the host copy is older
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -131,7 +136,11 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     want.vertexPipelineStoresAndAtomics = have.vertexPipelineStoresAndAtomics;
     want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics;
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &want};
+    static const char *const hostExt[] = {"VK_EXT_external_memory_host"};
+    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = hostExt;
     r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev);
+    vk->hostimport = r == VK_SUCCESS;
+    if (r != VK_SUCCESS) { dci.enabledExtensionCount = 0; dci.ppEnabledExtensionNames = NULL; r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev); }   // without the extension everything is copied as before
     if (r != VK_SUCCESS) { seterr(err, errlen, "vkCreateDevice", r); goto fail; }
 #define X(n) vk->n = (PFN_vk##n)vk->GetDeviceProcAddr(vk->dev, "vk" #n);
     DFUNCS(X)
@@ -157,7 +166,28 @@ void rn_vk_close(rn_vk *vk) {
 
 const char *rn_vk_device_name(const rn_vk *vk) { return vk->name; }
 
+// Small buffers come and go at a high rate (every draw with setVertexBytes / setFragmentBytes makes one): each is a Vulkan buffer, a buffer object in the kernel, a CPU mapping and a GPU
+// address, and freeing it undoes all of that, a few kernel calls each way (the sample of the compositor showed them as the largest cost of a commit). Freed small buffers are kept, by exact
+// size class (a power of two, so a buffer is up to twice the size asked for), and handed out again zeroed.
+#define RN_BUF_CACHE_MAX_BYTES 65536
+#define RN_BUF_CACHE_SLOTS 1024
+static rn_vk_buffer *g_buf_cache[RN_BUF_CACHE_SLOTS];
+static unsigned g_buf_cache_n;
+static pthread_mutex_t g_buf_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+uint64_t rn_vk_bufstat[6];                                    // hit, miss (small), big, kept on free, dropped on free (cache full), largest big size; read by the commit statistics
 rn_vk_buffer *rn_vk_buffer_create(rn_vk *vk, size_t bytes) {
+    if (bytes > RN_BUF_CACHE_MAX_BYTES) { __atomic_fetch_add(&rn_vk_bufstat[2], 1, __ATOMIC_RELAXED); if (bytes > rn_vk_bufstat[5]) rn_vk_bufstat[5] = bytes; }
+    if (bytes <= RN_BUF_CACHE_MAX_BYTES) {                       // size classes (powers of two from 256 bytes): sizes of setBytes data vary, an exact match almost never hit
+        size_t cls = 256; while (cls < bytes) cls <<= 1;
+        bytes = cls;
+        rn_vk_buffer *hit = NULL;
+        pthread_mutex_lock(&g_buf_cache_lock);
+        for (unsigned i = 0; i < g_buf_cache_n; i++)
+            if (g_buf_cache[i]->size == bytes) { hit = g_buf_cache[i]; g_buf_cache[i] = g_buf_cache[--g_buf_cache_n]; break; }
+        pthread_mutex_unlock(&g_buf_cache_lock);
+        if (hit) { __atomic_fetch_add(&rn_vk_bufstat[0], 1, __ATOMIC_RELAXED); memset(hit->map, 0, bytes ? bytes : 1); return hit; }
+        __atomic_fetch_add(&rn_vk_bufstat[1], 1, __ATOMIC_RELAXED);
+    }
     rn_vk_buffer *b = calloc(1, sizeof(*b));
     if (!b) return NULL;
     b->size = bytes;
@@ -184,6 +214,14 @@ void *rn_vk_buffer_contents(rn_vk_buffer *b) { return b->map; }
 size_t rn_vk_buffer_length(const rn_vk_buffer *b) { return b->size; }
 void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b) {
     if (!b) return;
+    if (b->map && b->buf && b->mem && b->size <= RN_BUF_CACHE_MAX_BYTES) {
+        int kept = 0;
+        pthread_mutex_lock(&g_buf_cache_lock);
+        if (g_buf_cache_n < RN_BUF_CACHE_SLOTS) { g_buf_cache[g_buf_cache_n++] = b; kept = 1; }
+        pthread_mutex_unlock(&g_buf_cache_lock);
+        __atomic_fetch_add(&rn_vk_bufstat[kept ? 3 : 4], 1, __ATOMIC_RELAXED);
+        if (kept) return;
+    }
     if (b->buf) vk->DestroyBuffer(vk->dev, b->buf, NULL);
     if (b->mem) vk->FreeMemory(vk->dev, b->mem, NULL);
     free(b);
@@ -425,7 +463,62 @@ rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const un
     if (vk->CreateImageView(vk->dev, &vci, NULL, &v->view) != VK_SUCCESS) { free(v); return NULL; }
     return v;
 }
-void *rn_vk_image_staging(rn_vk_image *im) { return rn_vk_buffer_contents(im->stage); }
+// An image over host memory the caller owns (an IOSurface's pixels): linear, in the pages the kext wires for the GPU (RN_UC_BO_USERPTR through VK_EXT_external_memory_host), so the GPU
+// samples and renders in them and nothing is copied. `pitch` is the surface's bytes per row and must be the one the driver gives the linear image; `bytes` its size. NULL (and
+// rn_vk_image_last_error says why): the caller keeps copying.
+rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t w, uint32_t h, void *ptr, size_t pitch, size_t bytes) {
+    g_image_err = "bad size or format";
+    const unsigned texel = rn_vk_format_texel_bytes(format);
+    if (!vk->hostimport) { g_image_err = "no VK_EXT_external_memory_host"; return NULL; }
+    if (!texel || !w || !h || !ptr || ((uintptr_t)ptr & 4095) || !bytes) return NULL;
+    rn_vk_image *im = calloc(1, sizeof(*im));
+    if (!im) return NULL;
+    im->fmt = vk_format(format); im->w = w; im->h = h; im->d = 1; im->texel = texel; im->hostmem = 1; im->hostptr = ptr;
+    VkFormatProperties fp;
+    vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
+    const VkFormatFeatureFlags f = fp.linearTilingFeatures;
+    if (!(f & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) { g_image_err = "linear format features"; goto fail; }
+    im->storage = (f & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+    im->color = (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_LINEAR, .initialLayout = VK_IMAGE_LAYOUT_PREINITIALIZED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                             .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0) | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0)};
+    if (vk->CreateImage(vk->dev, &ici, NULL, &im->img) != VK_SUCCESS) { g_image_err = "vkCreateImage (linear)"; goto fail; }
+    VkImageSubresource sr = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+    VkSubresourceLayout sl;
+    vk->GetImageSubresourceLayout(vk->dev, im->img, &sr, &sl);
+    if (sl.offset != 0 || sl.rowPitch != pitch) { g_image_err = "the surface's row pitch is not the linear image's"; goto fail; }
+    VkMemoryRequirements mr;
+    vk->GetImageMemoryRequirements(vk->dev, im->img, &mr);
+    if (mr.size > bytes) { g_image_err = "the image is larger than the surface"; goto fail; }
+    VkMemoryHostPointerPropertiesEXT hp = {.sType = VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
+    if (vk->GetMemoryHostPointerPropertiesEXT(vk->dev, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, ptr, &hp) != VK_SUCCESS) { g_image_err = "vkGetMemoryHostPointerPropertiesEXT"; goto fail; }
+    int mt = -1;
+    for (uint32_t i = 0; i < vk->mp.memoryTypeCount; i++)
+        if ((mr.memoryTypeBits & hp.memoryTypeBits & (1u << i)) && (vk->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) { mt = (int)i; break; }
+    if (mt < 0) { g_image_err = "no memory type for the host pointer"; goto fail; }
+    VkImportMemoryHostPointerInfoEXT imp = {.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, .handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, .pHostPointer = ptr};
+    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .pNext = &imp, .allocationSize = (bytes + 4095) & ~(size_t)4095, .memoryTypeIndex = (uint32_t)mt};
+    if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) { g_image_err = "vkAllocateMemory of the host pointer"; goto fail; }
+    if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) { g_image_err = "vkBindImageMemory (host)"; goto fail; }
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    if (format == RN_VK_A8) { vci.components = (VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R}; im->color = 0; }
+    if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view) != VK_SUCCESS) { g_image_err = "vkCreateImageView (host)"; goto fail; }
+    return im;
+fail:
+    rn_vk_image_destroy(vk, im);
+    return NULL;
+}
+int rn_vk_image_is_host(rn_vk_image *im) { return (im->base ? im->base : im)->hostmem; }
+static rn_vk *g_readback_vk;                                    // the device of the last render pass, for the lazy readback below
+static void image_readback_now(rn_vk *vk, rn_vk_image *r);
+void *rn_vk_image_staging(rn_vk_image *im) {
+    rn_vk_image *r = im->base ? im->base : im;
+    if (r->gpudirty && !r->hostmem && g_readback_vk) image_readback_now(g_readback_vk, r);
+    return r->hostmem ? r->hostptr : rn_vk_buffer_contents(im->stage);
+}
 void rn_vk_image_host_wrote(rn_vk_image *im) { (im->base ? im->base : im)->dirty = 1; }
 void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *im) {
     if (!im) return;
@@ -493,13 +586,13 @@ static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, uns
         for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
         if (seen) continue;
         if (!r->initialized) {
-            VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = r->hostmem ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
                                        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = r->img,
                                        .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
             vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
             r->initialized = 1;
         }
-        if (r->dirty) {
+        if (r->dirty && !r->hostmem) {
             VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
             vk->CmdCopyBufferToImage(cb, r->stage->buf, r->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
             r->dirty = 0;
@@ -513,15 +606,38 @@ static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, un
         rn_vk_image *r = im[i]->base ? im[i]->base : im[i];
         int seen = 0;
         for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
-        if (seen) continue;
+        if (seen || r->hostmem) continue;                            // an image over host memory is already where the host reads it
         VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
         vk->CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_GENERAL, r->stage->buf, 1, &bc);
+        r->gpudirty = 0;
         done++;
     }
     if (done) {
         VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
         vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
     }
+}
+// Render passes do not read their targets back: the host copy is only needed when the host asks for the pixels (rn_vk_image_staging), and a full-image copy after every pass was
+// a large part of the card time of a compositor frame. The image is marked and read back when the host looks at it.
+static void images_mark_gpu(rn_vk_image *const *im, unsigned n) {
+    for (unsigned i = 0; i < n; i++) { rn_vk_image *r = im[i]->base ? im[i]->base : im[i]; if (!r->hostmem) r->gpudirty = 1; }
+}
+static void image_readback_now(rn_vk *vk, rn_vk_image *r) {
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return;
+    VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    rn_vk_image *one[1] = {r};
+    if (vk->BeginCommandBuffer(cb, &cbb) == VK_SUCCESS) {
+        images_out(vk, cb, one, 1);                                  // clears gpudirty
+        if (vk->EndCommandBuffer(cb) == VK_SUCCESS && vk->CreateFence(vk->dev, &fci, NULL, &fence) == VK_SUCCESS) {
+            VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+            if (vk->QueueSubmit(vk->queue, 1, &si, fence) == VK_SUCCESS) vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 8000000000ull);
+        }
+    }
+    if (fence) vk->DestroyFence(vk->dev, fence, NULL);
+    vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
 }
 
 static int dispatch_regions(rn_vk *vk, rn_vk_compute *c, const rn_vk_arg *args, const void *push, const region *regs, unsigned nregs) {
@@ -778,7 +894,7 @@ static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
     }
     VkMemoryBarrier fromClear = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fromClear, 0, NULL, 0, NULL);
-    images_out(vk, cb, out, cleared);
+    images_mark_gpu(out, cleared);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto done;
@@ -806,8 +922,10 @@ static int samples_target(const rn_vk_draw *dr, const rn_vk_target *targets, uns
     return 0;
 }
 
+uint64_t rn_vk_fence_ticks;                  // time spent waiting for the card in render passes (mach ticks), read and cleared by the commit statistics
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_draw *draws, unsigned nd) {
     if (!nt || nt > 8) return 6;
+    g_readback_vk = vk;
     if (!nd) return clear_targets(vk, targets, nt);
     rn_vk_render *p0 = draws[0].pipe;
     for (unsigned i = 0; i < nt; i++) {
@@ -845,8 +963,25 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     static const VkDescriptorType ty[5] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT};
     uint32_t nps = 0;
     for (int k = 0; k < 5; k++) if (cnt[k]) ps[nps++] = (VkDescriptorPoolSize){ty[k], cnt[k]};
-    VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = 3 * nd, .poolSizeCount = nps, .pPoolSizes = nps ? ps : NULL};
-    if (vk->CreateDescriptorPool(vk->dev, &dpi, NULL, &pool) != VK_SUCCESS) goto done;
+    {   // One pool for all passes (they are committed one at a time): reset when it is big enough, rebuilt larger when not. Each count gets headroom so that the rebuilds stop quickly.
+        int fits = vk->rpool && 3 * nd <= vk->rpoolSets;
+        for (int k = 0; k < 5 && fits; k++) if (cnt[k] > vk->rpoolCnt[k]) fits = 0;
+        if (fits) {
+            vk->ResetDescriptorPool(vk->dev, vk->rpool, 0);
+        } else {
+            if (vk->rpool) vk->DestroyDescriptorPool(vk->dev, vk->rpool, NULL);
+            vk->rpool = VK_NULL_HANDLE;
+            uint32_t bigSets = 3 * nd * 2 > 192 ? 3 * nd * 2 : 192;
+            VkDescriptorPoolSize bigps[5];
+            uint32_t bigCnt[5], nb = 0;
+            for (int k = 0; k < 5; k++) { bigCnt[k] = cnt[k] * 2 > 256 ? cnt[k] * 2 : 256; bigps[nb++] = (VkDescriptorPoolSize){ty[k], bigCnt[k]}; }
+            VkDescriptorPoolCreateInfo dpi = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = bigSets, .poolSizeCount = nb, .pPoolSizes = bigps};
+            if (vk->CreateDescriptorPool(vk->dev, &dpi, NULL, &vk->rpool) != VK_SUCCESS) { vk->rpool = VK_NULL_HANDLE; goto done; }
+            vk->rpoolSets = bigSets;
+            for (int k = 0; k < 5; k++) vk->rpoolCnt[k] = bigCnt[k];
+        }
+        pool = vk->rpool;
+    }
     for (unsigned d = 0; d < nd; d++) {
         const rn_vk_render *p = draws[d].pipe;
         if (p->n_in) {
@@ -869,8 +1004,12 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     for (unsigned i = 0; i < nt; i++) views[i] = targets[i].image->view;
     VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = p0->rp, .attachmentCount = nt, .pAttachments = views, .width = W, .height = H, .layers = 1};
     if (vk->CreateFramebuffer(vk->dev, &fbi, NULL, &fb) != VK_SUCCESS) goto done;
-    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) { cb = VK_NULL_HANDLE; goto done; }
+    if (!vk->rcb) {
+        VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        if (vk->AllocateCommandBuffers(vk->dev, &cba, &vk->rcb) != VK_SUCCESS) { vk->rcb = VK_NULL_HANDLE; goto done; }
+    }
+    cb = vk->rcb;
+    vk->ResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
     images_in(vk, cb, in, nin);
@@ -940,7 +1079,111 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     VkMemoryBarrier fromGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
                                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &fromGfx, 0, NULL, 0, NULL);
-    images_out(vk, cb, out, nout);
+    images_mark_gpu(out, nout);
+    if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
+    if (!vk->rfence) {
+        VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vk->CreateFence(vk->dev, &fci, NULL, &vk->rfence) != VK_SUCCESS) { vk->rfence = VK_NULL_HANDLE; goto done; }
+    }
+    fence = vk->rfence;
+    vk->ResetFences(vk->dev, 1, &fence);
+    VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+    if (vk->QueueSubmit(vk->queue, 1, &si, fence) != VK_SUCCESS) goto done;
+    const uint64_t wt0 = mach_absolute_time();
+    rc = vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 8000000000ull) == VK_SUCCESS ? 0 : 3;
+    __atomic_fetch_add(&rn_vk_fence_ticks, mach_absolute_time() - wt0, __ATOMIC_RELAXED);
+    if (rc == 3) { vk->DestroyFence(vk->dev, vk->rfence, NULL); vk->rfence = VK_NULL_HANDLE; }   // still pending: not reusable
+done:
+    if (fb) vk->DestroyFramebuffer(vk->dev, fb, NULL);
+    free(sets); free(in); free(out); free(w); free(bi); free(ii);
+    return rc;
+}
+
+// Latency of the submit and wait path with no work in the command buffer: what one render pass costs the compositor before the card has done anything. Logs min / average / max over n round trips.
+void rn_vk_latency_probe(rn_vk *vk, unsigned n, double *min_us, double *avg_us, double *max_us) {
+    *min_us = *avg_us = *max_us = 0;
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return;
+    VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto out;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    double sum = 0, mn = 1e9, mx = 0; unsigned ok = 0;
+    for (unsigned i = 0; i < n; i++) {
+        VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        vk->ResetCommandBuffer(cb, 0);
+        if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS || vk->EndCommandBuffer(cb) != VK_SUCCESS) break;
+        vk->ResetFences(vk->dev, 1, &fence);
+        VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+        const uint64_t t0 = mach_absolute_time();
+        if (vk->QueueSubmit(vk->queue, 1, &si, fence) != VK_SUCCESS) break;
+        if (vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 2000000000ull) != VK_SUCCESS) break;
+        const double us = (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e3;
+        sum += us; if (us < mn) mn = us; if (us > mx) mx = us; ok++;
+    }
+    if (ok) { *min_us = mn; *avg_us = sum / ok; *max_us = mx; }
+out:
+    if (fence) vk->DestroyFence(vk->dev, fence, NULL);
+    vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
+}
+
+// Bulk transfer time of a 1920 x 1080 BGRA image between host memory and the card (a copy command, not shader accesses): upload = host staging to the image, download = the image to
+// the host staging. Milliseconds per copy, averaged over n copies; compares with the 3 to 5 ms a compositor pass takes with its surfaces in system memory.
+void rn_vk_bandwidth_probe(rn_vk *vk, int format, unsigned n, double *up_ms, double *down_ms) {
+    *up_ms = *down_ms = 0;
+    rn_vk_image *im = rn_vk_image_create(vk, format, 1920, 1080);
+    if (!im) return;
+    mach_timebase_info_data_t tb; mach_timebase_info(&tb);
+    double up = 0, down = 0;
+    for (unsigned i = 0; i < n; i++) {
+        VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE;
+        VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+        VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) break;
+        VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        rn_vk_image *one[1] = {im};
+        im->dirty = 1;
+        if (vk->BeginCommandBuffer(cb, &cbb) == VK_SUCCESS) {
+            images_in(vk, cb, one, 1);
+            if (vk->EndCommandBuffer(cb) == VK_SUCCESS && vk->CreateFence(vk->dev, &fci, NULL, &fence) == VK_SUCCESS) {
+                VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
+                const uint64_t t0 = mach_absolute_time();
+                if (vk->QueueSubmit(vk->queue, 1, &si, fence) == VK_SUCCESS) vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 2000000000ull);
+                up += (double)(mach_absolute_time() - t0) * tb.numer / tb.denom / 1e6;
+            }
+        }
+        if (fence) vk->DestroyFence(vk->dev, fence, NULL);
+        vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
+        im->gpudirty = 1;
+        const uint64_t t1 = mach_absolute_time();
+        image_readback_now(vk, im);
+        down += (double)(mach_absolute_time() - t1) * tb.numer / tb.denom / 1e6;
+    }
+    *up_ms = up / n; *down_ms = down / n;
+    rn_vk_image_destroy(vk, im);
+}
+
+// A symbol of the Vulkan driver library (it is loaded RTLD_LOCAL): the bridge's scanout and present helpers.
+void *rn_vk_symbol(rn_vk *vk, const char *name) { return vk && vk->lib ? dlsym(vk->lib, name) : NULL; }
+
+// Copies the whole of one image to another of the same format and size on the card (both stay in GENERAL layout), submitted and waited for. For a render result in VRAM into the
+// display's own surface: the copy runs at memory speed, with no PCIe traffic when the destination is VRAM. 0 on success.
+int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {
+    if (!src || !dst || src->w != dst->w || src->h != dst->h || src->fmt != dst->fmt) return 6;
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; int rc = 2;
+    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return 2;
+    VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
+    rn_vk_image *both[2] = {src, dst};
+    images_in(vk, cb, both, 2);
+    VkMemoryBarrier toCopy = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
+                              .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toCopy, 0, NULL, 0, NULL);
+    VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {src->w, src->h, 1}};
+    vk->CmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    VkMemoryBarrier done_ = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done_, 0, NULL, 0, NULL);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto done;
@@ -949,9 +1192,6 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     rc = vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 8000000000ull) == VK_SUCCESS ? 0 : 3;
 done:
     if (fence) vk->DestroyFence(vk->dev, fence, NULL);
-    if (cb) vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
-    if (fb) vk->DestroyFramebuffer(vk->dev, fb, NULL);
-    if (pool) vk->DestroyDescriptorPool(vk->dev, pool, NULL);
-    free(sets); free(in); free(out); free(w); free(bi); free(ii);
+    vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
     return rc;
 }

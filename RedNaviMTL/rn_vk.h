@@ -36,6 +36,8 @@ enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA
 unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknown format
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
 rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth);   // depth > 1: a 3D image (sampled only); staging is depth slices of width * height texels
+rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t width, uint32_t height, void *ptr, size_t pitch, size_t bytes);   // linear image over page-aligned host memory (an IOSurface's), zero copy; NULL: keep copying
+int rn_vk_image_is_host(rn_vk_image *img);                          // 1: made by rn_vk_image_from_host, no host copy exists, rn_vk_image_staging is the memory itself
 void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows packed (width * texel bytes)
 void rn_vk_image_host_wrote(rn_vk_image *img);
 // A view with another format of the same texel size (RN_VK_* as in rn_vk_image_create), components swizzled by VkComponentSwizzle values (NULL: as they are). It shares the image, its
@@ -117,6 +119,10 @@ typedef struct {
 } rn_vk_draw;
 // One render pass over the targets with the draws in order (no draws: only the clears are done), submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
 // offset is wrong). The targets' host copies are current afterwards.
+void rn_vk_latency_probe(rn_vk *vk, unsigned n, double *min_us, double *avg_us, double *max_us);   // submit + wait of an empty command buffer, in microseconds
+void rn_vk_bandwidth_probe(rn_vk *vk, int format, unsigned n, double *up_ms, double *down_ms);   // 1080p BGRA copy host to card and back, ms each
+void *rn_vk_symbol(rn_vk *vk, const char *name);   // dlsym in the Vulkan driver library
+int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // whole image to an image of the same size and format on the card, waited for
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_draw *draws, unsigned ndraws);
 
 // The test of tools/mtl_init_harness: the compute shader of mesa-bridge/test/vk_dispatch.comp (v[i] = i * 3 + 7, 64 invocations per group). Prints to stderr, returns 0 when every value is right.

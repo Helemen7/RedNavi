@@ -106,6 +106,13 @@ u64 rn_system_pte(u64 bus) {
     return (bus & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x2ull | 0x4ull | 0x10ull | 0x20ull | 0x40ull | (kMtypeUc << 48);
 }
 
+// A page of system memory that a program's data lives in (the IOSurfaces the compositor samples and renders into): the same as above with MTYPE_NC (0), what Linux maps GTT buffers
+// with by default, so the GPU's caches can hold the data (it stays coherent through SNOOPED). With MTYPE_UC every texel fetch is an uncached read over PCIe; measured 2026-11-08, a
+// compositor pass took 3 to 5 ms. The GART (the MES ring, kernel structures) keeps MTYPE_UC.
+u64 rn_system_pte_nc(u64 bus) {
+    return (bus & 0x0000FFFFFFFFF000ull) | 0x1ull | 0x2ull | 0x4ull | 0x10ull | 0x20ull | 0x40ull;
+}
+
 void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 bus) {
     // The PTE Linux writes for a GTT page: amdgpu_ttm_tt_pte_flags = amdgpu_ttm_tt_pde_flags (VALID | SYSTEM, plus SNOOPED for cached memory) | gart_pte_flags
     // (gmc_v11_0_gart_init: AMDGPU_PTE_MTYPE_NV10(MTYPE_UC) | AMDGPU_PTE_EXECUTABLE) | READABLE | WRITEABLE. Address in bits 47:12. EXECUTABLE matters: the command

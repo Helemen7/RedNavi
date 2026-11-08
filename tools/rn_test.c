@@ -10,6 +10,7 @@
 #include <mach/mach.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <dirent.h>
 #include <stdlib.h>
 #include <string.h>
@@ -216,6 +217,33 @@ int main(int argc, char **argv) {
         }
         IOServiceClose(c);
         return pr.v[0] == 0x600DC0DEu ? 0 : 2;
+    }
+    if (argc > 1 && !strcmp(argv[1], "userptr")) {              // userptr: the plain dispatch writes its result dword into memory this program allocated itself (a buffer over the caller's pages, RN_UC_BO_USERPTR), nothing copied
+        Bo code;
+        if (createBo(c, 4096, &code) || vaMap(c, code.handle, 0x10000, 0, 4096)) return 1;
+        const size_t bytes = 1u << 20;
+        void *mine = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+        if (mine == MAP_FAILED) { printf("mmap failed\n"); return 1; }
+        memset(mine, 0xAB, bytes);
+        struct rn_uc_bo_userptr in = {(uint64_t)(uintptr_t)mine, bytes, 0, 0};
+        struct rn_uc_bo_info out;
+        size_t outSize = sizeof(out);
+        kr = IOConnectCallStructMethod(c, RN_UC_BO_USERPTR, &in, sizeof(in), &out, &outSize);
+        printf("userptr buffer over %p: 0x%x, handle %u, size 0x%llx\n", mine, kr, out.handle, out.size);
+        if (kr) return 1;
+        if (vaMap(c, out.handle, 0x20000, 0, bytes)) { printf("va map failed\n"); return 1; }
+        const uint32_t n = buildDispatch(code.cpu, 0x10000, 0x20000);
+        kr = submitIb(c, 0x10000, n);
+        uint32_t r = 0;
+        kern_return_t kw = waitSeq(c, gSeq, 3000, &r, NULL);
+        printf("submit 0x%x, wait 0x%x, fence %s\n", kr, kw, r ? "reached" : "NOT reached");
+        const uint32_t *w = mine;
+        printf("my memory: %08x %08x %08x %08x (want 600dc0de first, abababab after)\n", w[0], w[1], w[2], w[3]);
+        struct rn_uc_bo_free f = {out.handle, 0};
+        kr = IOConnectCallStructMethod(c, RN_UC_BO_FREE, &f, sizeof(f), NULL, NULL);
+        printf("free: 0x%x; my memory still readable: %08x\n", kr, w[0]);
+        IOServiceClose(c);
+        return w[0] == 0x600DC0DEu ? 0 : 2;
     }
     if (argc > 1 && !strcmp(argv[1], "gfx")) {                  // gfx [N]: the plain dispatch on the graphics queue (a compute dispatch is valid on it), N times, interleaved with the compute queue
         const int rounds = argc > 2 ? atoi(argv[2]) : 1;

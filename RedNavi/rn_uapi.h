@@ -32,6 +32,7 @@ enum {
     RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
     RN_UC_PRESENT = 19,          // in rn_uc_present, out rn_uc_present_result: show a display surface (page flip)
     RN_UC_VRAM_PEEK = 18,        // in rn_uc_vram_peek, out rn_uc_vram_peek_result (debugging: reads VRAM through the index/data registers, any offset)
+    RN_UC_BO_USERPTR = 21,       // in rn_uc_bo_userptr, out rn_uc_bo_info: a buffer over a page-aligned range of the caller's own memory (an IOSurface's), wired for the buffer's life
     RN_UC_FB_OVERRIDE = 20,      // in: n x 24 bytes (kind, selector, result, unused, value), 0 to 16 entries: the answers RedNaviFB gives to framebuffer attributes (experiments; an empty input clears them)
     RN_UC_COUNT
 };
@@ -81,6 +82,7 @@ struct rn_uc_info {
 // 1 and 2 are further surfaces of the same size, for a program that presents on its own (rn_uc_info.fb_surfaces says how many exist in the current mode, 1 to 3). RN_UC_PRESENT
 // makes the display scan out one of them; when the connection that did so closes, the display goes back to surface 0.
 
+#define RN_PRESENT_FRAME_DONE 0xFFFF0001u   // rn_uc_present.surface: not a flip. The caller rendered the desktop into display surface 0 itself; the accelerator's next display transaction does not copy its surface
 #define RN_PRESENT_WAIT 1u     // return when the display uses the new surface (the next vertical blank), not before
 
 struct rn_uc_present {
@@ -96,6 +98,15 @@ struct rn_uc_present_result {
 struct rn_uc_bo_create {
     uint64_t size;             // bytes, rounded up to 4 KB
     uint32_t flags;            // 0, RN_BO_VRAM or RN_BO_VRAM_VISIBLE
+    uint32_t pad;
+};
+
+// RN_UC_BO_USERPTR: `addr` and `size` are 4 KB aligned and lie in the caller's address space. The buffer lives in host memory (flags 0 in the answer, no CPU mapping is made: the caller has it already),
+// and is mapped with RN_UC_VA_MAP like any other. Freeing it unwires the memory; the memory itself stays the caller's.
+struct rn_uc_bo_userptr {
+    uint64_t addr;
+    uint64_t size;
+    uint32_t flags;            // 0
     uint32_t pad;
 };
 

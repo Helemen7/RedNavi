@@ -20,6 +20,8 @@
 #define PPSMC_MSG_TransferTableSmu2Dram 0x12
 #define PPSMC_MSG_GetDpmFreqByIndex 0x1F
 #define PPSMC_MSG_NotifyPowerSource 0x35
+#define PPSMC_MSG_SetSoftMinByFreq 0x19      // smu_v13_0_0_ppsmc.h; argument (PPCLK_e << 16) | MHz
+#define PPSMC_MSG_SetSoftMaxByFreq 0x1A
 #define PPSMC_MSG_AllowGfxOff 0x28
 #define PPSMC_MSG_DisallowGfxOff 0x29
 #define PPSMC_MSG_GetRunningSmuFeaturesLow 0xC

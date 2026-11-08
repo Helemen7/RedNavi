@@ -584,6 +584,15 @@ long RedNaviDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *tx) 
     if (!surfP) return 0;                                   // nothing to show on plane 0 (or a resource source, not handled yet)
     IOSurface *surf = static_cast<IOSurface *>(surfP);
     IOService *prov = gFb ? gFb->getProvider() : nullptr;
+    {   // The Metal plug-in renders CoreDisplay's passes on the card and copies each finished frame into the scanout itself (RN_PRESENT_FRAME_DONE): then the surface is not read here.
+        static const OSSymbol *framesSym;
+        if (!framesSym) framesSym = OSSymbol::withCString("rednavi-gpu-frames");
+        uint32_t direct = 0;
+        if (prov && framesSym && prov->callPlatformFunction(framesSym, true, &direct, nullptr, nullptr, nullptr) == kIOReturnSuccess && direct) {
+            if (say) rnNote("  the plug-in puts the frames into the scanout itself: not copied");
+            return 0;
+        }
+    }
     uint64_t phys = 0, pitch = 0, height = 0, width = 0;
     if (!provNumber(prov, "fb-scanout-phys", &phys) || !provNumber(prov, "fb-pitch", &pitch) || !provNumber(prov, "fb-height", &height) || !provNumber(prov, "fb-width", &width)) return 0;
     uint32_t sw = surf->getWidth(), sh = surf->getHeight(), sp = surf->getBytesPerRow(), fmt = surf->getPixelFormat();
@@ -603,6 +612,7 @@ long RedNaviDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *tx) 
         const uint8_t *sb = reinterpret_cast<const uint8_t *>(src->getVirtualAddress());
         size_t row = sp < pitch ? sp : pitch;
         for (uint64_t y = 0; y < height; y++) memcpy(dst + y * pitch, sb + y * sp, row);
+        __sync_synchronize();   // the scanout mapping is write-combined: the stores must have left the CPU before the display engine is let at them
         if (say) {   // a sample of the surface that was copied: how many of 4096 spread pixels are not black (alpha ignored), and a few values
             unsigned nz = 0; uint32_t v0 = 0, v1 = 0, v2 = 0;
             for (unsigned i = 0; i < 4096; i++) {

@@ -276,7 +276,7 @@ class RedNaviProbe : public IOService {
     // gpuVa: the buffer's address in the GART window (0 for a buffer that is not mapped there); bus: the bus address of each of its 4 KB pages, from which the user address spaces get their PTEs.
     // A VRAM buffer has no md/dma/bus: vramOff is its offset in VRAM (physically contiguous, 4 KB aligned), dom is RN_BO_VRAM or RN_BO_VRAM_VISIBLE, and a visible one has vmd, the
     // sub-range of the PCI aperture it occupies, which is what the caller maps. A slot is free when size is 0.
-    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; IOMemoryDescriptor *vmd; uint64_t vramOff; uint32_t dom; bool fixed; };
+    struct RNBo { IOBufferMemoryDescriptor *md; IODMACommand *dma; uint64_t gpuVa; uint32_t size; uint64_t *bus; bool gart; IOMemoryDescriptor *vmd; uint64_t vramOff; uint32_t dom; bool fixed; IOMemoryDescriptor *umd; };   // umd: a buffer over a caller's memory (RN_UC_BO_USERPTR), wired by prepare(); md is then null
     // VRAM that no one else in the kext uses, handed out in 4 KB pages by first fit from a sorted list of free ranges that merge when they touch. A range allocator, not a buddy
     // system: buffers come in any size up to 1 GB, a buddy system would round a 640 MB buffer up to 1 GB, and the list stays short because a buffer's neighbours are merged on free.
     struct VramPool {
@@ -356,7 +356,7 @@ class RedNaviProbe : public IOService {
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     int resetGfxQueue(uint32_t info[4]);           // the same for the graphics queue
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
-    int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true);
+    int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true, IOMemoryDescriptor *umd = nullptr);   // umd: the pages of a caller's memory instead of fresh ones
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
     friend class IOAccelRedNaviClient;
 public:
@@ -431,6 +431,7 @@ private:
     uint32_t selRate {0x06};       // DisplayPort link rate code for that mode
     uint32_t selPitch {1920};      // scanout pitch in pixels
     void selectMode();
+    volatile uint32_t gpuDirect {0};   // 1 while the Metal plug-in puts the desktop into the scanout itself (RN_PRESENT_FRAME_DONE), cleared when its connection closes; the display pipe of RedNaviAccel2 reads it ("rednavi-gpu-frames")
     IOReturn callPlatformFunction(const OSSymbol *name, bool waitForFunction, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
     void applyMode(const rn_mode &m);
     void quiescePipe();
@@ -976,6 +977,21 @@ void RedNaviProbe::smuProbe(const char *property, bool send) {
             snprintf(key, sizeof(key), "%s_sdma_version", st.name); rnPublishOne(out, key, rd(sdmaVersion));
             if (rc == -ETIMEDOUT) break;
         }
+        // Opt-in (rednavi_gfxclk=<MHz>): pin the graphics clock (PPCLK_GFX 0) with soft min and max, what Linux's smu_v13_0_set_soft_freq_limited_range sends for the
+        // 'high' performance level. Without it the DPM state is left to the firmware: measured 2026-11-08, a compositor render pass of a few draws takes 3 to 5 ms on the card
+        // (an empty submit and wait takes 34 us), and the DPM table of this card has GFX levels of 500 and 2675 MHz.
+        uint32_t gfxclk = 0;
+        // The kernel keeps only the first 1024 characters of the boot-args and the desktop's are at that limit, so the value can also be a property of the kext's personality.
+        if (!PE_parse_boot_argn("rednavi_gfxclk", &gfxclk, sizeof(gfxclk))) { OSNumber *n = OSDynamicCast(OSNumber, getProperty("rednavi_gfxclk")); if (n) gfxclk = n->unsigned32BitValue(); }
+        if (gfxclk >= 500 && gfxclk <= 2800) {
+            uint32_t result = 0, resp = 0;
+            int rc1 = rn_smu13_send(adev, PPSMC_MSG_SetSoftMaxByFreq, (0u << 16) | gfxclk, &result, &resp, 1000000);
+            int rc2 = rn_smu13_send(adev, PPSMC_MSG_SetSoftMinByFreq, (0u << 16) | gfxclk, &result, &resp, 1000000);
+            IOLog("RedNavi: SMU gfxclk %u MHz: soft max rc %d, soft min rc %d, response 0x%x\n", gfxclk, rc1, rc2, resp);
+            rnPublishOne(out, "gfxclk_request_mhz", gfxclk);
+            rnPublishOne(out, "gfxclk_soft_max_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc1)));
+            rnPublishOne(out, "gfxclk_soft_min_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc2)));
+        }
         // Opt-in (rednavi_smu_setup=1): the rest of what Linux's smu_smc_hw_setup/smu_hw_init/smu_late_init send after the features
         // are on and that we did not: the combo pptable transfer, the DPM tables (level count and frequency of every clock), the power
         // source. With SCPM the allowed mask is rejected by the firmware, as above, so Linux does not send it either.
@@ -1400,6 +1416,7 @@ IOReturn RedNaviProbe::setModeLive(uint32_t index) {
 
 IOReturn RedNaviProbe::callPlatformFunction(const OSSymbol *name, bool waitForFunction, void *p1, void *p2, void *p3, void *p4) {
     if (name && name->isEqualTo("rednavi-set-mode")) return setModeLive(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p1)));
+    if (name && name->isEqualTo("rednavi-gpu-frames")) { if (p1) *static_cast<uint32_t *>(p1) = gpuDirect; return kIOReturnSuccess; }
     return IOService::callPlatformFunction(name, waitForFunction, p1, p2, p3, p4);
 }
 
@@ -1790,9 +1807,14 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // through the GART, a way to hand the compute queue a command buffer, and a fence wait. Every buffer belongs to the connection that
 // created it and goes away with it; command buffers and fences must lie inside the connection's own buffers. The caller is still trusted
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
+// A wait for the GPU polls: the first 2 ms in 20 us steps (a frame's fence is usually done within a few hundred microseconds; IOSleep(1) alone made every wait cost a millisecond or more,
+// several per frame), then in 1 ms sleeps as before. `ms` counts only the sleeps.
+#define RN_WAIT_STEP(spins, ms) do { if ((spins) < 100) { IODelay(20); (spins)++; } else { IOSleep(1); (ms)++; } } while (0)
+
 class IOAccelRedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(IOAccelRedNaviClient)
     static constexpr uint32_t kMaxHandles = 32768;
+    bool setDirect {false};                        // this connection set RedNaviProbe::gpuDirect
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
     int *boIdx {nullptr};                          // handle - 1 -> index in the probe's buffer table, -1 for a free handle
@@ -1800,6 +1822,7 @@ class IOAccelRedNaviClient : public IOUserClient {
     struct Map { uint64_t va; uint64_t size; uint32_t handle; bool used; };
     static constexpr uint32_t kMaxMaps = 65536;
     Map *maps {nullptr};                           // what is mapped in this connection's address space
+    task_t ownerTask {nullptr};                    // the process that opened the connection (RN_UC_BO_USERPTR wires its memory)
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
     uint32_t seqSubmitted {0};                     // the compute queue's counter (bit 31 clear)
@@ -2007,13 +2030,12 @@ class IOAccelRedNaviClient : public IOUserClient {
 
     // Waits for one (object, point): until work is attached (when `forSubmit`, else an object nothing was ever attached to is an error), then until it is done.
     IOReturn syncWaitOne(Syncobj &s, uint64_t point, uint32_t timeoutMs, bool forSubmit, bool availableOnly) {
-        uint32_t ms = 0;
+        uint32_t ms = 0, spins = 0;
         for (;;) {
             if (availableOnly ? isAttached(s, point) : isDone(s, point)) return kIOReturnSuccess;
             if (!forSubmit && !isAttached(s, point)) return kIOReturnBadArgument;
             if (ms >= timeoutMs) return kIOReturnTimeout;
-            IOSleep(1);
-            ms++;
+            RN_WAIT_STEP(spins, ms);
         }
     }
 
@@ -2051,6 +2073,7 @@ public:
             IOLockLock(lock);
             freeAll();                                  // the PTEs go invalid before the pages are released, so a late GPU access faults instead of corrupting memory
             IOLockUnlock(lock);
+            if (setDirect) { gpuOwner->gpuDirect = 0; setDirect = false; }       // the plug-in is gone: the display pipe copies surfaces again
             if (gpuOwner->frontSurface != 0) gpuOwner->present(0, false);   // a program that flipped to its own surface and went away: the desktop's surface is shown again
         }
         if (!isInactive()) terminate();
@@ -2129,6 +2152,27 @@ public:
                 rc = kIOReturnSuccess;
             }
             break;
+        case RN_UC_BO_USERPTR:
+            // A buffer over memory the caller already has (a page-aligned range of its own address space, such as an IOSurface's): the GPU reaches the same pages, nothing is copied.
+            if (sized(args, sizeof(rn_uc_bo_userptr), sizeof(rn_uc_bo_info)) && ownerTask) {
+                const rn_uc_bo_userptr *in = static_cast<const rn_uc_bo_userptr *>(args->structureInput);
+                if ((in->addr & 4095) || (in->size & 4095) || in->size == 0 || in->size > RedNaviProbe::kBoMaxBytes || in->flags != 0) break;
+                uint32_t h = 0;
+                while (h < kMaxHandles && boIdx[h] >= 0) h++;
+                if (h == kMaxHandles) { rc = kIOReturnNoResources; break; }
+                IOMemoryDescriptor *umd = IOMemoryDescriptor::withAddressRange(in->addr, in->size, kIODirectionInOut, ownerTask);
+                if (!umd) { rc = kIOReturnVMError; break; }
+                const int idx = gpuOwner->createHostBo(static_cast<uint32_t>(in->size), false, false, umd);   // like any host buffer: the address spaces map it from its page list
+                if (idx < 0) { umd->release(); rc = kIOReturnNoResources; break; }
+                boIdx[h] = idx;
+                boUsed++;
+                rn_uc_bo_info *o = static_cast<rn_uc_bo_info *>(args->structureOutput);
+                memset(o, 0, sizeof(*o));
+                o->handle = h + 1;
+                o->size = gpuOwner->bos[idx].size;
+                rc = kIOReturnSuccess;
+            }
+            break;
         case RN_UC_BO_FREE:
             if (sized(args, sizeof(rn_uc_bo_free), 0)) {
                 const uint32_t handle = static_cast<const rn_uc_bo_free *>(args->structureInput)->handle;
@@ -2197,10 +2241,9 @@ public:
                 if ((in->seq & 0x7fffffffu) == 0 || (ring && !gfxSeqSubmitted) || ((submitted - in->seq) & 0x7fffffffu) >= 0x40000000u) break;   // never submitted
                 const uint32_t timeout = in->timeout_ms > 10000 ? 10000 : in->timeout_ms;
                 const uint32_t fence0 = fenceWord(ring);
-                uint32_t ms = 0;
+                uint32_t ms = 0, spins = 0;
                 while (ms < timeout && !seqDone(fenceWord(ring), in->seq)) {
-                    IOSleep(1);
-                    ms++;
+                    RN_WAIT_STEP(spins, ms);
                     if (ms == gpuOwner->hangMs && fenceWord(ring) == fence0) {            // no progress for the whole hang time: the queue is stuck
                         uint32_t info[4];
                         IOLockLock(gpuOwner->queueLock);
@@ -2226,6 +2269,13 @@ public:
         case RN_UC_PRESENT:
             if (sized(args, sizeof(rn_uc_present), sizeof(rn_uc_present_result))) {
                 const rn_uc_present *in = static_cast<const rn_uc_present *>(args->structureInput);
+                if (in->surface == RN_PRESENT_FRAME_DONE) {          // not a flip: a desktop frame was rendered into the scanout by the GPU, the next display transaction need not copy
+                    gpuOwner->gpuDirect = 1; setDirect = true;
+                    rn_uc_present_result *o = static_cast<rn_uc_present_result *>(args->structureOutput);
+                    memset(o, 0, sizeof(*o));
+                    rc = kIOReturnSuccess;
+                    break;
+                }
                 if ((in->flags & ~RN_PRESENT_WAIT) != 0) break;
                 const int pr = gpuOwner->present(in->surface, (in->flags & RN_PRESENT_WAIT) != 0);
                 if (pr < 0) break;
@@ -2334,7 +2384,7 @@ public:
                 const bool all = in->flags & RN_UC_SYNCOBJ_WAIT_ALL, forSubmit = in->flags & RN_UC_SYNCOBJ_WAIT_FOR_SUBMIT, availOnly = in->flags & RN_UC_SYNCOBJ_WAIT_AVAILABLE;
                 const uint64_t ns = static_cast<uint64_t>(in->timeout_nsec) > 10000000000ull ? 10000000000ull : static_cast<uint64_t>(in->timeout_nsec);
                 const uint32_t timeoutMs = static_cast<uint32_t>(ns / 1000000);
-                uint32_t ms = 0;
+                uint32_t ms = 0, spins = 0;
                 for (;;) {
                     uint32_t nDone = 0, first = 0xffffffffu;
                     bool noWork = false;
@@ -2352,8 +2402,7 @@ public:
                         break;
                     }
                     if (ms >= timeoutMs) { rc = kIOReturnTimeout; break; }
-                    IOSleep(1);
-                    ms++;
+                    RN_WAIT_STEP(spins, ms);
                 }
             }
             break;
@@ -2508,6 +2557,7 @@ IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32
         return kIOReturnNotPrivileged;
     IOAccelRedNaviClient *c = OSTypeAlloc(IOAccelRedNaviClient);
     if (!c) return kIOReturnNoMemory;
+    c->ownerTask = owningTask;
     if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this) || !c->start(this)) {
         c->detach(this);
         c->release();
@@ -2540,7 +2590,7 @@ void RedNaviProbe::destroyBo(int idx) {
     if (bos[idx].bus) IOFree(bos[idx].bus, sizeof(uint64_t) * (bos[idx].size / 4096));
     boBytes -= bos[idx].size;
     if (bos[idx].dma) { bos[idx].dma->complete(); bos[idx].dma->clearMemoryDescriptor(); bos[idx].dma->release(); }
-    bos[idx].md->release();
+    if (bos[idx].umd) { bos[idx].umd->complete(); bos[idx].umd->release(); } else bos[idx].md->release();
     bos[idx] = {};
 }
 
@@ -2613,13 +2663,16 @@ bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, 
     const uint64_t *bus = bos[boIdx].bus;
     const bool vram = bos[boIdx].dom != 0;                 // a VRAM buffer is contiguous: page i is at kRNVramMcBase + vramOff + i * 4096
     const uint64_t vramPa = bos[boIdx].vramOff;           // the PTE of a local page holds the offset in VRAM, not the MC address (measured 2026-11-02: with 0x80_0000_0000 added the GPU's writes vanish)
+    static int ucUserptr = -1;                             // boot-arg rednavi_userptr_uc=1: map the buffers over a program's memory uncached like the rest of system memory (the way before 2026-11-08)
+    if (ucUserptr < 0) { uint32_t v = 0; ucUserptr = PE_parse_boot_argn("rednavi_userptr_uc", &v, sizeof(v)) && v == 1; }
+    const bool ncData = bos[boIdx].umd && !ucUserptr;
     uint64_t ptb = 0;
     bool ok = true;
     uint32_t done = 0;
     for (; done < pages; done++) {
         const uint64_t vp = vaPage + done;
         if (done == 0 || (vp & 0x1ff) == 0) { if (!vmPtb(vmid, vp, true, &ptb)) { ok = false; break; } }
-        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), vram ? rn_vram_pte(vramPa + static_cast<uint64_t>(boPage + done) * 4096) : rn_system_pte(bus[boPage + done]));
+        rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), vram ? rn_vram_pte(vramPa + static_cast<uint64_t>(boPage + done) * 4096) : ncData ? rn_system_pte_nc(bus[boPage + done]) : rn_system_pte(bus[boPage + done]));
     }
     if (!ok) {                                       // leave nothing half mapped
         for (uint32_t p = 0; p < done; p++) {
@@ -2644,7 +2697,7 @@ void RedNaviProbe::vmUnmap(int vmid, uint64_t vaPage, uint32_t pages) {
     rn_vm_flush(&gpu, vmid);
 }
 
-int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
+int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart, IOMemoryDescriptor *umd) {
     RNLockGuard g(boLock);
     int slot = -1;
     for (uint32_t i = 0; i < boCount; i++) if (!bos[i].size) { slot = static_cast<int>(i); break; }
@@ -2654,20 +2707,28 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
     const uint32_t pages = size / 4096;
     if (gart && gartNextPage + pages > 16384) return -1;
     if (boBytes + size > boBudget) return -1;
-    IOBufferMemoryDescriptor *md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | (writeCombine ? kIOMapWriteCombineCache : 0), size, 4096);
-    if (!md) return -1;
-    md->prepare();
-    memset(md->getBytesNoCopy(), 0, size);
+    IOBufferMemoryDescriptor *md = nullptr;
+    IOMemoryDescriptor *mdAny;                               // what the DMA command and the page list are made from
+    if (umd) {                                               // a caller's memory: wired for as long as the buffer lives, pages are the caller's
+        if (umd->getLength() < size || umd->prepare() != kIOReturnSuccess) return -1;
+        mdAny = umd;
+    } else {
+        md = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut | (writeCombine ? kIOMapWriteCombineCache : 0), size, 4096);
+        if (!md) return -1;
+        md->prepare();
+        memset(md->getBytesNoCopy(), 0, size);
+        mdAny = md;
+    }
     IODMACommand *dma = IODMACommand::withSpecification(kIODMACommandOutputHost64, 64, 0, IODMACommand::kMapped, 0, 1, nullptr, 0);
-    if (!dma || dma->setMemoryDescriptor(md) != kIOReturnSuccess) {
+    if (!dma || dma->setMemoryDescriptor(mdAny) != kIOReturnSuccess) {
         if (dma) dma->release();
-        md->release();
+        if (umd) umd->complete(); else md->release();
         return -1;
     }
     uint64_t *bus = static_cast<uint64_t *>(IOMalloc(sizeof(uint64_t) * pages));
     if (!bus) {
         dma->complete(); dma->clearMemoryDescriptor(); dma->release();
-        md->release();
+        if (umd) umd->complete(); else md->release();
         return -1;
     }
     uint32_t page = gartNextPage, n = 0;
@@ -2686,13 +2747,13 @@ int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart) {
         if (gart) gartNextPage = page;
         IOFree(bus, sizeof(uint64_t) * pages);
         dma->complete(); dma->clearMemoryDescriptor(); dma->release();
-        md->release();
+        if (umd) umd->complete(); else md->release();
         return -1;
     }
     if (gart) rn_gart_flush(&gpu);
     const int idx = slot;
     if (static_cast<uint32_t>(slot) == boCount) boCount++;
-    bos[idx] = {md, dma, gart ? 0x2000000000ull + static_cast<uint64_t>(gartNextPage) * 4096 : 0, size, bus, gart};
+    bos[idx] = {md, dma, gart ? 0x2000000000ull + static_cast<uint64_t>(gartNextPage) * 4096 : 0, size, bus, gart, nullptr, 0, 0, false, umd};
     if (gart) gartNextPage += pages;
     boBytes += size;
     return idx;
@@ -3688,6 +3749,7 @@ void RedNaviProbe::stop(IOService *provider) {
     for (uint32_t i = 0; bos && i < boCount; i++) {
         if (bos[i].dma) { bos[i].dma->complete(); bos[i].dma->clearMemoryDescriptor(); bos[i].dma->release(); }
         if (bos[i].md) bos[i].md->release();
+        if (bos[i].umd) { bos[i].umd->complete(); bos[i].umd->release(); }
         if (bos[i].vmd) bos[i].vmd->release();
         if (bos[i].bus) IOFree(bos[i].bus, sizeof(uint64_t) * (bos[i].size / 4096));
     }

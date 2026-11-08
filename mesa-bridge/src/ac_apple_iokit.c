@@ -784,7 +784,7 @@ int rn_bridge_present(uint32_t surface, int wait)
 
 int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size, ac_drm_bo *bo)
 {
-   /* Host memory cannot be imported (no userptr in the kext); the ranges that can are the display surfaces the program got from rn_bridge_scanout. */
+   /* The display surfaces the program got from rn_bridge_scanout are the kext's own memory and keep their special buffer; any other range goes through RN_UC_BO_USERPTR below. */
    for (uint32_t i = 0; i < 3; i++) {
       if (dev->scan_cpu[i] && cpu == dev->scan_cpu[i] && size != 0 && size <= dev->scan_len[i]) {
          struct amdgpu_bo *b;
@@ -795,7 +795,29 @@ int ac_drm_create_bo_from_user_mem(ac_drm_device *dev, void *cpu, uint64_t size,
          return 0;
       }
    }
-   return -EOPNOTSUPP;
+   /* A page-aligned range of this process's own memory (an IOSurface's, for the Metal plug-in): the kext wires the pages and maps them for the GPU, nothing is copied. */
+   if (((uintptr_t)cpu & 4095) || (size & 4095) || size == 0)
+      return -EINVAL;
+   struct rn_uc_bo_userptr in = {(uint64_t)(uintptr_t)cpu, size, 0, 0};
+   struct rn_uc_bo_info out;
+   int r = call(dev, RN_UC_BO_USERPTR, &in, sizeof(in), &out, sizeof(out));
+   if (r)
+      return r;
+   struct amdgpu_bo *b = calloc(1, sizeof(*b));
+   if (!b || out.handle >= dev->nbos) {
+      struct rn_uc_bo_free f = {out.handle, 0};
+      call(dev, RN_UC_BO_FREE, &f, sizeof(f), NULL, 0);
+      free(b);
+      return -ENOMEM;
+   }
+   b->handle = out.handle;
+   b->size = out.size;
+   b->placement = out.flags;                                  /* 0: host memory; there is no kext mapping (b->cpu stays NULL: the caller has the memory) */
+   pthread_mutex_lock(&dev->lock);
+   dev->bos[b->handle] = b;
+   pthread_mutex_unlock(&dev->lock);
+   bo->abo = b;
+   return 0;
 }
 
 int ac_drm_bo_set_metadata(ac_drm_device *dev, uint32_t bo_handle, struct amdgpu_bo_metadata *info)

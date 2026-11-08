@@ -95,6 +95,7 @@ void rn_mmhub_state(struct rn_device *adev, u32 out[8]);
 // zeroes it; rn_gart_map_page then makes page `page` of the window point at a system memory page (bus address as the IOMMU or the
 // physical address gives it: valid, system, snooped, readable, writeable). Do this before rn_gfxhub_enable, which also flushes the TLBs.
 u64 rn_vram_pte(u64 vram_offset);   // the PTE of a page of local VRAM at that offset in VRAM (what the user address spaces map VRAM buffers with)
+u64 rn_system_pte_nc(u64 bus_addr);   // the same with MTYPE_NC, for program data in system memory (userptr buffers)
 u64 rn_system_pte(u64 bus_addr);   // the PTE of a page of system memory: VALID, SYSTEM, SNOOPED, readable, writeable, executable, MTYPE_UC (what the GART and the user address spaces map host memory with)
 void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page, u64 bus_addr);
 void rn_gart_unmap_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page);   // an invalid PTE; follow with rn_gart_flush

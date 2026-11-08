@@ -51,7 +51,9 @@ class AMDRedNaviFB : public IOFramebuffer {
 
     // Diagnostics, published as the fb-diag property: what WindowServer asks and whether the surface changes.
     IOTimerEventSource *diagTimer {nullptr};
-    IOTimerEventSource *vblTimer {nullptr};                          // 60 Hz while a vertical blank procedure is registered (bit 4)
+    IOTimerEventSource *vblTimer {nullptr};                          // at the mode's refresh rate while a vertical blank procedure is registered (bit 4)
+    uint64_t vblNext {0};                                            // absolute time of its next tick
+    volatile uint64_t vblLast {0}, vblPeriod {0};                    // the last tick and the period, as getVBLTime reports them (WindowServer's display link paces on them)
     IOFBInterruptProc vblProc {nullptr}; OSObject *vblTarget {nullptr}; void *vblRef {nullptr};
     IOFBInterruptProc connProc {nullptr}; OSObject *connTarget {nullptr}; void *connRef {nullptr};
     IOMemoryMap *diagMap {nullptr};
@@ -300,10 +302,14 @@ public:
     void record(uint32_t kind, uint32_t sel, IOReturn r, uint64_t value) {
         AttrRec *e = nullptr;
         for (uint32_t i = 0; i < attrTableN; i++) if (attrTable[i].kind == kind && attrTable[i].sel == sel) { e = &attrTable[i]; break; }
-        if (!e && attrTableN < 48) { e = &attrTable[attrTableN++]; e->kind = kind; e->sel = sel; }
-        if (!e) return;
-        e->result = static_cast<int32_t>(r); e->count++; e->value = value;
-        OSData *d = OSData::withBytes(attrTable, sizeof(AttrRec) * attrTableN);
+        if (!e) {   // the slot is reserved atomically: two threads that both saw 47 entries must not both take the 48th
+            SInt32 slot = OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&attrTableN));
+            if (slot >= 48) { OSDecrementAtomic(reinterpret_cast<volatile SInt32 *>(&attrTableN)); return; }
+            e = &attrTable[slot]; e->kind = kind; e->sel = sel;
+        }
+        e->result = static_cast<int32_t>(r); OSIncrementAtomic(reinterpret_cast<volatile SInt32 *>(&e->count)); e->value = value;
+        uint32_t n = attrTableN > 48 ? 48 : attrTableN;
+        OSData *d = OSData::withBytes(attrTable, sizeof(AttrRec) * n);
         if (d) { setProperty("attr-table", d); d->release(); }
     }
 
@@ -516,10 +522,26 @@ public:
                 vblTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
                     AMDRedNaviFB *self = static_cast<AMDRedNaviFB *>(o);
                     static uint32_t ticks;
-                    if (self->vblProc) { ticks++; self->vblProc(self->vblTarget, self->vblRef); if (ticks == 1 || ticks % 3600 == 0) IOLog("RedNaviFB: vertical blank tick %u\n", ticks); }
-                    t->setTimeout(16667, kMicrosecondScale);
+                    // The period is the active mode's refresh rate and the next tick is an absolute time (the previous one plus a period), so the callback's own latency does not add up
+                    // (found by the code review of 2026-11-08: a fixed 16667 us timer made WindowServer pace a 120 Hz mode at 60).
+                    uint64_t per = 0, now = 0;
+                    nanoseconds_to_absolutetime(1000000000ull / (self->fbRefresh ? self->fbRefresh : 60), &per);
+                    clock_get_uptime(&now);
+                    IOFBInterruptProc proc = self->vblProc; OSObject *tg = self->vblTarget; void *rf = self->vblRef;
+                    self->vblPeriod = per; self->vblLast = self->vblNext ? self->vblNext : now;
+                    if (proc) { ticks++; proc(tg, rf); if (ticks == 1 || ticks % 3600 == 0) IOLog("RedNaviFB: vertical blank tick %u\n", ticks); }
+                    self->vblNext += per;
+                    if (self->vblNext <= now) self->vblNext = now + per;     // fell behind (or the rate changed): start again from now
+                    t->wakeAtTime(self->vblNext);
                 });
-                if (vblTimer) { wl->addEventSource(vblTimer); vblTimer->setTimeout(16667, kMicrosecondScale); }
+                if (vblTimer) {
+                    wl->addEventSource(vblTimer);
+                    uint64_t per = 0, now = 0;
+                    nanoseconds_to_absolutetime(1000000000ull / (fbRefresh ? fbRefresh : 60), &per);
+                    clock_get_uptime(&now);
+                    vblNext = now + per;
+                    vblTimer->wakeAtTime(vblNext);
+                }
             }
             if (diagTimer && wl->addEventSource(diagTimer) == kIOReturnSuccess) diagTimer->setTimeoutMS(1000);
         }
@@ -536,6 +558,12 @@ public:
         if (type == kIOFBVBLInterruptType) { vblProc = proc; vblTarget = target; vblRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(1)); return kIOReturnSuccess; }
         if (type == kIOFBConnectInterruptType) { connProc = proc; connTarget = target; connRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(2)); return kIOReturnSuccess; }
         return kIOReturnUnsupported;
+    }
+    // The family's own answer comes from state its vertical blank handler keeps; this driver calls the registered procedure from a timer, so report the timer's own tick and period.
+    void getVBLTime(AbsoluteTime *time, AbsoluteTime *delta) APPLE_KEXT_OVERRIDE {
+        if (!(fbExp() & 16) || !vblLast) { IOFramebuffer::getVBLTime(time, delta); return; }
+        if (time) AbsoluteTime_to_scalar(time) = vblLast;
+        if (delta) AbsoluteTime_to_scalar(delta) = vblPeriod;
     }
     IOReturn unregisterInterrupt(void *interruptRef) APPLE_KEXT_OVERRIDE {
         if (!(fbExp() & 16)) return IOFramebuffer::unregisterInterrupt(interruptRef);
