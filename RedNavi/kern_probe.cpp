@@ -3654,7 +3654,8 @@ bool RedNaviProbe::start(IOService *provider) {
             if (rn_navi33::hasComputeRegisterBases(check)) {
                 const auto &ips = check.bases;
                 for (uint32_t i = 0; i < 4; ++i) gpu.reg_offset[RN_GC_HWIP][0][i] = ips.gc.dwords[i];
-                for (uint32_t i = 0; i < 5; ++i) gpu.reg_offset[RN_MMHUB_HWIP][0][i] = ips.mmhub.dwords[i];
+                for (uint32_t i = 0; i < ips.mmhub.count && i < RN_MAX_SEG; ++i)
+                    gpu.reg_offset[RN_MMHUB_HWIP][0][i] = ips.mmhub.dwords[i];
                 for (uint32_t i = 0; i < 2; ++i) gpu.reg_offset[RN_OSSSYS_HWIP][0][i] = ips.osssys.dwords[i];
                 for (uint32_t i = 0; i < 6; ++i) gpu.reg_offset[RN_NBIO_HWIP][0][i] = ips.nbif.dwords[i];
                 for (uint32_t i = 0; i < ips.sdma0.count && i < RN_MAX_SEG; ++i)
