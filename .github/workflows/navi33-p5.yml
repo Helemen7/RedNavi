@@ -1,0 +1,32 @@
+name: Navi33 P5 Compute Preflight
+
+on:
+  push:
+    branches: [feature/navi33-p5-compute]
+  pull_request:
+    paths:
+      - 'RedNavi/navi33_runtime.h'
+      - 'RedNavi/navi33_bootstrap.h'
+      - 'RedNavi/kern_probe.cpp'
+      - 'tests/host/navi33_bootstrap_test.cpp'
+      - 'Makefile'
+      - '.github/workflows/navi33-p5.yml'
+
+jobs:
+  host-preflight:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile P5 preflight with sanitizers
+        run: |
+          mkdir -p build
+          ${{ matrix.cxx }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -IRedNavi \
+            tests/host/navi33_bootstrap_test.cpp -o build/navi33_bootstrap_san_test
+          ./build/navi33_bootstrap_san_test
+      - name: Complete host test suite
+        run: make test
