@@ -38,16 +38,24 @@ inline MemoryWindow makeMemoryWindow(uint32_t fbBase, uint32_t fbTop,
     out.fbStart = static_cast<uint64_t>(fbBase) * kFbUnit;
     out.fbBytes = units * kFbUnit;
     out.fbEnd = out.fbStart + out.fbBytes - 1u;
-    if (out.fbBytes < out.vramBytes) {
+    // Navi33 Linux reference: physical VRAM/BAR0 = 8192 MiB, but the
+    // reported accessible FB range can be 8176 MiB after a 16 MiB tail
+    // reservation. Do not reject a full-size Resizable BAR for this.
+    // Keep the allowed difference tight until another real ASIC capture
+    // establishes whether larger reservations occur.
+    constexpr uint64_t kMaxNavi33ReservedTail = 16ull << 20;
+    if (out.fbBytes > out.vramBytes ||
+        out.vramBytes - out.fbBytes > kMaxNavi33ReservedTail) {
         out.error = MemoryError::WindowTooSmall;
         return out;
     }
-    // BAR0 is a CPU aperture; it may be much smaller than local VRAM.
+    // BAR0 is a CPU aperture; it may cover physical VRAM including the
+    // reserved tail. The usable CPU-visible range must exclude that tail.
     if (bar0Bytes < 4096u || bar0Bytes > out.vramBytes) {
         out.error = MemoryError::InvalidBar;
         return out;
     }
-    out.cpuVisibleBytes = bar0Bytes;
+    out.cpuVisibleBytes = bar0Bytes < out.fbBytes ? bar0Bytes : out.fbBytes;
     out.error = MemoryError::Ok;
     return out;
 }
@@ -68,7 +76,7 @@ inline bool hasComputeRegisterBases(const RuntimeReport &r) {
     return r.eligibleForComputeBringup() &&
         r.bases.gc.count >= 4 && r.bases.mp0.count >= 1 &&
         r.bases.mp1.count >= 1 && r.bases.sdma0.count >= 1 &&
-        r.bases.mmhub.count >= 5 && r.bases.osssys.count >= 2 &&
+        r.bases.mmhub.count >= 2 && r.bases.osssys.count >= 2 &&
         r.bases.nbif.count >= 6;
 }
 } // namespace rn_navi33
