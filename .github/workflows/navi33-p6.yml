@@ -1,0 +1,37 @@
+name: Navi33 P6.1 PSP Preflight
+
+on:
+  push:
+    branches: [feature/navi33-p6-hw-bringup]
+  pull_request:
+    paths:
+      - 'RedNavi/navi33_p6_psp_preflight.h'
+      - 'RedNavi/kern_probe.cpp'
+      - 'RedNavi/navi33_psp_plan.h'
+      - 'tests/host/navi33_p6_psp_test.cpp'
+      - 'tests/host/navi33_p6_firmware_audit_test.py'
+      - 'tools/navi33_p6_firmware_verify.py'
+      - 'Makefile'
+      - '.github/workflows/navi33-p6.yml'
+
+jobs:
+  p6-psp-host-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: P6 PSP gate under ASan + UBSan
+        run: |
+          mkdir -p build
+          ${{ matrix.compiler }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -IRedNavi tests/host/navi33_p6_psp_test.cpp \
+            -o build/navi33_p6_psp_san
+          ./build/navi33_p6_psp_san
+      - name: Verify audit tool syntax
+        run: python3 -m py_compile tools/navi33_p6_firmware_verify.py
+      - name: Complete host test suite
+        run: make test
