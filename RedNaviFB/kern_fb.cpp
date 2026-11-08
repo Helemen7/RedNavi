@@ -54,7 +54,9 @@ class AMDRedNaviFB : public IOFramebuffer {
     IOTimerEventSource *vblTimer {nullptr};                          // at the mode's refresh rate while a vertical blank procedure is registered (bit 4)
     uint64_t vblNext {0};                                            // absolute time of its next tick
     volatile uint64_t vblLast {0}, vblPeriod {0};                    // the last tick and the period, as getVBLTime reports them (WindowServer's display link paces on them)
-    IOFBInterruptProc vblProc {nullptr}; OSObject *vblTarget {nullptr}; void *vblRef {nullptr};
+    // The family registers the vertical blank type more than once (its own handler, which keeps the shared-memory vblTime/vblDelta/vblCount that WindowServer paces on, and others):
+    // every registration is kept, each with its own handle, and the timer calls all of them that are enabled.
+    struct VblReg { IOFBInterruptProc proc; OSObject *target; void *ref; bool enabled; } vblRegs[4] {};
     IOFBInterruptProc connProc {nullptr}; OSObject *connTarget {nullptr}; void *connRef {nullptr};
     IOMemoryMap *diagMap {nullptr};
     uint32_t calls[8] {};              // 0 aperture, 1 setAttr, 2 getAttr, 3 setConnAttr, 4 getConnAttr, 5 setMode, 6 cursor, 7 other
@@ -527,9 +529,10 @@ public:
                     uint64_t per = 0, now = 0;
                     nanoseconds_to_absolutetime(1000000000ull / (self->fbRefresh ? self->fbRefresh : 60), &per);
                     clock_get_uptime(&now);
-                    IOFBInterruptProc proc = self->vblProc; OSObject *tg = self->vblTarget; void *rf = self->vblRef;
+                    VblReg regs[4]; memcpy(regs, self->vblRegs, sizeof(regs));
                     self->vblPeriod = per; self->vblLast = self->vblNext ? self->vblNext : now;
-                    if (proc) { ticks++; proc(tg, rf); if (ticks == 1 || ticks % 3600 == 0) IOLog("RedNaviFB: vertical blank tick %u\n", ticks); }
+                    bool any = false; for (const VblReg &r : regs) if (r.proc && r.enabled) { any = true; r.proc(r.target, r.ref); }
+                    if (any) { ticks++; if (ticks == 1 || ticks % 3600 == 0) IOLog("RedNaviFB: vertical blank tick %u\n", ticks); }
                     self->vblNext += per;
                     if (self->vblNext <= now) self->vblNext = now + per;     // fell behind (or the rate changed): start again from now
                     t->wakeAtTime(self->vblNext);
@@ -555,7 +558,10 @@ public:
     IOReturn registerForInterruptType(IOSelect type, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) APPLE_KEXT_OVERRIDE {
         if (!(fbExp() & 16)) return IOFramebuffer::registerForInterruptType(type, proc, target, ref, interruptRef);
         IOLog("RedNaviFB: registerForInterruptType('%c%c%c%c')\n", (char)(type >> 24), (char)(type >> 16), (char)(type >> 8), (char)type);
-        if (type == kIOFBVBLInterruptType) { vblProc = proc; vblTarget = target; vblRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(1)); return kIOReturnSuccess; }
+        if (type == kIOFBVBLInterruptType) {
+            for (unsigned i = 0; i < 4; i++) if (!vblRegs[i].proc) { vblRegs[i] = {proc, target, ref, true}; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(0x100 + i)); return kIOReturnSuccess; }
+            return kIOReturnNoResources;
+        }
         if (type == kIOFBConnectInterruptType) { connProc = proc; connTarget = target; connRef = ref; if (interruptRef) *interruptRef = reinterpret_cast<void *>(static_cast<uintptr_t>(2)); return kIOReturnSuccess; }
         return kIOReturnUnsupported;
     }
@@ -568,12 +574,14 @@ public:
     IOReturn unregisterInterrupt(void *interruptRef) APPLE_KEXT_OVERRIDE {
         if (!(fbExp() & 16)) return IOFramebuffer::unregisterInterrupt(interruptRef);
         const uintptr_t h = reinterpret_cast<uintptr_t>(interruptRef);
-        if (h == 1) { vblProc = nullptr; vblTarget = nullptr; vblRef = nullptr; }
+        if (h >= 0x100 && h < 0x104) vblRegs[h - 0x100] = {};
         else if (h == 2) { connProc = nullptr; connTarget = nullptr; connRef = nullptr; }
         return kIOReturnSuccess;
     }
     IOReturn setInterruptState(void *interruptRef, UInt32 state) APPLE_KEXT_OVERRIDE {
         if (!(fbExp() & 16)) return IOFramebuffer::setInterruptState(interruptRef, state);
+        const uintptr_t h = reinterpret_cast<uintptr_t>(interruptRef);
+        if (h >= 0x100 && h < 0x104) vblRegs[h - 0x100].enabled = (state == kEnabledInterruptState);
         return kIOReturnSuccess;
     }
     IOReturn setApertureEnable(IOPixelAperture aperture, IOOptionBits enable) APPLE_KEXT_OVERRIDE {
