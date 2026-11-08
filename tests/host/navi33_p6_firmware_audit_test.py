@@ -39,10 +39,10 @@ class Navi33P6FirmwareAuditTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             manifest = Path(t) / "bad.h"
             manifest.write_text(
-                'constexpr unsigned kFileCount = 2u;\\n'
-                'constexpr FileInfo kFiles[kFileCount] = {\\n'
-                '{"one", 1u, "' + "a"*64 + '"},\\n'
-                '};\\n', encoding="utf-8"
+                'constexpr unsigned kFileCount = 2u;\n'
+                'constexpr FileInfo kFiles[kFileCount] = {\n'
+                '{"one", 1u, "' + "a"*64 + '"},\n'
+                '};\n', encoding="utf-8"
             )
             with self.assertRaises(ValueError):
                 audit.read_manifest(manifest)
