@@ -28,5 +28,7 @@ jobs:
             -fsanitize=address,undefined -fno-omit-frame-pointer -IRedNavi \
             tests/host/navi33_bootstrap_test.cpp -o build/navi33_bootstrap_san_test
           ./build/navi33_bootstrap_san_test
+      - name: Check native Linux capture script syntax
+        run: bash -n tools/capture_navi33_linux_reference.sh
       - name: Complete host test suite
         run: make test
