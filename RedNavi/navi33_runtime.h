@@ -13,11 +13,20 @@ namespace rn_navi33 {
 
 enum class RuntimeError : uint8_t {
     Ok, NotNavi33, Truncated, BadSignature, BadSize, BadChecksum,
-    UnsupportedHeader, BadIpTable, MissingBlock, IpMismatch
+    UnsupportedHeader, BadIpTable, MissingBlock, IpMismatch, UnsupportedBase
+};
+// An IP Discovery register base is a DWORD offset, not a byte offset.
+struct RegisterBases {
+    uint32_t dwords[6]{};
+    uint8_t count = 0;
+};
+struct RuntimeBases {
+    RegisterBases gc, sdma0, mp0, mp1, mmhub, osssys, nbif, dmu;
 };
 struct RuntimeReport {
     RuntimeError error = RuntimeError::Truncated;
     Identity observed{};
+    RuntimeBases bases{};
     uint16_t binaryMajor = 0, binaryMinor = 0;
     uint16_t tableVersion = 0;
     uint16_t blocksFound = 0;
@@ -127,6 +136,35 @@ inline RuntimeReport inspectRuntimeDiscovery(uint16_t vendor, uint16_t device,
                 return out;
             }
             if (instance == 0) {
+                RegisterBases *selected = nullptr;
+                switch (hwId) {
+                    case 11: selected = &out.bases.gc; break;
+                    case 42: selected = &out.bases.sdma0; break;
+                    case 255: selected = &out.bases.mp0; break;
+                    case 1: selected = &out.bases.mp1; break;
+                    case 34: selected = &out.bases.mmhub; break;
+                    case 40: selected = &out.bases.osssys; break;
+                    case 108: selected = &out.bases.nbif; break;
+                    case 271: selected = &out.bases.dmu; break;
+                    default: break;
+                }
+                if (selected) {
+                    // Strict, bounded extraction: base offsets will drive
+                    // physical register reads and later GPU VM bring-up.
+                    if (selected->count || nbase == 0 || nbase > 6) {
+                        out.error = RuntimeError::BadIpTable;
+                        return out;
+                    }
+                    for (unsigned segment = 0; segment < nbase; ++segment) {
+                        const size_t baseAt = pos + 8u + static_cast<size_t>(segment) * baseWidth;
+                        if (base64 && readLe32(b, baseAt + 4u) != 0u) {
+                            out.error = RuntimeError::UnsupportedBase;
+                            return out;
+                        }
+                        selected->dwords[segment] = readLe32(b, baseAt);
+                    }
+                    selected->count = nbase;
+                }
                 for (unsigned k = 0; k < 6; ++k) {
                     if (hwId != hardwareIds[k]) continue;
                     if (present[k] || nbase == 0) {
