@@ -318,8 +318,8 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 }
 - (void)syncFromSurface {
     if (!surf || zeroCopy) return;
-    // The seed only changes for writes made under IOSurfaceLock; CoreDisplay's source surface is written by other means (WindowServer's own compositor), so every use copies it again.
-    if (surfSeed && IOSurfaceGetSeed(surf) == surfSeed && w < 1024) return;
+    // The seed only changes for writes made under IOSurfaceLock; surfaces are also written by other means (WindowServer's own compositor, the GPU of other processes), so every use copies
+    // the surface again. A seed shortcut for small surfaces left stale titlebars and small rectangles in the picture.
     if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
     const bool planar = IOSurfaceGetPlaneCount(surf) > 0;
     const uint8_t *src = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
@@ -1338,6 +1338,9 @@ static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL c
         if (!img) return NULL;
         if (order.count >= 16) { rn_vk_image_destroy(vk, (rn_vk_image *)cache[order[0]].pointerValue); [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
         cache[key] = [NSValue valueWithPointer:img]; [order addObject:key];
+        // A new ring surface starts with whatever the card's memory held, and CoreDisplay draws only what changed into it: the picture on the screen is its best starting point.
+        rn_vk_image *shown = rn_scanout_image(vk, rt->w, rt->h);
+        if (shown && rn_vk_image_copy(vk, shown, img) != 0) rn_log("direct scanout: the card copy for IOSurface %u could not be filled from the scanout", (unsigned)IOSurfaceGetID(rt->surf));
         rn_log("direct scanout: card copy for IOSurface %u (%lux%lu)", (unsigned)IOSurfaceGetID(rt->surf), (unsigned long)rt->w, (unsigned long)rt->h);
         return img;
     }

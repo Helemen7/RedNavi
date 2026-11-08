@@ -43,7 +43,8 @@ void rn_log(const char *fmt, ...) {
                        !strncmp(text, "isFramebuffer", 13) || !strncmp(text, "function requested", 18) || !strncmp(text, "unimplemented", 13);
     if (chatty) os_log_debug(log, "%{public}s", text); else os_log(log, "%{public}s", text);
     static int to_file = -1;
-    if (to_file < 0) to_file = getenv("RN_METAL_COMPUTE") != NULL || getenv("RN_LOG_FILE") != NULL;
+    static int var_tmp;      // /Users/Shared/rednavi-log: system daemons such as WindowServer log to /private/var/tmp as well (readable over ssh; the unified log needs root)
+    if (to_file < 0) { var_tmp = access("/Users/Shared/rednavi-log", F_OK) == 0; to_file = var_tmp || getenv("RN_METAL_COMPUTE") != NULL || getenv("RN_LOG_FILE") != NULL; }
     if (!to_file) return;
     char line[1100];
     struct timeval tv;
@@ -51,7 +52,7 @@ void rn_log(const char *fmt, ...) {
     int n = snprintf(line, sizeof(line), "%ld.%03d pid %d %s: %s\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid(), name, text);
     if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     char path[64];
-    snprintf(path, sizeof(path), "/tmp/rednavi-metal-%d.log", (int)getuid());   // one file per user: a file made by a root process cannot be appended to by the others
+    snprintf(path, sizeof(path), var_tmp ? "/private/var/tmp/rednavi-metal-%d.log" : "/tmp/rednavi-metal-%d.log", (int)getuid());   // one file per user: a file made by a root process cannot be appended to by the others
     mode_t old = umask(0);
     int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0666);
     umask(old);
