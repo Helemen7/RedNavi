@@ -32,7 +32,19 @@ static std::vector<uint8_t> makeDiscovery(bool version2 = false, bool optional =
     put16(b, 0x6c, 1);
     put16(b, 0x70, 0x100);
     const uint16_t ids[] = {11, 42, 255, 1, 271, 34, 40, 108};
-    const uint8_t counts[] = {4, 2, 1, 1, 3, 5, 2, 6};
+    // Observed on 2026-11-08, Sapphire RX 7600 / rev CF, Linux 7.0:
+    // Crucially MMHUB 3.0.2 has TWO segments (not five).
+    const uint8_t counts[] = {4, 4, 5, 5, 5, 2, 2, 6};
+    const uint32_t liveBases[8][6] = {
+        {0x1260, 0xA000, 0x1C000, 0x2402C00},
+        {0x1260, 0xA000, 0x1C000, 0x2402C00},
+        {0x16000, 0xDC0000, 0xE00000, 0xE40000, 0x243FC00},
+        {0x16000, 0xDC0000, 0xE00000, 0xE40000, 0x243FC00},
+        {0x12, 0xC0, 0x34C0, 0x9000, 0x2403C00},
+        {0x1A000, 0x2408800},
+        {0x10A0, 0x240A000},
+        {0, 0x14, 0xD20, 0x10400, 0x241B000, 0x4040000},
+    };
     const IpVersion versions[] = {kReference.gc, kReference.sdma, kReference.psp,
         kReference.smu, kReference.dcn, kReference.mmhub, {1, 0, 0}, {4, 0, 0}};
     unsigned count = optional ? 8 : 6;
@@ -46,7 +58,7 @@ static std::vector<uint8_t> makeDiscovery(bool version2 = false, bool optional =
         b[pos + 5] = versions[i].minor;
         b[pos + 6] = versions[i].revision;
         for (unsigned j = 0; j < counts[i]; ++j)
-            put32(b, pos + 8u + 4u * j, 0x1000u * (i + 1u) + 0x100u * j);
+            put32(b, pos + 8u + 4u * j, liveBases[i][j]);
         pos += 8u + 4u * counts[i];
     }
     finish(b);
@@ -59,9 +71,9 @@ int main() {
         const auto r = inspectRuntimeDiscovery(0x1002, 0x7480, b.data(), b.size());
         assert(r.error == RuntimeError::Ok);
         assert(hasComputeRegisterBases(r));
-        assert(r.bases.gc.count == 4 && r.bases.gc.dwords[3] == 0x1300u);
-        assert(r.bases.mmhub.count == 5 && r.bases.mmhub.dwords[4] == 0x6400u);
-        assert(r.bases.nbif.count == 6 && r.bases.nbif.dwords[5] == 0x8500u);
+        assert(r.bases.gc.count == 4 && r.bases.gc.dwords[3] == 0x2402c00u);
+        assert(r.bases.mmhub.count == 2 && r.bases.mmhub.dwords[1] == 0x2408800u);
+        assert(r.bases.nbif.count == 6 && r.bases.nbif.dwords[5] == 0x4040000u);
         b = makeDiscovery(v2, false);
         const auto missingOptional = inspectRuntimeDiscovery(0x1002, 0x7480, b.data(), b.size());
         assert(missingOptional.error == RuntimeError::Ok);
@@ -80,6 +92,18 @@ int main() {
     assert(window.fbStart == 0x8000000000ull);
     assert(window.fbBytes == 8ull * 1024 * 1024 * 1024);
     assert(window.cpuVisibleBytes == 256ull * 1024 * 1024);
+    // Physical RX7600: 8192 MiB BAR0, 8176 MiB usable FB, 16 MiB reserved.
+    const auto captured = makeMemoryWindow(0x8000, 0x81fe, 0, 8192,
+                                           8192ull * 1024 * 1024);
+    assert(captured.valid());
+    assert(captured.fbBytes == 8176ull * 1024 * 1024);
+    assert(captured.cpuVisibleBytes == 8176ull * 1024 * 1024);
+    assert(makeMemoryWindow(0x8000, 0x81fd, 0, 8192,
+                            8192ull * 1024 * 1024).error ==
+           MemoryError::WindowTooSmall);
+    assert(makeMemoryWindow(0x8000, 0x81fe, 0, 8192,
+                            8192ull * 1024 * 1024 + 4096ull).error ==
+           MemoryError::InvalidBar);
     assert(!makeMemoryWindow(0x8000, 0x81ff, 0, 0, 0x10000000).valid());
     assert(makeMemoryWindow(0x8001, 0x8000, 0, 8192, 0x10000000).error == MemoryError::BadLocation);
     assert(makeMemoryWindow(0x8000, 0x80ff, 0, 8192, 0x10000000).error == MemoryError::WindowTooSmall);
