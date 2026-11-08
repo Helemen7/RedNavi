@@ -98,6 +98,7 @@
 #include "splash_1920x1080.h"
 #include "linux_info_navi32.h"
 #include "gc_regs.h"
+#include "navi33_runtime.h"
 
 #ifdef RN_HAVE_PSP_FW
 #include "psp_fw.h"
@@ -3619,15 +3620,46 @@ bool RedNaviProbe::start(IOService *provider) {
     }
     IOLog("RedNavi: registers mapped, %llu KB\n", (uint64_t)regs->getLength() >> 10);
     rn_device_init(&gpu, "RedNavi", reinterpret_cast<volatile void *>(regs->getVirtualAddress()), regs->getLength());
+
+    // Navi 33 has distinct PSP/SMU, GC 11.0.2, SDMA 6.0.2 and DCN 3.2.1.
+    // Detect and verify its actual IP Discovery image before any Navi 32 GPU
+    // initialization. This is the first runtime stage of the Navi 33 compute
+    // port; firmware, GPU VM and queue takeover are NOT implemented yet.
+    // The discovery VRAM-index window below modifies MM_INDEX registers;
+    // it must not be misrepresented as a side-effect-free read.
+    if (pci->configRead16(kIOPCIConfigVendorID) == 0x1002 &&
+        pci->configRead16(kIOPCIConfigDeviceID) == 0x7480) {
+        dumpDiscovery();
+        const rn_navi33::RuntimeReport check =
+            rn_navi33::inspectRuntimeDiscovery(0x1002, 0x7480,
+                disc ? static_cast<const uint8_t *>(disc->getBytesNoCopy()) : nullptr,
+                disc ? disc->getLength() : 0);
+        setProperty("navi33-discovery-error", static_cast<uint64_t>(check.error), 32);
+        setProperty("navi33-blocks-found", static_cast<uint64_t>(check.blocksFound), 32);
+        setProperty("navi33-binary-header-major", static_cast<uint64_t>(check.binaryMajor), 32);
+        setProperty("navi33-ip-table-version", static_cast<uint64_t>(check.tableVersion), 32);
+        if (check.eligibleForComputeBringup()) {
+            IOLog("RedNavi: Navi33 GC11.0.2 / SDMA6.0.2 / PSP13.0.7 / SMU13.0.7 / DCN3.2.1 / MMHUB3.0.2 verified from device IP Discovery; compute initialization pending\n");
+            setProperty("navi33-identity-verified", true);
+        } else {
+            IOLog("RedNavi: Navi33 IP Discovery not validated (error %u, %u blocks); blocking compute initialization\n",
+                  static_cast<unsigned>(check.error), static_cast<unsigned>(check.blocksFound));
+            setProperty("navi33-identity-verified", false);
+        }
+        // A failed identity can be inspected in IORegistry. No Navi32 PSP,
+        // GC, SDMA, DCN, framebuffer or Metal acceleration runs on Navi33.
+        registerService();
+        return true;
+    }
     for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
     ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
 
-    // Anything but the RX 7800 XT (1002:747E, e.g. the RX 7600, 1002:7480) only gets the table and the VBIOS: every register number
-    // and firmware below is Navi 32's, and nothing here has been checked on another die.
+    // Other non-Navi32 devices retain the legacy diagnostic behaviour.
+    // Navi33 has already taken its own validation path above.
     if (pci->configRead16(kIOPCIConfigDeviceID) != 0x747E) {
-        IOLog("RedNavi: device 0x%04x is not a Navi 32, read-only: IP discovery and VBIOS only\n", pci->configRead16(kIOPCIConfigDeviceID));
+        IOLog("RedNavi: device 0x%04x is not a Navi 32: discovery diagnostic only\n",
+              pci->configRead16(kIOPCIConfigDeviceID));
         dumpDiscovery();
-        dumpVbios();
         registerService();
         return true;
     }
