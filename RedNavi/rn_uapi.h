@@ -32,6 +32,7 @@ enum {
     RN_UC_SYNCOBJ_TRANSFER = 17, // in rn_uc_syncobj_transfer
     RN_UC_PRESENT = 19,          // in rn_uc_present, out rn_uc_present_result: show a display surface (page flip)
     RN_UC_VRAM_PEEK = 18,        // in rn_uc_vram_peek, out rn_uc_vram_peek_result (debugging: reads VRAM through the index/data registers, any offset)
+    RN_UC_FB_OVERRIDE = 20,      // in: n x 24 bytes (kind, selector, result, unused, value), 0 to 16 entries: the answers RedNaviFB gives to framebuffer attributes (experiments; an empty input clears them)
     RN_UC_COUNT
 };
 

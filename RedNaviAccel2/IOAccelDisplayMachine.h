@@ -9,6 +9,8 @@
 class IOAccelResource2;
 class IOGraphicsAccelerator2;
 
+class IOAccelDisplayPipe;
+
 class IOAccelDisplayMachine : public IOService {
     OSDeclareAbstractStructors(IOAccelDisplayMachine)
 public:
@@ -31,4 +33,13 @@ public:
     virtual void display_mode_will_change(unsigned int);   // slot 281
     virtual void display_mode_did_change(unsigned int);   // slot 282
     virtual void found_framebuffer(IOFramebuffer*);   // slot 283
+    // exported, not virtual (not in the vtable): what the family answers for a framebuffer index
+    bool isFramebufferActive(unsigned int) const;
+    bool isDeferred(unsigned int) const;
+    void wsaa_will_enter_defer(unsigned int, int);
+    void wsaa_did_enter_defer(unsigned int, int);
+    void wsaa_will_exit_defer(unsigned int, int);
+    void wsaa_did_exit_defer(unsigned int, int);
+    unsigned int getFramebufferCount() const;
+    IOAccelDisplayPipe *getDisplayPipe(unsigned int) const;
 };

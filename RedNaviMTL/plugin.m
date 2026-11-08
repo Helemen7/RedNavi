@@ -13,6 +13,7 @@
 // Log: /tmp/rednavi-metal-<uid>.log (append, one line per event, mode 0666 so that the files of other processes of the same user can be appended to).
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#include <os/log.h>
 #include <IOKit/IOKitLib.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -23,18 +24,32 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+// The log goes to the unified log (subsystem org.rednavi.metal, category plugin: `log stream --predicate 'subsystem == "org.rednavi.metal"'`), which every process can write, WindowServer
+// and the other system daemons included. The long lists of selectors and capability answers a device is asked for go in at debug level (not kept unless asked). A process that was started
+// for testing (RN_METAL_COMPUTE or RN_LOG_FILE in its environment) also appends to /tmp/rednavi-metal-<uid>.log, which the test tools read.
 void rn_log(const char *fmt, ...) {
     static char name[64];
     if (!name[0]) { extern const char *getprogname(void); strlcpy(name, getprogname(), sizeof(name)); }
-    char line[1024];
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    int n = snprintf(line, sizeof(line), "%ld.%03d pid %d %s: ", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid(), name);
+    static os_log_t log;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ log = os_log_create("org.rednavi.metal", "plugin"); });
+    char text[1024];
     va_list ap;
     va_start(ap, fmt);
-    n += vsnprintf(line + n, sizeof(line) - n - 2, fmt, ap);
+    int m = vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
-    line[n++] = '\n';
+    if (m < 0) return;
+    const int chatty = !strncmp(text, "instance methods", 16) || !strncmp(text, "class methods", 13) || !strncmp(text, "supports", 8) || !strncmp(text, "featureProfile", 14) ||
+                       !strncmp(text, "isFramebuffer", 13) || !strncmp(text, "function requested", 18) || !strncmp(text, "unimplemented", 13);
+    if (chatty) os_log_debug(log, "%{public}s", text); else os_log(log, "%{public}s", text);
+    static int to_file = -1;
+    if (to_file < 0) to_file = getenv("RN_METAL_COMPUTE") != NULL || getenv("RN_LOG_FILE") != NULL;
+    if (!to_file) return;
+    char line[1100];
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    int n = snprintf(line, sizeof(line), "%ld.%03d pid %d %s: %s\n", (long)tv.tv_sec, (int)(tv.tv_usec / 1000), getpid(), name, text);
+    if (n >= (int)sizeof(line)) n = sizeof(line) - 1;
     char path[64];
     snprintf(path, sizeof(path), "/tmp/rednavi-metal-%d.log", (int)getuid());   // one file per user: a file made by a root process cannot be appended to by the others
     mode_t old = umask(0);
@@ -135,6 +150,7 @@ DYLD_INTERPOSE(rn_IOConnectSetNotificationPort, IOConnectSetNotificationPort)
 
 // Every init* method the plug-in class inherits, wrapped. The wrapper passes three more integer-class arguments through (enough for the init methods of a device).
 // Object pointers travel as integers: an init method consumes self and returns a +1 object, which ARC would get wrong through a plain function pointer.
+extern BOOL rn_compute_usable(void);
 typedef uintptr_t (*rn_init3)(uintptr_t, SEL, uintptr_t, uintptr_t, uintptr_t);
 static void rn_wrap_init(Class k, Class from) {
     unsigned n = 0;
@@ -158,6 +174,9 @@ static void rn_wrap_init(Class k, Class from) {
             id ro = (__bridge id)(void *)r;
             rn_log("-[RedNaviMTLDevice %s] end: result 0x%lx class %s, conforms to MTLDevice: %s", sel_getName(sel), (unsigned long)r,
                    r ? class_getName(object_getClass(ro)) : "-", r && p && [ro conformsToProtocol:p] ? "yes" : "no");
+            // A process that is not let in, or cannot open RADV (its sandbox refuses the mapping, say), gets no device at all: its clients fall back to the software path, instead of a device
+            // whose every pipeline fails and is retried forever.
+            if (r && !rn_compute_usable()) { rn_log("the plug-in is not let in or RADV is not usable in this process: no Metal device"); return 0; }
             return r;
         }), enc);
     }

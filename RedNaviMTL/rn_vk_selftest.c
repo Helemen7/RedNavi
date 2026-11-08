@@ -10,12 +10,13 @@ __attribute__((visibility("default"))) int rn_vk_selftest(const char *dir) {
     fprintf(stderr, "rn_vk: device %s\n", rn_vk_device_name(vk));
     const uint32_t groups = 4, count = groups * 64, add = 7;
     rn_vk_buffer *b = rn_vk_buffer_create(vk, count * 4);
-    const rn_vk_binding bind0 = {0, 1};
+    const rn_vk_binding bind0 = {0, 1, RN_VK_BUFFER, NULL};
     rn_vk_compute *c = rn_vk_compute_create(vk, (const uint32_t *)vk_dispatch_spv, vk_dispatch_spv_len, 1, &bind0, 4, 0);
     if (!b || !c) { fprintf(stderr, "buffer or pipeline failed\n"); return 11; }
     uint32_t *p = rn_vk_buffer_contents(b);
     for (uint32_t i = 0; i < count; i++) p[i] = 0xdeadbeef;
-    int rc = rn_vk_dispatch(vk, c, &b, NULL, &add, (const uint32_t[3]){groups, 1, 1}, NULL);
+    const rn_vk_arg arg0 = {.buffer = b};
+    int rc = rn_vk_dispatch(vk, c, &arg0, &add, (const uint32_t[3]){groups, 1, 1}, NULL);
     if (rc) { fprintf(stderr, "dispatch failed: %d\n", rc); return 12; }
     uint32_t bad = 0;
     for (uint32_t i = 0; i < count; i++) if (p[i] != i * 3u + add) bad++;

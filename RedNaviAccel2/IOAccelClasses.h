@@ -26,7 +26,6 @@ class IOAccelNewResourceArgs;
 class IOAccelResourcePrivate;
 class IOAccelShared2;
 class IOAccelSidebandBufferHeader;
-class IOAccelSysMemory;
 class IOAccelTask;
 class IOBufferMemoryDescriptor;
 class IOGraphicsAccelerator2;
@@ -63,6 +62,29 @@ public:
     virtual void unorphanIt(IOAccelShared2*);   // slot 57
     virtual long increment_wire_count() = 0;   // slot 58
     virtual long decrement_wire_count() = 0;   // slot 59
+};
+
+class IOAccelSysMemory : public IOAccelMemory {
+    OSDeclareAbstractStructors(IOAccelSysMemory)
+public:
+    uint8_t rn_pad_IOAccelSysMemory[232];
+    virtual long getDirtySize() const;   // slot 37, implemented by the family
+    virtual long getResidentSize() const;   // slot 38, implemented by the family
+    virtual long getPhysicalSegment(unsigned long long, unsigned long long*);   // slot 43, implemented by the family
+    virtual long setPurgeable(unsigned int, unsigned int*);   // slot 44, implemented by the family
+    virtual long setTag(unsigned int);   // slot 45, implemented by the family
+    virtual long getTag();   // slot 46, implemented by the family
+    virtual long matchForReuse(void*, unsigned long long);   // slot 47, implemented by the family
+    virtual long wire();   // slot 54, implemented by the family
+    virtual long unwire();   // slot 55, implemented by the family
+    virtual long increment_wire_count();   // slot 58, implemented by the family
+    virtual long decrement_wire_count();   // slot 59, implemented by the family
+    virtual void _RESERVEDIOAccelSysMemory0();   // slot 60
+    virtual void _RESERVEDIOAccelSysMemory1();   // slot 61
+    virtual void _RESERVEDIOAccelSysMemory2();   // slot 62
+    virtual void _RESERVEDIOAccelSysMemory3();   // slot 63
+    virtual void _RESERVEDIOAccelSysMemory4();   // slot 64
+    virtual void _RESERVEDIOAccelSysMemory5();   // slot 65
 };
 
 class IOAccelVidMemory : public IOAccelMemory {

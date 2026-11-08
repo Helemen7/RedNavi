@@ -10,6 +10,11 @@ endif
 
 SDK := MacKernelSDK
 OUT := build/$(CONFIG)
+# Every kext is signed at build time (ad hoc by default, no Team ID: an ad hoc signature is all the test machines need with SIP and AMFI relaxed), so nothing has to be signed
+# again where it is installed. RN_SIGN_ID=<identity> signs with a certificate instead (an Apple Development one gives a Team ID, but changes nothing for loading here).
+RN_SIGN_ID ?= -
+# iCloud Drive puts Finder attributes back on files of this folder at any moment, and codesign refuses them: strip and sign again until it takes (a copy made with rsync -a has none).
+SIGN = for i in 1 2 3 4 5; do xattr -cr $(1); codesign -f -s "$(RN_SIGN_ID)" --timestamp=none $(1) 2>/dev/null && break; sleep 1; done; codesign --verify $(1) || { echo "cannot sign $(1)"; exit 1; }
 KEXT := $(OUT)/RedNavi.kext
 FBKEXT := $(OUT)/RedNaviFB.kext
 ACCELKEXT := $(OUT)/RedNaviAccel.kext
@@ -75,6 +80,7 @@ $(KEXT): $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/
 	$(CXX) $(LDFLAGS) $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(COMPAT_OBJ) $(OUT)/kern_info.o -o $(KEXT)/Contents/MacOS/RedNavi
 	@if nm -u $(KEXT)/Contents/MacOS/RedNavi | grep -E "RedNavi|rn_|kRN|^ *_g[A-Z]" | grep -vE "_g(IO|OS)"; then echo "unresolved RedNavi symbols in the kext"; exit 1; fi
 	cp RedNavi/Info.plist.in $(KEXT)/Contents/Info.plist
+	$(call SIGN,$(KEXT))
 	@echo "built $(KEXT)"
 
 # The framebuffer is its own kext: IOGraphicsFamily is not in the boot kernel collection OpenCore injects into.
@@ -90,6 +96,7 @@ $(FBKEXT): $(OUT)/fb_kern_fb.o $(OUT)/fb_kern_info.o RedNaviFB/Info.plist.in
 	@mkdir -p $(FBKEXT)/Contents/MacOS
 	$(CXX) $(LDFLAGS) $(OUT)/fb_kern_fb.o $(OUT)/fb_kern_info.o -o $(FBKEXT)/Contents/MacOS/RedNaviFB
 	cp RedNaviFB/Info.plist.in $(FBKEXT)/Contents/Info.plist
+	$(call SIGN,$(FBKEXT))
 	@echo "built $(FBKEXT)"
 
 # The accelerator skeleton (M6): also an AuxKC kext, it depends on IOAcceleratorFamily2 (docs/M6_ACCELERATOR_STUDY.md).
@@ -105,10 +112,11 @@ $(ACCELKEXT): $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o RedNaviAccel/In
 	@mkdir -p $(ACCELKEXT)/Contents/MacOS
 	$(CXX) $(LDFLAGS) $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o -o $(ACCELKEXT)/Contents/MacOS/RedNaviAccel
 	cp RedNaviAccel/Info.plist.in $(ACCELKEXT)/Contents/Info.plist
+	$(call SIGN,$(ACCELKEXT))
 	@echo "built $(ACCELKEXT)"
 
 # RedNaviAccel2 (M6): the same family dependency, but the family's own start() runs (docs/M6_ACCELERATOR_STUDY.md).
-$(OUT)/accel2_kern_accel2.o: RedNaviAccel2/kern_accel2.cpp RedNaviAccel/IOGraphicsAccelerator2.h
+$(OUT)/accel2_kern_accel2.o: RedNaviAccel2/kern_accel2.cpp RedNaviAccel/IOGraphicsAccelerator2.h RedNaviAccel2/stubs.inc $(wildcard RedNaviAccel2/*.h)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -120,16 +128,17 @@ $(ACCEL2KEXT): $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o RedNaviAcce
 	@mkdir -p $(ACCEL2KEXT)/Contents/MacOS
 	$(CXX) $(LDFLAGS) $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o -o $(ACCEL2KEXT)/Contents/MacOS/RedNaviAccel2
 	cp RedNaviAccel2/Info.plist.in $(ACCEL2KEXT)/Contents/Info.plist
+	$(call SIGN,$(ACCEL2KEXT))
 	@echo "built $(ACCEL2KEXT)"
 
 # The Metal plug-in stub (user space, docs/M6_ACCELERATOR_STUDY.md) and the program that makes Metal load it.
 MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
-$(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
+$(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c $(wildcard RedNaviMTL/*.h) RedNaviMTL/Info.plist
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
-	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -framework Foundation -framework Metal -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
+	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -framework Foundation -framework Metal -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -framework IOSurface -framework ImageIO -framework CoreGraphics -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
 	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist
 	xattr -cr $(MTLBUNDLE)
-	codesign -f -s - $(MTLBUNDLE)
+	$(call SIGN,$(MTLBUNDLE))
 	@echo "built $(MTLBUNDLE)"
 
 $(OUT)/mtl_probe: RedNaviMTL/mtl_probe.m

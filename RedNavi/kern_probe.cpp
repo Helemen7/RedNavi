@@ -261,7 +261,7 @@ static void rnPublishOne(OSDictionary *d, const char *key, uint64_t v) {
     if (n) { d->setObject(key, n); n->release(); }
 }
 
-class RedNaviClient;
+class IOAccelRedNaviClient;
 
 class RedNaviProbe : public IOService {
     OSDeclareDefaultStructors(RedNaviProbe)
@@ -322,7 +322,7 @@ class RedNaviProbe : public IOService {
     uint64_t scanoutOff(uint32_t surface) const { return kRNScanoutVramOff + static_cast<uint64_t>(surface) * scanoutStride(); }
     uint32_t frontSurface {0};                     // the one the display was last told to scan out
     int present(uint32_t surface, bool wait);      // HUBP0 page flip at the next vertical blank; 0 ok, 1 still pending, <0 error                         // an alias of the display surface (fixed VRAM offset, never given back)
-    static constexpr uint32_t kBoCap = 4096;              // buffers of the whole kext, the connections' and the kernel's
+    static constexpr uint32_t kBoCap = 65536;             // buffers of the whole kext, the connections' and the kernel's
     static constexpr uint32_t kBoMaxBytes = 1u << 30;     // one buffer
     RNBo *bos {nullptr};
     uint64_t boBytes {0};                                 // host memory wired for buffers now
@@ -352,13 +352,13 @@ class RedNaviProbe : public IOService {
     uint32_t queueResets {0};
     uint32_t gfxQueueResets {0};
     uint32_t hangMs {8000};                        // a wait this long without the fence moving resets the queue (rednavi_hang_ms)
-    RedNaviClient *vmClient[8] {};                 // the connection of each VMID
+    IOAccelRedNaviClient *vmClient[8] {};                 // the connection of each VMID
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     int resetGfxQueue(uint32_t info[4]);           // the same for the graphics queue
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
     int createHostBo(uint32_t size, bool writeCombine = false, bool gart = true);
     void destroyBo(int idx);                       // invalidates the PTEs, flushes, then releases the pages; the slot is reused, the GPU addresses never are
-    friend class RedNaviClient;
+    friend class IOAccelRedNaviClient;
 public:
     IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 private:
@@ -1071,6 +1071,7 @@ void RedNaviProbe::publishFramebuffer() {
     setProperty("fb-height", selMode.vactive, 32);
     setProperty("fb-pitch", selPitch * 4, 32);
     setProperty("fb-refresh", selMode.refresh_hz, 32);
+    { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }   // struct rn_mode of the mode in use: the graphics control answers (command 0x921) read it
     setProperty("fb-scanout-phys", phys + kRNScanoutVramOff, 64);
     fbReady = true;
     setProperty("rednavi-fb-ready", kOSBooleanTrue);
@@ -1390,6 +1391,7 @@ IOReturn RedNaviProbe::setModeLive(uint32_t index) {
         setProperty("fb-height", selMode.vactive, 32);
         setProperty("fb-pitch", selPitch * 4, 32);
         setProperty("fb-refresh", selMode.refresh_hz, 32);
+        { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }
         setProperty("fb-current-mode", static_cast<uint64_t>(selIndex < 0 ? 0 : selIndex), 32);
     }
     IOLockUnlock(modeLock);
@@ -1788,15 +1790,15 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 // through the GART, a way to hand the compute queue a command buffer, and a fence wait. Every buffer belongs to the connection that
 // created it and goes away with it; command buffers and fences must lie inside the connection's own buffers. The caller is still trusted
 // with the whole GPU (one shared address space): it needs administrator privilege unless boot-arg rednavi_uc_anyone=1 is set.
-class RedNaviClient : public IOUserClient {
-    OSDeclareDefaultStructors(RedNaviClient)
-    static constexpr uint32_t kMaxHandles = 1024;
+class IOAccelRedNaviClient : public IOUserClient {
+    OSDeclareDefaultStructors(IOAccelRedNaviClient)
+    static constexpr uint32_t kMaxHandles = 32768;
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
     int *boIdx {nullptr};                          // handle - 1 -> index in the probe's buffer table, -1 for a free handle
     uint32_t boUsed {0};
     struct Map { uint64_t va; uint64_t size; uint32_t handle; bool used; };
-    static constexpr uint32_t kMaxMaps = 2048;
+    static constexpr uint32_t kMaxMaps = 65536;
     Map *maps {nullptr};                           // what is mapped in this connection's address space
     int vmid {0};
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
@@ -2398,6 +2400,24 @@ public:
                 rc = kIOReturnSuccess;
             }
             break;
+        case RN_UC_FB_OVERRIDE: {
+            if (args->structureInputSize % 24 != 0 || args->structureInputSize > 24 * 16) break;
+            IOService *fb = nullptr;
+            if (OSIterator *it = gpuOwner->getClientIterator()) {
+                while (OSObject *o = it->getNextObject()) {
+                    IOService *c = OSDynamicCast(IOService, o);
+                    if (c && !strcmp(c->getMetaClass()->getClassName(), "AMDRedNaviFB")) { fb = c; break; }
+                }
+                it->release();
+            }
+            if (!fb) { rc = kIOReturnNotFound; break; }
+            OSData *d = OSData::withBytes(args->structureInput, args->structureInputSize);
+            OSDictionary *dict = OSDictionary::withCapacity(1);
+            if (d && dict) { dict->setObject("attr-override", d); rc = fb->setProperties(dict); }
+            if (d) d->release();
+            if (dict) dict->release();
+            break;
+        }
         case RN_UC_QUEUE_RESET:
             if ((sized(args, 0, sizeof(rn_uc_reset_result)) || sized(args, sizeof(uint32_t), sizeof(rn_uc_reset_result))) && fenceIdx >= 0) {
                 const bool gfx = args->structureInputSize != 0 && *static_cast<const uint32_t *>(args->structureInput) == 1;   // the optional input names the queue: 1 graphics, otherwise compute
@@ -2443,7 +2463,7 @@ public:
         return rc;
     }
 };
-OSDefineMetaClassAndStructors(RedNaviClient, IOUserClient)
+OSDefineMetaClassAndStructors(IOAccelRedNaviClient, IOUserClient)
 
 // The queue is shared by every connection, so a reset drops everybody's work. Each connection's numbers from the last fence value it saw to the last it
 // submitted are lost; the fence then jumps to the last submitted number so that no wait is left hanging (the work that finished before keeps its result).
@@ -2454,7 +2474,7 @@ int RedNaviProbe::resetQueue(uint32_t info[4]) {
     queueResets++;
     if (rr != 0) return rr;
     for (int v = 1; v <= 7; v++) {
-        RedNaviClient *c = vmClient[v];
+        IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->lostFrom = before[v] + 1;
         c->lostTo = c->seqSubmitted;
@@ -2471,7 +2491,7 @@ int RedNaviProbe::resetGfxQueue(uint32_t info[4]) {
     gfxQueueResets++;
     if (rr != 0) return rr;
     for (int v = 1; v <= 7; v++) {
-        RedNaviClient *c = vmClient[v];
+        IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->gfxLostFrom = (before[v] + 1) | 0x80000000u;
         c->gfxLostTo = c->gfxSeqSubmitted;
@@ -2486,7 +2506,7 @@ IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32
     if (!(PE_parse_boot_argn("rednavi_uc_anyone", &anyone, sizeof(anyone)) && anyone == 1) &&
         IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
         return kIOReturnNotPrivileged;
-    RedNaviClient *c = OSTypeAlloc(RedNaviClient);
+    IOAccelRedNaviClient *c = OSTypeAlloc(IOAccelRedNaviClient);
     if (!c) return kIOReturnNoMemory;
     if (!c->initWithTask(owningTask, securityID, type) || !c->attach(this) || !c->start(this)) {
         c->detach(this);
