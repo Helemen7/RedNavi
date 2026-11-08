@@ -3745,7 +3745,7 @@ bool RedNaviProbe::start(IOService *provider) {
                 };
                 rnPublish(this, "navi33-p6-psp-preflight", p6names,
                           p6values, sizeof(p6values) / sizeof(p6values[0]));
-                IOLog("RedNavi: Navi33 P6.1 PSP status %u (NO PSP GPU commands)\\n",
+                IOLog("RedNavi: Navi33 P6.1 PSP status %u (NO PSP GPU commands)\n",
                       static_cast<unsigned>(gate.status));
                 IOLog("RedNavi: Navi33 PSP status: IFWI=0x%08x sOS=0x%08x SMU=0x%08x (no commands sent)\n",
                       pspInit, pspSos, smuResp);
