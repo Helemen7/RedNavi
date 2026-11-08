@@ -1,0 +1,33 @@
+name: Navi33 P4 runtime discovery
+
+on:
+  push:
+    branches:
+      - feature/navi33-p4-runtime
+  pull_request:
+    paths:
+      - 'RedNavi/navi33_runtime.h'
+      - 'RedNavi/navi33_facts.h'
+      - 'RedNavi/kern_probe.cpp'
+      - 'tests/host/navi33_runtime_test.cpp'
+      - 'Makefile'
+      - '.github/workflows/navi33-p4.yml'
+
+jobs:
+  p4-host:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cxx: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run Navi33 discovery validator
+        run: |
+          mkdir -p build
+          ${{ matrix.cxx }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer -IRedNavi \
+            tests/host/navi33_runtime_test.cpp -o build/navi33_runtime_test
+          ./build/navi33_runtime_test
+      - name: Run full host suite
+        run: make test
