@@ -6,9 +6,11 @@ on:
   pull_request:
     paths:
       - 'RedNavi/navi33_p6_psp_preflight.h'
+      - 'RedNavi/navi33_p6_psp_staging.h'
       - 'RedNavi/kern_probe.cpp'
       - 'RedNavi/navi33_psp_plan.h'
       - 'tests/host/navi33_p6_psp_test.cpp'
+      - 'tests/host/navi33_p6_staging_test.cpp'
       - 'tests/host/navi33_p6_firmware_audit_test.py'
       - 'tools/navi33_p6_firmware_verify.py'
       - 'Makefile'
@@ -31,6 +33,11 @@ jobs:
             -IRedNavi tests/host/navi33_p6_psp_test.cpp \
             -o build/navi33_p6_psp_san
           ./build/navi33_p6_psp_san
+          ${{ matrix.compiler }} -std=c++17 -O1 -g -Wall -Wextra -Werror -pedantic \
+            -fsanitize=address,undefined -fno-omit-frame-pointer \
+            -IRedNavi tests/host/navi33_p6_staging_test.cpp \
+            -o build/navi33_p6_staging_san
+          ./build/navi33_p6_staging_san
       - name: Verify audit tool syntax
         run: python3 -m py_compile tools/navi33_p6_firmware_verify.py
       - name: Complete host test suite
