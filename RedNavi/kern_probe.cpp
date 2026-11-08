@@ -100,6 +100,7 @@
 #include "gc_regs.h"
 #include "navi33_runtime.h"
 #include "navi33_bootstrap.h"
+#include "navi33_p6_psp_preflight.h"
 
 #ifdef RN_HAVE_PSP_FW
 #include "psp_fw.h"
@@ -3684,6 +3685,7 @@ bool RedNaviProbe::start(IOService *provider) {
                     readBar(ips.mmhub.dwords[0], 0x8ec, &fbBase) &&
                     readBar(ips.mmhub.dwords[0], 0x8ed, &fbTop) &&
                     readBar(ips.mmhub.dwords[0], 0x8d7, &fbOffset);
+                bool p6MemoryVerified = false;
                 if (mmhubRead) {
                     const auto memory = rn_navi33::makeMemoryWindow(
                         fbBase, fbTop, fbOffset, vramMbytes, bar0Bytes);
@@ -3698,6 +3700,7 @@ bool RedNaviProbe::start(IOService *provider) {
                         vramMbytes, static_cast<uint32_t>(bar0Bytes >> 20),
                         static_cast<uint32_t>(memory.error)};
                     rnPublish(this, "navi33-memory-preflight", mn, mv, 10);
+                    p6MemoryVerified = memory.valid();
                     setProperty("navi33-memory-window-verified", memory.valid());
                     if (memory.valid()) {
                         setProperty("navi33-fb-start", memory.fbStart, 64);
@@ -3724,6 +3727,26 @@ bool RedNaviProbe::start(IOService *provider) {
                                        static_cast<uint32_t>(pspRead),
                                        static_cast<uint32_t>(smuRead)};
                 rnPublish(this, "navi33-firmware-preflight", pn, pv, 5);
+                // P6.1 is a fail-closed readiness report, not a PSP loader.
+                // In particular, SOS-alive is not proof of ring ownership.
+                const rn_navi33::p6_psp::Evidence evidence{
+                    check.eligibleForComputeBringup(), true, p6MemoryVerified,
+                    pspRead, pspInit, pspSos
+                };
+                const auto gate = rn_navi33::p6_psp::inspect(evidence);
+                const char *const p6names[] = {"status", "ifwi_ready",
+                    "sos_alive", "firmware_required", "may_issue_psp_commands"};
+                const uint32_t p6values[] = {
+                    static_cast<uint32_t>(gate.status),
+                    static_cast<uint32_t>(gate.ifwiReady),
+                    static_cast<uint32_t>(gate.secureOsAlive),
+                    static_cast<uint32_t>(gate.firmwareRequired),
+                    static_cast<uint32_t>(gate.mayIssuePspCommands)
+                };
+                rnPublish(this, "navi33-p6-psp-preflight", p6names,
+                          p6values, sizeof(p6values) / sizeof(p6values[0]));
+                IOLog("RedNavi: Navi33 P6.1 PSP status %u (NO PSP GPU commands)\\n",
+                      static_cast<unsigned>(gate.status));
                 IOLog("RedNavi: Navi33 PSP status: IFWI=0x%08x sOS=0x%08x SMU=0x%08x (no commands sent)\n",
                       pspInit, pspSos, smuResp);
             } else {
