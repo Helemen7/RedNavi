@@ -38,9 +38,12 @@ No stage advances automatically.
 
 The P1 reference file `RedNavi/navi33_psp_plan.h` names nine gfx1102 /
 SMU13 firmware files and pins their expected uncompressed sizes and
-SHA-256 digests. Those historical hashes **have not been independently
-validated from the 2026-11-08 Linux capture**. The capture listed file
-names/sizes but did not include firmware bytes.
+SHA-256 digests. The separate 2026-11-08 WSL verification found
+**all nine hashes match** the uncompressed firmware in Ubuntu package
+`20260915.git1522c78a-0ubuntu1` (see
+`docs/NAVI33_P6_FIRMWARE_PROVENANCE.md`). This does **not** verify the
+PSP secure-OS firmware itself, and the prior native Linux snapshot
+contained no firmware bytes.
 
 ```sh
 sudo apt update
@@ -50,7 +53,7 @@ python3 tools/navi33_p6_firmware_verify.py --firmware-dir /lib/firmware/amdgpu
 
 If the WSL image does not contain AMD firmware, supply another local
 directory containing genuine `*.bin`, `*.bin.zst` or `*.bin.xz`
-images, or install Ubuntu's `linux-firmware` package if desired.
+images, or install a suitable Ubuntu AMD firmware package if desired.
 A nonzero exit means missing, mismatched, or unreadable files; **do not
 bypass the hash check to load firmware**. A zero exit means only that
 the files match the P1 reference; firmware revision compatibility,
@@ -82,10 +85,13 @@ working display is this GPU without a tested out-of-band recovery route.
 
 ## P6.2 follow-up
 
-Before a PSP command can be added, implement an owned/reserved VRAM
-staging allocator, verify all nine actual firmware bytes, handle
-already-alive firmware without reloading, port PSP13.0.7 command/ring
-handshakes and timeouts from Linux with Navi33-specific addresses,
-and prove a physical acknowledge/fence on the test macOS machine.
+The nine GC/SMU/MES/SDMA hashes now match the 2026-09 reference.
+A **host-only staging and buffer validation plan** is implemented
+(see `docs/NAVI33_P6_STAGING.md`), but it does not allocate VRAM.
+Before a PSP command can be added, independently verify PSP secure-OS
+firmware, implement an owned/reserved VRAM allocator, handle already-alive
+firmware without reloading, port PSP13.0.7 command/ring handshakes and
+timeouts from Linux with Navi33-specific addresses, and prove a physical
+acknowledge/fence on the test macOS machine.
 Only then move on to GMC11/GART, MES/KIQ and a real shader-written
 marker. Host-only green tests are not GPU compute acceleration.
