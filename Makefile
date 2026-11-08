@@ -166,5 +166,7 @@ test:
 	./build/navi33_p1_test
 	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi -Imesa-bridge/include tests/host/navi33_p2_test.cpp -o build/navi33_p2_test
 	./build/navi33_p2_test
+	clang++ -std=c++17 -Wall -Wextra -Werror -pedantic -IRedNavi tests/host/navi33_runtime_test.cpp -o build/navi33_runtime_test
+	./build/navi33_runtime_test
 
 .PHONY: all clean test mtl
