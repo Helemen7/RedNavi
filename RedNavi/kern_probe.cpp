@@ -492,6 +492,13 @@ void RedNaviProbe::dumpDiscovery() {
     uint32_t vramMB = rd(kRNRccConfigMemsize);
     IOLog("RedNavi: RCC_CONFIG_MEMSIZE = 0x%08x\n", vramMB);
     if (vramMB == 0 || vramMB == 0xFFFFFFFFu) {
+        // Never substitute the RX 7800 XT's 16 GiB size for Navi 33.
+        // The discovery location depends on physical VRAM size, so a
+        // guessed address would be wrong on an RX 7600.
+        if (pci->configRead16(kIOPCIConfigDeviceID) == 0x7480) {
+            IOLog("RedNavi: Navi33 memsize unreadable; refusing guessed discovery address\n");
+            return;
+        }
         vramMB = kRNFallbackVramMB;
         IOLog("RedNavi: memsize register unusable, assuming %u MB\n", vramMB);
     }
