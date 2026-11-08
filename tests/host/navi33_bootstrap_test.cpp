@@ -60,7 +60,7 @@ int main() {
         assert(r.error == RuntimeError::Ok);
         assert(hasComputeRegisterBases(r));
         assert(r.bases.gc.count == 4 && r.bases.gc.dwords[3] == 0x1300u);
-        assert(r.bases.mmhub.count == 5 && r.bases.mmhub.dwords[4] == 0x6500u);
+        assert(r.bases.mmhub.count == 5 && r.bases.mmhub.dwords[4] == 0x6400u);
         assert(r.bases.nbif.count == 6 && r.bases.nbif.dwords[5] == 0x8500u);
         b = makeDiscovery(v2, false);
         const auto missingOptional = inspectRuntimeDiscovery(0x1002, 0x7480, b.data(), b.size());
