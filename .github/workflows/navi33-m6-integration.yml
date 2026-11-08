@@ -1,0 +1,15 @@
+name: Navi33 M6 Integration
+
+on:
+  push:
+    branches:
+      - feature/navi33-m6-integration
+  pull_request:
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run all host tests
+        run: make test
