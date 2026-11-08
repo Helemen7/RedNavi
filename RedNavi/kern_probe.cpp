@@ -99,6 +99,7 @@
 #include "linux_info_navi32.h"
 #include "gc_regs.h"
 #include "navi33_runtime.h"
+#include "navi33_bootstrap.h"
 
 #ifdef RN_HAVE_PSP_FW
 #include "psp_fw.h"
@@ -3646,8 +3647,88 @@ bool RedNaviProbe::start(IOService *provider) {
         setProperty("navi33-binary-header-major", static_cast<uint64_t>(check.binaryMajor), 32);
         setProperty("navi33-ip-table-version", static_cast<uint64_t>(check.tableVersion), 32);
         if (check.eligibleForComputeBringup()) {
-            IOLog("RedNavi: Navi33 GC11.0.2 / SDMA6.0.2 / PSP13.0.7 / SMU13.0.7 / DCN3.2.1 / MMHUB3.0.2 verified from device IP Discovery; compute initialization pending\n");
+            IOLog("RedNavi: Navi33 GC11.0.2 / SDMA6.0.2 / PSP13.0.7 / SMU13.0.7 / DCN3.2.1 / MMHUB3.0.2 verified from device IP Discovery\n");
             setProperty("navi33-identity-verified", true);
+            // Populate genuine gfx1102 segment bases before any future SOC15
+            // register writes. Every source is the validated device table.
+            if (rn_navi33::hasComputeRegisterBases(check)) {
+                const auto &ips = check.bases;
+                for (uint32_t i = 0; i < 4; ++i) gpu.reg_offset[RN_GC_HWIP][0][i] = ips.gc.dwords[i];
+                for (uint32_t i = 0; i < 5; ++i) gpu.reg_offset[RN_MMHUB_HWIP][0][i] = ips.mmhub.dwords[i];
+                for (uint32_t i = 0; i < 2; ++i) gpu.reg_offset[RN_OSSSYS_HWIP][0][i] = ips.osssys.dwords[i];
+                for (uint32_t i = 0; i < 6; ++i) gpu.reg_offset[RN_NBIO_HWIP][0][i] = ips.nbif.dwords[i];
+                for (uint32_t i = 0; i < ips.sdma0.count && i < RN_MAX_SEG; ++i)
+                    gpu.reg_offset[RN_SDMA0_HWIP][0][i] = ips.sdma0.dwords[i];
+                gpu.reg_offset[RN_MP0_HWIP][0][0] = ips.mp0.dwords[0];
+                gpu.reg_offset[RN_MP1_HWIP][0][0] = ips.mp1.dwords[0];
+                for (uint32_t i = 0; i < ips.dmu.count && i < RN_MAX_SEG; ++i)
+                    gpu.reg_offset[RN_DCE_HWIP][0][i] = ips.dmu.dwords[i];
+                setProperty("navi33-ip-bases-ready", true);
+
+                // P5 preflight reads actual MMHUB FB_LOCATION_BASE/TOP/OFFSET
+                // and firmware mailbox status. No Navi32 constant is used.
+                // These reads access real GPU registers, not host fixtures.
+                auto readBar = [&](uint32_t base, uint32_t dword, uint32_t *out) -> bool {
+                    uint32_t byteOff = 0;
+                    if (!rn_navi33::checkedBarDword(base, dword, regs->getLength(), &byteOff))
+                        return false;
+                    *out = rd(byteOff);
+                    return true;
+                };
+                uint32_t fbBase = 0, fbTop = 0, fbOffset = 0;
+                IODeviceMemory *aperture = pci->getDeviceMemoryWithRegister(
+                    kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
+                const uint64_t bar0Bytes = aperture ? aperture->getLength() : 0;
+                const bool mmhubRead =
+                    readBar(ips.mmhub.dwords[0], 0x8ec, &fbBase) &&
+                    readBar(ips.mmhub.dwords[0], 0x8ed, &fbTop) &&
+                    readBar(ips.mmhub.dwords[0], 0x8d7, &fbOffset);
+                if (mmhubRead) {
+                    const auto memory = rn_navi33::makeMemoryWindow(
+                        fbBase, fbTop, fbOffset, vramMbytes, bar0Bytes);
+                    const char *mn[] = {"fb_base_raw", "fb_top_raw", "fb_offset_raw",
+                        "fb_start_lo", "fb_start_hi", "fb_end_lo", "fb_end_hi",
+                        "vram_mib", "bar0_mib", "preflight_error"};
+                    const uint32_t mv[] = {fbBase, fbTop, fbOffset,
+                        static_cast<uint32_t>(memory.fbStart),
+                        static_cast<uint32_t>(memory.fbStart >> 32),
+                        static_cast<uint32_t>(memory.fbEnd),
+                        static_cast<uint32_t>(memory.fbEnd >> 32),
+                        vramMbytes, static_cast<uint32_t>(bar0Bytes >> 20),
+                        static_cast<uint32_t>(memory.error)};
+                    rnPublish(this, "navi33-memory-preflight", mn, mv, 10);
+                    setProperty("navi33-memory-window-verified", memory.valid());
+                    if (memory.valid()) {
+                        setProperty("navi33-fb-start", memory.fbStart, 64);
+                        setProperty("navi33-fb-end", memory.fbEnd, 64);
+                        IOLog("RedNavi: Navi33 FB window 0x%llx..0x%llx VRAM %u MiB BAR0 %llu MiB\n",
+                              memory.fbStart, memory.fbEnd, vramMbytes, bar0Bytes >> 20);
+                    } else {
+                        IOLog("RedNavi: Navi33 memory preflight error %u\n",
+                              static_cast<unsigned>(memory.error));
+                    }
+                } else {
+                    IOLog("RedNavi: Navi33 MMHUB FB registers not accessible through BAR5\n");
+                    setProperty("navi33-memory-window-verified", false);
+                }
+
+                uint32_t pspInit = 0, pspSos = 0, smuResp = 0;
+                const bool pspRead =
+                    readBar(ips.mp0.dwords[0], 0x061, &pspInit) &&
+                    readBar(ips.mp0.dwords[0], 0x091, &pspSos);
+                const bool smuRead = readBar(ips.mp1.dwords[0], 0x29a, &smuResp);
+                const char *pn[] = {"psp_ifwi_ready", "psp_sos_alive",
+                                    "smu_response", "psp_read_ok", "smu_read_ok"};
+                const uint32_t pv[] = {pspInit, pspSos, smuResp,
+                                       static_cast<uint32_t>(pspRead),
+                                       static_cast<uint32_t>(smuRead)};
+                rnPublish(this, "navi33-firmware-preflight", pn, pv, 5);
+                IOLog("RedNavi: Navi33 PSP status: IFWI=0x%08x sOS=0x%08x SMU=0x%08x (no commands sent)\n",
+                      pspInit, pspSos, smuResp);
+            } else {
+                IOLog("RedNavi: Navi33 discovery valid but required GC/MMHUB/NBIO/OSSSYS IP bases missing\n");
+                setProperty("navi33-ip-bases-ready", false);
+            }
         } else {
             IOLog("RedNavi: Navi33 IP Discovery not validated (error %u, %u blocks); blocking compute initialization\n",
                   static_cast<unsigned>(check.error), static_cast<unsigned>(check.blocksFound));
@@ -3658,9 +3739,6 @@ bool RedNaviProbe::start(IOService *provider) {
         registerService();
         return true;
     }
-    for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
-    ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
-
     // Other non-Navi32 devices retain the legacy diagnostic behaviour.
     // Navi33 has already taken its own validation path above.
     if (pci->configRead16(kIOPCIConfigDeviceID) != 0x747E) {
@@ -3682,6 +3760,10 @@ bool RedNaviProbe::start(IOService *provider) {
     }
 
     dumpDiscovery();
+    // IP bases cannot be resolved until the copied discovery table exists.
+    for (uint32_t i = 0; i < 4; i++)
+        ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
+    ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
     dumpVbios();
     dumpRegs(kRNMailboxRegs, sizeof(kRNMailboxRegs) / sizeof(kRNMailboxRegs[0]), "mailbox-regs");
     dumpRegs(kRNMmhubRegs, sizeof(kRNMmhubRegs) / sizeof(kRNMmhubRegs[0]), "mmhub-regs");
