@@ -3,7 +3,7 @@
 // The display hardware is lit by RedNaviProbe (linear XRGB8888). This class tells WindowServer where the surface
 // is: an aperture over BAR0, which macOS maps as 256 MB, so the surface lives in the first 256 MB of VRAM. It lists
 // the modes of the monitor's EDID (fb-modes, published by the probe) and a mode change is a platform function call
-// to the probe ("rednavi-set-mode"), which reprograms the pipe. There is no cursor plane, no gamma and no vertical
+// to the probe ("rednavi-set-mode"), which reprograms the pipe. The cursor is the DCN cursor plane (the probe's platform functions "rednavi-cursor-image" and "rednavi-cursor-state"; boot-arg rednavi_hwcursor=0 keeps the software cursor). There is no gamma and no vertical
 // blank interrupt yet. The firmware boot framebuffer (IONDRVFramebuffer) on the same PCI device would be listed by macOS as a
 // second display (see docs/DP_BRINGUP.md); it is removed by default (rednavi_kill_boot_fb, mode 4 below; =0 keeps it). IOFramebuffer::terminate panics
 // inside Apple's AppleUpstreamUserClient, so the removal bypasses it.
@@ -18,6 +18,7 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/graphics/IOFramebuffer.h>
+#include <IOKit/graphics/IOGraphicsInterfaceTypes.h>
 #include <pexpert/pexpert.h>
 
 #define kRNFbMaxModes 32
@@ -412,11 +413,55 @@ public:
         record(1, attr, r, value);
         return r;
     }
+    // Hardware cursor: the probe publishes cursor-hw when it mapped the cursor image; boot-arg rednavi_hwcursor=0 turns it off.
+    bool hwCursor() {
+        static uint32_t on = 1, read;
+        if (!read) { read = 1; uint32_t v; if (PE_parse_boot_argn("rednavi_hwcursor", &v, sizeof(v))) on = v != 0; }
+        IOService *probe = getProvider();
+        return on && probe && probe->getProperty("cursor-hw") == kOSBooleanTrue;
+    }
+    uint32_t *cursorBuf {nullptr};                                   // 64 x 64 ARGB, the layout the probe copies into the cursor surface
+    IOReturn setCursorImage(void *cursorImage) APPLE_KEXT_OVERRIDE {
+        note(6, 1);
+        IOService *probe = getProvider();
+        if (!hwCursor()) return kIOReturnUnsupported;
+        if (!cursorBuf) { cursorBuf = static_cast<uint32_t *>(IOMalloc(64 * 64 * 4)); if (!cursorBuf) return kIOReturnNoMemory; }
+        memset(cursorBuf, 0, 64 * 64 * 4);
+        IOHardwareCursorDescriptor desc;
+        memset(&desc, 0, sizeof(desc));
+        desc.majorVersion = kHardwareCursorDescriptorMajorVersion;
+        desc.minorVersion = kHardwareCursorDescriptorMinorVersion;
+        desc.height = 64; desc.width = 64;
+        desc.bitDepth = kIO32ARGBPixelFormat;
+        IOHardwareCursorInfo info;
+        memset(&info, 0, sizeof(info));
+        info.majorVersion = kHardwareCursorInfoMajorVersion;
+        info.minorVersion = kHardwareCursorInfoMinorVersion;
+        info.hardwareCursorData = reinterpret_cast<UInt8 *>(cursorBuf);
+        if (!convertCursorImage(cursorImage, &desc, &info) || info.cursorWidth == 0 || info.cursorHeight == 0 || info.cursorWidth > 64 || info.cursorHeight > 64) {
+            probe->callPlatformFunction("rednavi-cursor-state", true, nullptr, nullptr, nullptr, nullptr);          // hide the plane, the software cursor takes over
+            return kIOReturnUnsupported;
+        }
+        // The converter packs the rows with the cursor's own width, the plane reads a pitch of 64 pixels: spread the rows out, last row first so that nothing is overwritten before it is moved.
+        if (info.cursorWidth < 64) {
+            for (int y = static_cast<int>(info.cursorHeight) - 1; y >= 0; y--) {
+                memmove(cursorBuf + y * 64, cursorBuf + y * info.cursorWidth, info.cursorWidth * 4);
+                memset(cursorBuf + y * 64 + info.cursorWidth, 0, (64 - info.cursorWidth) * 4);
+            }
+        }
+        return probe->callPlatformFunction("rednavi-cursor-image", true, cursorBuf, reinterpret_cast<void *>(static_cast<uintptr_t>((info.cursorWidth << 16) | info.cursorHeight)), nullptr, nullptr);
+    }
+    IOReturn setCursorState(SInt32 x, SInt32 y, bool visible) APPLE_KEXT_OVERRIDE {
+        note(6, 2);
+        if (!hwCursor()) return kIOReturnUnsupported;
+        return getProvider()->callPlatformFunction("rednavi-cursor-state", true, reinterpret_cast<void *>(static_cast<intptr_t>(x)), reinterpret_cast<void *>(static_cast<intptr_t>(y)), visible ? reinterpret_cast<void *>(1) : nullptr, nullptr);
+    }
     IOReturn getAttribute(IOSelect attr, uintptr_t *value) APPLE_KEXT_OVERRIDE {
         note(2, attr);
         const AttrRec *ov = overrideFor(2, attr);
         IOReturn r;
-        if (ov) { if (value) *value = static_cast<uintptr_t>(ov->value); r = static_cast<IOReturn>(ov->result); }
+        if (!ov && attr == kIOHardwareCursorAttribute) { if (value) *value = hwCursor() ? 1 : 0; r = kIOReturnSuccess; }
+        else if (ov) { if (value) *value = static_cast<uintptr_t>(ov->value); r = static_cast<IOReturn>(ov->result); }
         else if ((fbExp() & 8) && attr == kIOWindowServerActiveAttribute) { if (value) *value = 1; r = kIOReturnSuccess; }     // as the reference driver does
         else r = IOFramebuffer::getAttribute(attr, value);
         record(2, attr, r, value ? *value : 0);

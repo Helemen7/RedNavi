@@ -159,6 +159,8 @@
 #define kRNMp0C2pmsg70        0x086
 #define kRNMp0C2pmsg71        0x087
 #define kRNPspMboxMask        0x8000FFFFu      // response flag plus status bits
+#define kRNCursorVramOff      0x0A200000ull    // the hardware cursor image: 64 KB right after the scanout surfaces (scanoutSurfaces() packs them below 0x0A200000), the CPU-visible pool starts behind it
+#define kRNCursorVramSize     0x10000ull
 #define kRNScanoutVramOff     0x08000000ull    // 128 MB into VRAM, inside the 256 MB macOS maps through BAR0: MC address 0x8008000000, the value in dcn_replay.h
 #define kRNPspBufSize         (1u << 20)
 #define kRNHwIdMp1            1
@@ -438,6 +440,21 @@ private:
     void trace(const char *what);
     bool programLive(const rn_mode &m);
     IOReturn setModeLive(uint32_t index);
+    // Hardware cursor: the HUBP0 cursor plane and the DPP0 cursor input, fed by RedNaviFB through the platform functions "rednavi-cursor-image" and "rednavi-cursor-state". The image is
+    // 64x64 ARGB8888, pre-multiplied alpha, at kRNCursorVramOff. Register sequences are those of Linux's hubp32_cursor_set_attributes, dpp3_set_cursor_attributes and
+    // hubp1_cursor_set_position; not verified on hardware yet.
+    IOMemoryDescriptor *cursorMd {nullptr};
+    IOMemoryMap *cursorMap {nullptr};
+    bool cursorHave {false};                    // an image is loaded
+    bool cursorAttrsDone {false};               // the plane has its address, size and format (not before the pipe is up)
+    uint32_t cursorW {0}, cursorH {0};
+    int32_t curX {0}, curY {0};
+    bool curVisible {false};
+    uint32_t curImages {0}, curMoves {0};
+    IOReturn cursorImage(const uint32_t *argb, uint32_t w, uint32_t h);
+    IOReturn cursorState(int32_t x, int32_t y, bool visible);
+    void cursorProgram(bool attributes);        // modeLock held
+    void cursorPublish();
     int selIndex {-1};             // index of selMode in edidInfo.modes, -1 when it is the built-in 1080p60
     bool pipeReady {false};        // the pipe has been lit once, a live mode change is possible
     bool liveSwitch {false};       // dcnReplay is running for a mode change: do not repaint the test image
@@ -1089,6 +1106,12 @@ void RedNaviProbe::publishFramebuffer() {
     setProperty("fb-refresh", selMode.refresh_hz, 32);
     { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }   // struct rn_mode of the mode in use: the graphics control answers (command 0x921) read it
     setProperty("fb-scanout-phys", phys + kRNScanoutVramOff, 64);
+    if (kRNCursorVramOff + kRNCursorVramSize <= len) {                          // the hardware cursor image, mapped write-combined
+        cursorMd = IODeviceMemory::withSubRange(bar0, kRNCursorVramOff, kRNCursorVramSize);
+        cursorMap = cursorMd ? cursorMd->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
+        if (cursorMap) setProperty("cursor-hw", kOSBooleanTrue);
+        else IOLog("RedNavi: framebuffer: no mapping for the cursor image, the software cursor stays\n");
+    }
     fbReady = true;
     setProperty("rednavi-fb-ready", kOSBooleanTrue);
 }
@@ -1409,12 +1432,91 @@ IOReturn RedNaviProbe::setModeLive(uint32_t index) {
         setProperty("fb-refresh", selMode.refresh_hz, 32);
         { OSData *t = OSData::withBytes(&selMode, sizeof(selMode)); if (t) { setProperty("fb-timing", t); t->release(); } }
         setProperty("fb-current-mode", static_cast<uint64_t>(selIndex < 0 ? 0 : selIndex), 32);
+        if (cursorHave) cursorProgram(true);                                // the pipe was reprogrammed: the cursor plane again, with the new clock ratio
     }
     IOLockUnlock(modeLock);
     return rc;
 }
 
+// Registers of the cursor plane (HUBP0, base index 2 like the primary surface): CURSOR0_0_* 0x678.., HUBPREQ0_CURSOR_SETTINGS 0x65b; DPP0: CNVC_CUR0_CURSOR0_CONTROL 0xcf1.
+// attributes: also the image address, size, format and pitch (after a new image or a mode change); otherwise only the position and the enable bits.
+void RedNaviProbe::cursorProgram(bool attributes) {
+    uint32_t b2 = 0;
+    if (!cursorMap || !pipeReady || !ipBase(kRNHwIdDmu, &b2, 2)) return;
+    const uint32_t ctlOff = (b2 + 0x678) * 4, cnvcOff = (b2 + 0xcf1) * 4;
+    if (attributes) {
+        const uint64_t mc = kRNVramMcBase + kRNCursorVramOff;
+        wr((b2 + 0x67a) * 4, static_cast<uint32_t>(mc >> 32));
+        wr((b2 + 0x679) * 4, static_cast<uint32_t>(mc));
+        wr((b2 + 0x67b) * 4, (64u << 16) | 64u);                                                 // CURSOR_SIZE: width 31:16, height 15:0 (the image is padded to 64x64)
+        uint32_t ctl = rd(ctlOff) & ~(0x00000700u | 0x00030000u | 0x1F000000u);
+        ctl |= (2u << 8)                                                                          // CURSOR_MODE: color, pre-multiplied alpha
+             | (0u << 16)                                                                         // CURSOR_PITCH: 64 pixels
+             | (3u << 24);                                                                        // CURSOR_LINES_PER_CHUNK: 8 (CURSOR_LINE_PER_CHUNK_8, 33 to 64 pixels wide)
+        wr(ctlOff, ctl);
+        wr((b2 + 0x65b) * 4, 0x00000300u);                                                       // HUBPREQ0_CURSOR_SETTINGS: DST_Y_OFFSET 0, CHUNK_HDL_ADJUST 3
+        uint32_t cn = rd(cnvcOff) & ~(0x00000070u | 0x00000002u | 0x00000008u);                  // CUR0_MODE, CUR0_EXPANSION_MODE 0, CUR0_ROM_EN 0
+        wr(cnvcOff, cn | (2u << 4));
+        cursorAttrsDone = true;
+    }
+    // As amdgpu_dm and hubp1_cursor_set_position do: the position is not negative, a cursor partly off the left or top edge moves its hot spot instead.
+    const int32_t w = static_cast<int32_t>(cursorW), h = static_cast<int32_t>(cursorH);
+    bool en = curVisible && cursorHave;
+    if (curX >= static_cast<int32_t>(selMode.hactive) || curX + w <= 0 || curY >= static_cast<int32_t>(selMode.vactive) || curY + h <= 0) en = false;
+    const uint32_t posX = curX < 0 ? 0u : static_cast<uint32_t>(curX), posY = curY < 0 ? 0u : static_cast<uint32_t>(curY);
+    const uint32_t hotX = curX < 0 ? static_cast<uint32_t>(-curX) : 0u, hotY = curY < 0 ? static_cast<uint32_t>(-curY) : 0u;
+    // CURSOR_DST_X_OFFSET: the visible x scaled from pixel clocks to DCHUB reference clocks (50 MHz: HUBPREQ0_REF_FREQ_TO_PIX_FREQ of the 1080p60 capture is 50000/148500 in 0.19 fixed point).
+    const uint32_t dstX = selMode.pclk_khz ? static_cast<uint32_t>(static_cast<uint64_t>(posX) * 50000u / selMode.pclk_khz) : 0u;
+    if (en) {
+        wr((b2 + 0x67c) * 4, (posX << 16) | posY);
+        wr((b2 + 0x67d) * 4, (hotX << 16) | hotY);
+        wr((b2 + 0x67f) * 4, dstX);
+    }
+    wr(ctlOff, (rd(ctlOff) & ~1u) | (en ? 1u : 0u));
+    wr(cnvcOff, (rd(cnvcOff) & ~1u) | (en ? 1u : 0u));
+}
+
+void RedNaviProbe::cursorPublish() {
+    uint32_t b2 = 0;
+    if (!ipBase(kRNHwIdDmu, &b2, 2)) return;
+    const char *names[] = {"images", "moves", "x", "y", "visible", "width", "height", "hubp_cursor_control", "hubp_cursor_addr", "hubp_cursor_addr_hi", "hubp_cursor_pos", "dpp_cursor_control", "settings"};
+    const uint32_t vals[] = {curImages, curMoves, static_cast<uint32_t>(curX), static_cast<uint32_t>(curY), curVisible, cursorW, cursorH,
+                             rd((b2 + 0x678) * 4), rd((b2 + 0x679) * 4), rd((b2 + 0x67a) * 4), rd((b2 + 0x67c) * 4), rd((b2 + 0xcf1) * 4), rd((b2 + 0x65b) * 4)};
+    rnPublish(this, "cursor-diag", names, vals, sizeof(vals) / sizeof(vals[0]));
+}
+
+// A new cursor image: argb holds w x h pixels with a pitch of 64 (RedNaviFB converts into that layout), copied into the cursor surface, then the plane is told about it.
+IOReturn RedNaviProbe::cursorImage(const uint32_t *argb, uint32_t w, uint32_t h) {
+    if (!cursorMap || !modeLock) return kIOReturnNotReady;
+    if (!argb || w == 0 || h == 0 || w > 64 || h > 64) return kIOReturnBadArgument;
+    IOLockLock(modeLock);
+    volatile uint32_t *dst = reinterpret_cast<volatile uint32_t *>(cursorMap->getVirtualAddress());
+    const bool wasOn = curVisible && cursorHave;
+    if (wasOn) { curVisible = false; cursorProgram(false); curVisible = true; }               // hide while the image changes
+    for (uint32_t i = 0; i < 64 * 64; i++) dst[i] = argb[i];
+    __asm__ volatile("sfence" ::: "memory");
+    cursorW = w; cursorH = h; cursorHave = true;
+    curImages++;
+    cursorProgram(true);
+    if (curImages <= 4 || (curImages & 63) == 0) cursorPublish();
+    IOLockUnlock(modeLock);
+    return kIOReturnSuccess;
+}
+
+IOReturn RedNaviProbe::cursorState(int32_t x, int32_t y, bool visible) {
+    if (!cursorMap || !modeLock) return kIOReturnNotReady;
+    IOLockLock(modeLock);
+    curX = x; curY = y; curVisible = visible;
+    curMoves++;
+    cursorProgram(!cursorAttrsDone && cursorHave);
+    if (curMoves == 1 || (curMoves & 1023) == 0) cursorPublish();
+    IOLockUnlock(modeLock);
+    return kIOReturnSuccess;
+}
+
 IOReturn RedNaviProbe::callPlatformFunction(const OSSymbol *name, bool waitForFunction, void *p1, void *p2, void *p3, void *p4) {
+    if (name && name->isEqualTo("rednavi-cursor-image")) return cursorImage(static_cast<const uint32_t *>(p1), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p2)) >> 16, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p2)) & 0xFFFF);
+    if (name && name->isEqualTo("rednavi-cursor-state")) return cursorState(static_cast<int32_t>(reinterpret_cast<intptr_t>(p1)), static_cast<int32_t>(reinterpret_cast<intptr_t>(p2)), p3 != nullptr);
     if (name && name->isEqualTo("rednavi-set-mode")) return setModeLive(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p1)));
     if (name && name->isEqualTo("rednavi-gpu-frames")) { if (p1) *static_cast<uint32_t *>(p1) = gpuDirect; return kIOReturnSuccess; }
     return IOService::callPlatformFunction(name, waitForFunction, p1, p2, p3, p4);
@@ -3065,7 +3167,7 @@ void RedNaviProbe::sdmaTest() {
         const uint64_t apLen = bar0Mem ? static_cast<uint64_t>(bar0Mem->getLength()) : 0;
         devPool.init(kVmTables + 7ull * kVmPoolPages * 4096, 0x3D0000000ull - (kVmTables + 7ull * kVmPoolPages * 4096));
         if (apLen >= 0x10000000ull) {
-            visPool.init(kRNScanoutVramOff + 0x02200000ull, 0x0C000000ull - (kRNScanoutVramOff + 0x02200000ull));
+            visPool.init(kRNCursorVramOff + kRNCursorVramSize, 0x0C000000ull - (kRNCursorVramOff + kRNCursorVramSize));
             visPool.add(0x0D000000ull, 0x10000000ull - 0x0D000000ull);
         }
         IOLog("RedNavi: VRAM allocator: %llu MB device-local, %llu MB CPU-visible\n", (uint64_t)(devPool.totalPages >> 8), (uint64_t)(visPool.totalPages >> 8));
