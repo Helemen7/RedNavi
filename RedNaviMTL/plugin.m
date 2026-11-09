@@ -45,7 +45,7 @@ void rn_log(const char *fmt, ...) {
     static int to_file = -1;
     static int var_tmp;      // /Users/Shared/rednavi-log: system daemons such as WindowServer log to /private/var/tmp as well (readable over ssh; the unified log needs root)
     if (to_file < 0) { var_tmp = access("/Users/Shared/rednavi-log", F_OK) == 0; to_file = var_tmp || getenv("RN_METAL_COMPUTE") != NULL || getenv("RN_LOG_FILE") != NULL; }
-    if (!to_file) return;
+    if (!to_file || (chatty && var_tmp)) return;     // the per-call chatter would be most of the file and a file write each
     char line[1100];
     struct timeval tv;
     gettimeofday(&tv, NULL);

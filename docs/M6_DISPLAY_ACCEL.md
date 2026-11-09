@@ -46,9 +46,23 @@ After these, `performTransaction` runs about 10 times a second with a 1920x1080 
 - WindowServer crashes a few seconds after the first mouse movement: `memmove` in `+[RedNaviMTLBuffer syncNoCopyIn:]`, called from `commitBody` (SIGSEGV once, SIGBUS once). It is the copy of buffers made over the caller's memory (`newBufferWithBytesNoCopy`) when the memory has gone.
 - Visible glitches on the first frames, and the frame rate is low: `performTransaction` and the plug-in copy whole surfaces on the CPU every time; each command buffer waits on RADV fences.
 - The compositor choice is still made at boot with no device (restart WindowServer by hand once the accelerator is attached).
-- `performTransaction` does not wait for the GPU to finish the surface (the reference driver waits up to 100 ms for a per-surface ready flag); it happens to be right because `commit` is synchronous.
+- `performTransaction` does not wait for the GPU to finish the surface (the reference driver waits up to 100 ms for a per-surface ready flag). It used to be right because `commit` was synchronous; since the async commit below the plug-in reports the frame (RN_PRESENT_FRAME_DONE) when the scanout copy is done, but the kernel path is unchanged and this has not been re-checked.
 - `+0x08 = 0x30844300` of the accelerator configuration (shared events, bit 14) was not applied.
 - Video decode (no IOGVA* or VA driver) and AGDP are not implemented.
+
+## Performance work of 2026-11-09
+
+What changed in the Metal plug-in (`RedNaviMTL/compute.m`, `rn_vk.c`), with what was measured on the desktop (log in `/private/var/tmp/rednavi-metal-0.log`, written when `/Users/Shared/rednavi-log` exists; per-call chatter is left out of it):
+
+- **Async commit.** `commit` queues the command buffer on one serial queue and returns; handlers, presents and the semaphore run at the end of the body, on the queue. A buffer that waits for an event runs on the caller's thread after the queue is drained. `commitAndWait*` really wait. Verified: runs on the desktop; the effect alone was not isolated.
+- **One submit per command buffer.** `rn_vk_batch_begin/end` record the render passes into one Vulkan command buffer, with one submit and one fence wait. Anything that needs the card's results submits first: a dispatch, a copy, the host reading an image the batch uses, an image being destroyed, an event signal or wait. Framebuffers and the descriptor pool of the recorded passes live until the submit; `setBytes` buffers are kept until then (a freed one goes to the buffer cache and the next pass would overwrite it). The barrier at the end of a pass now also makes its writes visible to the next pass (sampling, blending, transfer). The scanout copy is recorded in the same submit (`rn_vk_batch_copy`). Verified: per command buffer 1 ms during window animation, down from 2.3 to 3.5 ms, about 300 command buffers a second, the plug-in about 30% busy. First build crashed WindowServer (a null framebuffer in `CmdBeginRenderPass`), fixed.
+- **Unchanged textures are not copied or uploaded again.** `syncFromSurface` and `syncFromBuffer` compare row by row and mark the image dirty only if something differs. Unverified in isolation.
+- **Format views of the card's copy of a scanout surface** (`rn_vram_as`): a texture view with another pixel format of the same texel size samples and renders through the card copy, not the texture's own old image. Whether this changed the glitches was not established.
+- **HOST_READ barrier** at the end of a pass: it removed the large black streaks in the dump of the rendered frame.
+- **Debug flags cost time.** `rednavi-scandump` (a GPU readback and a PNG every 2 s, up to 148 ms) and a file log with every call made idle commits take 35 ms. Both are off unless wanted.
+- **Frame counter** in the stats log (`frames: N reached the scanout in 5 s, longest gap, gaps over 12 ms`).
+
+Still open after this: about 10% of frames arrive more than 12 ms after the last (longest gaps 185 to 290 ms; the worst single commit is 127 ms, so part of it is outside the plug-in); RADV compiles a shader the first time an effect appears (the "pipelines" time, up to seconds in one 5 s interval), a pipeline cache on disk would remove that; 100 to 200 large buffers or textures are made every 5 s during animation; the scanout is copied 230 to 300 times a second, more than the refresh, into the one surface the display reads (no double buffer, no flip at vblank, so tearing is possible); corner radius and checkerboard glitches seen by the user are not explained: the dump of the rendered frame (`rednavi-scandump`) shows correct corners on the frames looked at.
 
 ## Tools added
 

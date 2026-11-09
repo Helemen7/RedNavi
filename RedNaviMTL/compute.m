@@ -325,10 +325,14 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     const uint8_t *src = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
     const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surf, surfPlane) : IOSurfaceGetBytesPerRow(surf);
     uint8_t *dst = rn_vk_image_staging(img);
-    for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * w * texel, src + y * pitch, w * texel);
+    BOOL changed = NO;      // rows that are the same are not written, and an image that did not change is not uploaded to the card again
+    for (NSUInteger y = 0; y < h; y++) {
+        uint8_t *d = dst + y * w * texel; const uint8_t *r = src + y * pitch;
+        if (changed || memcmp(d, r, w * texel)) { memcpy(d, r, w * texel); changed = YES; }
+    }
     IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
     surfSeed = IOSurfaceGetSeed(surf);
-    rn_vk_image_host_wrote(img);
+    if (changed) rn_vk_image_host_wrote(img);
 }
 - (void)syncToSurface {
     if (!surf || zeroCopy || IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return;
@@ -352,8 +356,23 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     if (!srcBuf && !srcRaw) return;
     const uint8_t *src = srcBuf ? (const uint8_t *)[(id<MTLBuffer>)srcBuf contents] + srcOff : srcRaw;
     uint8_t *dst = rn_vk_image_staging(img);
-    for (NSUInteger y = 0; y < h; y++) if (!rn_copy_from_caller(dst + y * w * texel, src + y * srcBpr, w * texel)) { static unsigned said; if (said++ < 20) rn_log("texture over caller memory %p: row %lu cannot be read, skipped", (const void *)src, (unsigned long)y); break; }
-    rn_vk_image_host_wrote(img);
+    // Only what differs is written, and an image that did not change is not uploaded to the card again. The caller's memory is read through the kernel copy (it can vanish under us), a row at a time.
+    BOOL changed = NO;
+    uint8_t rowbuf[16384];
+    const BOOL small = w * texel <= sizeof(rowbuf);
+    for (NSUInteger y = 0; y < h; y++) {
+        uint8_t *d = dst + y * w * texel;
+        BOOL ok;
+        if (small && !changed) {
+            ok = rn_copy_from_caller(rowbuf, src + y * srcBpr, w * texel);
+            if (ok && memcmp(d, rowbuf, w * texel)) { memcpy(d, rowbuf, w * texel); changed = YES; }
+        } else {
+            ok = rn_copy_from_caller(d, src + y * srcBpr, w * texel);
+            if (ok) changed = YES;
+        }
+        if (!ok) { static unsigned said; if (said++ < 20) rn_log("texture over caller memory %p: row %lu cannot be read, skipped", (const void *)src, (unsigned long)y); break; }
+    }
+    if (changed) rn_vk_image_host_wrote(img);
 }
 - (id<MTLDevice>)device { return dev; }
 - (NSString *)label { return label_; }
@@ -535,6 +554,7 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 
 // The resources a Metal encoder has bound, turned into the rn_vk arguments of a pipeline's bindings (compute, vertex and fragment stages all use it). Returns an error text or nil.
 // setBytes data becomes a small buffer that is kept in `temps` until the work is done.
+static NSMutableArray *rn_batch_keep(void) { static NSMutableArray *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [NSMutableArray new]; }); return k; }
 static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kind, const unsigned *mi, RedNaviMTLBuffer *const *bufs, const uint64_t *offs, NSData *const *bytesAt,
                               RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps) {
     for (unsigned i = 0; i < n; i++) {
@@ -890,7 +910,10 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     NSMutableArray *presents;                   // drawables to present once the command buffer is done (CAMetalLayer)
     MTLCommandBufferStatus st;
     unsigned directPasses;                      // passes of this command buffer that rendered into the scanout
+    size_t scanW, scanH;                        // size of the surface scanSrc belongs to
     rn_vk_image *scanSrc;                       // the card's copy of the surface the last such pass finished: copied into the scanout when the command buffer ends
+    BOOL ran;                                   // the body has started
+    BOOL scanCopied;                            // the scanout copy was recorded in the batch
     BOOL handlersRun;                           // the completed handlers have been called
     NSError *err;
     NSString *label_;
@@ -995,6 +1018,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 @implementation RNBlit
 @end
 
+static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL create);
 static NSString *rn_run_blit(RNBlit *b) {
     switch (b->kind) {
     case 0: case 1: {
@@ -1024,6 +1048,22 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (s2->texel != d2->texel) return @"blit: the textures have different texel sizes";
         if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > s2->w || b->so.y + b->sz.height > s2->h || b->dorg.x + b->sz.width > d2->w || b->dorg.y + b->sz.height > d2->h)
             return @"blit: the region is outside a texture";
+        {   // A CoreDisplay scanout surface lives on the card (direct scanout renders into its VRAM copy): a copy into it, or out of it into a surface the CPU reads, is done there. A memmove on the
+            // host copy would leave the picture the card draws on unchanged, and the pixels the blit meant to carry over stay as they were.
+            RedNaviMTLTexture *sr = s2->parent ? s2->parent : s2, *dr = d2->parent ? d2->parent : d2;
+            if ((dr->displayScan || sr->displayScan) && s2->pf == d2->pf) {
+                rn_vk *vk = rn_vk_shared();
+                rn_vk_image *si = sr->displayScan ? rn_display_vram_get(vk, sr, NO) : NULL, *di = dr->displayScan ? rn_display_vram_get(vk, dr, YES) : NULL;
+                if (!si && sr->displayScan) si = rn_display_vram_get(vk, sr, YES);
+                if (!si) si = sr->img;
+                if (!di && (dr->zeroCopy)) di = dr->img;
+                if (si && di && (dr->displayScan || dr->zeroCopy)) {
+                    const int rc = rn_vk_image_copy_region(vk, si, di, (uint32_t)b->so.x, (uint32_t)b->so.y, (uint32_t)b->dorg.x, (uint32_t)b->dorg.y, (uint32_t)b->sz.width, (uint32_t)b->sz.height);
+                    static unsigned said; if (said++ < 12) rn_log("blit between display surfaces on the card: %lux%lu from (%lu,%lu) to (%lu,%lu), result %d", (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)b->so.x, (unsigned long)b->so.y, (unsigned long)b->dorg.x, (unsigned long)b->dorg.y, rc);
+                    if (rc == 0) return nil;
+                }
+            }
+        }
         const uint8_t *sp = rn_vk_image_staging(s2->img);
         uint8_t *dp = rn_vk_image_staging(d2->img);
         for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + ((b->dorg.y + y) * d2->w + b->dorg.x) * d2->texel, sp + ((b->so.y + y) * s2->w + b->so.x) * s2->texel, b->sz.width * s2->texel);
@@ -1255,6 +1295,18 @@ extern uint64_t rn_vk_fence_ticks;
 extern uint64_t rn_vk_bufstat[6];
 static _Atomic uint64_t g_ph[8];
 static inline void rn_ph(int i, uint64_t t0) { atomic_fetch_add(&g_ph[i], mach_absolute_time() - t0); }
+static _Atomic uint64_t g_frames, g_framegapmax, g_framelast, g_framelong, g_passes;   // frames that reached the scanout, the longest gap between two (ticks), gaps over 12 ms, render passes
+static void rn_frame_note(void) {
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    const uint64_t now = mach_absolute_time(), last = atomic_exchange(&g_framelast, now);
+    atomic_fetch_add(&g_frames, 1);
+    if (!last) return;
+    const uint64_t gap = (now - last) * tb.numer / tb.denom;          // ns
+    uint64_t m = atomic_load(&g_framegapmax);
+    while (gap > m && !atomic_compare_exchange_weak(&g_framegapmax, &m, gap)) {}
+    if (gap > 12000000ull) atomic_fetch_add(&g_framelong, 1);
+}
 static void rn_commit_stats(uint64_t ticks) {
     static mach_timebase_info_data_t tb;
     static uint64_t sum, worst, count, since;
@@ -1269,6 +1321,7 @@ static void rn_commit_stats(uint64_t ticks) {
           rn_log("commit time in ms: render passes %.0f (vulkan %.0f, card wait %.0f), surfaces in %.0f, caller buffers %.0f, pipelines %.0f, handlers %.0f", ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6]); }
         { uint64_t bs[6]; for (int i = 0; i < 5; i++) bs[i] = __atomic_exchange_n(&rn_vk_bufstat[i], 0, __ATOMIC_RELAXED); bs[5] = rn_vk_bufstat[5];
           rn_log("buffer cache: %llu hits, %llu small misses, %llu big (largest %llu bytes), %llu kept, %llu dropped", bs[0], bs[1], bs[2], bs[5], bs[3], bs[4]); }
+        rn_log("frames: %llu reached the scanout in 5 s, longest gap %.1f ms, %llu gaps over 12 ms, %llu render passes", (unsigned long long)atomic_exchange(&g_frames, 0), (double)atomic_exchange(&g_framegapmax, 0) / 1e6, (unsigned long long)atomic_exchange(&g_framelong, 0), (unsigned long long)atomic_exchange(&g_passes, 0));
         rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst; textures alive %ld (%lu MB), made so far %ld", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6, (long)g_tex_live, (unsigned long)g_tex_bytes >> 20, (long)g_tex_made);
         sum = worst = count = 0; since = now;
         rn_sites_report();
@@ -1325,6 +1378,94 @@ static rn_vk_image *rn_scanout_image(rn_vk *vk, size_t w, size_t h) {
 }
 // The card's own copy of a CoreDisplay scanout surface (device memory), one per IOSurface and not per texture: CoreDisplay makes a new MTLTexture over the same ring surface
 // for each frame and draws only the changed part into it, so the contents have to outlive the texture object.
+// Glitch locator (with /Users/Shared/rednavi-scandump): the last passes into display surfaces, one record per draw (shaders, the rectangle it covers, what it samples), kept in a ring.
+// When the dump of a finished frame has a block of pure green (what a texture of zeros looks like through a YCbCr conversion, or what uninitialised memory often is), the draws of the
+// ring that cover that point are written to the log: either the draw that produced it is named, or nothing recent drew there (the pixels were never redrawn).
+typedef struct { uint64_t seq; char vs[48], fs[48]; int x0, y0, x1, y1; unsigned ntex; unsigned tw[3], th[3], tpf[3], tsurf[3]; unsigned instances, vertices; int blend; } RNDrawRec;
+static RNDrawRec g_drawring[512]; static unsigned g_drawhead; static uint64_t g_passseq;
+static BOOL rn_locator_on(void) { static int on = -1; if (on < 0) on = access("/Users/Shared/rednavi-scandump", F_OK) == 0; return on; }
+static void rn_locator_note(RNRenderPass *rp, RedNaviMTLTexture *rt) {
+    if (!rn_locator_on() || !rt) return;
+    const uint64_t seq = ++g_passseq;
+    for (RNDraw *d in rp->draws) {
+        RNDrawRec *r = &g_drawring[g_drawhead++ % 512];
+        memset(r, 0, sizeof(*r));
+        r->seq = seq;
+        strlcpy(r->vs, d->pso && d->pso->names[0] ? d->pso->names[0].UTF8String : "-", sizeof(r->vs));
+        strlcpy(r->fs, d->pso && d->pso->names[1] ? d->pso->names[1].UTF8String : "-", sizeof(r->fs));
+        r->x0 = 0; r->y0 = 0; r->x1 = (int)rt->w; r->y1 = (int)rt->h;
+        if (d->hasViewport) { r->x0 = (int)d->viewport[0]; r->y0 = (int)d->viewport[1]; r->x1 = (int)(d->viewport[0] + d->viewport[2]); r->y1 = (int)(d->viewport[1] + d->viewport[3]); }
+        if (d->hasScissor) { int sx0 = (int)d->scissor[0], sy0 = (int)d->scissor[1], sx1 = sx0 + (int)d->scissor[2], sy1 = sy0 + (int)d->scissor[3]; if (sx0 > r->x0) r->x0 = sx0; if (sy0 > r->y0) r->y0 = sy0; if (sx1 < r->x1) r->x1 = sx1; if (sy1 < r->y1) r->y1 = sy1; }
+        for (int i = 0; i < 16 && r->ntex < 3; i++) { RedNaviMTLTexture *t = d->texs[1][i]; if (!t) continue; r->tw[r->ntex] = (unsigned)t->w; r->th[r->ntex] = (unsigned)t->h; r->tpf[r->ntex] = (unsigned)t->pf; r->tsurf[r->ntex] = t->surf ? (unsigned)IOSurfaceGetID(t->surf) : 0; r->ntex++; }
+        r->instances = d->instanceCount; r->vertices = d->vertexCount; r->blend = d->pso ? d->pso->blend[0].enabled : 0;
+    }
+}
+static void rn_locator_find(const uint8_t *px, size_t w, size_t h) {
+    int found = 0;
+    for (size_t y = 8; y + 8 < h && found < 3; y += 8)
+        for (size_t x = 8; x + 8 < w && found < 3; x += 8) {
+            int ok = 1;
+            for (int dy = 0; dy < 8 && ok; dy += 7) for (int dx = 0; dx < 8 && ok; dx += 7) { const uint8_t *q = px + ((y + dy) * w + x + dx) * 4; ok = q[1] > 200 && q[2] < 90 && q[0] < 90; }
+            if (!ok) continue;
+            found++;
+            rn_log("locator: green block at (%zu,%zu); draws covering it, newest first:", x, y);
+            unsigned shown = 0;
+            for (unsigned k = 0; k < 512 && shown < 6; k++) {
+                RNDrawRec *r = &g_drawring[(g_drawhead - 1 - k) % 512];
+                if (!r->seq) break;
+                if ((int)x < r->x0 || (int)x >= r->x1 || (int)y < r->y0 || (int)y >= r->y1) continue;
+                shown++;
+                rn_log("locator:   pass %llu: %s + %s, rect (%d,%d)-(%d,%d), %u vertices x %u instances, blend %d, samples %u: %ux%u/%u surf %u, %ux%u/%u surf %u, %ux%u/%u surf %u", (unsigned long long)r->seq, r->vs, r->fs, r->x0, r->y0, r->x1, r->y1, r->vertices, r->instances, r->blend, r->ntex,
+                       r->tw[0], r->th[0], r->tpf[0], r->tsurf[0], r->tw[1], r->th[1], r->tpf[1], r->tsurf[1], r->tw[2], r->th[2], r->tpf[2], r->tsurf[2]);
+            }
+            if (!shown) rn_log("locator:   no draw of the last %u covers it (never redrawn)", MIN(g_drawhead, 512u));
+        }
+}
+// Trace aid (only with /Users/Shared/rednavi-scandump): the finished frame as the card rendered it (the card copy of the surface, read back with a GPU transfer into host memory;
+// reading the display's own VRAM surface through the BAR takes seconds) as /private/var/tmp/rednavi-scan-<n>.png, one every two seconds, eight files in rotation.
+static void rn_scan_dump(rn_vk_image *src, size_t w, size_t h) {
+    static uint64_t last; static unsigned seq; static int on = -1;
+    if (on < 0) on = access("/Users/Shared/rednavi-scandump", F_OK) == 0;
+    if (!on || !src) return;
+    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    const uint64_t now = mach_absolute_time();
+    if (last && (now - last) * tb.numer / tb.denom < 2000000000ull) return;
+    last = now;
+    const size_t pitch = w * 4;
+    uint8_t *copy = malloc(pitch * h);
+    if (!copy) return;
+    memcpy(copy, rn_vk_image_staging(src), pitch * h);
+    rn_locator_find(copy, w, h);
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef cg = CGBitmapContextCreate(copy, w, h, 8, pitch, cs, kCGImageAlphaNoneSkipFirst | kCGBitmapByteOrder32Little);
+    CGImageRef img = cg ? CGBitmapContextCreateImage(cg) : NULL;
+    if (img) {
+        char path[128]; snprintf(path, sizeof(path), "/private/var/tmp/rednavi-scan-%u.png", seq++ % 8);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+        CGImageDestinationRef dst = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL);
+        if (dst) { CGImageDestinationAddImage(dst, img, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+        CFRelease(url); CGImageRelease(img);
+    }
+    if (cg) CGContextRelease(cg);
+    CGColorSpaceRelease(cs);
+    free(copy);
+}
+// A texture view of a scanout surface with another pixel format of the same texel size (an sRGB view of a BGRA8 surface is what colour managed drawing samples and renders through) is a view of the
+// card's copy, not of the texture's own image, whose pixels are old. One view per (card copy, format), dropped with the copy.
+typedef struct { rn_vk_image *base, *view; MTLPixelFormat pf; } RNVramView;
+static RNVramView g_vviews[64]; static unsigned g_vviewn;
+static void rn_vram_views_drop(rn_vk *vk, rn_vk_image *base) {
+    for (unsigned i = 0; i < g_vviewn;) if (g_vviews[i].base == base) { rn_vk_image_destroy(vk, g_vviews[i].view); g_vviews[i] = g_vviews[--g_vviewn]; } else i++;
+}
+static rn_vk_image *rn_vram_as(rn_vk *vk, rn_vk_image *base, MTLPixelFormat pf) {
+    for (unsigned i = 0; i < g_vviewn; i++) if (g_vviews[i].base == base && g_vviews[i].pf == pf) return g_vviews[i].view;
+    const int f = rn_vk_format_of(pf);
+    if (!f || g_vviewn >= 64) return NULL;
+    rn_vk_image *v = rn_vk_image_view(vk, base, f, NULL);
+    if (!v) return NULL;
+    g_vviews[g_vviewn++] = (RNVramView){base, v, pf};
+    return v;
+}
 static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL create) {
     static NSMutableDictionary<NSNumber *, NSValue *> *cache; static NSMutableArray<NSNumber *> *order;
     if (!rt->surf) return NULL;
@@ -1336,7 +1477,7 @@ static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL c
         if (!create) return NULL;
         rn_vk_image *img = rn_vk_image_create(vk, rn_vk_format_of(rt->pf), (uint32_t)rt->w, (uint32_t)rt->h);
         if (!img) return NULL;
-        if (order.count >= 16) { rn_vk_image_destroy(vk, (rn_vk_image *)cache[order[0]].pointerValue); [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
+        if (order.count >= 16) { rn_vram_views_drop(vk, (rn_vk_image *)cache[order[0]].pointerValue); rn_vk_image_destroy(vk, (rn_vk_image *)cache[order[0]].pointerValue); [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
         cache[key] = [NSValue valueWithPointer:img]; [order addObject:key];
         // A new ring surface starts with whatever the card's memory held, and CoreDisplay draws only what changed into it: the picture on the screen is its best starting point.
         rn_vk_image *shown = rn_scanout_image(vk, rt->w, rt->h);
@@ -1349,8 +1490,12 @@ static rn_vk_image *rn_display_vram(rn_vk *vk, RedNaviMTLTexture *rt) { return r
 // A scanout surface that is sampled (CoreDisplay reads one ring surface while it draws into another) is read from the card's copy, which is where its pixels are now.
 static rn_vk_image *rn_display_vram_peek(void *tp) {
     RedNaviMTLTexture *t = (__bridge RedNaviMTLTexture *)tp, *rt = t->parent ? t->parent : t;
-    if (!rt->displayScan || t->pf != rt->pf) return NULL;
-    return rn_display_vram_get(rn_vk_shared(), rt, NO);
+    if (!rt->displayScan) return NULL;
+    rn_vk *vk = rn_vk_shared();
+    rn_vk_image *vr = rn_display_vram_get(vk, rt, NO);
+    if (!vr || t->pf == rt->pf) return vr;
+    if (t->texel != rt->texel || t->swz.red != MTLTextureSwizzleRed || t->swz.green != MTLTextureSwizzleGreen || t->swz.blue != MTLTextureSwizzleBlue || t->swz.alpha != MTLTextureSwizzleAlpha) return NULL;
+    @synchronized ([RedNaviMTLTexture class]) { return rn_vram_as(vk, vr, t->pf); }
 }
 static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the bridge's present call (selector RN_UC_PRESENT)
     static int (*present)(uint32_t, int); static dispatch_once_t once;
@@ -1393,9 +1538,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 - (void)waitUntilScheduled {}
 // Private variants of commit that SkyLight and CoreAnimation use (SkyLight's MetalContext::Flush sends commitAndWaitUntilSubmitted, found with tools/ws_flush.sh): the commit here is synchronous,
 // so the buffer is submitted and completed when it returns. Without them the message is unimplemented and WindowServer's composition never reaches the GPU.
-- (void)commitAndWaitUntilSubmitted { [self commit]; }
-- (void)commitAndWaitUntilScheduled { [self commit]; }
-- (void)commitAndWaitUntilCompleted { [self commit]; }
+- (void)commitAndWaitUntilSubmitted { [self commitAsync:YES]; }
+- (void)commitAndWaitUntilScheduled { [self commitAsync:YES]; }
+- (void)commitAndWaitUntilCompleted { [self commitAsync:YES]; }
 // The first version runs everything at commit, so a drawable is presented at the end of commit.
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value {
     RNEventOp *o = [RNEventOp new]; o->event = (RedNaviMTLSharedEvent *)event; o->value = value; [records addObject:o];
@@ -1439,8 +1584,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     BOOL direct = NO;
     for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}, !rp->store[i]};
         RedNaviMTLTexture *rt = rp->tex[i]->parent ? rp->tex[i]->parent : rp->tex[i];
-        if (rt->displayScan && rp->tex[i]->pf == rt->pf && rn_scanout_image(vk, rt->w, rt->h)) {
+        if (rt->displayScan && rp->tex[i]->texel == rt->texel && rn_scanout_image(vk, rt->w, rt->h)) {
             rn_vk_image *vr = rn_display_vram(vk, rt);
+            if (vr && rp->tex[i]->pf != rt->pf) { @synchronized ([RedNaviMTLTexture class]) { vr = rn_vram_as(vk, vr, rp->tex[i]->pf); } }
             if (vr) { tg[i].image = vr; direct = YES; }
         } }
     if (getenv("RN_LOG_DRAWS"))
@@ -1461,7 +1607,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
     rn_vk_arg (*fa)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*fa));
     rn_vk_vbuf (*vbs)[16] = calloc(na, sizeof(*vbs));
-    NSMutableArray *temps = [NSMutableArray new];
+    NSMutableArray *temps = rn_batch_keep();     // setBytes buffers stay alive until the batch has run (a freed one goes to the buffer cache and the next pass would overwrite it)
     NSString *bad = (dr && va && fa && vbs) ? nil : @"out of memory";
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
@@ -1515,11 +1661,12 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     const uint64_t phv = mach_absolute_time();
     int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
     rn_ph(1, phv);
+    if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
     if (direct && !rc) {         // a pass that fills the surface with a colour (CoreDisplay clears a surface before it draws into it) is not a finished frame; any other is, and goes to the scanout
         RNDraw *d0 = nd ? rp->draws[0] : nil;
         if (!(d0 && d0->pso && d0->pso->names[1] && [d0->pso->names[1] hasPrefix:@"ColorFill"])) {
             RedNaviMTLTexture *rt = rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0];
-            scanSrc = rn_display_vram(vk, rt);      // the frame is complete when the command buffer is: one copy into the scanout at its end
+            scanSrc = rn_display_vram(vk, rt); scanW = rt->w; scanH = rt->h;      // the frame is complete when the command buffer is: one copy into the scanout at its end
             directPasses++;
         }
     }
@@ -1560,18 +1707,35 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 // The first version runs the recorded dispatches synchronously on the calling thread.
 // One commit at a time: the Vulkan queue and command pool are the process's single ones and are not thread safe, and the textures and buffers a commit copies are shared with the others.
 // Recursive: a completion handler may commit another command buffer.
-- (void)commit {
-    static NSRecursiveLock *lock; static dispatch_once_t once;
-    dispatch_once(&once, ^{ lock = [NSRecursiveLock new]; });
-    const uint64_t t0 = mach_absolute_time();
-    [lock lock];
-    [self commitBody];
-    [lock unlock];
-    rn_commit_stats(mach_absolute_time() - t0);
+- (void)commit { [self commitAsync:NO]; }
+// Commit order is kept by one serial queue; the caller goes on while the card works. The completion handlers, the presents and the semaphore run at the end of the body, on the queue.
+// A buffer that waits for an event runs on the caller's thread after the queue is drained: the signal may come from a buffer committed later by another thread, and the queue must not block on it.
+- (void)commitAsync:(BOOL)wait {
+    static dispatch_queue_t q; static dispatch_once_t once; static void *key = &key;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("rednavi.commit", DISPATCH_QUEUE_SERIAL); dispatch_queue_set_specific(q, key, key, NULL); });
+    if (st >= MTLCommandBufferStatusCommitted) return;
+    const BOOL onQueue = dispatch_get_specific(key) == key;
+    BOOL waits = NO;
+    for (id rec in records) if ([rec isKindOfClass:[RNEventOp class]] && ((RNEventOp *)rec)->wait) { waits = YES; break; }
+    void (^run)(void) = ^{
+        static NSRecursiveLock *lock; static dispatch_once_t o2;
+        dispatch_once(&o2, ^{ lock = [NSRecursiveLock new]; });
+        const uint64_t t0 = mach_absolute_time();
+        [lock lock];
+        [self commitBody];
+        [lock unlock];
+        rn_commit_stats(mach_absolute_time() - t0);
+    };
+    if (onQueue) { run(); return; }
+    if (waits) { dispatch_sync(q, ^{}); run(); return; }
+    st = MTLCommandBufferStatusCommitted;       // visible at once; the body sets the final state
+    dispatch_async(q, run);
+    if (wait) [self waitUntilCompleted];
 }
 - (void)commitBody {
     if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
-    if (st >= MTLCommandBufferStatusCommitted) return;
+    if (ran) return;
+    ran = YES;
     st = MTLCommandBufferStatusCommitted;
     NSArray *schedHandlers; @synchronized(scheduled) { st = MTLCommandBufferStatusCommitted; schedHandlers = [scheduled copy]; [scheduled removeAllObjects]; }
     for (MTLCommandBufferHandler h in schedHandlers) h((id)self);
@@ -1580,6 +1744,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     // IOSurface-backed textures: what the surface holds goes to the images first, what the command buffer wrote goes back to the surface afterwards
     NSMutableOrderedSet<RedNaviMTLTexture *> *surfUsed = [NSMutableOrderedSet orderedSet], *surfWritten = [NSMutableOrderedSet orderedSet];
     void (^note)(RedNaviMTLTexture *, BOOL) = ^(RedNaviMTLTexture *t, BOOL written) {
+        if (t && t->parent) t = t->parent;       // a view shares its root's storage and host copy: the root is what is synchronised (a view has none of the buffer fields and not the plane)
         if (!t || (!t->surf && !t->srcBuf && !t->srcRaw)) return;
         [surfUsed addObject:t];
         if (written) [surfWritten addObject:t];
@@ -1648,15 +1813,21 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         }
     }
     { const uint64_t ph4i = mach_absolute_time(); [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:YES]; rn_ph(4, ph4i); }
+    if (vk) rn_vk_batch_begin(vk);
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
-        if ([rec isKindOfClass:[RNRenderPass class]]) { const uint64_t ph0 = mach_absolute_time(); [self runRenderPass:rec]; rn_ph(0, ph0); continue; }
+        if ([rec isKindOfClass:[RNRenderPass class]]) { atomic_fetch_add(&g_passes, 1); const uint64_t ph0 = mach_absolute_time(); [self runRenderPass:rec]; rn_ph(0, ph0); continue; }
         if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; continue; }
         if ([rec isKindOfClass:[RNEventOp class]]) {
             RNEventOp *o = rec;
             if (![o->event isKindOfClass:[RedNaviMTLSharedEvent class]]) { [self fail:@"an event that is not from RedNavi"]; break; }
+            // the batch ends first: a signal must not run ahead of the work before it, and a wait must not hold the card lock
+            { const int br = vk ? rn_vk_batch_end(vk) : 0; if (br) [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; [rn_batch_keep() removeAllObjects]; }
+            BOOL got = YES;
             if (!o->wait) { if (o->event.signaledValue < o->value) o->event.signaledValue = o->value; }
-            else if (![o->event waitFor:o->value timeoutMS:10000]) [self fail:[NSString stringWithFormat:@"waiting for an event to reach %llu timed out after 10 s (it is at %llu)", o->value, o->event.signaledValue]];
+            else got = [o->event waitFor:o->value timeoutMS:10000];
+            if (vk) rn_vk_batch_begin(vk);
+            if (!got) [self fail:[NSString stringWithFormat:@"waiting for an event to reach %llu timed out after 10 s (it is at %llu)", o->value, o->event.signaledValue]];
             continue;
         }
         RNDispatch *d = rec;
@@ -1674,25 +1845,33 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
+    if (vk && scanSrc && st != MTLCommandBufferStatusError) {       // the scanout copy rides in the same submit as the passes
+        rn_vk_image *scan = rn_scanout_image(vk, scanW, scanH);
+        if (scan && rn_vk_batch_copy(vk, scanSrc, scan) == 0) scanCopied = YES;
+    }
+    if (vk) { const int br = rn_vk_batch_end(vk); if (br) [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; }
+    [rn_batch_keep() removeAllObjects];
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
     {   struct stat tst2;
         if (stat("/Users/Shared/rednavi-trace", &tst2) == 0)
             for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
     }
     { const uint64_t ph4 = mach_absolute_time(); if (st != MTLCommandBufferStatusError) [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:NO]; rn_ph(4, ph4); }
+    if (scanSrc && st != MTLCommandBufferStatusError) {      // the frame reaches the scanout before the buffer is reported complete: a completion handler lets the client reuse the surface
+        rn_vk_image *scan = scanCopied ? NULL : rn_scanout_image(rn_vk_shared(), scanW, scanH);
+        if (scanCopied || (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0)) { rn_frame_done(); rn_frame_note(); rn_scan_dump(scanSrc, scanW, scanH); }
+        else { static unsigned said; if (said++ < 20) rn_log("direct scanout: the finished frame (%lux%lu) could not be copied into the scanout", (unsigned long)scanW, (unsigned long)scanH); }
+    }
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     NSArray *doneHandlers; @synchronized(completed) { handlersRun = YES; doneHandlers = [completed copy]; [completed removeAllObjects]; }
     { const uint64_t ph6 = mach_absolute_time(); for (MTLCommandBufferHandler h in doneHandlers) h((id)self); rn_ph(6, ph6); }
-    if (scanSrc && st != MTLCommandBufferStatusError) {
-        rn_vk_image *scan = rn_scanout_image(rn_vk_shared(), 1920, 1080);
-        if (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0) rn_frame_done();
-    }
     for (id<MTLDrawable> dr in presents) [dr present];
     dispatch_semaphore_signal(done);
 }
 - (void)waitUntilCompleted {
     if (st < MTLCommandBufferStatusCommitted) return;
-    dispatch_semaphore_wait(done, DISPATCH_TIME_NOW);
+    dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+    dispatch_semaphore_signal(done);
 }
 @end
 
