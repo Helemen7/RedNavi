@@ -257,6 +257,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     NSUInteger surfPlane;                         // the plane of a multi-planar surface this texture shows (0 for the others)                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
     RedNaviMTLTexture *parent;                       // a texture view: the texture it is a view of (it shares its image, memory and host copy)
     MTLTextureSwizzleChannels swz;
+    atomic_int queued_;                           // command buffers that use this texture (a root, not a view), were committed and have not run yet
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc;
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane;
@@ -265,6 +266,25 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 - (void)syncToSurface;
 - (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)pf swizzle:(const MTLTextureSwizzleChannels *)sw;
 @end
+// A commit returns before its command buffer has run (the bodies run on one serial queue). Metal's rule is that a committed command buffer sees the textures as they were when it was
+// committed, so a host access to a texture (replaceRegion, getBytes) waits until the command buffers that use it have run. Without the wait a client that draws with a texture, commits
+// and writes the next picture into the same texture got the new pixels in the old frame. The wait ends when the card's work is done, before the completion handlers, and gives up after
+// two seconds: a handler that needs a lock the waiting thread holds must not stop both for good.
+static pthread_mutex_t g_texq_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_texq_cv = PTHREAD_COND_INITIALIZER;
+static void *g_commit_key = &g_commit_key;      // set on the commit queue
+static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
+    RedNaviMTLTexture *r = t->parent ? t->parent : t;
+    if (atomic_load(&r->queued_) <= 0 || dispatch_get_specific(g_commit_key) == g_commit_key) return;
+    struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec += 2;
+    int rc = 0;
+    pthread_mutex_lock(&g_texq_mu);
+    while (atomic_load(&r->queued_) > 0 && rc == 0) rc = pthread_cond_timedwait(&g_texq_cv, &g_texq_mu, &until);
+    pthread_mutex_unlock(&g_texq_mu);
+    static atomic_uint waits, late;
+    const unsigned n = atomic_fetch_add(&waits, 1);
+    if (rc) { if (atomic_fetch_add(&late, 1) < 20) rn_log("texture %lux%lu: a host access did not wait for the command buffers that use it (2 s passed)", (unsigned long)r->w, (unsigned long)r->h); }
+    else if (n < 8 || n % 1000 == 0) rn_log("texture %lux%lu: host access waited for a committed command buffer (%u such waits so far)", (unsigned long)r->w, (unsigned long)r->h, n + 1);
+}
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
@@ -458,6 +478,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
     if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    rn_tex_wait_idle(self);
     uint8_t *dst = rn_vk_image_staging(img);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
@@ -471,8 +492,10 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
     if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    rn_tex_wait_idle(self);
     [self syncFromSurface];
-    const uint8_t *src = rn_vk_image_staging(img);
+    rn_vk_image *card = rn_display_vram_peek((__bridge void *)self);      // a scanout surface's pixels are in the card's copy, not in the texture's own image
+    const uint8_t *src = rn_vk_image_staging(card ? card : img);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
@@ -918,6 +941,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     BOOL ran;                                   // the body has started
     BOOL scanCopied;                            // the scanout copy was recorded in the batch
     BOOL handlersRun;                           // the completed handlers have been called
+    NSArray *queuedTex;                         // the textures counted as in use from the commit until the body has run (rn_tex_wait_idle)
     NSError *err;
     NSString *label_;
     dispatch_semaphore_t done;
@@ -1037,7 +1061,8 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (!b->sz.width || !b->sz.height) return nil;
         if (bpr < b->sz.width * t->texel) return @"blit: bytesPerRow is smaller than a row of the region";
         if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
-        uint8_t *tex = rn_vk_image_staging(t->img), *buf = (uint8_t *)rn_vk_buffer_contents(bf->b) + off;
+        rn_vk_image *card = b->kind == 1 ? rn_display_vram_peek((__bridge void *)t) : NULL;      // reading a scanout surface: its pixels are in the card's copy
+        uint8_t *tex = rn_vk_image_staging(card ? card : t->img), *buf = (uint8_t *)rn_vk_buffer_contents(bf->b) + off;
         for (NSUInteger y = 0; y < b->sz.height; y++) {
             uint8_t *tp = tex + ((o.y + y) * t->w + o.x) * t->texel, *bp = buf + y * bpr;
             if (b->kind == 0) memcpy(tp, bp, b->sz.width * t->texel); else memcpy(bp, tp, b->sz.width * t->texel);
@@ -1067,7 +1092,8 @@ static NSString *rn_run_blit(RNBlit *b) {
                 }
             }
         }
-        const uint8_t *sp = rn_vk_image_staging(s2->img);
+        rn_vk_image *scard = rn_display_vram_peek((__bridge void *)s2);
+        const uint8_t *sp = rn_vk_image_staging(scard ? scard : s2->img);
         uint8_t *dp = rn_vk_image_staging(d2->img);
         for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + ((b->dorg.y + y) * d2->w + b->dorg.x) * d2->texel, sp + ((b->so.y + y) * s2->w + b->so.x) * s2->texel, b->sz.width * s2->texel);
         rn_vk_image_host_wrote(d2->img);
@@ -1296,6 +1322,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 // 5 render pipelines made (translation and Vulkan), 6 the completed handlers. Ticks of mach_absolute_time.
 extern uint64_t rn_vk_fence_ticks;
 extern uint64_t rn_vk_bufstat[6];
+extern uint64_t rn_vk_imgstat[3];
 static _Atomic uint64_t g_ph[8];
 static inline void rn_ph(int i, uint64_t t0) { atomic_fetch_add(&g_ph[i], mach_absolute_time() - t0); }
 static _Atomic uint64_t g_frames, g_framegapmax, g_framelast, g_framelong, g_passes;   // frames that reached the scanout, the longest gap between two (ticks), gaps over 12 ms, render passes
@@ -1324,6 +1351,8 @@ static void rn_commit_stats(uint64_t ticks) {
           rn_log("commit time in ms: render passes %.0f (vulkan %.0f, card wait %.0f), surfaces in %.0f, caller buffers %.0f, pipelines %.0f, handlers %.0f", ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6]); }
         { uint64_t bs[6]; for (int i = 0; i < 5; i++) bs[i] = __atomic_exchange_n(&rn_vk_bufstat[i], 0, __ATOMIC_RELAXED); bs[5] = rn_vk_bufstat[5];
           rn_log("buffer cache: %llu hits, %llu small misses, %llu big (largest %llu bytes), %llu kept, %llu dropped", bs[0], bs[1], bs[2], bs[5], bs[3], bs[4]); }
+        { uint64_t is[3]; for (int i = 0; i < 3; i++) is[i] = __atomic_exchange_n(&rn_vk_imgstat[i], 0, __ATOMIC_RELAXED);
+          rn_log("images: %llu reused from the pool, %llu made, %llu kept on free", is[0], is[1], is[2]); }
         rn_log("frames: %llu reached the scanout in 5 s, longest gap %.1f ms, %llu gaps over 12 ms, %llu render passes", (unsigned long long)atomic_exchange(&g_frames, 0), (double)atomic_exchange(&g_framegapmax, 0) / 1e6, (unsigned long long)atomic_exchange(&g_framelong, 0), (unsigned long long)atomic_exchange(&g_passes, 0));
         rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst; textures alive %ld (%lu MB), made so far %ld", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6, (long)g_tex_live, (unsigned long)g_tex_bytes >> 20, (long)g_tex_made);
         sum = worst = count = 0; since = now;
@@ -1476,7 +1505,10 @@ static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL c
         if (!cache) { cache = [NSMutableDictionary new]; order = [NSMutableArray new]; }
         NSNumber *key = @(((unsigned long long)IOSurfaceGetID(rt->surf) << 32) | ((rt->w & 0xFFFF) << 16) | (rt->h & 0xFFFF));
         NSValue *v = cache[key];
-        if (v) return (rn_vk_image *)v.pointerValue;
+        if (v) {        // least recently used goes first: the ring surfaces in use stay at the end, and the copy dropped for a new surface is one nothing has touched for longest
+            if (order.lastObject != key && ![order.lastObject isEqual:key]) { [order removeObject:key]; [order addObject:key]; }
+            return (rn_vk_image *)v.pointerValue;
+        }
         if (!create) return NULL;
         rn_vk_image *img = rn_vk_image_create(vk, rn_vk_format_of(rt->pf), (uint32_t)rt->w, (uint32_t)rt->h);
         if (!img) return NULL;
@@ -1495,7 +1527,9 @@ static rn_vk_image *rn_display_vram_peek(void *tp) {
     RedNaviMTLTexture *t = (__bridge RedNaviMTLTexture *)tp, *rt = t->parent ? t->parent : t;
     if (!rt->displayScan) return NULL;
     rn_vk *vk = rn_vk_shared();
-    rn_vk_image *vr = rn_display_vram_get(vk, rt, NO);
+    // With direct scanout a scanout surface's pixels are only ever on the card: its own image is never drawn into. A surface whose copy is not there (never drawn yet, or dropped
+    // from the cache) is given one, filled from the picture on the screen; the texture's own image would be read as old pixels in exactly the rectangles a frame carries over.
+    rn_vk_image *vr = rn_display_vram_get(vk, rt, rn_scanout_image(vk, rt->w, rt->h) != NULL);
     if (!vr || t->pf == rt->pf) return vr;
     if (t->texel != rt->texel || t->swz.red != MTLTextureSwizzleRed || t->swz.green != MTLTextureSwizzleGreen || t->swz.blue != MTLTextureSwizzleBlue || t->swz.alpha != MTLTextureSwizzleAlpha) return NULL;
     @synchronized ([RedNaviMTLTexture class]) { return rn_vram_as(vk, vr, t->pf); }
@@ -1665,9 +1699,10 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
     rn_ph(1, phv);
     if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
-    if (direct && !rc) {         // a pass that fills the surface with a colour (CoreDisplay clears a surface before it draws into it) is not a finished frame; any other is, and goes to the scanout
-        RNDraw *d0 = nd ? rp->draws[0] : nil;
-        if (!(d0 && d0->pso && d0->pso->names[1] && [d0->pso->names[1] hasPrefix:@"ColorFill"])) {
+    if (direct && !rc) {         // a pass that only fills the surface with a colour (CoreDisplay clears a surface before it draws into it) is not a finished frame; any other is, and goes to the scanout
+        BOOL onlyFills = nd > 0;     // every draw is looked at: a pass that starts with a fill and then draws content is a frame, and one left out stays off the screen until the next change
+        for (NSUInteger k = 0; k < nd && onlyFills; k++) { RNDraw *dk = rp->draws[k]; onlyFills = dk->pso && dk->pso->names[1] && [dk->pso->names[1] hasPrefix:@"ColorFill"]; }
+        if (!onlyFills) {
             RedNaviMTLTexture *rt = rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0];
             scanSrc = rn_display_vram(vk, rt); scanW = rt->w; scanH = rt->h;      // the frame is complete when the command buffer is: one copy into the scanout at its end
             directPasses++;
@@ -1714,10 +1749,10 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 // Commit order is kept by one serial queue; the caller goes on while the card works. The completion handlers, the presents and the semaphore run at the end of the body, on the queue.
 // A buffer that waits for an event runs on the caller's thread after the queue is drained: the signal may come from a buffer committed later by another thread, and the queue must not block on it.
 - (void)commitAsync:(BOOL)wait {
-    static dispatch_queue_t q; static dispatch_once_t once; static void *key = &key;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("rednavi.commit", DISPATCH_QUEUE_SERIAL); dispatch_queue_set_specific(q, key, key, NULL); });
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("rednavi.commit", DISPATCH_QUEUE_SERIAL); dispatch_queue_set_specific(q, g_commit_key, g_commit_key, NULL); });
     if (st >= MTLCommandBufferStatusCommitted) return;
-    const BOOL onQueue = dispatch_get_specific(key) == key;
+    const BOOL onQueue = dispatch_get_specific(g_commit_key) == g_commit_key;
     BOOL waits = NO;
     for (id rec in records) if ([rec isKindOfClass:[RNEventOp class]] && ((RNEventOp *)rec)->wait) { waits = YES; break; }
     void (^run)(void) = ^{
@@ -1731,9 +1766,34 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     };
     if (onQueue) { run(); return; }
     if (waits) { dispatch_sync(q, ^{}); run(); return; }
+    {   // the textures are in use from now until the body has run: host accesses to them wait (rn_tex_wait_idle)
+        NSMutableOrderedSet<RedNaviMTLTexture *> *used = [NSMutableOrderedSet orderedSet];
+        [self eachTexture:^(RedNaviMTLTexture *t, BOOL written) { if (t) [used addObject:t->parent ? t->parent : t]; }];
+        for (RedNaviMTLTexture *t in used) atomic_fetch_add(&t->queued_, 1);
+        queuedTex = used.array;
+    }
     st = MTLCommandBufferStatusCommitted;       // visible at once; the body sets the final state
     dispatch_async(q, run);
     if (wait) [self waitUntilCompleted];
+}
+// Every texture the records use (nil entries included), with whether the record writes it.
+- (void)eachTexture:(void (^)(RedNaviMTLTexture *, BOOL))note {
+    for (id rec in records) {
+        if ([rec isKindOfClass:[RNRenderPass class]]) {
+            RNRenderPass *rp = rec;
+            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
+            for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
+        } else if ([rec isKindOfClass:[RNEventOp class]]) {
+            // no textures
+        } else if ([rec isKindOfClass:[RNBlit class]]) {
+            RNBlit *bl = rec;
+            note(bl->st, NO);
+            note(bl->dt, YES);
+        } else {
+            RNDispatch *dp = rec;
+            for (int i = 0; i < 16; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
+        }
+    }
 }
 - (void)commitBody {
     if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
@@ -1752,22 +1812,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         [surfUsed addObject:t];
         if (written) [surfWritten addObject:t];
     };
-    for (id rec in records) {
-        if ([rec isKindOfClass:[RNRenderPass class]]) {
-            RNRenderPass *rp = rec;
-            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
-            for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
-        } else if ([rec isKindOfClass:[RNEventOp class]]) {
-            // no textures
-        } else if ([rec isKindOfClass:[RNBlit class]]) {
-            RNBlit *bl = rec;
-            note(bl->st, NO);
-            note(bl->dt, YES);
-        } else {
-            RNDispatch *dp = rec;
-            for (int i = 0; i < 16; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
-        }
-    }
+    [self eachTexture:note];
     { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { [t syncFromSurface]; [t syncFromBuffer]; } rn_ph(3, ph3); }
     {   // /Users/Shared/rednavi-trace: what each command buffer draws (a client such as WindowServer has no environment to set)
         struct stat tst;
@@ -1864,6 +1909,13 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         rn_vk_image *scan = scanCopied ? NULL : rn_scanout_image(rn_vk_shared(), scanW, scanH);
         if (scanCopied || (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0)) { rn_frame_done(); rn_frame_note(); rn_scan_dump(scanSrc, scanW, scanH); }
         else { static unsigned said; if (said++ < 20) rn_log("direct scanout: the finished frame (%lux%lu) could not be copied into the scanout", (unsigned long)scanW, (unsigned long)scanH); }
+    }
+    if (queuedTex) {        // the card's work is done and the surfaces are written back: host accesses to the textures may go on
+        pthread_mutex_lock(&g_texq_mu);
+        for (RedNaviMTLTexture *t in queuedTex) atomic_fetch_sub(&t->queued_, 1);
+        pthread_cond_broadcast(&g_texq_cv);
+        pthread_mutex_unlock(&g_texq_mu);
+        queuedTex = nil;
     }
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     NSArray *doneHandlers; @synchronized(completed) { handlersRun = YES; doneHandlers = [completed copy]; [completed removeAllObjects]; }

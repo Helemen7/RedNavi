@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #include <mach/mach_time.h>
 #include <vulkan/vulkan.h>
 
@@ -16,6 +17,7 @@
     X(DestroyInstance) X(EnumeratePhysicalDevices) X(GetPhysicalDeviceProperties) X(GetPhysicalDeviceQueueFamilyProperties) X(GetPhysicalDeviceMemoryProperties) \
     X(CreateDevice) X(GetDeviceProcAddr) X(GetPhysicalDeviceFeatures) X(GetPhysicalDeviceFormatProperties)
 #define DFUNCS(X) \
+    X(CreatePipelineCache) X(GetPipelineCacheData) X(DestroyPipelineCache) \
     X(DestroyDevice) X(GetDeviceQueue) X(CreateBuffer) X(DestroyBuffer) X(GetBufferMemoryRequirements) X(AllocateMemory) X(FreeMemory) X(BindBufferMemory) X(MapMemory) \
     X(CreateShaderModule) X(DestroyShaderModule) X(CreateDescriptorSetLayout) X(DestroyDescriptorSetLayout) X(CreatePipelineLayout) X(DestroyPipelineLayout) \
     X(CreateComputePipelines) X(DestroyPipeline) X(CreateDescriptorPool) X(DestroyDescriptorPool) X(AllocateDescriptorSets) X(UpdateDescriptorSets) X(CreateCommandPool) \
@@ -39,6 +41,7 @@ struct rn_vk {
     VkCommandPool pool;
     VkDescriptorPool rpool; uint32_t rpoolSets, rpoolCnt[5];   // the render pass's descriptor pool, kept and reset (a pool owns a buffer object: creating one per pass cost kernel calls each time)
     VkCommandBuffer rcb; VkFence rfence;                      // and its command buffer and fence
+    VkPipelineCache pcache; unsigned pcnew; uint64_t pcsaved; // the pipeline cache, kept on disk between runs (RADV compiles a shader the first time an effect shows up: hundreds of ms)
     int brec, brc;                             // render passes are being recorded into rcb (one submit for all of a command buffer's passes); the failure a nested flush had
     VkFramebuffer *bfb; unsigned nbfb, capbfb; // framebuffers of the recorded passes, destroyed after the submit
     struct rn_vk_image **bimg; unsigned nbimg, capbimg;   // images the recorded work uses (pending until the submit has finished)
@@ -51,7 +54,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; };   // gpudirty: a render pass wrote the image and the host copy is older
+struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; };   // gpudirty: a render pass wrote the image and the host copy is older
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -86,6 +89,44 @@ const char *rn_vk_dir(void) {
     }
     snprintf(path, sizeof(path), "/Library/Application Support/RedNavi/vk");
     return path;
+}
+
+// The pipeline cache: loaded from /private/var/tmp/rednavi-pipecache-<uid>.bin (the driver ignores data that is not its own or is from another version), saved after new pipelines were
+// compiled, at most every 20 s. A file written by one user is not readable by the same uid's other processes only if the mode says so, hence 0644 and a write through a temporary name.
+static void pipecache_path(char *path, size_t n) { snprintf(path, n, "/private/var/tmp/rednavi-pipecache-%d.bin", (int)getuid()); }
+static void pipecache_load(rn_vk *vk) {
+    char path[96]; pipecache_path(path, sizeof(path));
+    void *data = NULL; size_t len = 0;
+    FILE *f = fopen(path, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        if (sz > 0 && sz < (64 << 20) && (data = malloc((size_t)sz)) && fread(data, 1, (size_t)sz, f) == (size_t)sz) len = (size_t)sz; else { free(data); data = NULL; }
+        fclose(f);
+    }
+    VkPipelineCacheCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, .initialDataSize = len, .pInitialData = data};
+    if (vk->CreatePipelineCache(vk->dev, &ci, NULL, &vk->pcache) != VK_SUCCESS) vk->pcache = VK_NULL_HANDLE;
+    free(data);
+}
+static void pipecache_note(rn_vk *vk) {
+    if (!vk->pcache) return;
+    const unsigned n = __atomic_add_fetch(&vk->pcnew, 1, __ATOMIC_RELAXED);
+    const uint64_t now = mach_absolute_time();
+    static mach_timebase_info_data_t tb;
+    if (!tb.denom) mach_timebase_info(&tb);
+    if (n < 4 || (vk->pcsaved && (now - vk->pcsaved) * tb.numer / tb.denom < 20000000000ull)) return;
+    vk->pcsaved = now; __atomic_store_n(&vk->pcnew, 0, __ATOMIC_RELAXED);
+    size_t len = 0;
+    if (vk->GetPipelineCacheData(vk->dev, vk->pcache, &len, NULL) != VK_SUCCESS || !len) return;
+    void *data = malloc(len);
+    if (!data) return;
+    if (vk->GetPipelineCacheData(vk->dev, vk->pcache, &len, data) == VK_SUCCESS || len) {
+        char path[96], tmp[112]; pipecache_path(path, sizeof(path)); snprintf(tmp, sizeof(tmp), "%s.%d", path, (int)getpid());
+        const mode_t old = umask(0);
+        FILE *f = fopen(tmp, "wb");
+        umask(old);
+        if (f) { const int ok = fwrite(data, 1, len, f) == len; fclose(f); if (ok) rename(tmp, path); else unlink(tmp); }
+    }
+    free(data);
 }
 
 rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
@@ -156,6 +197,7 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk->family};
     r = vk->CreateCommandPool(vk->dev, &cpci, NULL, &vk->pool);
     if (r != VK_SUCCESS) { seterr(err, errlen, "vkCreateCommandPool", r); goto fail; }
+    pipecache_load(vk);
     return vk;
 fail:
     rn_vk_close(vk);
@@ -164,6 +206,7 @@ fail:
 
 void rn_vk_close(rn_vk *vk) {
     if (!vk) return;
+    if (vk->dev && vk->pcache) vk->DestroyPipelineCache(vk->dev, vk->pcache, NULL);
     if (vk->dev && vk->pool) vk->DestroyCommandPool(vk->dev, vk->pool, NULL);
     if (vk->dev) vk->DestroyDevice(vk->dev, NULL);
     if (vk->inst) vk->DestroyInstance(vk->inst, NULL);
@@ -319,7 +362,8 @@ rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t byt
         VkComputePipelineCreateInfo cpi = {.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                                            .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = c->sm, .pName = "main"},
                                            .layout = c->pl};
-        if (vk->CreateComputePipelines(vk->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &c->variants[0].pipe) != VK_SUCCESS) goto fail;
+        if (vk->CreateComputePipelines(vk->dev, vk->pcache, 1, &cpi, NULL, &c->variants[0].pipe) != VK_SUCCESS) goto fail;
+        pipecache_note(vk);
         memcpy(c->variants[0].l, own, sizeof(own));
         c->nvariants = 1;
     }
@@ -344,7 +388,8 @@ static VkPipeline pipeline_for(rn_vk *vk, rn_vk_compute *c, const uint32_t l[3])
                                        .stage = {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = c->sm, .pName = "main", .pSpecializationInfo = &si},
                                        .layout = c->pl};
     VkPipeline p;
-    if (vk->CreateComputePipelines(vk->dev, VK_NULL_HANDLE, 1, &cpi, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    if (vk->CreateComputePipelines(vk->dev, vk->pcache, 1, &cpi, NULL, &p) != VK_SUCCESS) return VK_NULL_HANDLE;
+    pipecache_note(vk);
     memcpy(c->variants[c->nvariants].l, l, 12);
     c->variants[c->nvariants].pipe = p;
     c->nvariants++;
@@ -402,6 +447,28 @@ static VkFormat vk_format(int f) {
     }
 }
 
+// Freed device images are kept for reuse by (format, size): a compositor makes and frees window-sized textures all the time during an animation, and each is an image, its memory and a host copy
+// (kernel objects and a mapping) plus a zeroing. A reused image comes back zeroed in its host copy and is uploaded again before its first use, like a new one.
+#define RN_IMG_POOL_MAX 48
+#define RN_IMG_POOL_BYTES (192ull << 20)
+static struct rn_vk_image *g_img_pool[RN_IMG_POOL_MAX]; static unsigned g_img_pool_n; static unsigned long long g_img_pool_bytes;
+static pthread_mutex_t g_img_pool_lock = PTHREAD_MUTEX_INITIALIZER;
+uint64_t rn_vk_imgstat[3];                                     // reused, made, kept on free; read by the commit statistics
+static rn_vk_image *image_pool_take(int format, uint32_t w, uint32_t h, uint32_t d) {
+    rn_vk_image *hit = NULL;
+    pthread_mutex_lock(&g_img_pool_lock);
+    for (unsigned i = 0; i < g_img_pool_n; i++) {
+        rn_vk_image *c = g_img_pool[i];
+        if (c->rnfmt == format && c->w == w && c->h == h && c->d == d) { hit = c; g_img_pool[i] = g_img_pool[--g_img_pool_n]; g_img_pool_bytes -= (unsigned long long)w * h * d * c->texel; break; }
+    }
+    pthread_mutex_unlock(&g_img_pool_lock);
+    if (hit) {
+        memset(rn_vk_buffer_contents(hit->stage), 0, (size_t)w * h * d * hit->texel);
+        hit->dirty = 1; hit->gpudirty = 0; hit->pending = 0;
+        __atomic_fetch_add(&rn_vk_imgstat[0], 1, __ATOMIC_RELAXED);
+    }
+    return hit;
+}
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) { return rn_vk_image_create3d(vk, format, w, h, 1); }
 static __thread const char *g_image_err = "";
 const char *rn_vk_image_last_error(void) { return g_image_err; }
@@ -409,9 +476,11 @@ rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h,
     const unsigned texel = rn_vk_format_texel_bytes(format);
     g_image_err = "bad size or format";
     if (!texel || !w || !h || !d) return NULL;
+    { rn_vk_image *re = image_pool_take(format, w, h, d); if (re) return re; }
+    __atomic_fetch_add(&rn_vk_imgstat[1], 1, __ATOMIC_RELAXED);
     rn_vk_image *im = calloc(1, sizeof(*im));
     if (!im) return NULL;
-    im->fmt = vk_format(format); im->w = w; im->h = h; im->d = d; im->texel = texel;
+    im->fmt = vk_format(format); im->rnfmt = format; im->w = w; im->h = h; im->d = d; im->texel = texel;
     VkFormatProperties fp;
     vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
     const VkFormatFeatureFlags f = fp.optimalTilingFeatures;
@@ -522,13 +591,17 @@ int rn_vk_image_is_host(rn_vk_image *im) { return (im->base ? im->base : im)->ho
 static rn_vk *g_readback_vk;                                    // the device of the last render pass, for the lazy readback below
 static void image_readback_now(rn_vk *vk, rn_vk_image *r);
 static void bsync(rn_vk *vk);
+static void batch_lock(void);
+static void batch_unlock(void);
 void *rn_vk_image_staging(rn_vk_image *im) {
     rn_vk_image *r = im->base ? im->base : im;
     if (r->pending && g_readback_vk) bsync(g_readback_vk);
-    if (r->gpudirty && !r->hostmem && g_readback_vk) image_readback_now(g_readback_vk, r);
+    // The readback uses the one command pool and queue: under the batch lock, because this is also reached from threads other than the one that commits (replaceRegion, getBytes).
+    if (r->gpudirty && !r->hostmem && g_readback_vk) { batch_lock(); if (r->gpudirty) image_readback_now(g_readback_vk, r); batch_unlock(); }
     return r->hostmem ? r->hostptr : rn_vk_buffer_contents(im->stage);
 }
 void rn_vk_image_host_wrote(rn_vk_image *im) { (im->base ? im->base : im)->dirty = 1; }
+static void image_really_destroy(rn_vk *vk, rn_vk_image *im);
 void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *im) {
     if (!im) return;
     if ((im->base ? im->base : im)->pending) bsync(vk);
@@ -537,6 +610,26 @@ void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *im) {
         free(im);
         return;
     }
+    if (!im->hostmem && im->img && im->stage && im->view && im->texel) {          // kept for reuse
+        const unsigned long long bytes = (unsigned long long)im->w * im->h * im->d * im->texel;
+        rn_vk_image *evict[RN_IMG_POOL_MAX]; unsigned ne = 0; int kept = 0;
+        pthread_mutex_lock(&g_img_pool_lock);
+        if (bytes <= RN_IMG_POOL_BYTES / 4) {
+            while (g_img_pool_n && (g_img_pool_n >= RN_IMG_POOL_MAX || g_img_pool_bytes + bytes > RN_IMG_POOL_BYTES)) {      // the oldest go
+                rn_vk_image *o = g_img_pool[0];
+                g_img_pool_bytes -= (unsigned long long)o->w * o->h * o->d * o->texel;
+                memmove(g_img_pool, g_img_pool + 1, (--g_img_pool_n) * sizeof(*g_img_pool));
+                evict[ne++] = o;
+            }
+            g_img_pool[g_img_pool_n++] = im; g_img_pool_bytes += bytes; kept = 1;
+        }
+        pthread_mutex_unlock(&g_img_pool_lock);
+        for (unsigned i = 0; i < ne; i++) image_really_destroy(vk, evict[i]);
+        if (kept) { __atomic_fetch_add(&rn_vk_imgstat[2], 1, __ATOMIC_RELAXED); return; }
+    }
+    image_really_destroy(vk, im);
+}
+static void image_really_destroy(rn_vk *vk, rn_vk_image *im) {
     if (im->view) vk->DestroyImageView(vk->dev, im->view, NULL);
     if (im->img) vk->DestroyImage(vk->dev, im->img, NULL);
     if (im->mem) vk->FreeMemory(vk->dev, im->mem, NULL);
@@ -594,6 +687,8 @@ static int fill_writes(rn_vk *vk, unsigned n, const unsigned *kinds, const unsig
 // an image in flight wait for the end of the batch instead of racing it.
 static pthread_mutex_t g_bmu; static pthread_once_t g_bmu_once = PTHREAD_ONCE_INIT;
 static void bmu_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_bmu, &a); }
+static void batch_lock(void) { pthread_once(&g_bmu_once, bmu_init); pthread_mutex_lock(&g_bmu); }
+static void batch_unlock(void) { pthread_mutex_unlock(&g_bmu); }
 uint64_t rn_vk_fence_ticks;
 static void batch_hold(rn_vk *vk, rn_vk_image *im) {
     rn_vk_image *r = im->base ? im->base : im;
@@ -899,7 +994,8 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
     VkGraphicsPipelineCreateInfo gp = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
                                        .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = r->pl,
                                        .renderPass = r->rp, .subpass = 0};
-    if (vk->CreateGraphicsPipelines(vk->dev, VK_NULL_HANDLE, 1, &gp, NULL, &r->pipe) != VK_SUCCESS) goto fail;
+    if (vk->CreateGraphicsPipelines(vk->dev, vk->pcache, 1, &gp, NULL, &r->pipe) != VK_SUCCESS) goto fail;
+    pipecache_note(vk);
     return r;
 fail:
     rn_vk_render_destroy(vk, r);
@@ -1255,15 +1351,17 @@ static void record_copy(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *src, rn_vk_i
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toCopy, 0, NULL, 0, NULL);
     VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .extent = {src->w, src->h, 1}};
     vk->CmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    images_mark_gpu(&dst, 1);                    // the destination's host copy is older than the image now: without the mark a later host access worked on the old pixels and uploaded them again
     VkMemoryBarrier done_ = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &done_, 0, NULL, 0, NULL);
 }
 int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {
     if (!src || !dst || src->w != dst->w || src->h != dst->h || src->fmt != dst->fmt) return 6;
-    bsync(vk);
+    batch_lock();                                // the command pool and the queue are single: also when the caller is not the committing thread
+    batch_flush(vk);
     VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; int rc = 2;
     VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return 2;
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) { batch_unlock(); return 2; }
     VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
     if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
     record_copy(vk, cb, src, dst);
@@ -1276,6 +1374,7 @@ int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {
 done:
     if (fence) vk->DestroyFence(vk->dev, fence, NULL);
     vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
+    batch_unlock();
     return rc;
 }
 // The same copy recorded at the end of the open batch: it runs on the card after the passes, in the same submit.
@@ -1287,15 +1386,7 @@ int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {
     return 0;
 }
 
-// A rectangle of one image into another of the same format on the card (a blit between surfaces): both stay in GENERAL layout, submitted and waited for. 0 on success.
-int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
-    bsync(vk);
-    if (!src || !dst || src->fmt != dst->fmt || sx + w > src->w || sy + h > src->h || dx + w > dst->w || dy + h > dst->h) return 6;
-    VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; int rc = 2;
-    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
-    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) return 2;
-    VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
+static void record_copy_region(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
     rn_vk_image *both[2] = {src, dst};
     images_in(vk, cb, both, 2);
     VkMemoryBarrier toCopy = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
@@ -1303,8 +1394,26 @@ int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint3
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &toCopy, 0, NULL, 0, NULL);
     VkImageCopy rg = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .srcOffset = {(int32_t)sx, (int32_t)sy, 0}, .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .dstOffset = {(int32_t)dx, (int32_t)dy, 0}, .extent = {w, h, 1}};
     vk->CmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, dst->img, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+    images_mark_gpu(&dst, 1);
     VkMemoryBarrier done_ = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &done_, 0, NULL, 0, NULL);
+}
+// A rectangle of one image into another of the same format on the card (a blit between surfaces): both stay in GENERAL layout. Inside an open batch it is recorded there; otherwise it is submitted and waited for. 0 on success.
+int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h) {
+    if (!src || !dst || src->fmt != dst->fmt || sx + w > src->w || sy + h > src->h || dx + w > dst->w || dy + h > dst->h) return 6;
+    batch_lock();
+    if (vk->brec) {                              // a batch is open: the copy is recorded after its passes and runs in the same submit, in order
+        record_copy_region(vk, vk->rcb, src, dst, sx, sy, dx, dy, w, h);
+        batch_hold(vk, src); batch_hold(vk, dst);
+        batch_unlock();
+        return 0;
+    }
+    VkCommandBuffer cb = VK_NULL_HANDLE; VkFence fence = VK_NULL_HANDLE; int rc = 2;
+    VkCommandBufferAllocateInfo cba = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, .commandPool = vk->pool, .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    if (vk->AllocateCommandBuffers(vk->dev, &cba, &cb) != VK_SUCCESS) { batch_unlock(); return 2; }
+    VkCommandBufferBeginInfo cbb = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (vk->BeginCommandBuffer(cb, &cbb) != VK_SUCCESS) goto done;
+    record_copy_region(vk, cb, src, dst, sx, sy, dx, dy, w, h);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     if (vk->CreateFence(vk->dev, &fci, NULL, &fence) != VK_SUCCESS) goto done;
@@ -1314,5 +1423,6 @@ int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint3
 done:
     if (fence) vk->DestroyFence(vk->dev, fence, NULL);
     vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
+    batch_unlock();
     return rc;
 }
