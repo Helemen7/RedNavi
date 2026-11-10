@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Read-only: lists the selectors a system framework references (its __objc_selrefs) and which of them belong to Metal protocols but are not implemented by the RedNavi classes.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

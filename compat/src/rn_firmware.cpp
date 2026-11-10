@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // request_firmware without a file system: blobs are registered by name, request_firmware looks them up.
 #include <linux/firmware.h>
 #include <linux/errno.h>

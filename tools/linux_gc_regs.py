@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Read the GC / SDMA registers RedNavi programs (RedNavi/gc_regs.h) on Linux, to see what a healthy card shows (run as root).
 
     sudo python3 linux_gc_regs.py ../RedNavi/gc_regs.h out.txt         # amdgpu loaded, through debugfs amdgpu_regs

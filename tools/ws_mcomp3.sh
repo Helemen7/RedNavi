@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # The accelerator id WindowServer asks the Metal compositor map for, and what comes back (dtrace pid provider, root, 8 s), into /Users/Shared/ws_mcomp3.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp3.sh >/dev/null 2>&1 &'  (move a window while it runs)
 OUT=/Users/Shared/ws_mcomp3.txt

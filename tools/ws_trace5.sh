@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Looks inside the display machine when WindowServer's transaction asks isFramebufferActive: the array at +0x110 and what it points to (dtrace, root). Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace5.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props5.txt
 ERR=/Users/Shared/ws_trace_err5.txt

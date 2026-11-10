@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Why IOPresentmentBegin returns NULL (CoreDisplay: "Fallback GPU Display Pipe transaction submission failed"): return values of the IOPresentment set-up functions in the
 # running WindowServer, and the IOKit user-client calls made from inside them, into /Users/Shared/ws_mcomp13.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp13.sh >/dev/null 2>&1 &'   (then move a window for 8 s; to see the set-up itself restart WindowServer a few seconds after starting this)

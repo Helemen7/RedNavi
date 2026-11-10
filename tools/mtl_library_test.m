@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Builds an MTLLibrary of the plug-in (RedNaviMTL/compute.m) from a .metallib file, without a device, and lists its functions: tools/mtl_library_test BUNDLE METALLIB
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>

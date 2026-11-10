@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Who creates and picks CompositorSW when WindowServer starts: dtrace -W waits for the next WindowServer, the script then kills the running one; the stacks of every CompositorSW and
 # CompositorMetal entry (counted per stack, rare ones are the constructors and the choice) go to /Users/Shared/ws_start_sw.txt. Run: sudo sh -c 'nohup sh /Users/Shared/ws_start_sw.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_start_sw.txt

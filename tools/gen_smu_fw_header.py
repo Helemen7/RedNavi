@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn the SMU firmware into a C header for local builds (git-ignored, firmware is not redistributed).
 
     python3 tools/gen_smu_fw_header.py smu_13_0_10.bin RedNavi/smu_fw.h

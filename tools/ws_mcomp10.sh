@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What the display update gets from the compositor choice: inside WS::Displays::Update::Update, the accelerator id given to WSGetCompositorForAccelerator, whether WSGetCompositorMetal
 # is reached and what it returns, and CompositorMetal::new_compositor (id, result), into /Users/Shared/ws_mcomp10.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp10.sh >/dev/null 2>&1 &'   then move/minimize a window for 8 s.

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Why the display pipe is not active when WindowServer ends a transaction (IOAccelDisplayPipeUserClient2::transactionEnd returns kIOReturnNotReady when IOAccelDisplayPipe::isActive(),
 # the byte at pipe+0x298, is 0; the pipe is client+232). Prints the pipe's bytes at transactionEnd and the results of the family's init_framebuffer_resource and of the pipe's
 # initFramebufferResource, 10 s, into /Users/Shared/k_txend.txt.

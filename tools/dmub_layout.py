@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Dry run of the DMUB framebuffer layout that amdgpu builds for DCN 3.2 (dmub_srv_calc_region_info).
 
 Reads the DMCUB firmware (dcn_3_2_0_dmcub.bin), finds the firmware meta block and prints each

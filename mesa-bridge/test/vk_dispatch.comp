@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) buffer Out { uint v[]; } o;
 layout(push_constant) uniform PC { uint add; } pc;

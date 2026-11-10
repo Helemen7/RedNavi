@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which registry properties and which matching classes WindowServer asks the kernel for while it starts (dtrace on the kernel's IOKit MIG routines, root), counted, into
 # /Users/Shared/ws_props15.txt. WindowServer is killed after 6 s so that the whole start is traced. Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace15.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props15.txt

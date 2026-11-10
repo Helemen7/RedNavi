@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Print the IP blocks of an AMD GPU (IP discovery: hardware id, version, instance, base addresses) from sysfs on Linux.
 
     python3 linux_ip_discovery.py > ip_discovery.txt        # first AMD GPU

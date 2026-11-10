@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which Objective-C selectors QuartzCore sends inside CA::OGL::MetalContext::copy_image_to_texture (the function that logs "nil client storage texture from buffer"), counted by selector address (dtrace cannot read the names: they live in the shared cache; tools/ws_msgs_decode.py turns them into names), into
 # /Users/Shared/ws_msgs.txt (dtrace pid provider on the running WindowServer, root, 6 s, WindowServer is not restarted).
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_msgs.sh >/dev/null 2>&1 &'

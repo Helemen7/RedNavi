@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <linux/dma-mapping.h>

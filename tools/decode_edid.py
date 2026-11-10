@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Decode the EDID the RedNavi probe read over AUX (the "edid" property of RedNaviProbe).
 
 Accepts a raw EDID file or the output of `ioreg -rn RedNaviProbe -l -x`. Prints the vendor, product,

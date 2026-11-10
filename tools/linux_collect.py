@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """One-command data collection for a new AMD GPU on Linux: IP discovery, connectors, firmware log lines and the display pipe
 registers of the output that is lit. Read-only. Run as root, from a text console (Ctrl+Alt+F3), with amdgpu loaded and the
 monitor on:

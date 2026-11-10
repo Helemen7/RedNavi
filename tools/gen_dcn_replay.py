@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn the Linux register dump of a lit pipe into the replay table the probe applies for a test pattern.
 
 Reads docs/logs/linux-reference/dcn_pipe_linux.txt (tools/linux_dcn_pipe_dump.py output while amdgpu showed a

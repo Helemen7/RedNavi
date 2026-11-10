@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Prints the limits, alignments and sizes a Metal device reports, for the real device (`system`) and for the RedNavi plug-in (a bundle path, loaded as in ca_renderer_test), so the two can be diffed.
 // QuartzCore sizes and aligns its buffer arenas from these. usage: mtl_limits <RedNaviMTLDriver.bundle|system>
 #import <Foundation/Foundation.h>

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * First graphics test: a triangle drawn by RADV on the RedNavi graphics queue. A 256 x 256 R8G8B8A8_UNORM image (optimal tiling, device-local VRAM) is cleared to blue by a render
  * pass and a triangle covering its upper-left half is drawn in red; the image is copied to a host buffer and checked pixel by pixel away from the diagonal edge.

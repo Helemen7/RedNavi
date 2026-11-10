@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Runs every function of a .metallib through the plug-in's translator interface (RedNaviMTL/rn_air.c, metallib.c) and the librn_air2spirv.dylib in DIR, and counts what works and why
 // the rest does not. Read-only: it writes nothing but a summary. A way to measure how much of a real shader library (the ones that ship in macOS, for instance) the translator covers.
 //   tools/air_batch FILE.metallib DIR [stride [max]]     (stride n: every n-th function; max: stop after that many tried)

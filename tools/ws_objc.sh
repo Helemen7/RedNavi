@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which class receives newTextureWithDescriptor:offset:bytesPerRow: (and who creates the buffers) in the running WindowServer (dtrace objc provider, root), into /Users/Shared/ws_objc.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_objc.sh >/dev/null 2>&1 &'      (6 s, does not restart WindowServer)
 OUT=/Users/Shared/ws_objc.txt

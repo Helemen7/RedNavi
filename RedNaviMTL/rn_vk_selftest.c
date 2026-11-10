@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // rn_vk_selftest(): RADV inside the calling process. The shader is mesa-bridge/test/vk_dispatch.comp (v[i] = i * 3 + push), the same one vk_dispatch runs with the Vulkan loader.
 #include "rn_vk.h"
 #include <stdio.h>

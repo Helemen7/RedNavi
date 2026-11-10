@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Builds build/<Config>/RedNavi.kext. Needs macOS + Xcode command-line tools and the
 # MacKernelSDK (scripts/bootstrap.sh fetches it).
 ifeq ($(DEBUG),1)

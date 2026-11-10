@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Installs the Metal plug-in stub (RedNaviMTL/) where the accelerator kext's MetalPluginName points: /Library/GPUBundles/RedNaviMTLDriver.bundle.
 # Run on the machine with the RX 7800 XT, needs sudo. It logs (/tmp/rednavi-metal-<uid>.log): the methods Metal expects, the init methods of the device with the IOKit calls made inside them, and answers nil to what nobody implements.
 # usage: sudo scripts/install_mtl_stub.sh path/to/RedNaviMTLDriver.bundle [directory with libvulkan_radeon.dylib and libzstd.1.dylib]

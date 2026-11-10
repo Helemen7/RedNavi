@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Generate RedNavi/gc_regs.h from the AMD gc_11_0_0 register headers (MIT licence, see NOTICE).
 
     python3 tools/gen_gc_regs.py gc_11_0_0_offset.h gc_11_0_0_sh_mask.h tools/gc_regs_spec.txt gc_11_0_0_default.h > RedNavi/gc_regs.h

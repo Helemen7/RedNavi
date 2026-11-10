@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNavi compat layer: the few functions the pure headers need from their environment.
 // The kext implements them in compat/src/rn_hooks.cpp; the host tests in tests/host/host_hooks.cpp.
 #ifndef RN_HOOKS_H

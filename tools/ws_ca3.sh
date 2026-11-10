@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Who creates, enqueues and commits the plug-in's command buffers in WindowServer: the callers (3 frames) of commandBuffer creation, enqueue and commit, counted for 8 s, into /Users/Shared/ws_ca3.txt.
 # Run in the foreground: sudo sh /Users/Shared/ws_ca3.sh
 OUT=/Users/Shared/ws_ca3.txt

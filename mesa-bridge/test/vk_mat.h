@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /* Small column-major 4x4 matrix helpers and a millisecond clock for the cube tests (Vulkan clip space: y down, depth 0 to 1). */
 #ifndef VK_MAT_H
 #define VK_MAT_H

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // kmalloc and friends on top of rn_raw_alloc. Every block carries a 16-byte header with its size, so kfree and
 // krealloc work without the caller passing it.
 #include <linux/slab.h>

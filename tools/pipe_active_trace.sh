@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Who sets the "active" byte of the display pipe (pipe+0x298)? Run on a Mac whose Intel (or AMD) accelerator works, read only (dtrace, root).
 # Traces every function of IOAccelDisplayPipe / IGAccelDisplayPipe / IOAccelDisplayMachine / IGAccelDisplayMachine; after each return it reads pipe+0x282 and +0x298 (bytes)
 # and machine+0x10c (uint32), and prints the call (only) whenever one of them changed since the last print, with its arguments and the kernel stack, so the first call that takes

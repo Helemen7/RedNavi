@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Everything the accelerator family calls while it handles WindowServer's client type 4 (the display pipe): dtrace, root. Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace3.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props3.txt
 ERR=/Users/Shared/ws_trace_err3.txt

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # SkyLight's MetalContext / CompositorMetal calls counted for 8 s, with the first return values of Flush, into /Users/Shared/ws_sl.txt. Run in the foreground: sudo sh /Users/Shared/ws_sl.sh
 OUT=/Users/Shared/ws_sl.txt
 ERR=/Users/Shared/ws_sl_err.txt

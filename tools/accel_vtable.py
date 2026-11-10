@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Virtual method tables of the IOAcceleratorFamily2 classes, from the symbol tables of this Mac's kernel and system kernel collection.
 
 Reads data and symbol names only (nm, otool -l, the vtable words in the collection file); no code is disassembled. The collection stores pointers as chained

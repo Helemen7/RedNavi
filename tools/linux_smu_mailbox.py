@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Look at the SMU (MP1) mailbox of the RX 7800 XT on Linux, and optionally send the same harmless messages
 RedNavi sends on macOS, to compare behaviour (run as root, amdgpu loaded, debugfs mounted).
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Mode-dependent DCN 3.2 register values for the replay table (RedNavi/dcn_replay.h), no kernel dependencies.
 //
 // The replay table holds the registers of one lit pipe: 1920x1080@60 with a linear XRGB8888 plane, as Linux left them.

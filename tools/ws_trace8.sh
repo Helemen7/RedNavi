@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # The framebuffer notification events the display pipe receives (dtrace, root): display_change_handler(refcon, framebuffer, event, info), into /Users/Shared/ws_props8.txt. Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace8.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props8.txt
 ERR=/Users/Shared/ws_trace_err8.txt

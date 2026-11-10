@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Dumps the scanout surface (VRAM offset 0x08000000, 1920x1080, pitch 7680) as raw BGRA to a file through the probe's user client, one line in STEP (default 4), 64 pixels per call.
 // usage: rn_peek_dump OUT.raw [STEP [OFFSET [PITCH]]]; STEP lines are skipped (the file holds 1920 x (1080 / STEP) pixels).
 #include <IOKit/IOKitLib.h>

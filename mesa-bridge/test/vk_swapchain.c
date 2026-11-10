@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * A Vulkan program that presents the standard way: VK_KHR_swapchain on a VK_EXT_headless_surface (on this driver the headless surface is the display), vkAcquireNextImageKHR,
  * render, vkQueuePresentKHR. Nothing here knows about the RedNavi kext or its bridge. Two cubes (vertex and index buffers, MVP in push constants, a uniform buffer rewritten every

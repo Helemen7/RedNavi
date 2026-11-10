@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Collects what Linux uses for its compute queues, to compare with RedNavi's writeComputeMqd (docs/COMPAT.md). Run as root on Linux with amdgpu
 # loaded on the RX 7800 XT and a GPU workload running (vkcube), then send the resulting file:
 #

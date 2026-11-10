@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Functions with "ompositor" in the name that run inside WS::Updater::UpdateDisplays on the way to render_update, with their return values, into /Users/Shared/ws_mcomp11.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp11.sh >/dev/null 2>&1 &'   then move/minimize a window for 8 s.
 OUT=/Users/Shared/ws_mcomp11.txt

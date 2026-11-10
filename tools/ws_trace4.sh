@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What the display pipe functions of the family return while WindowServer runs (no restart): 20 seconds, to /Users/Shared/ws_props4.txt. Run: sudo sh /Users/Shared/ws_trace4.sh
 OUT=/Users/Shared/ws_props4.txt
 rm -f $OUT

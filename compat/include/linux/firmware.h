@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 #ifndef _LINUX_FIRMWARE_H
 #define _LINUX_FIRMWARE_H
 

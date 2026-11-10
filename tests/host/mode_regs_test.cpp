@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Host test: the mode-dependent register values computed by RedNavi/mode_regs.cpp against Linux register captures of the
 // same card at 1280x720@60, 1920x1080@60 and 1920x1080@144 (docs/logs/linux-reference/modes/pipe_*.txt). Run from the
 // repository root with `make test`.

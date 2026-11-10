@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // MPS on the RedNavi device: a Gaussian blur through MetalPerformanceShaders, as WindowServer does for desktop window effects. Same arguments as ci_test.
 // (derived from ci_test.m) CoreImage on the RedNavi device: a CIContext made on the plug-in's MTLDevice renders a filtered image (what iconservicesagent, mediaanalysisd and others do all day). CoreImage builds
 // Metal programs (stitched libraries, compute pipelines) at the first render; before the plug-in answered those it crashed inside Metal. Prints the pixel it got; the log of the plug-in

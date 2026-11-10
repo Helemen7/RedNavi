@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Read, on Linux with amdgpu loaded (run as root), the per-pipe state RedNavi compares with: the MEC pipes' program counters, the two MES pipes' program
 counters, and the hardware queue descriptors of the MEC queues and of the MES queues. It uses the debugfs register file with the "ring" bank
 selection (bit 61 of the file offset, then ME at bit 24, pipe at 34, queue at 44, VMID at 54), which does what GRBM_GFX_CNTL does in the driver.

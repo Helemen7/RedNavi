@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // A small layer over RADV for the Metal plug-in (docs/M6_METAL_ON_RADV.md). RADV's ICD library is opened directly with dlopen, without the Vulkan loader: the ICD only needs
 // the system libraries and libzstd next to it (@loader_path), and vk_icdGetInstanceProcAddr gives every entry point. Nothing is opened until rn_vk_open(), so a process that only
 // enumerates Metal devices (Dock, Core Animation clients that never encode) does not pay for it or open the kext's user client.

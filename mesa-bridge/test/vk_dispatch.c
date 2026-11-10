@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * First compute dispatch through RADV on the RedNavi kext: one storage buffer, one compute shader (vk_dispatch.comp) that writes v[i] = i * 3 + push_constant,
  * 64 invocations per group, a number of groups from the command line (default 1). Checks every dword on the CPU.

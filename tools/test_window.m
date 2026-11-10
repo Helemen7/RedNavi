@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // A real Cocoa window with a CAMetalLayer, drawn with the RedNavi Metal plug-in on RADV: a triangle that turns and changes colour, 60 times a second. Everything the layer does with
 // the device (drawable textures made from IOSurfaces, presentDrawable:) goes through RedNaviMTL/compute.m. Run it inside the desktop's GUI session (open -n test_window.app --env ...),
 // never with RN_METAL_COMPUTE set outside of this one process: only processes that set it get the plug-in's queues, so WindowServer keeps its own rendering.

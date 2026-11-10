@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * ac_apple_iokit: Mesa's ac_drm_* layer over the RedNavi user client.
  *

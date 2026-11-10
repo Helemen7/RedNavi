@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 #ifndef RN_AMD_DEVICE_H
 #define RN_AMD_DEVICE_H
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNaviFB: IOFramebuffer on top of the DCN scanout the probe brings up.
 //
 // The display hardware is lit by RedNaviProbe (linear XRGB8888). This class tells WindowServer where the surface

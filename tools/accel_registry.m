@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Read-only: the registry entry IDs involved in how CoreDisplay finds the Metal device of a display: every Metal device's registryID, the IOAccelerator services, the IOFramebuffer
 // services, their parents and the properties that mention an accelerator. (docs/M6_WINDOWSERVER_STUDY.md)
 #import <Foundation/Foundation.h>

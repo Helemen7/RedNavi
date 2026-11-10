@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which kernel function returns kIOReturnNotReady (0xe00002d8) to the display pipe user client calls that WindowServer makes (CoreDisplay's transaction submission fails with it).
 # fbt on the IOAccelDisplayPipe user clients, the pipe, the display machine and the accelerator; counts by function and prints one stack. 10 s, into /Users/Shared/k_notready.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/k_notready.sh >/dev/null 2>&1 &'

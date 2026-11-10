@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Return values (not arguments) of the compositor selection in the running WindowServer: WSMetalCompositorEnabled (active_compositor == 0 && metal_lovin),
 # WSGetCompositorForAccelerator, HaveMetalCompositorForAccelerator, WSGetCompositorMetal; counted by value, into /Users/Shared/ws_mcomp6.txt.
 # dtrace pid provider, root, 8 s. Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp6.sh >/dev/null 2>&1 &'  (move a window while it runs)

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Decode the MES firmware log that the probe arms with `rednavi_mes_dbgext=1`.
 
 The probe hands the MES scheduler a 16 KB buffer with MESAPI_MISC__SETUP_MES_DBGEXT (the v11 API's

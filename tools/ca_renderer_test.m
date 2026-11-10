@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // QuartzCore's own Metal renderer on the RedNavi device, without WindowServer: a CARenderer draws a small layer tree (colours, rounded corners, opacity, a gradient, a shadow, an image,
 // text) into a Metal texture. QuartzCore asks the device for its library (default.metallib), functions with function constants and pipelines, so the plug-in log
 // (/tmp/rednavi-metal-<uid>.log) shows what it needs; the picture is written as a PNG. Environment of QuartzCore (for instance CA_DISABLE_INPLACE_SHADERS=1) can be set when running it.

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Deploy the built kext and rn_test to the development desktop, reboot it, and run rn_test modes over ssh once the kext has published the MES result.
 #
 #     tools/desktop_test.sh [mode ...]          modes: plain ring seq info syncobj bo vm vmhole high vmfault (default: all of them, vmfault last because it leaves compute stuck until a reset)

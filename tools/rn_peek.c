@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Reads 4 pixels at a grid of points of the scanout surface (VRAM offset 0x08000000, pitch 7680, 1920x1080) through the probe's user client (RN_UC_VRAM_PEEK), to see what the display shows
 // when the screen looks blank. usage: rn_peek [OFFSET_IN_VRAM [PITCH]]
 #include <IOKit/IOKitLib.h>

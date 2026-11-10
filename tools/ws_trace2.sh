@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What the family's display pipe and display machine functions do for WindowServer's startup (dtrace, root): entries and returns, into /Users/Shared/ws_props2.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace2.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props2.txt

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Calls the device client (type 5) of the Intel accelerator on this Mac the way Metal does (selector 9 with "Metal", selector 2 with a 600-byte output) and dumps the reply.
 #include <IOKit/IOKitLib.h>
 #include <stdio.h>

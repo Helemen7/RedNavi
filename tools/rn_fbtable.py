@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Prints the attr-table of RedNaviFB (what WindowServer asks the framebuffer and what it was answered): ioreg -rc RedNaviFB -w0 | python3 tools/rn_fbtable.py
 import re, struct, sys
 m = re.search(r'"attr-table" = <([0-9a-f]*)>', sys.stdin.read())

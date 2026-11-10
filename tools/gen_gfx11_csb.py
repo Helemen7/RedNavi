@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Generate RedNavi/gfx11_csb.h, the default context register values (the "clear state") that the command processor of GC 11 needs before the first draw, from Linux's
 drivers/gpu/drm/amd/amdgpu/clearstate_gfx11.h (MIT licence, Copyright 2021 Advanced Micro Devices, Inc.; see NOTICE).
 

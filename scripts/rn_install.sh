@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Installs the kexts the desktop is tested with from a staging folder into /Library/Extensions and loads them into the auxiliary kernel collection, in one command. The kexts are signed
 # when they are built (Makefile, ad hoc), so there is no signing step here; one that is not validly signed is signed ad hoc as a fallback. A kext whose executable did not change is
 # left alone (no reinstall, no need for the reboot that goes with it).

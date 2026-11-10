@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Run on Linux as root on the machine with the RX 7800 XT: asks the amdgpu kernel driver the DRM_AMDGPU_INFO queries RADV uses and prints
 the answers as raw bytes, so that the kext (RedNavi/kern_probe.cpp, infoQuery) can answer them the way the Linux kernel does, field for field.
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which Linux-only constructs does a Mesa checkout carry in the parts RADV is built from? Read-only, the analysis behind docs/M5_MESA_BUILD.md.
 #     git clone --depth 1 --filter=blob:none --no-checkout https://gitlab.freedesktop.org/mesa/mesa.git mesa-src
 #     (cd mesa-src && git sparse-checkout init --cone && git sparse-checkout set src/amd src/util src/vulkan include/drm-uapi include/vulkan && git checkout)

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What IOFramebuffer (IOGraphicsFamily) does for WindowServer's attribute and notification traffic (dtrace, root): names and the first arguments, into /Users/Shared/ws_props6.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace6.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props6.txt

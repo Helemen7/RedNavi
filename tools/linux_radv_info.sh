@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Run on Linux (the live USB) on the machine with the RX 7800 XT, as root, to collect what the kext's INFO queries have to answer the way the Linux kernel does
 # (docs/M5_PLAN.md, "Not answered yet"): the numbers RADV gets from DRM_AMDGPU_INFO DEV_INFO and FW_VERSION, and what it derives from them.
 #

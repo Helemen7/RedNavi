@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 #include <IOKit/IOLib.h>      // before the compat headers: their min() macro breaks libkern.h
 #include "gfx11.h"
 #include "gfx11_csb.h"

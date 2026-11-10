@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Loads the plug-in bundle in this process and sends it the messages Metal sends, to see that it does not crash before it is installed anywhere. usage: bundle_test BUNDLE
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>

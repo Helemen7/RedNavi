@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # rebuild the ICD, push it to the desktop, run vulkaninfo there
 export PATH=/private/tmp/claude-501/venv/bin:$PATH:/opt/local/bin
 cd /private/tmp/claude-501/build-radv && ninja 2>&1 | grep -E "error|FAILED" | head

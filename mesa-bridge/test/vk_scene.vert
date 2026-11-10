@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Three draws in one call: instance 0 a checkerboard-textured quad whose depth rises to the right, instance 1 a gradient quad whose depth rises to the left (they cross at x = 0),
 // instance 2 a thin slanted triangle on the right edge, for the multisample resolve.
 layout(location = 0) out vec2 uv;

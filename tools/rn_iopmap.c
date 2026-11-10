@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Prints whether IOPresentment has a map (the table CoreDisplay's InitializeDisplayPipes builds from the display pipes it finds). NULL: no pipe was found.
 // Build: clang -o rn_iopmap tools/rn_iopmap.c -framework CoreFoundation
 #include <CoreFoundation/CoreFoundation.h>

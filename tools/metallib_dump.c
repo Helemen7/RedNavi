@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Lists the functions of a .metallib with RedNaviMTL/metallib.c: tools/metallib_dump FILE...
 #include "../RedNaviMTL/metallib.h"
 #include <stdio.h>

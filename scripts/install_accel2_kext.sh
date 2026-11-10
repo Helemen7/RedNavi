@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Installs RedNaviAccel2.kext (docs/M6_ACCELERATOR_STUDY.md, "RedNaviAccel2") into /Library/Extensions so that macOS puts it in the auxiliary kernel collection.
 # Same reasons and prerequisites as install_accel_kext.sh. The kext does nothing unless boot-arg rednavi_accel2=<stage> is set (1: log only, 2: let the family's start()
 # run with the hooks answered); with the boot-arg set it replaces RedNaviAccel for the card (probe score 200 against 100), which stays installed as the baseline.

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Installs RedNaviAccel.kext (the accelerator skeleton, docs/M6_ACCELERATOR_STUDY.md) into /Library/Extensions so that macOS puts it in the auxiliary kernel collection.
 # Like RedNaviFB it depends on kexts of the system kernel collection (IOAcceleratorFamily2, IOGraphicsFamily), so OpenCore cannot inject it. Run on the machine with the
 # RX 7800 XT, needs sudo, SIP configured as for RedNaviFB (docs/DP_BRINGUP.md).

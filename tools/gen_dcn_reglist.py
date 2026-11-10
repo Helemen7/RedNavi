@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Build the list of DCN 3.2 registers (base index 2 of the DMU block) used to compare display states.
 
 Reads dcn_3_2_0_offset.h (Linux, MIT) and writes

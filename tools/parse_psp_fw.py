@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """List the components inside an AMD PSP firmware file (psp_*_sos.bin, header v2.0).
 
 Layout follows psp_firmware_header_v2_0 in drivers/gpu/drm/amd/amdgpu/amdgpu_ucode.h:

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Reader for the container format of .metallib files (what the Metal compiler tools write and -[MTLDevice newLibraryWithData:error:] takes). The layout below was read off
 // the metallib files that ship in macOS (e.g. /System/Library/ScreenCaptureKitMetal/.../default.metallib), not from a specification, so it is checked against every function
 // it finds: the bitcode must start with LLVM's magic. Header (little endian): "MTLB", then at 0x10 the file size, at 0x18 offset and at 0x20 size of the function list, at 0x28/0x30 public

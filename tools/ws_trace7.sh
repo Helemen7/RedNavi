@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # The arguments of the framebuffer resource calls of the display machine and pipe while WindowServer starts (dtrace, root), into /Users/Shared/ws_props7.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace7.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/ws_props7.txt

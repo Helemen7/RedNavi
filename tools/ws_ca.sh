@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What CoreAnimation's Metal renderer does inside WindowServer: counts of the CA::OGL::MetalContext functions that run in 8 s, and of the Metal calls it makes on the command buffer / encoders
 # (objc provider on the plug-in's classes), into /Users/Shared/ws_ca.txt. Run in the foreground: sudo sh /Users/Shared/ws_ca.sh
 OUT=/Users/Shared/ws_ca.txt

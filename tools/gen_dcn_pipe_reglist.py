@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Build a curated, ordered register list for one DCN 3.2 display pipe: OTG/OPP/DPG/MPC 0, DIG/DP 4, clocks.
 
 The full list of tools/dcn32_reglist.txt hangs the machine when read (on macOS and on Linux): some blocks are

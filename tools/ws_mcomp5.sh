@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What WSGetCompositorForAccelerator calls before it returns (functions entered inside it, in SkyLight, CoreDisplay, IOKit and libsystem), counted, into /Users/Shared/ws_mcomp5.txt.
 # dtrace pid provider on the running WindowServer, root, 6 s. Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp5.sh >/dev/null 2>&1 &'  (move a window while it runs)
 OUT=/Users/Shared/ws_mcomp5.txt

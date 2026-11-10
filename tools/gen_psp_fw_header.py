@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Extract the bootloader-loadable components of an AMD PSP firmware file into a C header.
 
 The header is git-ignored: firmware is not redistributed from this repository.

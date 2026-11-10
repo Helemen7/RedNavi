@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Read-only: prints the C strings of a loaded system framework that contain one of the keywords.
 #include <mach-o/dyld.h>
 #include <mach-o/getsect.h>

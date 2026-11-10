@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Where in SkyLight "Unsupported sw composite destination." is logged from: user stack of every os_log call, counted per (format pointer, stack) (dtrace pid provider on the running
 # WindowServer, root; the most frequent one is the message, comparing the string in dtrace fails on pages of the shared cache), into /Users/Shared/ws_ustack.txt. Does not restart WindowServer.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_ustack.sh >/dev/null 2>&1 &'

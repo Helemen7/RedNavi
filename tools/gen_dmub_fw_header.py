@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn the DMCUB firmware into a C header for local builds (git-ignored, firmware is not redistributed).
 
     python3 tools/gen_dmub_fw_header.py dcn_3_2_0_dmcub.bin 57856 RedNavi/dmub_fw.h

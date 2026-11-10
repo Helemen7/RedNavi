@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // EDID parsing and video timings, no kernel or libc dependencies beyond memcpy/memset, so it builds in the kext and in
 // the host tests (tests/host/edid_test.cpp).
 //

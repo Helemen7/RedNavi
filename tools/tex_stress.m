@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Many small textures on the RedNavi device until one is refused (WindowServer lost them after ~150): prints how many, and how many at each step. Same arguments as ci_test.
 // (derived from mps_test.m) MPS on the RedNavi device: a Gaussian blur through MetalPerformanceShaders, as WindowServer does for desktop window effects. Same arguments as ci_test.
 // (derived from ci_test.m) CoreImage on the RedNavi device: a CIContext made on the plug-in's MTLDevice renders a filtered image (what iconservicesagent, mediaanalysisd and others do all day). CoreImage builds

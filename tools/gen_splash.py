@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn a splash PNG into RedNavi/splash_<W>x<H>.h: the pixels as XRGB8888 in run-length form.
 
     python3 tools/gen_splash.py assets/splash_1920x1080.png RedNavi/splash_1920x1080.h

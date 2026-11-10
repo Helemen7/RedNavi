@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # The functions that decide whether WindowServer composes the display with Metal: calls and return values of HardwareSupportsMetalCompositor, HaveMetalCompositorForAccelerator,
 # WSMetalCompositorEnabled and WSGetCompositorMetal in the running WindowServer (dtrace pid provider, root, 10 s), into /Users/Shared/ws_mcomp.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp.sh >/dev/null 2>&1 &'

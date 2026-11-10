@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which Objective-C selectors SkyLight's MetalContext::Flush sends (the commit of CoreAnimation's command buffer should be among them) and the arguments of Flush, 8 s, into /Users/Shared/ws_flush.txt
 # (selectors by address: python3 tools/ws_msgs_decode.py /Users/Shared/ws_flush.txt on the desktop, same boot). Run in the foreground: sudo sh /Users/Shared/ws_flush.sh
 OUT=/Users/Shared/ws_flush.txt

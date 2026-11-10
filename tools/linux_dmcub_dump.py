@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Dump the DMCUB registers of an RX 7800 XT from a Linux live system (run as root).
 
 Reads through amdgpu's debugfs register file, so nothing is written. Compare the output with the

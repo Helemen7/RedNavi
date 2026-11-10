@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Vertex and index buffers in, a model-view-projection matrix in a push constant.
 layout(location = 0) in vec3 pos;
 layout(location = 1) in vec3 col;

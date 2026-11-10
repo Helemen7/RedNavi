@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Check a VBIOS image dumped by the RedNavi probe (the "vbios" property of RedNaviProbe).
 
 Accepts the raw image or the output of `ioreg -rn RedNaviProbe -l -x`. Prints the PCI ROM and

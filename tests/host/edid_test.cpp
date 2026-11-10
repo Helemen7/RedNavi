@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Host tests for RedNavi/edid.cpp. Run with `make test`.
 #include "../../RedNavi/edid.h"
 #include <stdio.h>

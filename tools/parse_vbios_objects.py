@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """List the display paths in a VBIOS image: connectors, encoders, DDC/AUX and HPD lines.
 
 Reads the ATOM display object table (displayobjectinfo, v1.4 or v1.5) and the GPIO pin table, the way

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Takes one kernel of a .metallib through the plug-in's translator interface (RedNaviMTL/rn_air.c, metallib.c) and the librn_air2spirv.dylib in DIR, and writes the SPIR-V:
 //   tools/air_translate_test FILE.metallib FUNCTION DIR OUT.spv [vertex|fragment]      (METAL2VULKAN_LLVM_DIS and METAL2VULKAN_SPIRV_VAL may point at the tools)
 #include "../RedNaviMTL/metallib.h"

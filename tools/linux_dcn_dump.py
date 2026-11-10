@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Dump the DCN 3.2 display registers of an RX 7800 XT from a Linux live system (run as root, read-only).
 
 Run it while the monitor is lit by amdgpu (for example the desktop of the live session). It reads every

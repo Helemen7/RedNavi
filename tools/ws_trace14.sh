@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Why the Metal plug-in's allocations fail ("vkAllocateMemory ... out of device memory"): return values of the probe kext's buffer allocator, GPU page-table mapper and page-table
 # page allocator while WindowServer restarts (dtrace, root), counted per value, into /Users/Shared/ws_props14.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace14.sh >/dev/null 2>&1 &'

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNaviAccel2: second attempt at the M6 accelerator (docs/M6_ACCELERATOR_STUDY.md). RedNaviAccel answers the device client call by call and gets nowhere; this kext
 // instead lets the family run: it subclasses IOGraphicsAccelerator2 and does NOT override start(), stop(), free(), requestProbe(), message() or newUserClient(), so the
 // family's own code runs them (the slot table says it implements all six). What the family needs from the subclass are its 17 pure virtuals; this file implements them.

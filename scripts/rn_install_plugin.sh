@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Replaces the executable of the installed Metal plug-in (/Library/GPUBundles/RedNaviMTLDriver.bundle) with a new build staged on the desktop and seals the bundle again (ad hoc). The RADV and
 # translator libraries inside the bundle stay as they are. WindowServer must be restarted afterwards to load it (sudo killall -9 WindowServer).
 # usage (on the desktop): sudo sh /Users/Shared/rn_install_plugin.sh [/Users/Shared/rnstage/RedNaviMTLDriver.bin [/Users/Shared/rnstage/libvulkan_radeon.dylib]]

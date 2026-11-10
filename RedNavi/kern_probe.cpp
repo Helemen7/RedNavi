@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNavi probe (milestone M1): read-only. Matches the RX 7800 XT (Navi 32, 1002:747E),
 // maps the register BAR, and logs what the GPU tells us about itself: PCI config, BAR sizes
 // and the IP discovery table (the authoritative list of IP block versions).

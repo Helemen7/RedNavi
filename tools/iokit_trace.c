@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Interposing library: writes every IOKit connection call of the process to stderr (IOServiceOpen with the class of the service, IOConnectCall* with selector, sizes, first words
 // and result, IOConnectMapMemory64, IOConnectSetNotificationPort). Used with DYLD_INSERT_LIBRARIES (the test desktop has SIP off) to see what Metal's user-space asks of the
 // accelerator kext: DYLD_INSERT_LIBRARIES=/tmp/iokit_trace.dylib /tmp/mtl_init_harness

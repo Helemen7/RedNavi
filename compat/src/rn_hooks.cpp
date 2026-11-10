@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Kernel side of the hooks the pure compat headers rely on.
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>

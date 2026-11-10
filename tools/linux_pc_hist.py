@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Histogram of the program counters of the two MES pipes and the MEC pipe 0 on Linux (run as root, amdgpu loaded), to see which addresses the KIQ pipe
 visits and how often, at idle and under load. Read only; debugfs ring-bank select as tools/linux_pipe_pcs.py.
 

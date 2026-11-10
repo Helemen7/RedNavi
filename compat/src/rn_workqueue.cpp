@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Work items on top of thread_call. Linux runs work in a kernel thread that may sleep; a thread_call callback
 // is a kernel thread too, so the same code can block.
 #include <kern/clock.h>

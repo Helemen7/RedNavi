@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Decode an AMD IP discovery binary dumped by the RedNavi probe kext.
 
 Accepted inputs (auto-detected):

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Every SkyLight function with "ompositor" in its name that runs in the running WindowServer, counted (dtrace pid provider, root, 8 s), and the Compositor* that render_update receives,
 # into /Users/Shared/ws_mcomp2.txt. Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp2.sh >/dev/null 2>&1 &'  (move a window while it runs)
 OUT=/Users/Shared/ws_mcomp2.txt

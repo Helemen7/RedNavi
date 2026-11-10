@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // See rn_vk.h. Plain Vulkan 1.1, loaded by hand: the process may be any Metal client, so nothing here links against a Vulkan library.
 #include "rn_vk.h"
 #include <dlfcn.h>

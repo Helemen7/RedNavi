@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn the GC 11.0.3 / SDMA 6.0.3 firmware set into a C header for local builds (git-ignored, firmware is not redistributed).
 
     python3 tools/gen_gc_fw_header.py <directory with the linux-firmware amdgpu files> RedNavi/gc_fw.h

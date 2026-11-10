@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * Compute stress tests for RADV on the RedNavi kext (plain Vulkan 1.1, compute queue only):
  *

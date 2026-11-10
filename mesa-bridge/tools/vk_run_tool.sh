@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # usage: ./run_tool.sh <program in this directory> [args]
 D="$(cd "$(dirname "$0")" && pwd)"
 P="$1"; shift

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // The interface between the plug-in (BSD-3-Clause) and the AIR to SPIR-V translator. The translator is NOT part of this code base: it is a separate shared library,
 // librn_air2spirv.dylib, looked for next to RADV (rn_vk_dir()), so that a translator under another licence (the candidate, metal2vulkan, is LGPL-3.0-or-later) stays a separate work
 // that is dynamically loaded and can be replaced by the user. Nothing here includes or copies translator code. When the library is absent every pipeline from a Metal library fails

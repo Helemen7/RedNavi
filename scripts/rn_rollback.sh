@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Safety net for tests on the desktop: reads and changes the boot-args in the OpenCore config of the INTERNAL EFI over SSH, always with a backup, and can put it back.
 # Runs on the machine you work from. It needs no sudo on the desktop (the EFI is writable by the user), so it also needs no password; what needs root (restarting WindowServer, rebooting,
 # removing an installed bundle) is only printed by `root-help`.

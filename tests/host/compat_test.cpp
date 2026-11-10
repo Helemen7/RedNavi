@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Host tests for the pure parts of the compat layer. Run with `make test`.
 #include <amd/rn_device.h>
 #include <linux/atomic.h>

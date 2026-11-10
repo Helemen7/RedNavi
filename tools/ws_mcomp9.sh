@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # During an animation: the Compositor* that render_update receives, the object (this) of CompositorSW / CompositorMetal CompositeLayersToDestination, and counts of both, into /Users/Shared/ws_mcomp9.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp9.sh >/dev/null 2>&1 &'   then minimize and restore a window repeatedly for 8 s.
 OUT=/Users/Shared/ws_mcomp9.txt

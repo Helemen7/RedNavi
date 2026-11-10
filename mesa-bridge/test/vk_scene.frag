@@ -1,4 +1,7 @@
 #version 450
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 layout(set = 0, binding = 0) uniform sampler2D tex;
 layout(location = 0) in vec2 uv;
 layout(location = 1) flat in int inst;

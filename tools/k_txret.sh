@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Return values (as 32-bit hex) of the display pipe user client's transaction calls, and which functions run inside transactionEnd, 10 s, into /Users/Shared/k_txret.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/k_txret.sh >/dev/null 2>&1 &'
 OUT=/Users/Shared/k_txret.txt

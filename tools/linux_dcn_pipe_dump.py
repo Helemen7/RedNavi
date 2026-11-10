@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Read-only dump of the curated DCN 3.2 pipe register list on Linux (run as root, amdgpu loaded, monitor lit, text console).
 
     sudo python3 linux_dcn_pipe_dump.py                          # six safe groups into dcn_pipe_<pci device id>.txt

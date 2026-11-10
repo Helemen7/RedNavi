@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Asks Metal for its devices, the way any Metal program does, so that the plug-in stub is loaded and logs. Run on the machine with the accelerator kext.
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>

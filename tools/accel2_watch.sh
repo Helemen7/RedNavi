@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Follows the log of RedNaviAccel2 (property rednavi-accel2-log of the PCI device) on the test desktop and prints every line once, as it appears. A kernel panic loses the
 # property, so the last lines printed are what the kext did right before it (docs/M6_ACCELERATOR_STUDY.md). Stops when ssh loses the machine.
 # usage: tools/accel2_watch.sh [user@host]

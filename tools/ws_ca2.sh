@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Why CoreAnimation's command buffers are released without commit: CA::OGL functions with commit / abort / cancel / discard / flush / finish / submit / error in the name, and every
 # selector the plug-in's command buffer receives, counted for 8 s into /Users/Shared/ws_ca2.txt. Run in the foreground: sudo sh /Users/Shared/ws_ca2.sh
 OUT=/Users/Shared/ws_ca2.txt

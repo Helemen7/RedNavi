@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # What WindowServer gets back from the display pipe client before it closes it: the value setPipeIndex writes (from the accelerator, +0x178), the size getCapabilitiesData writes, and the
 # first 64 bytes of the capabilities data (dtrace, root), into /Users/Shared/ws_props13.txt. Needs the hand-made client (boot-arg rednavi_accel2_pipe_hand=1), as ws_trace12.sh.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_trace13.sh >/dev/null 2>&1 &'

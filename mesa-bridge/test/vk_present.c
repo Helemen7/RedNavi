@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * Presentation test: what vk_draw renders (a red triangle over the upper-left half of a blue image) goes to the monitor. The image is as large as the display surface of RedNaviFB
  * (B8G8R8A8, which is the surface's XRGB8888 byte order), rendered in tiled device-local VRAM; the surface itself is imported with VK_EXT_external_memory_host (the bridge maps it

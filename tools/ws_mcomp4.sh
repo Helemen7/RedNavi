@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Who asks WSGetCompositorForAccelerator and with which arguments; where the display's accelerator id comes from (dtrace pid provider, root, 6 s), into /Users/Shared/ws_mcomp4.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp4.sh >/dev/null 2>&1 &'  (move a window while it runs)
 OUT=/Users/Shared/ws_mcomp4.txt

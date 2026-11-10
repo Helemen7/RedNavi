@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Turns the selector addresses of ws_msgs.txt (tools/ws_msgs.sh) into selector names with sel_getName: the shared cache is mapped at the same address in every process of a boot,
 # so run this on the machine and in the same boot. usage: python3 ws_msgs_decode.py /Users/Shared/ws_msgs.txt
 import ctypes, re, sys

@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Order of events around WindowServer's display pipe client (type 4) while WindowServer starts (dtrace, root), into /Users/Shared/ws_props12.txt.
 # Needs the hand-made client (boot-arg rednavi_accel2_pipe_hand=1). Shows, in time order: WindowServer's service opens (connect type), its IOConnect method calls (selector) and memory
 # maps (memory type), the display pipe client's functions with return values, who runs clientClose (process and kernel stack), and IOAccelDisplayPipe::get_user_client with its caller.

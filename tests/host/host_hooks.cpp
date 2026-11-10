@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // Host implementations of the compat hooks, so the pure parts of the layer run as a normal program.
 #include <rn/hooks.h>
 #include <sched.h>

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // SMU 13.0.x message interface (MP1 mailbox), written against the compat layer so it can move into a ported
 // amdgpu smu_v13_0 later. Protocol and message numbers: Linux drivers/gpu/drm/amd/pm/swsmu (smu_cmn.c,
 // pmfw_if/smu_v13_0_0_ppsmc.h; SMU 13.0.10 uses the smu_v13_0_0 tables).

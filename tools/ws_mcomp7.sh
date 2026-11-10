@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which compositor really renders: entries into CompositorSW / CompositorMetal methods in the running WindowServer, counted by function, into /Users/Shared/ws_mcomp7.txt.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_mcomp7.sh >/dev/null 2>&1 &'  (minimize a window while it runs)
 OUT=/Users/Shared/ws_mcomp7.txt

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNaviAccel: the accelerator skeleton of M6 (docs/M6_ACCELERATOR_STUDY.md). It is an IOAccelerator service for the 7800 XT, matched on the PCI device like
 // Apple's and NullMoth's accelerators, and it does nothing but look and write down:
 //  - at start it asks the OSMetaClass registry for the size and parent of every class of IOAcceleratorFamily2 and IOGraphicsFamily the study lists (property accel-class-info),

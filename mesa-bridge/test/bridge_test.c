@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 /*
  * What tools/rn_test.c does against the user client, done through the ac_drm_* functions only, in the way RADV's winsys calls them: device, queries, buffers, address ranges,
  * a context, a submit with chunks, syncobjs, fence queries. If this passes the bridge does what Mesa's ac_linux_drm.c does for the winsys.

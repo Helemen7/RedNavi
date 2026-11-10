@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 // RedNaviMTLDriver.bundle: a stub Metal driver plug-in (docs/M6_ACCELERATOR_STUDY.md). The accelerator kext names it in MetalPluginName; Metal.framework loads the bundle in
 // every process that enumerates devices and asks it for the class named by MetalPluginClassName. This stub does nothing but write down what happens:
 //  - when it is loaded, in which process, and the whole method list of the superclass the plug-in class has to derive from (MTLIOAccelDevice, found through the Objective-C

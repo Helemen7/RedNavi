@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 """Turn the raw DRM_AMDGPU_INFO answers of a Linux run (tools/linux_amdgpu_info_raw.py) into RedNavi/linux_info_navi32.h.
 
     python3 tools/gen_linux_info_header.py docs/logs/linux-reference/amdgpu_info_raw_navi32.txt RedNavi/linux_info_navi32.h

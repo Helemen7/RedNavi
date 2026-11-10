@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-3-Clause
+# Copyright (c) 2026 Helemen7 and RedNavi contributors
+
 # Which branch WSGetCompositorForAccelerator takes in the running WindowServer, with instruction-offset probes on the function (dtrace pid provider, root, 8 s), counted:
 #   +24: active_compositor was just loaded (printed), +52: about to test the accelerator id (printed), +65: both tests passed, the Metal compositor is returned, +78: the software compositor is returned.
 # Run: sudo sh -c 'nohup sh /Users/Shared/ws_flags.sh >/dev/null 2>&1 &'  (move a window while it runs)
