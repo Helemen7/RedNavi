@@ -3121,8 +3121,14 @@ int RedNaviProbe::createVramBo(uint32_t size, bool visible) {
     size = (size + 4095u) & ~4095u;
     VramPool &pool = visible ? visPool : devPool;
     uint64_t off = 0;
-    if (!pool.alloc(size, &off)) return -1;
-    IOMemoryDescriptor *vmd = nullptr;
+    if (!pool.alloc(size, &off)) {
+        if (gpu.is_apu) {
+            // On APU (Strix Halo UMA), physical VRAM is carveout only (256 MB).
+            // Fallback seamlessly to host BO (GTT domain) in 128 GB LPDDR5X system RAM.
+            return createHostBo(size, false, false);
+        }
+        return -1;
+    }
     if (visible) {
         vmd = bar0Mem ? IODeviceMemory::withSubRange(bar0Mem, off, size) : nullptr;
         IOMemoryMap *km = vmd ? vmd->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : nullptr;
@@ -4037,11 +4043,11 @@ bool RedNaviProbe::start(IOService *provider) {
     if (pci->configRead16(kIOPCIConfigDeviceID) != 0x747E) {
         uint16_t devId = pci->configRead16(kIOPCIConfigDeviceID);
         if (devId == 0x1586) {
+            gpu.is_gfx115 = true;
+            gpu.is_apu = true;
             static const char kName8060[] = "AMD Radeon 8060S";
-            OSData *m = OSData::withBytes(kName8060, sizeof(kName8060));
             if (m) { pci->setProperty("model", m); m->release(); }
             dumpDiscovery();
-            uint32_t mmhubBase = 0;
             if (ipBase(kRNHwIdMmhub, &mmhubBase, 1)) {
                 uint32_t fbBase = rd((mmhubBase + 0x09ec) * 4) & 0xFFFFFF;
                 uint32_t fbTop = rd((mmhubBase + 0x09ed) * 4) & 0xFFFFFF;

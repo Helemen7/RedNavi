@@ -42,6 +42,8 @@ struct rn_device {
     size_t rmmio_size;
     u32 reg_offset[RN_HWIP_MAX][RN_MAX_INST][RN_MAX_SEG];   // dword base of each IP segment (IP discovery)
     spinlock_t mmio_idx_lock;
+    bool is_gfx115;
+    bool is_apu;
 };
 
 #ifdef __cplusplus
@@ -62,9 +64,16 @@ void rn_wreg32(struct rn_device *adev, u32 reg, u32 v);
 
 #define RREG32(reg) rn_rreg32(adev, (reg))
 #define WREG32(reg, v) rn_wreg32(adev, (reg), (v))
-#define RREG32_SOC15(ip, inst, reg) rn_rreg32(adev, adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + (reg))
-#define WREG32_SOC15(ip, inst, reg, v) rn_wreg32(adev, adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + (reg), (v))
-#define SOC15_REG_OFFSET(ip, inst, reg) (adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX] + (reg))
+static inline u32 rn_soc15_reg_offset(const struct rn_device *adev, u32 base, u32 reg) {
+    if (adev && adev->is_gfx115) {
+        if (reg >= 0x1680 && reg <= 0x1750) return base + reg - 12;
+        if (reg == 0x4e82) return base + 0x4e7e;
+    }
+    return base + reg;
+}
+#define RREG32_SOC15(ip, inst, reg) rn_rreg32(adev, rn_soc15_reg_offset(adev, adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX], (reg)))
+#define WREG32_SOC15(ip, inst, reg, v) rn_wreg32(adev, rn_soc15_reg_offset(adev, adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX], (reg)), (v))
+#define SOC15_REG_OFFSET(ip, inst, reg) rn_soc15_reg_offset(adev, adev->reg_offset[ip##_HWIP][inst][reg##_BASE_IDX], (reg))
 
 #define REG_SET_FIELD(orig, reg, field, val) (((orig) & ~reg##__##field##_MASK) | (reg##__##field##_MASK & ((u32)(val) << reg##__##field##__SHIFT)))
 #define REG_GET_FIELD(value, reg, field) (((value) & reg##__##field##_MASK) >> reg##__##field##__SHIFT)
