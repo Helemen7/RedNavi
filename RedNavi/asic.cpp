@@ -10,8 +10,9 @@
 // Navi 32. Verified on the RX 7800 XT (docs/TEST_MACHINES.md). The RX 7700 XT is the same die and reports the same
 // PCI device ID; nobody has run it, so it is not told apart here (unverified).
 static const struct rn_asic_board kNavi32Boards[] = {
-    {0x747E, "AMD Radeon RX 7800 XT", 16384, kRNReplay, sizeof(kRNReplay) / sizeof(kRNReplay[0])},
-    {0, nullptr, 0, nullptr, 0},
+    // Path 0 of the VBIOS table: DisplayPort on UNIPHY2 (transmitter E, phy id 4), HPD pin 5, AUX engine 4, 4 lanes.
+    {0x747E, "AMD Radeon RX 7800 XT", 16384, kRNReplay, sizeof(kRNReplay) / sizeof(kRNReplay[0]), {4, 4, 5, 19, 4}},
+    {0, nullptr, 0, nullptr, 0, {0, 0, 0, 0, 0}},
 };
 
 static const struct rn_asic kAsics[] = {

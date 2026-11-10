@@ -744,17 +744,19 @@ void RedNaviProbe::dpInit() {
         return;
     }
     if (!dmubUp) { IOLog("RedNavi: DP init: DMCUB not running\n"); return; }
+    if (!board) { IOLog("RedNavi: DP init: no board\n"); return; }
+    const struct rn_dp_path &dp = board->dp;
     uint8_t cmd[64] = {};
     // header: type DMUB_CMD__VBIOS (128), sub_type DIG1_TRANSMITTER_CONTROL (1), payload 16 bytes (<< 24)
     cmd[0] = 128; cmd[1] = 1; cmd[3] = 16;
     // struct dig_transmitter_control_parameters_v1_6 at offset 4
-    cmd[4 + 0] = 4;       // phyid: UNIPHY E
+    cmd[4 + 0] = dp.phy_id;          // phyid (the RX 7800 XT: 4, UNIPHY E)
     cmd[4 + 1] = 7;       // ATOM_TRANSMITTER_ACTION_INIT
     cmd[4 + 2] = 0;       // digmode: DP
-    cmd[4 + 3] = 4;       // lanenum
-    cmd[4 + 8] = 5;       // hpdsel: HPD5 (pin id 5)
+    cmd[4 + 3] = dp.lanes;           // lanenum
+    cmd[4 + 8] = dp.hpd_sel;         // hpdsel (the RX 7800 XT: pin id 5)
     cmd[4 + 9] = 0;       // digfe_sel
-    cmd[4 + 10] = 19;     // connector object id: DisplayPort
+    cmd[4 + 10] = dp.connector_id;   // connector object id (19: DisplayPort)
     uint32_t reply[16];
     bool ok = dmubSend(cmd, 20, reply);
     IOLog("RedNavi: DP transmitter INIT via DMUB: %s, slot %08x %08x %08x %08x %08x\n", ok ? "consumed" : "NOT consumed", reply[0], reply[1], reply[2], reply[3], reply[4]);
@@ -776,13 +778,14 @@ bool RedNaviProbe::dpcdRead(uint32_t eng, uint32_t addr, uint8_t *d, uint32_t n)
     return auxTransfer(eng, 0x90, addr, d, n, &st, &rep);
 }
 
-// DIG1_TRANSMITTER_CONTROL for path 0 (phy id 4, HPD 5, connector id 19) through the DMCUB.
+// DIG1_TRANSMITTER_CONTROL for the board's DisplayPort path (the RX 7800 XT: phy id 4, HPD 5, connector id 19) through the DMCUB.
 bool RedNaviProbe::dpTx(uint8_t action, uint8_t modeOrLane, uint8_t lanes, uint32_t symclk10k) {
+    if (!board) return false;
     uint8_t cmd[64] = {};
     cmd[0] = 128; cmd[1] = 1; cmd[3] = 16;
-    cmd[4 + 0] = 4; cmd[4 + 1] = action; cmd[4 + 2] = modeOrLane; cmd[4 + 3] = lanes;
+    cmd[4 + 0] = board->dp.phy_id; cmd[4 + 1] = action; cmd[4 + 2] = modeOrLane; cmd[4 + 3] = lanes;
     memcpy(cmd + 4 + 4, &symclk10k, 4);
-    cmd[4 + 8] = 5; cmd[4 + 9] = 0; cmd[4 + 10] = 19;
+    cmd[4 + 8] = board->dp.hpd_sel; cmd[4 + 9] = 0; cmd[4 + 10] = board->dp.connector_id;
     uint32_t reply[16];
     return dmubSend(cmd, 20, reply);
 }
@@ -794,11 +797,12 @@ void RedNaviProbe::dpTrain() {
         return;
     }
     if (!dmubUp) { IOLog("RedNavi: DP training: DMCUB not running\n"); return; }
+    if (!board) { IOLog("RedNavi: DP training: no board\n"); return; }
     // Link rate: RBR (0x06, 162000 kHz symbol clock) like Linux uses for 1080p60 8 bpc, which is also the state the replay table
     // was captured in (DP_DTO0, VID_M/N); rednavi_dp_rate=0x14 selects HBR2 as before.
     uint32_t rateArg = selRate;                                             // from the selected mode (RBR for 1080p60)
     PE_parse_boot_argn("rednavi_dp_rate", &rateArg, sizeof(rateArg));
-    const uint32_t aux = 4, lanes = 4, rateCode = rateArg, symclk10k = rateCode * 27000 / 10;
+    const uint32_t aux = board->dp.aux, lanes = board->dp.lanes, rateCode = rateArg, symclk10k = rateCode * 27000 / 10;
     uint32_t dmu = dmubDmu;
     // DP4 back end and DIG4 registers (dcn_3_2_0_offset.h, base index 2)
     const uint32_t DP_CONFIG = 0x250b, DP_LINK_CNTL = 0x2508, DP_DPHY_CNTL = 0x2517, DP_PATTERN_SEL = 0x2518, DP_SCRAM = 0x251e;

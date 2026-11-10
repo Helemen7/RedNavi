@@ -36,7 +36,18 @@ struct rn_drm_info {
     uint32_t max_ibs_count;
 };
 
-struct RNReplayReg;           // RedNavi/dcn_replay.h
+// One register of the display replay (tools/gen_dcn_replay.py writes the tables).
+struct RNReplayReg { unsigned char group; unsigned char baseIdx; unsigned short dword; unsigned int value; const char *name; };
+
+// The connector the driver lights on a board: what the VBIOS display object table says about that path
+// (docs/DC_PLAN.md, step 1) and the AUX engine its DDC line is on.
+struct rn_dp_path {
+    uint8_t aux;              // DCN AUX engine (0-based) the monitor answers on
+    uint8_t phy_id;           // phyid of dig_transmitter_control_parameters_v1_6 (UNIPHY A = 0 ... E = 4)
+    uint8_t hpd_sel;          // hpdsel of the same structure (HPD pin id)
+    uint8_t connector_id;     // connector object id (19 is DisplayPort)
+    uint8_t lanes;            // lanes wired to the connector
+};
 
 // One board of an ASIC that somebody has run the driver on.
 struct rn_asic_board {
@@ -45,6 +56,7 @@ struct rn_asic_board {
     uint32_t vram_mb;         // "VRAM,totalMB" property of the PCI node
     const struct RNReplayReg *replay;   // display registers of one lit pipe on this board, in programming order (dcnReplay)
     uint32_t replay_count;
+    struct rn_dp_path dp;     // the DisplayPort path the replay table drives
 };
 
 struct rn_asic {

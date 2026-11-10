@@ -76,6 +76,7 @@ static void testLookup() {
     CHECK(a && a->drm_info && a->drm_info->dev_info_size == 448 && a->drm_info->dev_info[0] == 0x7e && a->drm_info->dev_info[1] == 0x74);
     CHECK(a && a->drm_info->fw_count == 16 && a->drm_info->max_ibs_count == 10 && a->drm_info->hw_ip_info[0][0] == 0x0b);
     CHECK(board && board->replay && board->replay_count > 100);
+    CHECK(board && board->dp.aux == 4 && board->dp.phy_id == 4 && board->dp.hpd_sel == 5 && board->dp.connector_id == 19 && board->dp.lanes == 4);
 
     std::vector<Ip> other = navi32();
     other[3].rev = 2;                                                     // GC 11.0.2 is Navi 33
