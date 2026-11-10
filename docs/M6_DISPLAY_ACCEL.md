@@ -72,6 +72,15 @@ Verified on hardware (the desktop, 7800 XT): the cursor shows and follows the mo
 
 A lesson: the converter packs the rows with the cursor's own width, not with the descriptor's 64. Read as pitch 64, a 32-pixel cursor showed as two squashed copies side by side; RedNaviFB now spreads the rows out.
 
+## Old pixels on the screen: changes from reading the code (2026-11-10, unverified on hardware)
+
+Written while the test machine had no working display; none of this has run on the card.
+
+- The cache of card copies of CoreDisplay's scanout surfaces (16 entries) dropped its oldest entry whatever was still in use. A surface whose copy was gone was then sampled from the texture's own image, which direct scanout never draws into: old pixels in exactly the rectangles a frame carries over from the one before. The cache now drops the least recently used entry, and a sampled scanout surface without a copy gets one filled from the picture on the screen. How often the cache really turned over is not known (count the `direct scanout: card copy for IOSurface` lines per surface in the plug-in log).
+- A direct pass counted as a finished frame only if its first draw was not a `ColorFill`. A pass that fills and then draws would have been left out, and stayed off the screen until the next change. Now only a pass whose draws are all fills is left out.
+- A blit between display surfaces ended the open batch with a submit and a wait of its own; it is now recorded in the batch.
+- A host write into a scanout surface (`replaceRegion`, a blit from a buffer, a blit between different pixel formats) reaches only the texture's own image. Not handled: the plug-in logs `direct scanout: ... writes the host image of scanout IOSurface` when it happens, so the next run says whether a client does it.
+
 ## Tools added
 
 `tools/ws_*.sh`, `tools/k_*.sh`: dtrace scripts, run as root on the desktop, each a single question (comments at the top say what and how to run). `tools/ws_msgs_decode.py` turns selector addresses into names on the same boot. `tools/rn_iopmap.c` calls `IOPresentmentGetMap`. `tools/rn_peek*.c` read the scanout through the probe's user client: heavy, they stalled the desktop's network once; do not run them while the machine is in use. `scripts/rn_install.sh` and `scripts/rn_install_plugin.sh` install the kexts and the plug-in executable from `/Users/Shared`.

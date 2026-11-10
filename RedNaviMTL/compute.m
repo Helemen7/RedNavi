@@ -107,6 +107,7 @@ static void rn_sites_report(void) {                    // the four sites with th
 
 static int rn_vk_format_of(MTLPixelFormat pf);
 static rn_vk_image *rn_display_vram_peek(void *tex);
+static void rn_display_host_write_note(void *tex, const char *how);
 static rn_vk *rn_vk_shared(void) {
     static rn_vk *vk;
     static dispatch_once_t once;
@@ -485,6 +486,7 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
         for (NSUInteger y = 0; y < region.size.height; y++)
             memcpy(dst + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
+    rn_display_host_write_note((__bridge void *)self, "replaceRegion");
     [self syncToSurface];
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr {
@@ -1067,7 +1069,7 @@ static NSString *rn_run_blit(RNBlit *b) {
             uint8_t *tp = tex + ((o.y + y) * t->w + o.x) * t->texel, *bp = buf + y * bpr;
             if (b->kind == 0) memcpy(tp, bp, b->sz.width * t->texel); else memcpy(bp, tp, b->sz.width * t->texel);
         }
-        if (b->kind == 0) rn_vk_image_host_wrote(t->img);
+        if (b->kind == 0) { rn_vk_image_host_wrote(t->img); rn_display_host_write_note((__bridge void *)t, "a blit from a buffer"); }
         return nil;
     }
     case 2: {
@@ -1097,6 +1099,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         uint8_t *dp = rn_vk_image_staging(d2->img);
         for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + ((b->dorg.y + y) * d2->w + b->dorg.x) * d2->texel, sp + ((b->so.y + y) * s2->w + b->so.x) * s2->texel, b->sz.width * s2->texel);
         rn_vk_image_host_wrote(d2->img);
+        rn_display_host_write_note((__bridge void *)d2, "a blit on the host");
         return nil;
     }
     case 3:
@@ -1533,6 +1536,14 @@ static rn_vk_image *rn_display_vram_peek(void *tp) {
     if (!vr || t->pf == rt->pf) return vr;
     if (t->texel != rt->texel || t->swz.red != MTLTextureSwizzleRed || t->swz.green != MTLTextureSwizzleGreen || t->swz.blue != MTLTextureSwizzleBlue || t->swz.alpha != MTLTextureSwizzleAlpha) return NULL;
     @synchronized ([RedNaviMTLTexture class]) { return rn_vram_as(vk, vr, t->pf); }
+}
+// A host write into a scanout surface (replaceRegion, a blit from a buffer, a blit between different pixel formats) lands in the texture's own image, which direct scanout never shows:
+// the card copy keeps its old pixels there. Not handled; the log says whether a client ever does it, and how.
+static void rn_display_host_write_note(void *tp, const char *how) {
+    RedNaviMTLTexture *t = (__bridge RedNaviMTLTexture *)tp, *rt = t->parent ? t->parent : t;
+    if (!rt->displayScan || !rn_scanout_image(rn_vk_shared(), rt->w, rt->h)) return;
+    static atomic_uint said; const unsigned n = atomic_fetch_add(&said, 1);
+    if (n < 20 || n % 1000 == 0) rn_log("direct scanout: %s writes the host image of scanout IOSurface %u, the card copy does not get it (%u such writes so far)", how, rt->surf ? (unsigned)IOSurfaceGetID(rt->surf) : 0u, n + 1);
 }
 static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the bridge's present call (selector RN_UC_PRESENT)
     static int (*present)(uint32_t, int); static dispatch_once_t once;
