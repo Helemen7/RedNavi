@@ -59,10 +59,14 @@ int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const c
 int rn_air_translate_stage(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
 // A function constant value (newFunctionWithName:constantValues:error:): index is the constant's index, or negative when it is given by name; size bytes at data are the value in
 // Metal's layout for its data type (bool 1 byte, int and float 4, vectors the components one after the other).
-typedef struct { int32_t index; const char *name; uint32_t size; const void *data; } rn_air_const;
+typedef struct { int32_t index; const char *name; uint32_t size; const void *data; uint32_t type; } rn_air_const;
 // rn_air_translate_stage for a function specialized with constants: the module is specialized before it is translated, so what a constant switches off is not in the bindings. A
 // translator library without rn_air_translate_stage_fc fails here when nconsts is not 0.
 int rn_air_translate_stage_fc(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
+int rn_air_translate_pipeline(const char *dir,
+    const void *v_bitcode, size_t v_bytes, const char *v_entry, const rn_air_const *v_consts, unsigned v_nconsts, rn_air_kernel_info *v_info, uint32_t **v_spirv, size_t *v_spirv_bytes,
+    const void *f_bitcode, size_t f_bytes, const char *f_entry, const rn_air_const *f_consts, unsigned f_nconsts, rn_air_kernel_info *f_info, uint32_t **f_spirv, size_t *f_spirv_bytes,
+    char *err, size_t errlen);
 void rn_air_free(uint32_t *spirv, size_t bytes);
 
 #ifdef __cplusplus
