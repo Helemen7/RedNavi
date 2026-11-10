@@ -72,6 +72,10 @@ static void testLookup() {
     const rn_asic *a = rn_asic_lookup(t.data(), len, 0x747E, &board);
     CHECK(a && !strcmp(a->name, "Navi 32") && board && board->vram_mb == 16384 && !strcmp(board->model, "AMD Radeon RX 7800 XT"));
     CHECK(!rn_asic_lookup(t.data(), len, 0x7480, nullptr));              // right versions, a board nobody has run
+    // The data behind the row: the DRM_AMDGPU_INFO answers start with the device ID, and the board has its display registers.
+    CHECK(a && a->drm_info && a->drm_info->dev_info_size == 448 && a->drm_info->dev_info[0] == 0x7e && a->drm_info->dev_info[1] == 0x74);
+    CHECK(a && a->drm_info->fw_count == 16 && a->drm_info->max_ibs_count == 10 && a->drm_info->hw_ip_info[0][0] == 0x0b);
+    CHECK(board && board->replay && board->replay_count > 100);
 
     std::vector<Ip> other = navi32();
     other[3].rev = 2;                                                     // GC 11.0.2 is Navi 33

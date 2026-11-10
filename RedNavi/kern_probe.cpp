@@ -99,7 +99,6 @@
 #include "gfx11.h"
 #include "rn_uapi.h"
 #include "splash_1920x1080.h"
-#include "linux_info_navi32.h"
 #include "gc_regs.h"
 #include "asic.h"
 
@@ -347,6 +346,8 @@ class RedNaviProbe : public IOService {
     uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
     bool vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff);
     uint64_t vmPageAlloc(int vmid);                  // a zeroed pool page (VRAM offset), 0 when the pool is empty
+    const struct rn_asic *asic {nullptr};            // the card's row of the ASIC table (RedNavi/asic.cpp); NULL: read-only
+    const struct rn_asic_board *board {nullptr};
     uint32_t vramMbytes {16384};                     // RCC_CONFIG_MEMSIZE (the INFO queries answer with it)
     uint32_t vmidUsed {0};                           // bit n: VMID n is a connection's
     bool vmReady {false};
@@ -416,7 +417,7 @@ private:
 
     void dumpPci();
     void dumpDiscovery();
-    void publishAsic(const struct rn_asic *asic, const struct rn_asic_board *board);
+    void publishAsic();
     void dumpVbios();
     void loadDmcub();
     void loadSmuFw();
@@ -572,7 +573,7 @@ bool RedNaviProbe::ipBase(uint16_t hwId, uint32_t *base, uint32_t idx) {
 
 // The "asic" property: which row of the ASIC table the card matched, and the IP versions the lookup read. A card that matched
 // no row still gets the versions, which is what a new row is written from (docs/ADDING_A_GPU.md).
-void RedNaviProbe::publishAsic(const struct rn_asic *asic, const struct rn_asic_board *board) {
+void RedNaviProbe::publishAsic() {
     OSDictionary *out = OSDictionary::withCapacity(12);
     if (!out) return;
     auto str = [&](const char *key, const char *value) {
@@ -1143,6 +1144,9 @@ void RedNaviProbe::dcnReplay() {
     uint32_t maxGroup = 0;
     if (!PE_parse_boot_argn("rednavi_dcn_replay", &maxGroup, sizeof(maxGroup)) || maxGroup == 0) return;
     if (maxGroup > 14) maxGroup = 14;
+    if (!board || !board->replay) { IOLog("RedNavi: replay: no register table for this board\n"); return; }
+    const RNReplayReg *const replay = board->replay;
+    const uint32_t replayCount = board->replay_count;
     uint32_t base[4] = {};
     for (uint32_t i = 0; i < 4; i++) if (!ipBase(kRNHwIdDmu, &base[i], i)) { IOLog("RedNavi: replay: no DMU base %u\n", i); return; }
     uint32_t regLen = static_cast<uint32_t>(regs->getLength());
@@ -1199,7 +1203,8 @@ void RedNaviProbe::dcnReplay() {
         RN_STEP("RedNavi: replay group %u: %s\n", g, names[g]);
         if (liveSwitch) { char t[40]; snprintf(t, sizeof(t), "live: replay group %u", g); trace(t); }
         if (g == 13 && !liveSwitch) { RN_STEP("RedNavi: replay: writing the scanout image to VRAM\n"); fillScanout(); RN_STEP("RedNavi: replay: scanout image written\n"); }
-        for (const RNReplayReg &r : kRNReplay) {
+        for (uint32_t ri = 0; ri < replayCount; ri++) {
+            const RNReplayReg &r = replay[ri];
             if (r.group != g) continue;
             uint32_t off = (base[r.baseIdx] + r.dword) * 4;
             if (off + 4 > regLen) { IOLog("RedNavi: replay: %s outside the BAR\n", r.name); continue; }
@@ -1210,7 +1215,8 @@ void RedNaviProbe::dcnReplay() {
             for (; ms < 200; ms++) { if (rd(ctl) & (1u << 16)) break; IOSleep(1); }
             RN_STEP("RedNavi: replay: OTG_CONTROL = 0x%08x after %u ms\n", rd(ctl), ms);
         }
-        for (const RNReplayReg &r : kRNReplay) {                            // read back, ignoring status bits
+        for (uint32_t ri = 0; ri < replayCount; ri++) {
+            const RNReplayReg &r = replay[ri];                            // read back, ignoring status bits
             if (r.group != g) continue;
             uint32_t v = rd((base[r.baseIdx] + r.dword) * 4), want = valueFor(r);
             if (v != want) {
@@ -1229,7 +1235,8 @@ void RedNaviProbe::dcnReplay() {
     // Second pass: a few registers (line buffer partitions) do not take a write made early in the sequence. Write the
     // ones that read back wrong once more, now that the pipe runs.
     uint32_t fixed = 0;
-    for (const RNReplayReg &r : kRNReplay) {
+    for (uint32_t ri = 0; ri < replayCount; ri++) {
+        const RNReplayReg &r = replay[ri];
         if (r.group > maxGroup) continue;
         uint32_t want = valueFor(r), off = (base[r.baseIdx] + r.dword) * 4;
         if (off + 4 > regLen || rd(off) == want) continue;
@@ -2060,40 +2067,42 @@ class IOAccelRedNaviClient : public IOUserClient {
         else if (point > s.tlValue) s.tlValue = point;
     }
     // INFO queries (DRM_AMDGPU_INFO), answered in the caller's buffer, min(size, what the query returns) bytes as Linux does. The device info, the IP info and
-    // the firmware versions are what the Linux kernel answered on this card (RedNavi/linux_info_navi32.h, tools/linux_amdgpu_info_raw.py), with the one thing the
+    // the firmware versions are what the Linux kernel answered on this card (the drm_info of its row in RedNavi/asic.cpp, tools/linux_amdgpu_info_raw.py), with the one thing the
     // kext does differently: it submits to one compute queue only. What it cannot say yet is refused (kIOReturnUnsupported): the timestamp, the sensors, the video
     // and user-queue queries.
     static void putOut(void *out, uint32_t outSize, const void *v, size_t n) { memcpy(out, v, n < outSize ? n : outSize); }
     IOReturn infoQuery(const drm_amdgpu_info *r, void *out, uint32_t outSize) {
         memset(out, 0, outSize);
+        const struct rn_drm_info *li = gpuOwner->asic ? gpuOwner->asic->drm_info : nullptr;
+        if (!li) return kIOReturnUnsupported;                                // a card outside the ASIC table: nothing to answer with
         const uint64_t gttTotal = gpuOwner->boBudget, gttUsed = gpuOwner->boBytes;      // the host memory that can be wired for buffers, and what is
         switch (r->query) {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
-        case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, kRNLinuxDevInfo, sizeof(kRNLinuxDevInfo)); return kIOReturnSuccess;
+        case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, li->dev_info, li->dev_info_size); return kIOReturnSuccess;
         case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue (Linux says 4 compute, 1 graphics, 2 SDMA)
             const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : (r->query_hw_ip.type == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk) ? 1 : 0;
             putOut(out, outSize, &v, sizeof(v));
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_HW_IP_INFO: {
-            uint8_t ip[sizeof(kRNLinuxHwIpInfo[0])];
+            uint8_t ip[sizeof(li->hw_ip_info[0])];
             memset(ip, 0, sizeof(ip));
             if (r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE && r->query_hw_ip.ip_instance == 0) {
-                memcpy(ip, kRNLinuxHwIpInfo[AMDGPU_HW_IP_COMPUTE], sizeof(ip));
+                memcpy(ip, li->hw_ip_info[AMDGPU_HW_IP_COMPUTE], sizeof(ip));
                 reinterpret_cast<drm_amdgpu_info_hw_ip *>(ip)->available_rings = 1;       // Linux: 0xf, four compute rings
             }
             if (r->query_hw_ip.type == AMDGPU_HW_IP_GFX && r->query_hw_ip.ip_instance == 0 && gpuOwner->gfxQueueOk) {
-                memcpy(ip, kRNLinuxHwIpInfo[AMDGPU_HW_IP_GFX], sizeof(ip));                 // one graphics ring, as Linux (available_rings 1)
+                memcpy(ip, li->hw_ip_info[AMDGPU_HW_IP_GFX], sizeof(ip));                 // one graphics ring, as Linux (available_rings 1)
             }
             putOut(out, outSize, ip, sizeof(ip));
             return kIOReturnSuccess;
         }
         case AMDGPU_INFO_FW_VERSION: {
-            for (uint32_t i = 0; i < kRNLinuxFwCount; i++) {
-                if (kRNLinuxFw[i].type != r->query_fw.fw_type) continue;
+            for (uint32_t i = 0; i < li->fw_count; i++) {
+                if (li->fw[i].type != r->query_fw.fw_type) continue;
                 drm_amdgpu_info_firmware f;
-                f.ver = kRNLinuxFw[i].version;
-                f.feature = kRNLinuxFw[i].feature;
+                f.ver = li->fw[i].version;
+                f.feature = li->fw[i].feature;
                 putOut(out, outSize, &f, sizeof(f));
                 return kIOReturnSuccess;
             }
@@ -2143,9 +2152,10 @@ class IOAccelRedNaviClient : public IOUserClient {
         }
         case AMDGPU_INFO_GTT_USAGE: putOut(out, outSize, &gttUsed, sizeof(gttUsed)); return kIOReturnSuccess;
         case AMDGPU_INFO_MAX_IBS: {                                          // IBs per submit, one value per IP type: a submit of the kext takes one IB (Linux: 192, 125, 49, ...)
-            uint32_t v[sizeof(kRNLinuxMaxIbs) / sizeof(kRNLinuxMaxIbs[0])];
-            for (uint32_t i = 0; i < sizeof(v) / sizeof(v[0]); i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE || (i == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk)) ? 1 : 0;
-            putOut(out, outSize, v, sizeof(v));
+            uint32_t v[16];
+            const uint32_t nIbs = li->max_ibs_count < 16 ? li->max_ibs_count : 16;
+            for (uint32_t i = 0; i < nIbs; i++) v[i] = (i == AMDGPU_HW_IP_COMPUTE || (i == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk)) ? 1 : 0;
+            putOut(out, outSize, v, nIbs * sizeof(v[0]));
             return kIOReturnSuccess;
         }
         default:
@@ -3812,10 +3822,9 @@ bool RedNaviProbe::start(IOService *provider) {
     // Anything that is not in the table (the RX 7600, 1002:7480, for example) only gets the table and the VBIOS dumped: every register
     // number and firmware below belongs to the ASICs of the table, and nothing here has been checked on another die.
     dumpDiscovery();
-    const struct rn_asic_board *board = nullptr;
     uint16_t pciDevice = pci->configRead16(kIOPCIConfigDeviceID);
-    const struct rn_asic *asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board) : nullptr;
-    publishAsic(asic, board);
+    asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board) : nullptr;
+    publishAsic();
     if (!asic) {
         IOLog("RedNavi: device 0x%04x is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice);
         dumpVbios();

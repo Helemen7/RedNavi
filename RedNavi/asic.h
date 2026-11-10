@@ -20,19 +20,40 @@ struct rn_ip_version {
     uint8_t major, minor, rev;
 };
 
+// What the Linux driver answered to DRM_AMDGPU_INFO on an ASIC (tools/linux_amdgpu_info_raw.py, tools/gen_linux_info_header.py).
+// The user client answers RADV with it.
+struct rn_drm_fw {
+    uint32_t type, version, feature;
+};
+struct rn_drm_info {
+    const uint8_t *dev_info;              // DEV_INFO
+    uint32_t dev_info_size;
+    const uint32_t *hw_ip_count;          // HW_IP_COUNT, one per IP type (10)
+    const uint8_t (*hw_ip_info)[40];      // HW_IP_INFO of instance 0, one per IP type (10)
+    const struct rn_drm_fw *fw;           // FW_VERSION
+    uint32_t fw_count;
+    const uint32_t *max_ibs;              // MAX_IBS, one per IP type
+    uint32_t max_ibs_count;
+};
+
+struct RNReplayReg;           // RedNavi/dcn_replay.h
+
 // One board of an ASIC that somebody has run the driver on.
 struct rn_asic_board {
     uint16_t pci_device;      // PCI device ID (vendor 0x1002); 0 ends the list
     const char *model;        // name System Information shows
     uint32_t vram_mb;         // "VRAM,totalMB" property of the PCI node
+    const struct RNReplayReg *replay;   // display registers of one lit pipe on this board, in programming order (dcnReplay)
+    uint32_t replay_count;
 };
 
 struct rn_asic {
     const char *name;                         // name of the die
     struct rn_ip_version gc, dcn, mp0, mp1, sdma;   // what the IP discovery table must say (GC, DMU, MP0, MP1, SDMA0)
     const struct rn_asic_board *boards;       // boards verified on hardware
-    // What the code paths of this ASIC were built from. Documentation for now: these are compiled in, the strings are
-    // published in the "asic" property so a report shows which ones a build used.
+    const struct rn_drm_info *drm_info;       // answers of the DRM_AMDGPU_INFO queries
+    // What the code paths of this ASIC were built from. Names only: the firmware and the register headers are compiled in
+    // and not selected through the row yet. Published in the "asic" property so a report shows which ones a build used.
     const char *firmware;                     // linux-firmware files (amdgpu/), separated by spaces
     const char *reg_headers;                  // generated register headers and the Linux headers they come from
     const char *dev_info;                     // the DRM_AMDGPU_INFO answers of the Linux driver on this ASIC

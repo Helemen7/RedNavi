@@ -20,7 +20,12 @@ It holds the five versions the probe read (`gc`, `dcn`, `mp0`, `mp1`, `sdma`) an
 
 State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The read-only path for a card outside the table is host-tested only (`tests/host/asic_test.cpp`); it has not run on such a card since the change (unverified).
 
-Not done yet: the row's `firmware`, `reg_headers`, `dev_info` and `display_ref` fields are names, not data the code selects from. The register headers, the firmware headers and the display replay are compiled in for Navi 32, and the code that uses them does not look at the row. So a second row is not enough to run another die: the Navi 32 constants listed below have to move behind the row first, one block at a time. Issue #7 tracks this.
+Selected through the row (built and host-tested, not yet run on the card: unverified on hardware):
+
+- the `DRM_AMDGPU_INFO` answers (`drm_info` of the row, generated into `RedNavi/linux_info_<name>.h`). A card outside the table gets `kIOReturnUnsupported` for these queries;
+- the display replay table (`replay` of the board, `RedNavi/dcn_replay.h`).
+
+Not done yet: the row's `firmware` and `reg_headers` fields are names, not data the code selects from. The register headers and the firmware headers are compiled in for Navi 32, and the code that uses them does not look at the row. So a second row is not enough to run another die: the Navi 32 constants listed below have to move behind the row first, one block at a time, each with a boot on the RX 7800 XT that shows nothing changed. Issue #7 tracks this.
 
 Navi 32 constants still outside the table:
 
@@ -29,9 +34,8 @@ Navi 32 constants still outside the table:
 | GC and SDMA register offsets | `RedNavi/gc_regs.h` (generated from the `gc_11_0_3` headers) | GC version. The memory hub registers differ between 11.0.0 and 11.0.3 |
 | Display register offsets | `RedNavi/dcn_reglist.h`, offsets in `kern_probe.cpp` | DCN 3.2.0 |
 | Firmware | `RedNavi/psp_fw.h`, `smu_fw.h`, `gc_fw.h`, `dmub_fw.h` (generated locally, git-ignored) | PSP, SMU, GC, SDMA and DCN versions |
-| Display replay | `RedNavi/dcn_replay.h` | One Linux capture: 1920x1080 at 60 Hz, DisplayPort on DIG4 / UNIPHY2 / AUX 0x94, 4 lanes |
-| Connector path | `kern_probe.cpp` (`dpInit`, `probeAux`, `dpTrain`) | The board, not the die |
-| `DRM_AMDGPU_INFO` answers | `RedNavi/linux_info_navi32.h` | What Linux answered on this card |
+| Display replay generator | `tools/gen_dcn_replay.py` (its register list and the output name `kRNReplay`) | DCN 3.2, pipe 0 on DIG4 / DP4. The table it writes is selected through the board; a second board needs its own symbol name |
+| Connector path | `kern_probe.cpp` (`dpInit`, `probeAux`, `dpTrain`: AUX channel 4, DIG4, UNIPHY2, 4 lanes as literal numbers) | The board, not the die |
 | MES, doorbell and memory layout constants | `RedNavi/gfx11.cpp`, `kern_probe.cpp` | GC 11.0.3 with MES; the VRAM offsets assume 16 GB |
 | Accelerator match | `RedNaviAccel2/Info.plist.in` | PCI device ID |
 
@@ -81,7 +85,7 @@ Follow the order of `docs/ROADMAP.md`. Every stage that writes to the card is be
 3. DMCUB: `tools/gen_dmub_fw_header.py` with your `dcn_*_dmcub.bin`. `docs/DMUB_BRINGUP.md`.
 4. Display: your own pipe capture (`tools/linux_dcn_pipe_dump.py`) and a replay table generated from it (`tools/gen_dcn_replay.py`). `docs/DP_BRINGUP.md`, `docs/DC_PLAN.md`.
 5. GC, SDMA, MES: register headers generated from the Linux headers of your GC version (`tools/gen_gc_regs.py` with `tools/gc_regs_spec.txt`), firmware with `tools/gen_gc_fw_header.py`. `docs/COMPAT.md`.
-6. `DRM_AMDGPU_INFO`: `tools/gen_linux_info_header.py` on your `amdgpu_info_raw.txt`.
+6. `DRM_AMDGPU_INFO`: `python3 tools/gen_linux_info_header.py amdgpu_info_raw.txt RedNavi/linux_info_<name>.h <name>`, then point the row's `drm_info` at `kRNLinuxInfo_<name>`.
 
 Firmware headers are generated on your machine and never committed. Register headers are generated and committed together with the command that produced them; do not edit them by hand and do not copy the Linux headers into the repository.
 
