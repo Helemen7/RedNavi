@@ -101,6 +101,7 @@
 #include "splash_1920x1080.h"
 #include "linux_info_navi32.h"
 #include "gc_regs.h"
+#include "asic.h"
 
 #ifdef RN_HAVE_PSP_FW
 #include "psp_fw.h"
@@ -415,6 +416,7 @@ private:
 
     void dumpPci();
     void dumpDiscovery();
+    void publishAsic(const struct rn_asic *asic, const struct rn_asic_board *board);
     void dumpVbios();
     void loadDmcub();
     void loadSmuFw();
@@ -560,27 +562,45 @@ bool RedNaviProbe::ipBase(uint16_t hwId, uint32_t *base, uint32_t idx) {
     auto u16 = [&](uint32_t o) -> uint32_t { return o + 2 <= len ? static_cast<uint32_t>(b[o] | (b[o + 1] << 8)) : 0u; };
     auto u32 = [&](uint32_t o) -> uint32_t { return o + 4 <= len ? u16(o) | (u16(o + 2) << 16) : 0; };
 
-    if (u16(4) >= 2) return false;                       // binary header v2 has another table layout
-    uint32_t ipOff = u16(12);                            // table_list[0].offset (IP_DISCOVERY)
-    uint32_t numDies = u16(ipOff + 12);
-    bool base64 = u16(ipOff + 4) == 4 && (ipOff + 78 < len) && (b[ipOff + 78] & 1);
-    if (numDies > 16) numDies = 16;
+    bool base64 = false;
+    uint32_t pos = rn_disc_find_ip(b, len, hwId, &base64);
+    if (!pos || idx >= b[pos + 3]) return false;
+    if (base64 && u32(pos + 8 + idx * 8 + 4) != 0) return false;   // above 4 GB, not a register offset we can use
+    *base = u32(pos + 8 + idx * (base64 ? 8 : 4));
+    return true;
+}
 
-    for (uint32_t d = 0; d < numDies; d++) {
-        uint32_t pos = u16(ipOff + 14 + d * 4 + 2);      // die_info[d].die_offset, absolute
-        uint32_t numIps = u16(pos + 2);
-        pos += 4;
-        for (uint32_t i = 0; i < numIps && pos + 8 <= len; i++) {
-            uint32_t nbase = b[pos + 3];
-            if (u16(pos) == hwId && b[pos + 2] == 0 && idx < nbase) {
-                if (base64 && u32(pos + 8 + idx * 8 + 4) != 0) return false;   // above 4 GB, not a register offset we can use
-                *base = u32(pos + 8 + idx * (base64 ? 8 : 4));
-                return true;
-            }
-            pos += 8 + nbase * (base64 ? 8 : 4);
-        }
+// The "asic" property: which row of the ASIC table the card matched, and the IP versions the lookup read. A card that matched
+// no row still gets the versions, which is what a new row is written from (docs/ADDING_A_GPU.md).
+void RedNaviProbe::publishAsic(const struct rn_asic *asic, const struct rn_asic_board *board) {
+    OSDictionary *out = OSDictionary::withCapacity(12);
+    if (!out) return;
+    auto str = [&](const char *key, const char *value) {
+        OSString *s = OSString::withCString(value);
+        if (s) { out->setObject(key, s); s->release(); }
+    };
+    static const struct { const char *key; uint16_t hwId; } kBlocks[] = {
+        {"gc", RN_HWID_GC}, {"dcn", RN_HWID_DMU}, {"mp0", RN_HWID_MP0}, {"mp1", RN_HWID_MP1}, {"sdma", RN_HWID_SDMA0},
+    };
+    for (const auto &blk : kBlocks) {
+        struct rn_ip_version v;
+        char text[16];
+        if (disc && rn_disc_ip_version(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), blk.hwId, &v))
+            snprintf(text, sizeof(text), "%u.%u.%u", v.major, v.minor, v.rev);
+        else
+            snprintf(text, sizeof(text), "not found");
+        str(blk.key, text);
     }
-    return false;
+    str("name", asic ? asic->name : "not in the table");
+    if (asic) {
+        str("model", board->model);
+        str("firmware", asic->firmware);
+        str("reg-headers", asic->reg_headers);
+        str("dev-info", asic->dev_info);
+        str("display-ref", asic->display_ref);
+    }
+    setProperty("asic", out);
+    out->release();
 }
 
 void RedNaviProbe::dumpRegs(const RNMailboxReg *list, size_t count, const char *property) {
@@ -3788,11 +3808,16 @@ bool RedNaviProbe::start(IOService *provider) {
     for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
     ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
 
-    // Anything but the RX 7800 XT (1002:747E, e.g. the RX 7600, 1002:7480) only gets the table and the VBIOS: every register number
-    // and firmware below is Navi 32's, and nothing here has been checked on another die.
-    if (pci->configRead16(kIOPCIConfigDeviceID) != 0x747E) {
-        IOLog("RedNavi: device 0x%04x is not a Navi 32, read-only: IP discovery and VBIOS only\n", pci->configRead16(kIOPCIConfigDeviceID));
-        dumpDiscovery();
+    // The card is looked up once in the ASIC table (RedNavi/asic.cpp) by the versions in its IP discovery table and its PCI device ID.
+    // Anything that is not in the table (the RX 7600, 1002:7480, for example) only gets the table and the VBIOS dumped: every register
+    // number and firmware below belongs to the ASICs of the table, and nothing here has been checked on another die.
+    dumpDiscovery();
+    const struct rn_asic_board *board = nullptr;
+    uint16_t pciDevice = pci->configRead16(kIOPCIConfigDeviceID);
+    const struct rn_asic *asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board) : nullptr;
+    publishAsic(asic, board);
+    if (!asic) {
+        IOLog("RedNavi: device 0x%04x is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice);
         dumpVbios();
         registerService();
         return true;
@@ -3800,15 +3825,13 @@ bool RedNaviProbe::start(IOService *provider) {
 
     // System Information reads the GPU name and VRAM size from these properties of the PCI node.
     {
-        static const char kName[] = "AMD Radeon RX 7800 XT";
-        uint32_t vramMb = 16384;
-        OSData *m = OSData::withBytes(kName, sizeof(kName));
+        uint32_t vramMb = board->vram_mb;
+        OSData *m = OSData::withBytes(board->model, static_cast<unsigned int>(strlen(board->model) + 1));
         OSData *v = OSData::withBytes(&vramMb, sizeof(vramMb));
         if (m) { pci->setProperty("model", m); m->release(); }
         if (v) { pci->setProperty("VRAM,totalMB", v); v->release(); }
     }
 
-    dumpDiscovery();
     dumpVbios();
     dumpRegs(kRNMailboxRegs, sizeof(kRNMailboxRegs) / sizeof(kRNMailboxRegs[0]), "mailbox-regs");
     dumpRegs(kRNMmhubRegs, sizeof(kRNMmhubRegs) / sizeof(kRNMmhubRegs[0]), "mmhub-regs");

@@ -71,7 +71,7 @@ Say what ran on hardware and what did not.
 
 ## Support for other chips
 
-The development target is the RX 7800 XT (Navi 32, `1002:747E`). Support for another chip is welcome in `main` under these conditions:
+The development target is the RX 7800 XT (Navi 32, `1002:747E`). `docs/ADDING_A_GPU.md` describes the steps, from the Linux capture to the row in the ASIC table. Support for another chip is welcome in `main` under these conditions:
 
 - You own the hardware and have run the code on it. Commit the evidence first: the IP discovery table and the `ioreg` properties of the probe from your machine, and, when possible, the Linux reference dumps (`tools/linux_collect.py`), in `docs/logs/<chip>/`.
 - You stay reachable as the person who tests that chip. The maintainers cannot test it, and code nobody can test will be removed when it gets in the way.
