@@ -1,6 +1,10 @@
 # RedNavi: notes for coding agents and contributors
 
 Native macOS display driver for the AMD Radeon RX 7800 XT (Navi 32, RDNA 3, PCI `1002:747E`). Read `README.md` for the state, then `docs/ARCHITECTURE.md`, `docs/ROADMAP.md`, `docs/TEST_MACHINES.md` and the bring-up notes in `docs/`.
+Edit: Not RX 7800XT but Ryzen AI Max+ 395 APU w/ Radeon 8060s Graphics iGPU (RDNA 3.5)
+ROG Flow Z13 2025 GZ302EA-DRU161W
+- Ryzen AI Max+ 395 w/ Radeon 8060s Graphics
+- 128Gb LPDDX5X UMA 8000MHz 256bit-bus 256GB/s
 
 ## Layout
 
@@ -48,3 +52,10 @@ make test                   # host tests for the compat layer
 ## Safety
 
 The probe writes to a real GPU from the kernel and can hang the machine. Test on a system whose display does not depend on this card, keep SSH enabled, and keep a USB copy of the OpenCore EFI without the kexts.
+
+
+## Windows binaries for gfx1151/ROG Flow Z13
+- ROCm GFX1151 sources "C:\Users\Naessah\AppData\Local\Bubo\runtime\rocm-10.0.0-gfx1151"
+- G-Helper sources (Asus Management for ROG Flow Z13) : "D:\GIT\g-helper"
+- Reverse Engineering Anything "D:\GIT\RedNavi\skills\rea"
+- Ghidra "D:\AI_Stack\Tools\Ghidra"

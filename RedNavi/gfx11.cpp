@@ -129,9 +129,7 @@ void rn_gart_map_page(struct rn_device *adev, const struct rn_gmc *gmc, u32 page
 // The user VMIDs (1 and up, the ones the MES does not own): a page table each in VRAM. Linux's setup_vmid_config (gmc_v11_0: amdgpu_vm_adjust_size(256 TB, 9, 3, 48))
 // gives them PAGE_TABLE_DEPTH 3 and PAGE_TABLE_BLOCK_SIZE 0 over the 48-bit space: three directory levels of 512 entries (PDB2, PDB1, PDB0) above 512-entry page tables.
 void rn_vm_enable_contexts(struct rn_device *adev, u64 startVa, u64 endVa, u32 depth, u32 firstVmid, u32 lastVmid) {
-    u32 tmp = RREG32_SOC15(RN_GC, 0, regCP_DEBUG);                           // gfxhub_v3_0_set_fault_enable_default(true): the CP keeps going after a fault, faults go to the default page
-    tmp = REG_SET_FIELD(tmp, CP_DEBUG, CPG_UTCL1_ERROR_HALT_DISABLE, 1);
-    WREG32_SOC15(RN_GC, 0, regCP_DEBUG, tmp);
+    u32 tmp = 0;
     tmp = RREG32_SOC15(RN_GC, 0, regGCVM_L2_PROTECTION_FAULT_CNTL);
     tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, RANGE_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
     tmp = REG_SET_FIELD(tmp, GCVM_L2_PROTECTION_FAULT_CNTL, PDE0_PROTECTION_FAULT_ENABLE_DEFAULT, 1);
@@ -696,13 +694,12 @@ void rn_doorbell_aperture_enable(struct rn_device *adev, int writeS2a, u32 befor
 // Tells the compute queue (selected by grbmSelect) that the ring now ends at wptr dwords.
 static void computeSubmit(struct rn_device *adev, u64 wptrShadowOff, u32 wptr) {
     gComputeWptr = wptr;
-    if (gDoorbellBase) {
-        *reinterpret_cast<volatile u64 *>(gDoorbellBase + gDoorbellDword * 4) = wptr;     // the doorbell carries the wptr
-        return;
-    }
-    rn_vram_wr32(adev, wptrShadowOff, wptr);                                 // the polled shadow as well as the register
+    rn_vram_wr32(adev, wptrShadowOff, wptr);
     WREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_LO, wptr);
     WREG32_SOC15(RN_GC, 0, regCP_HQD_PQ_WPTR_HI, 0);
+    if (gDoorbellBase) {
+        *reinterpret_cast<volatile u64 *>(gDoorbellBase + gDoorbellDword * 4) = wptr;
+    }
 }
 
 // What gfx_v11_0_hw_init does between the memory hub and the CP resume and RedNavi had skipped (gfx_v11_0_init_golden_registers, gfx_v11_0_constants_init
@@ -774,6 +771,13 @@ void rn_gfx_constants_init(struct rn_device *adev) {
     WREG32_SOC15(RN_GC, 0, regCP_ME_CNTL, tmp);
     udelay(50);
 }
+void rn_cp_me_unhalt(struct rn_device *adev) {
+    u32 tmp = RREG32_SOC15(RN_GC, 0, regCP_ME_CNTL);
+    tmp = REG_SET_FIELD(tmp, CP_ME_CNTL, ME_HALT, 0);
+    tmp = REG_SET_FIELD(tmp, CP_ME_CNTL, PFP_HALT, 0);
+    WREG32_SOC15(RN_GC, 0, regCP_ME_CNTL, tmp);
+    udelay(50);
+}
 
 // gfx_v11_0_cp_compute_enable(true): the four MEC pipes out of reset and active, ucode cache valid, MEC running.
 void rn_mec_enable(struct rn_device *adev) {
@@ -815,9 +819,9 @@ void rn_compute_ring_test(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 r
     WREG32_SOC15(RN_GC, 0, regSCRATCH_REG0, 0xBADC0DE0u);
 
     // gfx_v11_0_compute_mqd_init values, written like gfx_v11_0_kiq_init_register
-    grbmSelect(adev, 1, 0, 0, 2);
+    grbmSelect(adev, 1, 0, 0, 0);
     tmp = RREG32_SOC15(RN_GC, 0, regCP_PQ_WPTR_POLL_CNTL);                    // wptr polling on unless there is a doorbell
-    tmp = REG_SET_FIELD(tmp, CP_PQ_WPTR_POLL_CNTL, EN, gDoorbellBase ? 0 : 1);
+    tmp = REG_SET_FIELD(tmp, CP_PQ_WPTR_POLL_CNTL, EN, 1);
     WREG32_SOC15(RN_GC, 0, regCP_PQ_WPTR_POLL_CNTL, tmp);
     WREG32_SOC15(RN_GC, 0, regCP_HQD_ACTIVE, 0);
     const u64 eopBase = (vaBase + eopOff) >> 8;
@@ -1013,7 +1017,7 @@ void rn_compute_dispatch_test(struct rn_device *adev, u64 vaBase, u64 ringOff, u
 
     const u32 start = 8;                                                     // after the SCRATCH_REG0 packet of the first test
     for (u32 i = 0; i < n; i++) rn_vram_wr32(adev, ringOff + (start + i) * 4, ring[i]);
-    grbmSelect(adev, 1, 0, 0, 2);
+    grbmSelect(adev, 1, 0, 0, 0);
     computeSubmit(adev, wptrOff, start + n);
     res->step = 2;
     if (waitDone) {                                                          // no fence polling: the caller waits for the interrupt
@@ -1272,7 +1276,7 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
     }
     const u32 w = gComputeWptr;
     for (u32 i = 0; i < n; i++) rn_vram_wr32(adev, ringOff + ((w + i) & mask) * 4, pk[i]);
-    grbmSelect(adev, 1, 0, 0, 2);
+    grbmSelect(adev, 1, 0, 0, 0);
     computeSubmit(adev, wptrOff, w + n);
     grbmSelect(adev, 0, 0, 0, 0);
     return 0;

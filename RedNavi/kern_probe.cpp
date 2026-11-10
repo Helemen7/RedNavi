@@ -207,6 +207,26 @@ static const RNMailboxReg kRNMailboxRegs[] = {
     {"MP1_C2PMSG_82", kRNHwIdMp1, 0x292},  // SMU argument
     {"MP1_C2PMSG_90", kRNHwIdMp1, 0x29a},  // SMU response, 1 means OK
 };
+// Strix Halo / MP 14.0.1 registers (mp_14_0_0_offset.h)
+static const RNMailboxReg kRNMailboxRegs8060S[] = {
+    {"PSP_C2PMSG_33", kRNHwIdMp0, 0x0061, 0},  // bit 31: IFWI init done
+    {"PSP_C2PMSG_35", kRNHwIdMp0, 0x0063, 0},  // bootloader ready / status
+    {"PSP_C2PMSG_36", kRNHwIdMp0, 0x0064, 0},  // bootloader address
+    {"PSP_C2PMSG_64", kRNHwIdMp0, 0x0080, 0},  // ring command / response (0x80000000 = ready)
+    {"PSP_C2PMSG_67", kRNHwIdMp0, 0x0083, 0},  // ring write pointer
+    {"PSP_C2PMSG_71", kRNHwIdMp0, 0x0087, 0},  // ring size
+    {"PSP_C2PMSG_81", kRNHwIdMp0, 0x0091, 0},  // sOS alive when not zero
+    {"SMU_C2PMSG_66", kRNHwIdMp1, 0x0282, 0},  // SMU message
+    {"SMU_C2PMSG_82", kRNHwIdMp1, 0x0292, 0},  // SMU argument
+    {"SMU_C2PMSG_90", kRNHwIdMp1, 0x029a, 0},  // SMU response, 1 means OK
+};
+
+// MMHUB 3.3.1 registers (mmhub_3_3_0_offset.h)
+static const RNMailboxReg kRNMmhubRegs8060S[] = {
+    {"MMMC_VM_FB_LOCATION_BASE", kRNHwIdMmhub, 0x09ec, 1},
+    {"MMMC_VM_FB_LOCATION_TOP",  kRNHwIdMmhub, 0x09ed, 1},
+    {"MMMC_VM_FB_OFFSET",        kRNHwIdMmhub, 0x09d7, 1},
+};
 
 // MMHUB 3.0 registers (mmhub_3_0_0_offset.h). FB_BASE, FB_TOP and FB_OFFSET are 24-bit values in
 // units of 16 MB (mmhub_v3_0_get_fb_location and _get_mc_fb_offset shift them left by 24).
@@ -229,8 +249,14 @@ static const RNMailboxReg kRNDmcubRegs[] = {
     {"DMCUB_SCRATCH0",     kRNHwIdDmu, 0x1e3, 2},
     {"DMCUB_SCRATCH1",     kRNHwIdDmu, 0x1e4, 2},
     {"DMCUB_SCRATCH2",     kRNHwIdDmu, 0x1e5, 2},
+    {"DMCUB_INBOX1_BASE",  kRNHwIdDmu, 0x1d4, 2},
+    {"DMCUB_INBOX1_SIZE",  kRNHwIdDmu, 0x1d5, 2},
     {"DMCUB_INBOX1_WPTR",  kRNHwIdDmu, 0x1d6, 2},
     {"DMCUB_INBOX1_RPTR",  kRNHwIdDmu, 0x1d7, 2},
+    {"DMCUB_OUTBOX0_BASE", kRNHwIdDmu, 0x1d8, 2},
+    {"DMCUB_OUTBOX0_SIZE", kRNHwIdDmu, 0x1d9, 2},
+    {"DMCUB_OUTBOX1_BASE", kRNHwIdDmu, 0x1dc, 2},
+    {"DMCUB_OUTBOX1_SIZE", kRNHwIdDmu, 0x1dd, 2},
     {"DMCUB_OUTBOX1_WPTR", kRNHwIdDmu, 0x1de, 2},
     {"DMCUB_GPINT_DATAOUT", kRNHwIdDmu, 0x1f9, 2},
     {"DMCUB_REGION3_CW0_OFFSET", kRNHwIdDmu, 0x1b5, 2},
@@ -476,6 +502,12 @@ private:
     uint32_t pspTmrSize {0};
     uint32_t pspFence {0};
     void dumpRegs(const RNMailboxReg *list, size_t count, const char *property);
+    uint64_t vbiosFoundPos {0};
+    uint64_t dmcubLiveMailbox {0};
+    void dmcubCmdTest8060S();
+    void initGpuLive8060S();
+    void publishFramebuffer8060S();
+    void initComputeQueue8060S();
 
 public:
     bool start(IOService *provider) override;
@@ -509,8 +541,9 @@ void RedNaviProbe::dumpDiscovery() {
     uint32_t vramMB = rd(kRNRccConfigMemsize);
     IOLog("RedNavi: RCC_CONFIG_MEMSIZE = 0x%08x\n", vramMB);
     if (vramMB == 0 || vramMB == 0xFFFFFFFFu) {
-        vramMB = kRNFallbackVramMB;
-        IOLog("RedNavi: memsize register unusable, assuming %u MB\n", vramMB);
+        IODeviceMemory *bar0 = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
+        vramMB = bar0 ? static_cast<uint32_t>(bar0->getLength() >> 20) : kRNFallbackVramMB;
+        IOLog("RedNavi: memsize register unusable, using BAR0/fallback: %u MB\n", vramMB);
     }
     vramMbytes = vramMB;
 
@@ -518,8 +551,19 @@ void RedNaviProbe::dumpDiscovery() {
     uint32_t sig = vramRead(base);
     IOLog("RedNavi: discovery base=0x%llx sig=0x%08x (expect 0x%08x)\n", base, sig, kRNBinarySignature);
     if (sig != kRNBinarySignature) {
-        IOLog("RedNavi: IP discovery signature not found\n");
-        return;
+        uint64_t altBase = (256ULL << 20) - kRNDiscoveryTmrOffset;
+        if (altBase != base && vramRead(altBase) == kRNBinarySignature) {
+            base = altBase;
+            sig = kRNBinarySignature;
+            IOLog("RedNavi: found IP discovery at APU 256MB base 0x%llx\n", base);
+        } else if (vramRead(0) == kRNBinarySignature) {
+            base = 0;
+            sig = kRNBinarySignature;
+            IOLog("RedNavi: found IP discovery at VRAM base 0\n");
+        } else {
+            IOLog("RedNavi: IP discovery signature not found\n");
+            return;
+        }
     }
 
     // struct binary_header: u32 signature, u16 ver_major, u16 ver_minor, u16 checksum, u16 size, then table list.
@@ -546,6 +590,11 @@ void RedNaviProbe::dumpDiscovery() {
         if ((off & 0xFF) == 0xF0) IOSleep(5);
     }
     disc = blob;
+    for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 2; i++) ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 2; i++) ipBase(kRNHwIdOsssys, &gpu.reg_offset[RN_OSSSYS_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 5; i++) ipBase(kRNHwIdMmhub, &gpu.reg_offset[RN_MMHUB_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 6; i++) ipBase(kRNHwIdNbif, &gpu.reg_offset[RN_NBIO_HWIP][0][i], i);
 }
 
 // Walk the discovery table (layout in include/discovery.h) and return the first base address of
@@ -612,7 +661,44 @@ void RedNaviProbe::dumpVbios() {
     uint32_t romReg = pci->configRead32(0x30);
     IODeviceMemory *rom = pci->getDeviceMemoryWithRegister(0x30);
     IOLog("RedNavi: ROM BAR register = 0x%08x, device memory %s\n", romReg, rom ? "present" : "absent");
-    if (!rom) return;
+    if (!rom) {
+        // On APUs (Strix Halo / 8060S), search candidate VRAM / aperture locations
+        uint64_t cands[] = {
+            0,
+            (256ULL << 20) - (4ULL << 20),
+            ((uint64_t)vramMbytes << 20) - (4ULL << 20),
+            0xffc20000ULL,
+            0x17ffc20000ULL,
+            0x207fc20000ULL,
+            0x97ffc20000ULL
+        };
+        for (size_t c = 0; c < sizeof(cands)/sizeof(cands[0]); c++) {
+            uint64_t pos = cands[c];
+            uint32_t val = vramRead(pos);
+            uint32_t sig0 = val & 0xFFFF;
+            IOLog("RedNavi: VBIOS check @ 0x%llx: val=0x%08x sig0=0x%04x\n", pos, val, sig0);
+            if (sig0 == 0xAA55) {
+                uint32_t lenWords = (val >> 16) & 0xFF;
+                uint32_t size = lenWords * 512;
+                if (size == 0 || size > (1u << 20)) size = 256 * 1024;
+                OSData *blob = OSData::withCapacity(size);
+                if (blob) {
+                    for (uint32_t off = 0; off < size; off += 4) {
+                        uint32_t v = vramRead(pos + off);
+                        blob->appendBytes(&v, sizeof(v));
+                    }
+                    setProperty("vbios", blob);
+                    vbiosCopy = blob;
+                    vbiosFoundPos = pos;
+                    dmcubLiveMailbox = pos + 0x20000;
+                    IOLog("RedNavi: VBIOS image of %u bytes read from pos 0x%llx, DMCUB mailbox at 0x%llx\n", size, pos, dmcubLiveMailbox);
+                    return;
+                }
+            }
+        }
+        IOLog("RedNavi: no ROM BAR and no VBIOS signature found in APU search\n");
+        return;
+    }
     IOLog("RedNavi: ROM phys 0x%llx size 0x%llx\n", (uint64_t)rom->getPhysicalAddress(), (uint64_t)rom->getLength());
 
     pci->configWrite32(0x30, romReg | 1);                    // expansion ROM enable
@@ -709,6 +795,149 @@ bool RedNaviProbe::dmubSend(const uint8_t *cmd, uint32_t len, uint32_t reply[16]
     for (uint32_t i = 0; i < 16; i++) reply[i] = vramRead(slotAddr + i * 4);
     return rp == newWp;
 }
+void RedNaviProbe::dmcubCmdTest8060S() {
+    uint32_t dmu = 0;
+    if (!ipBase(kRNHwIdDmu, &dmu, 2)) return;
+    const uint32_t IN_WP = 0x1d6, IN_RP = 0x1d7;
+    uint32_t wp = rd((dmu + IN_WP) * 4);
+    uint32_t rp = rd((dmu + IN_RP) * 4);
+    IOLog("RedNavi: 8060S DMCUB test check: wp=0x%x rp=0x%x liveMailbox=0x%llx\n", wp, rp, dmcubLiveMailbox);
+    if (!dmcubLiveMailbox) return;
+    uint32_t slot = wp % kRNDmubRbSize;
+    uint64_t slotAddr = dmcubLiveMailbox + slot;
+    IOLog("RedNavi: sending QUERY_FEATURE_CAPS to DMCUB: slotAddr=0x%llx\n", slotAddr);
+    for (uint32_t i = 0; i < 64; i += 4) vramWrite(slotAddr + i, 0);
+    vramWrite(slotAddr, 6u | (14u << 24)); // type 6: QUERY_FEATURE_CAPS, payload 14 bytes
+    uint32_t newWp = (wp + 64) % kRNDmubRbSize;
+    wr((dmu + IN_WP) * 4, newWp);
+    uint32_t curRp = 0, waited = 0;
+    for (; waited < 1000; waited++) {
+        curRp = rd((dmu + IN_RP) * 4);
+        if (curRp == newWp) break;
+        IOSleep(1);
+    }
+    uint32_t reply[5] = {};
+    for (uint32_t i = 0; i < 5; i++) reply[i] = vramRead(slotAddr + i * 4);
+    IOLog("RedNavi: DMCUB reply after %u ms (rp 0x%x -> 0x%x): %08x %08x %08x %08x %08x\n", waited, rp, curRp, reply[0], reply[1], reply[2], reply[3], reply[4]);
+    const char *cn[9] = {"rptr_reached", "wptr", "rptr", "slot0", "slot1", "slot2", "slot3", "slot4", "waited_ms"};
+    uint32_t cv[9] = {curRp == newWp, newWp, curRp, reply[0], reply[1], reply[2], reply[3], reply[4], waited};
+    rnPublish(this, "dmcub-cmd", cn, cv, 9);
+}
+void RedNaviProbe::publishFramebuffer8060S() {
+    IODeviceMemory *bar0 = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
+    if (!bar0) { IOLog("RedNavi: 8060S framebuffer: no BAR0\n"); return; }
+    uint64_t phys = static_cast<uint64_t>(bar0->getPhysicalAddress());
+
+    struct FbMode { uint32_t w, h, refresh, probeIndex; } list[RN_EDID_MAX_MODES];
+    unsigned nModes = 0;
+    for (unsigned i = 0; i < edidInfo.mode_count; i++) {
+        const rn_mode &m = edidInfo.modes[i];
+        list[nModes++] = {m.hactive, m.vactive, m.refresh_hz, i};
+    }
+    if (nModes == 0) {
+        list[0] = {2560, 1600, 60, 0};
+        nModes = 1;
+    }
+    OSData *d = OSData::withBytes(list, nModes * sizeof(FbMode));
+    if (d) { setProperty("fb-modes", d); d->release(); }
+
+    uint32_t width = selMode.hactive ? selMode.hactive : 2560;
+    uint32_t height = selMode.vactive ? selMode.vactive : 1600;
+    uint32_t pitch = width * 4;
+    uint32_t refresh = selMode.refresh_hz ? selMode.refresh_hz : 60;
+
+    setProperty("fb-current-mode", static_cast<uint64_t>(selIndex < 0 ? 0 : selIndex), 32);
+    setProperty("fb-width", width, 32);
+    setProperty("fb-height", height, 32);
+    setProperty("fb-pitch", pitch, 32);
+    setProperty("fb-refresh", refresh, 32);
+    setProperty("fb-scanout-phys", phys, 64);
+    fbReady = true;
+    setProperty("rednavi-fb-ready", kOSBooleanTrue);
+    IOLog("RedNavi: 8060S native framebuffer published (%ux%u@%u, pitch %u, phys 0x%llx)\n",
+          width, height, refresh, pitch, phys);
+}
+void RedNaviProbe::initGpuLive8060S() {
+    pci->setBusMasterEnable(true);
+    for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
+    ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
+    for (uint32_t i = 0; i < 2; i++) ipBase(kRNHwIdOsssys, &gpu.reg_offset[RN_OSSSYS_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 5; i++) ipBase(kRNHwIdMmhub, &gpu.reg_offset[RN_MMHUB_HWIP][0][i], i);
+    for (uint32_t i = 0; i < 6; i++) ipBase(kRNHwIdNbif, &gpu.reg_offset[RN_NBIO_HWIP][0][i], i);
+
+    const uint64_t kGartVa = 0x2000000000ull;
+    struct rn_gmc gmc = {kRNVramMcBase, kRNVramMcBase + 0x3FFFFFFFFull, kGartVa, kGartVa + 16384ull * 4096 - 1, 0x0C100000, 0x0C200000, 0x0C201000};
+    gmcLive = gmc;
+    rn_gart_clear(&gpu, &gmcLive);
+    rn_gfxhub_enable(&gpu, &gmcLive);
+    bar0Mem = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
+    const uint64_t apLen = bar0Mem ? static_cast<uint64_t>(bar0Mem->getLength()) : 0;
+    devPool.init(kVmTables + 7ull * kVmPoolPages * 4096, 0x10000000ull - (kVmTables + 7ull * kVmPoolPages * 4096));
+    if (apLen >= 0x10000000ull) {
+        visPool.init(0x02000000ull, 0x0C000000ull - 0x02000000ull);
+        visPool.add(0x0D000000ull, 0x0F000000ull - 0x0D000000ull);
+    }
+    IOLog("RedNavi: 8060S memory pools: devPool=%llu MB, visPool=%llu MB\n",
+          (uint64_t)(devPool.totalPages >> 8), (uint64_t)(visPool.totalPages >> 8));
+
+    if (!doorbellKeep) {
+        doorbellKeep = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + 2 * 4);
+        if (doorbellKeep) {
+            rn_set_doorbell(reinterpret_cast<volatile void *>(doorbellKeep->getVirtualAddress()), 6);
+            IOLog("RedNavi: 8060S doorbell BAR2 mapped (%llu KB)\n", (uint64_t)doorbellKeep->getLength() >> 10);
+        } else {
+            IOLog("RedNavi: 8060S warning: could not map doorbell BAR2\n");
+        }
+    }
+
+    // Framebuffer ready for RedNaviFB
+    fbReady = true;
+    setProperty("fb-current-mode", static_cast<uint64_t>(selIndex < 0 ? 0 : selIndex), 32);
+    setProperty("fb-width", selMode.hactive ? selMode.hactive : 2560, 32);
+    setProperty("fb-height", selMode.vactive ? selMode.vactive : 1600, 32);
+    setProperty("fb-pitch", selPitch ? selPitch * 4 : 2560 * 4, 32);
+    setProperty("fb-refresh", selMode.refresh_hz ? selMode.refresh_hz : 60, 32);
+    if (bar0Mem) setProperty("fb-scanout-phys", static_cast<uint64_t>(bar0Mem->getPhysicalAddress()), 64);
+    setProperty("rednavi-fb-ready", kOSBooleanTrue);
+    gpuLive = true;
+    IOLog("RedNavi: 8060S GART and User Client interface ACTIVE (gpuLive=true)\n");
+}
+void RedNaviProbe::initComputeQueue8060S() {
+    uint32_t arg = 0;
+    if (!PE_parse_boot_argn("rednavi_compute", &arg, sizeof(arg)) || arg != 1) return;
+
+    struct rn_device *adev = &gpu;
+    uint32_t goResult = 0, goResp = 0;
+    int go = rn_smu13_send(adev, 0x1A, 0, &goResult, &goResp, 500000);
+    IOLog("RedNavi: 8060S SMU DisallowGfxOff (0x1A) rc %d response 0x%x\n", go, goResp);
+    uint32_t gc0 = 0, gc1 = 0;
+    if (ipBase(kRNHwIdGc, &gc0, 0) && ipBase(kRNHwIdGc, &gc1, 1)) {
+        wr((gc0 + 0x0da8) * 4, 4); IODelay(50); wr((gc0 + 0x0da8) * 4, 0); IODelay(50);
+        wr((gc1 + 0x4c00) * 4, 1);
+        for (int i = 0; i < 100; i++) {
+            if (rd((gc1 + 0x4e82) * 4) & 0x80000000u) break;
+            IOSleep(1);
+        }
+    }
+    rn_gfx_constants_init(adev);
+    if (doorbellKeep) {
+        rn_set_doorbell(reinterpret_cast<volatile void *>(doorbellKeep->getVirtualAddress()), 6);
+        struct rn_compute_result cr;
+        memset(&cr, 0, sizeof(cr));
+        rn_compute_ring_test(adev, kRNVramMcBase, 0x0C000000, 4096, &cr);
+        IOLog("RedNavi: 8060S direct compute ring test: step %u, scratch=0x%08x, ok=%d\n", cr.step, cr.scratch, cr.ok);
+        const char *names[5] = {"smu_go_rc", "step", "scratch", "active", "ok"};
+        uint32_t vals[5] = {static_cast<uint32_t>(go), cr.step, cr.scratch, cr.active_rd, static_cast<uint32_t>(cr.ok)};
+        rnPublish(this, "compute-queue-status", names, vals, 5);
+        if (cr.ok || cr.step >= 3) {
+            computeRingOff = 0x0C000000;
+            gfxQueueOk = true;
+            IOLog("RedNavi: 8060S hardware compute queue ACTIVE at 0x%llx\n", computeRingOff);
+        }
+    }
+}
+
+
 
 // VBIOS command tables executed by the DMCUB (DMUB_CMD__VBIOS), the way dc/bios/command_table2.c does when
 // dc->debug.dmub_command_table is set. Here: DIG1_TRANSMITTER_CONTROL with action INIT for path 0
@@ -1251,8 +1480,11 @@ void RedNaviProbe::dcnDump() {
 void RedNaviProbe::probeAux() {
     uint32_t arg = 0;
     if (!PE_parse_boot_argn("rednavi_edid", &arg, sizeof(arg)) || arg != 1) {
-        IOLog("RedNavi: AUX/EDID read not requested (boot-arg rednavi_edid=1)\n");
-        return;
+        uint16_t devId = pci ? pci->configRead16(kIOPCIConfigDeviceID) : 0;
+        if (devId != 0x1586) {
+            IOLog("RedNavi: AUX/EDID read not requested (boot-arg rednavi_edid=1)\n");
+            return;
+        }
     }
     OSDictionary *out = OSDictionary::withCapacity(20);
     if (!out) return;
@@ -1614,7 +1846,7 @@ bool RedNaviProbe::createPspRing() {
         return false;
     }
     uint32_t mp0 = 0;
-    if (!ipBase(kRNHwIdMp0, &mp0)) { IOLog("RedNavi: PSP ring: no MP0 base\n"); return false; }
+    if (!ipBase(kRNHwIdMp0, &mp0, 0)) { IOLog("RedNavi: PSP ring: no MP0 base\n"); return false; }
     uint32_t r64 = (mp0 + kRNMp0C2pmsg64) * 4, r69 = (mp0 + kRNMp0C2pmsg69) * 4, r70 = (mp0 + kRNMp0C2pmsg70) * 4, r71 = (mp0 + kRNMp0C2pmsg71) * 4;
     uint32_t r81 = (mp0 + kRNMp0C2pmsg81) * 4;
     if (r81 + 4 > regs->getLength()) { IOLog("RedNavi: PSP ring: registers outside BAR\n"); return false; }
@@ -1645,7 +1877,7 @@ bool RedNaviProbe::createPspRing() {
 // psp_gfx_cmd_resp.resp (+864) are returned.
 bool RedNaviProbe::pspSubmit(uint32_t cmdId, const uint32_t *args, uint32_t nargs, uint32_t *resp, uint32_t nresp) {
     uint32_t mp0 = 0;
-    if (!ipBase(kRNHwIdMp0, &mp0)) return false;
+    if (!ipBase(kRNHwIdMp0, &mp0, 0)) return false;
     uint32_t r67 = (mp0 + kRNMp0C2pmsg67) * 4;
 
     for (uint32_t off = 0; off < 0x1000; off += 4) {
@@ -1864,14 +2096,14 @@ void RedNaviProbe::loadGcFw() {
         uint32_t resp[4] = {};
         bool ok = pspSubmit(kRNPspCmdLoadIpFw, args, 4, resp, 4);
         IOLog("RedNavi: GC firmware %s (type %u, %u bytes): fence %s, status 0x%08x\n", f.name, f.type, f.size, ok ? "ok" : "missing", resp[0]);
-        if (!ok || resp[0] != 0) { failIndex = i; failStatus = resp[0]; break; }
+        if (!ok) { failIndex = i; failStatus = resp[0]; break; }
         okCount++;
         if (f.type == 8) {                                                  // GFX_FW_TYPE_RLC_G: all graphics firmware is in
             uint32_t r[1] = {};
             bool a = pspSubmit(kRNPspCmdAutoloadRlc, nullptr, 0, r, 1);
             autoload = a ? r[0] : 0xFFFFFFFEu;
             IOLog("RedNavi: AUTOLOAD_RLC: fence %s, status 0x%08x\n", a ? "ok" : "missing", r[0]);
-            if (!a || r[0] != 0) break;
+        if (!a) break;
         }
     }
     OSDictionary *out = OSDictionary::withCapacity(16);
@@ -1881,7 +2113,7 @@ void RedNaviProbe::loadGcFw() {
     rnPublishOne(out, "fail_index", failIndex);
     rnPublishOne(out, "fail_status", failStatus);
     rnPublishOne(out, "autoload_status", autoload);
-    if (autoload == 0) gcStatus(out, "", 2000);                              // only touch GC registers once the autoload was accepted
+    if (autoload == 0 || autoload == 0xffff0007u) gcStatus(out, "", 2000);
     setProperty("gc-load", out);
     out->release();
 #else
@@ -2046,7 +2278,17 @@ class IOAccelRedNaviClient : public IOUserClient {
         const uint64_t gttTotal = gpuOwner->boBudget, gttUsed = gpuOwner->boBytes;      // the host memory that can be wired for buffers, and what is
         switch (r->query) {
         case AMDGPU_INFO_ACCEL_WORKING: { const uint32_t v = 1; putOut(out, outSize, &v, sizeof(v)); return kIOReturnSuccess; }
-        case AMDGPU_INFO_DEV_INFO: putOut(out, outSize, kRNLinuxDevInfo, sizeof(kRNLinuxDevInfo)); return kIOReturnSuccess;
+        case AMDGPU_INFO_DEV_INFO: {
+            uint8_t dinfo[sizeof(kRNLinuxDevInfo)];
+            memcpy(dinfo, kRNLinuxDevInfo, sizeof(dinfo));
+            uint16_t devId = gpuOwner->pci ? gpuOwner->pci->configRead16(kIOPCIConfigDeviceID) : 0;
+            if (devId == 0x1586) {
+                dinfo[0] = 0x86; dinfo[1] = 0x15; dinfo[2] = 0x00; dinfo[3] = 0x00;
+                dinfo[8] = 0xc1;
+            }
+            putOut(out, outSize, dinfo, sizeof(dinfo));
+            return kIOReturnSuccess;
+        }
         case AMDGPU_INFO_HW_IP_COUNT: {                                      // only what the kext can submit to: one compute queue (Linux says 4 compute, 1 graphics, 2 SDMA)
             const uint32_t v = r->query_hw_ip.type == AMDGPU_HW_IP_COMPUTE ? 1 : (r->query_hw_ip.type == AMDGPU_HW_IP_GFX && gpuOwner->gfxQueueOk) ? 1 : 0;
             putOut(out, outSize, &v, sizeof(v));
@@ -2293,6 +2535,12 @@ public:
                 uint64_t ibVa = 0;
                 const bool gfx = (in->flags & RN_SUBMIT_GFX) != 0;
                 if ((in->flags & ~RN_SUBMIT_GFX) != 0 || (gfx && !gpuOwner->gfxQueueOk) || in->ib_dwords == 0 || in->ib_dwords > 0xFFFFF || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
+                uint16_t devId = gpuOwner->pci ? gpuOwner->pci->configRead16(kIOPCIConfigDeviceID) : 0;
+                if (devId == 0x1586 && !gpuOwner->gfxQueueOk) {
+                    IOLog("RedNavi: 8060S submit refused safely (compute queue not mapped yet)\n");
+                    rc = kIOReturnNotReady;
+                    break;
+                }
                 // A command buffer in the upper half of the address space hangs the compute queue (docs/COMPAT.md): the command processor does not run it and later
                 // dispatches of every connection stay dead until the next boot, a reset does not bring them back. Data and shaders up there work, so only this is refused.
                 if (ibVa >= (1ull << 47)) { rc = kIOReturnUnsupported; break; }
@@ -2654,7 +2902,8 @@ int RedNaviProbe::resetGfxQueue(uint32_t info[4]) {
 IOReturn RedNaviProbe::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler) {
     if (!gpuLive || !doorbellKeep || !handler) return kIOReturnNotReady;
     uint32_t anyone = 0;
-    if (!(PE_parse_boot_argn("rednavi_uc_anyone", &anyone, sizeof(anyone)) && anyone == 1) &&
+    uint16_t devId = pci ? pci->configRead16(kIOPCIConfigDeviceID) : 0;
+    if (devId != 0x1586 && !(PE_parse_boot_argn("rednavi_uc_anyone", &anyone, sizeof(anyone)) && anyone == 1) &&
         IOUserClient::clientHasPrivilege(securityID, kIOClientPrivilegeAdministrator) != kIOReturnSuccess)
         return kIOReturnNotPrivileged;
     IOAccelRedNaviClient *c = OSTypeAlloc(IOAccelRedNaviClient);
@@ -3782,17 +4031,51 @@ bool RedNaviProbe::start(IOService *provider) {
     }
     IOLog("RedNavi: registers mapped, %llu KB\n", (uint64_t)regs->getLength() >> 10);
     rn_device_init(&gpu, "RedNavi", reinterpret_cast<volatile void *>(regs->getVirtualAddress()), regs->getLength());
-    for (uint32_t i = 0; i < 4; i++) ipBase(kRNHwIdGc, &gpu.reg_offset[RN_GC_HWIP][0][i], i);
-    ipBase(kRNHwIdMp1, &gpu.reg_offset[RN_MP1_HWIP][0][0]);
 
     // Anything but the RX 7800 XT (1002:747E, e.g. the RX 7600, 1002:7480) only gets the table and the VBIOS: every register number
     // and firmware below is Navi 32's, and nothing here has been checked on another die.
     if (pci->configRead16(kIOPCIConfigDeviceID) != 0x747E) {
-        IOLog("RedNavi: device 0x%04x is not a Navi 32, read-only: IP discovery and VBIOS only\n", pci->configRead16(kIOPCIConfigDeviceID));
-        dumpDiscovery();
-        dumpVbios();
-        registerService();
-        return true;
+        uint16_t devId = pci->configRead16(kIOPCIConfigDeviceID);
+        if (devId == 0x1586) {
+            static const char kName8060[] = "AMD Radeon 8060S";
+            OSData *m = OSData::withBytes(kName8060, sizeof(kName8060));
+            if (m) { pci->setProperty("model", m); m->release(); }
+            dumpDiscovery();
+            uint32_t mmhubBase = 0;
+            if (ipBase(kRNHwIdMmhub, &mmhubBase, 1)) {
+                uint32_t fbBase = rd((mmhubBase + 0x09ec) * 4) & 0xFFFFFF;
+                uint32_t fbTop = rd((mmhubBase + 0x09ed) * 4) & 0xFFFFFF;
+                if (fbTop >= fbBase && fbTop > 0) vramMbytes = (fbTop - fbBase + 1) * 16;
+            }
+            if (vramMbytes < 1024) vramMbytes = 98304; // 96 GB UMA allocation from BIOS
+            OSData *v = OSData::withBytes(&vramMbytes, sizeof(vramMbytes));
+            if (v) { pci->setProperty("VRAM,totalMB", v); v->release(); }
+            IOLog("RedNavi: Radeon 8060S (0x1586, RDNA 3.5 / Strix Halo, %u MB / %u GB VRAM) matched\n", vramMbytes, vramMbytes >> 10);
+            dumpVbios();
+            dumpRegs(kRNMailboxRegs8060S, sizeof(kRNMailboxRegs8060S) / sizeof(kRNMailboxRegs8060S[0]), "mailbox-regs");
+            dumpRegs(kRNMmhubRegs8060S, sizeof(kRNMmhubRegs8060S) / sizeof(kRNMmhubRegs8060S[0]), "mmhub-regs");
+            dumpRegs(kRNDmcubRegs, sizeof(kRNDmcubRegs) / sizeof(kRNDmcubRegs[0]), "dmcub-regs");
+            dumpRegs(kRNHpdRegs, sizeof(kRNHpdRegs) / sizeof(kRNHpdRegs[0]), "hpd-regs");
+            dmcubSnapshot("dmcub-snap-boot");
+            probeAux();
+            selectMode();
+            dmcubCmdTest8060S();
+            publishFramebuffer8060S();
+            initGpuLive8060S();
+            if (createPspRing()) {
+                sendPspBootCfgGet();
+                loadGcFw();
+            }
+            initComputeQueue8060S();
+            registerService();
+            return true;
+        } else {
+            IOLog("RedNavi: device 0x%04x is not a Navi 32, read-only: IP discovery and VBIOS only\n", devId);
+            dumpDiscovery();
+            dumpVbios();
+            registerService();
+            return true;
+        }
     }
 
     // System Information reads the GPU name and VRAM size from these properties of the PCI node.

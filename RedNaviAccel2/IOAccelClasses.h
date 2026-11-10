@@ -111,6 +111,22 @@ public:
     virtual void _RESERVEDIOAccelVidMemory4();   // slot 67
     virtual void _RESERVEDIOAccelVidMemory5();   // slot 68
 };
+class IOAccelSysMemory : public IOAccelMemory {
+    OSDeclareAbstractStructors(IOAccelSysMemory)
+public:
+    uint8_t rn_pad_IOAccelSysMemory[232];
+    virtual long getDirtySize() const;
+    virtual long getResidentSize() const;
+    virtual long setPurgeable(unsigned int, unsigned int*);
+    virtual long setTag(unsigned int);
+    virtual long getTag();
+    virtual long matchForReuse(void*, unsigned long long);
+    virtual long wire();
+    virtual long unwire();
+    virtual long increment_wire_count();
+    virtual long decrement_wire_count();
+};
+static_assert(sizeof(IOAccelSysMemory) == 408, "IOAccelSysMemory is 408 bytes in the registry");
 
 class IOAccelResource2 : public OSObject {
     OSDeclareAbstractStructors(IOAccelResource2)

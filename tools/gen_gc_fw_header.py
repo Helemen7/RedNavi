@@ -13,7 +13,7 @@ import struct
 import sys
 
 # GFX_FW_TYPE values (psp_gfx_if.h)
-T = {"RLC_V": 7, "RLC_G": 8, "RLC_RESTORE_LIST_GPM_MEM": 20, "RLC_RESTORE_LIST_SRM_MEM": 21, "RLC_RESTORE_LIST_SRM_CNTL": 22,
+T = {"CP_ME": 1, "CP_PFP": 2, "CP_MEC": 4, "RLC_V": 7, "RLC_G": 8, "RLC_RESTORE_LIST_GPM_MEM": 20, "RLC_RESTORE_LIST_SRM_MEM": 21, "RLC_RESTORE_LIST_SRM_CNTL": 22,
      "RLC_P": 25, "RLC_IRAM": 26, "CP_MES": 33, "MES_STACK": 34, "RLC_DRAM_BOOT": 48, "IMU_I": 68, "IMU_D": 69,
      "SDMA_UCODE_TH0": 71, "SDMA_UCODE_TH1": 72, "CP_MES_KIQ": 81, "MES_KIQ_STACK": 82, "RS64_PFP": 87, "RS64_ME": 88,
      "RS64_MEC": 89, "RS64_PFP_P0_STACK": 90, "RS64_PFP_P1_STACK": 91, "RS64_ME_P0_STACK": 92, "RS64_ME_P1_STACK": 93,
@@ -25,11 +25,17 @@ def u32(d, off):
 
 
 def manifest(fwdir):
+    import os
     def rd(name):
         return open(f"{fwdir}/{name}", "rb").read()
 
-    pfp, me, mec, rlc, imu = (rd(f"gc_11_0_3_{n}.bin") for n in ("pfp", "me", "mec", "rlc", "imu"))
-    mes, mes1, sdma = rd("gc_11_0_3_mes_2.bin"), rd("gc_11_0_3_mes1.bin"), rd("sdma_6_0_3.bin")
+    is_11_5 = os.path.exists(f"{fwdir}/gc_11_5_1_pfp.bin")
+    if is_11_5:
+        pfp, me, mec, rlc, imu = (rd(f"gc_11_5_1_{n}.bin") for n in ("pfp", "me", "mec", "rlc", "imu"))
+        mes, mes1, sdma = rd("gc_11_5_1_mes_2.bin"), rd("gc_11_5_1_mes1.bin"), rd("sdma_6_1_1.bin")
+    else:
+        pfp, me, mec, rlc, imu = (rd(f"gc_11_0_3_{n}.bin") for n in ("pfp", "me", "mec", "rlc", "imu"))
+        mes, mes1, sdma = rd("gc_11_0_3_mes_2.bin"), rd("gc_11_0_3_mes1.bin"), rd("sdma_6_0_3.bin")
     out = []
 
     def add(name, typ, data, off, size):
@@ -49,19 +55,23 @@ def manifest(fwdir):
     add("SDMA_UCODE_TH0", "SDMA_UCODE_TH0", sdma, array_off(sdma), u32(sdma, 36))
     add("SDMA_UCODE_TH1", "SDMA_UCODE_TH1", sdma, u32(sdma, 48), u32(sdma, 52))
 
-    # CP, RS64 (gfx_firmware_header_v2_0: ucode size at 36, data size at 44, data offset at 48)
-    for d in (pfp, me, mec):
-        if struct.unpack_from("<HH", d, 8) != (2, 0):
-            sys.exit("CP firmware is not header v2.0 (RS64)")
-    add("CP_RS64_PFP", "RS64_PFP", pfp, array_off(pfp), u32(pfp, 36))
-    add("CP_RS64_ME", "RS64_ME", me, array_off(me), u32(me, 36))
-    add("CP_RS64_MEC", "RS64_MEC", mec, array_off(mec), u32(mec, 36))
-    for n in range(2):
-        add(f"CP_RS64_PFP_P{n}_STACK", f"RS64_PFP_P{n}_STACK", pfp, u32(pfp, 48), u32(pfp, 44))
-    for n in range(2):
-        add(f"CP_RS64_ME_P{n}_STACK", f"RS64_ME_P{n}_STACK", me, u32(me, 48), u32(me, 44))
-    for n in range(4):
-        add(f"CP_RS64_MEC_P{n}_STACK", f"RS64_MEC_P{n}_STACK", mec, u32(mec, 48), u32(mec, 44))
+    if is_11_5:
+        add("CP_PFP", "CP_PFP", pfp, array_off(pfp), u32(pfp, 20))
+        add("CP_ME", "CP_ME", me, array_off(me), u32(me, 20))
+        add("CP_MEC", "CP_MEC", mec, array_off(mec), u32(mec, 20))
+    else:
+        for d in (pfp, me, mec):
+            if struct.unpack_from("<HH", d, 8) != (2, 0):
+                sys.exit("CP firmware is not header v2.0 (RS64)")
+        add("CP_RS64_PFP", "RS64_PFP", pfp, array_off(pfp), u32(pfp, 36))
+        add("CP_RS64_ME", "RS64_ME", me, array_off(me), u32(me, 36))
+        add("CP_RS64_MEC", "RS64_MEC", mec, array_off(mec), u32(mec, 36))
+        for n in range(2):
+            add(f"CP_RS64_PFP_P{n}_STACK", f"RS64_PFP_P{n}_STACK", pfp, u32(pfp, 48), u32(pfp, 44))
+        for n in range(2):
+            add(f"CP_RS64_ME_P{n}_STACK", f"RS64_ME_P{n}_STACK", me, u32(me, 48), u32(me, 44))
+        for n in range(4):
+            add(f"CP_RS64_MEC_P{n}_STACK", f"RS64_MEC_P{n}_STACK", mec, u32(mec, 48), u32(mec, 44))
 
     # MES: scheduler pipe (mes_2) then KIQ pipe (mes1); header v1.0: ucode size/offset at 36/40, data size/offset at 48/52
     add("CP_MES", "CP_MES", mes, u32(mes, 40), u32(mes, 36))
@@ -107,13 +117,18 @@ def main():
             f.write(f'    {{"{name}", {typ}u, {off}u, {len(data)}u}},\n')
             off += len(data)
         f.write("};\n")
-        # program counter start of the RS64 CP firmware (gfx_firmware_header_v2_0: ucode_start_addr_lo/hi at 52/56), for gfx11.cpp
-        for n in ("pfp", "me", "mec"):
-            d = open(f"{sys.argv[1]}/gc_11_0_3_{n}.bin", "rb").read()
-            f.write(f"#define kRNGc{n.capitalize()}StartLo 0x{u32(d, 52):x}u\n#define kRNGc{n.capitalize()}StartHi 0x{u32(d, 56):x}u\n")
-        # MES: program counter start of the two pipes (mes_firmware_header_v1_0: mes_uc_start_addr_lo/hi at 56/60), 64-bit, for gfx11.cpp
+        import os
+        is_11_5 = os.path.exists(f"{sys.argv[1]}/gc_11_5_1_pfp.bin")
+        prefix = "gc_11_5_1_" if is_11_5 else "gc_11_0_3_"
+        if not is_11_5:
+            for n in ("pfp", "me", "mec"):
+                d = open(f"{sys.argv[1]}/{prefix}{n}.bin", "rb").read()
+                f.write(f"#define kRNGc{n.capitalize()}StartLo 0x{u32(d, 52):x}u\n#define kRNGc{n.capitalize()}StartHi 0x{u32(d, 56):x}u\n")
+        else:
+            for n in ("pfp", "me", "mec"):
+                f.write(f"#define kRNGc{n.capitalize()}StartLo 0u\n#define kRNGc{n.capitalize()}StartHi 0u\n")
         for n, fn in (("0", "mes_2"), ("1", "mes1")):
-            d = open(f"{sys.argv[1]}/gc_11_0_3_{fn}.bin", "rb").read()
+            d = open(f"{sys.argv[1]}/{prefix}{fn}.bin", "rb").read()
             f.write(f"#define kRNMes{n}StartLo 0x{u32(d, 56):x}u\n#define kRNMes{n}StartHi 0x{u32(d, 60):x}u\n")
         f.write("static const unsigned char kRNGcFwBlob[] = {\n")
         blob = b"".join(d for _, _, d in items)

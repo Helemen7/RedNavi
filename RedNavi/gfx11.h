@@ -199,6 +199,7 @@ extern volatile u8 *gMesHostMem;
 extern u64 gMesHostSize;
 void rn_hdp_flush(struct rn_device *adev);   // soc21_flush_hdp: write 0 to HDP_MEM_COHERENCY_FLUSH_CNTL and read it back
 void rn_mec_enable(struct rn_device *adev);   // MEC pipes out of reset and running, no queue
+void rn_cp_me_unhalt(struct rn_device *adev); // unhalt ME and PFP
 void rn_mes_doorbell_regs(struct rn_device *adev, u32 out[12]);   // CP_MES_DOORBELL_CONTROL1..6 per MES pipe
 void rn_scan_hqds(struct rn_device *adev, u32 out[33]);   // the active ME 1 queues: 8 x {pipe*8+queue, doorbell control, rptr, wptr}, count
 

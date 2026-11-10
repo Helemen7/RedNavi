@@ -1,0 +1,5 @@
+
+select disk 2
+clean
+convert gpt
+create partition primary id=48465300-0000-11AA-AA11-00306543ECAC

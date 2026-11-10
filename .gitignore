@@ -11,3 +11,7 @@ RedNavi/gc_*.h
 !RedNavi/gc_regs.h
 rn_test_x86
 mesa-bridge/bridge_test
+/.agents
+docs/HACKINTOSH_ROG_FLOW_Z13_KNOWLEDGE_BASE.md
+/skills
+CLAUDE.md
