@@ -314,7 +314,7 @@ void *RedNaviAccel2::newCLContext() { return allocByName("newCLContext", "IOAcce
 void *RedNaviAccel2::newSurface() { return allocStub<RedNaviSurface>("newSurface"); }
 void *RedNaviAccel2::new2DContext() { return allocStub<RedNavi2DContext2>("new2DContext"); }
 void *RedNaviAccel2::newVideoContext() { return allocByName("newVideoContext", "IOAccelVideoContext2"); }
-void *RedNaviAccel2::newSysMemory() { return allocByName("newSysMemory", "IOAccelSysMemory"); }
+void *RedNaviAccel2::newSysMemory() { return allocStub<RedNaviSysMemory>("newSysMemory"); }
 void *RedNaviAccel2::newVidMemory() { return allocStub<RedNaviVidMemory>("newVidMemory"); }
 void *RedNaviAccel2::newResource() { return allocStub<RedNaviResource2>("newResource"); }
 void *RedNaviAccel2::newMemoryMap() { return allocStub<RedNaviMemoryMap>("newMemoryMap"); }

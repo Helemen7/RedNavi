@@ -37,7 +37,7 @@ struct rn_vk {
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
-    unsigned nbind, push, binds[16];
+    unsigned nbind, push, binds[32];
     int spec;
     struct { uint32_t l[3]; VkPipeline pipe; } variants[8];
     unsigned nvariants;
@@ -153,13 +153,13 @@ void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b) {
 }
 
 rn_vk_compute *rn_vk_compute_create(rn_vk *vk, const uint32_t *spirv, size_t bytes, unsigned nbind, const rn_vk_binding *binds, unsigned push_bytes, int specialize_local_size) {
-    if (nbind == 0 || nbind > 16) return NULL;
+    if (nbind == 0 || nbind > 32) return NULL;
     rn_vk_compute *c = calloc(1, sizeof(*c));
     if (!c) return NULL;
     c->nbind = nbind; c->push = push_bytes; c->spec = specialize_local_size;
     VkShaderModuleCreateInfo smi = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes, .pCode = spirv};
     if (vk->CreateShaderModule(vk->dev, &smi, NULL, &c->sm) != VK_SUCCESS) goto fail;
-    VkDescriptorSetLayoutBinding b[16];
+    VkDescriptorSetLayoutBinding b[32];
     for (unsigned i = 0; i < nbind; i++) {
         c->binds[i] = binds[i].binding;
         b[i] = (VkDescriptorSetLayoutBinding){.binding = binds[i].binding, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
@@ -225,8 +225,8 @@ void rn_vk_compute_destroy(rn_vk *vk, rn_vk_compute *c) {
 uint64_t rn_vk_storage_offset_alignment(const rn_vk *vk) { return vk->storageAlign; }
 
 int rn_vk_dispatch(rn_vk *vk, rn_vk_compute *c, rn_vk_buffer *const *buffers, const uint64_t *offsets, const void *push, const uint32_t groups[3], const uint32_t local[3]) {
-    VkDescriptorBufferInfo bi[16];
-    VkWriteDescriptorSet w[16];
+    VkDescriptorBufferInfo bi[32];
+    VkWriteDescriptorSet w[32];
     for (unsigned i = 0; i < c->nbind; i++) {
         const uint64_t off = offsets ? offsets[i] : 0;
         if (off % vk->storageAlign || off >= buffers[i]->size) return 4;

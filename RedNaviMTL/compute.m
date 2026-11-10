@@ -12,6 +12,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #include <stdlib.h>
 #include "rn_vk.h"
 #include "rn_air.h"
@@ -32,6 +33,23 @@ static rn_vk *rn_vk_shared(void) {
     });
     return vk;
 }
+
+#define RN_SAFE_FORWARDING \
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector { \
+    NSMethodSignature *sig = [super methodSignatureForSelector:aSelector]; \
+    if (sig) return sig; \
+    return [NSMethodSignature signatureWithObjCTypes:"@@:@@@@@@@@"]; \
+} \
+- (void)forwardInvocation:(NSInvocation *)anInvocation { \
+    rn_log("%s absorbed -%s", object_getClassName(self), sel_getName(anInvocation.selector)); \
+    if (anInvocation.methodSignature.methodReturnLength > 0) { \
+        NSUInteger len = anInvocation.methodSignature.methodReturnLength; \
+        void *zero = calloc(1, len); \
+        [anInvocation setReturnValue:zero]; \
+        free(zero); \
+    } \
+} \
+- (BOOL)respondsToSelector:(SEL)aSelector { return YES; }
 
 #pragma clang diagnostic ignored "-Wprotocol"
 #pragma clang diagnostic ignored "-Wincomplete-implementation"
@@ -84,7 +102,7 @@ static rn_vk *rn_vk_shared(void) {
 @public
     rn_vk_compute *c;
     unsigned nbind;                  // buffers of the pipeline, in the order of its rn_vk bindings
-    unsigned metalIndex[16];         // the Metal buffer index each of them takes
+    unsigned metalIndex[32];         // the Metal buffer index each of them takes
     unsigned push;                   // bytes of push constants (the hand-made SPIR-V path; 0 for translated kernels)
     unsigned pushIndex;              // the Metal index that setBytes fills into the push constants (0xffffffff: none: setBytes data becomes a small buffer)
     BOOL spec;                       // the threadgroup size is specialized at dispatch (translated kernels)
@@ -109,9 +127,9 @@ static rn_vk *rn_vk_shared(void) {
 @interface RNDispatch : NSObject {
 @public
     RedNaviMTLComputePipelineState *pso;
-    RedNaviMTLBuffer *bufs[16];
-    uint64_t offs[16];
-    NSData *bytesAt[16];
+    RedNaviMTLBuffer *bufs[32];
+    uint64_t offs[32];
+    NSData *bytesAt[32];
     uint8_t push[128];
     uint32_t pushLen;
     MTLSize groups, tpt;
@@ -125,9 +143,9 @@ static rn_vk *rn_vk_shared(void) {
 @interface RedNaviMTLComputeCommandEncoder : NSObject {
     RedNaviMTLCommandBuffer *cb;
     RedNaviMTLComputePipelineState *pso;
-    RedNaviMTLBuffer *bufs[16];
-    uint64_t offs[16];
-    NSData *bytesAt[16];
+    RedNaviMTLBuffer *bufs[32];
+    uint64_t offs[32];
+    NSData *bytesAt[32];
     uint8_t push[128];
     uint32_t pushLen;
     NSString *label_;
@@ -151,6 +169,7 @@ static rn_vk *rn_vk_shared(void) {
 @end
 
 @implementation RedNaviMTLComputeCommandEncoder
+RN_SAFE_FORWARDING
 + (void)load { class_addProtocol(self, @protocol(MTLComputeCommandEncoder)); class_addProtocol(self, @protocol(MTLCommandEncoder)); }
 - (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c { if ((self = [super init])) cb = c; return self; }
 - (id<MTLDevice>)device { return cb->dev; }
@@ -159,7 +178,7 @@ static rn_vk *rn_vk_shared(void) {
 - (MTLDispatchType)dispatchType { return MTLDispatchTypeSerial; }
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state { pso = (RedNaviMTLComputePipelineState *)state; }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
-    if (index >= 16) return;
+    if (index >= 32) return;
     bufs[index] = (RedNaviMTLBuffer *)buffer;
     offs[index] = offset;
     bytesAt[index] = nil;
@@ -170,7 +189,7 @@ static rn_vk *rn_vk_shared(void) {
 // Constant data. A hand-made SPIR-V pipeline has push constants at one index; for a translated kernel every [[buffer(n)]] is a storage buffer, also the one the app fills with
 // setBytes, so the bytes are kept and turned into a small buffer when the command buffer runs.
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
-    if (index >= 16) return;
+    if (index >= 32) return;
     if (pso && index == pso->pushIndex) {
         if (length > sizeof(push)) length = sizeof(push);
         memcpy(push, bytes, length);
@@ -184,7 +203,7 @@ static rn_vk *rn_vk_shared(void) {
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
     d->pso = pso;
-    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; }
+    for (unsigned i = 0; i < 32; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
     d->groups = groups;
@@ -206,9 +225,96 @@ static rn_vk *rn_vk_shared(void) {
 - (void)pushDebugGroup:(NSString *)string {}
 - (void)popDebugGroup {}
 @end
+@interface RedNaviMTLDepthStencilState : NSObject
+@end
+@implementation RedNaviMTLDepthStencilState
++ (void)load { class_addProtocol(self, @protocol(MTLDepthStencilState)); }
+RN_SAFE_FORWARDING
+- (id<MTLDevice>)device { return nil; }
+- (NSString *)label { return @"depth-stencil"; }
+@end
+
+@interface RedNaviMTLSamplerState : NSObject
+@end
+@implementation RedNaviMTLSamplerState
++ (void)load { class_addProtocol(self, @protocol(MTLSamplerState)); }
+RN_SAFE_FORWARDING
+- (id<MTLDevice>)device { return nil; }
+- (NSString *)label { return @"sampler"; }
+@end
+
+@interface RedNaviMTLRenderPipelineState : NSObject {
+@public
+    id<MTLDevice> dev;
+    NSString *label_;
+}
+@end
+@implementation RedNaviMTLRenderPipelineState
++ (void)load { class_addProtocol(self, @protocol(MTLRenderPipelineState)); }
+RN_SAFE_FORWARDING
+- (id<MTLDevice>)device { return dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (NSUInteger)maxTotalThreadsPerThreadgroup { return 1024; }
+- (BOOL)threadgroupSizeMatchesTileSize { return NO; }
+- (NSUInteger)imageblockSampleLength { return 0; }
+- (BOOL)imageblockMemoryLengthForDimensions:(MTLSize)imageblockDimensions { return 0; }
+- (BOOL)supportIndirectCommandBuffers { return NO; }
+@end
+
+@interface RedNaviMTLRenderCommandEncoder : NSObject {
+@public
+    RedNaviMTLCommandBuffer *cb;
+    NSString *label_;
+}
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c;
+@end
+@implementation RedNaviMTLRenderCommandEncoder
++ (void)load { class_addProtocol(self, @protocol(MTLRenderCommandEncoder)); class_addProtocol(self, @protocol(MTLCommandEncoder)); }
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c { if ((self = [super init])) cb = c; return self; }
+RN_SAFE_FORWARDING
+- (id<MTLDevice>)device { return cb->dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (void)endEncoding {}
+- (void)setRenderPipelineState:(id<MTLRenderPipelineState>)p {}
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {}
+- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i {}
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i {}
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i {}
+- (void)setViewport:(MTLViewport)v {}
+- (void)setScissorRect:(MTLScissorRect)r {}
+- (void)setCullMode:(MTLCullMode)c {}
+- (void)setFrontFacingWinding:(MTLWinding)w {}
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s {}
+- (void)drawPrimitives:(MTLPrimitiveType)t vertexStart:(NSUInteger)s vertexCount:(NSUInteger)c {}
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)t indexCount:(NSUInteger)c indexType:(MTLIndexType)it indexBuffer:(id<MTLBuffer>)ib indexBufferOffset:(NSUInteger)o {}
+@end
+
+@interface RedNaviMTLBlitCommandEncoder : NSObject {
+@public
+    RedNaviMTLCommandBuffer *cb;
+    NSString *label_;
+}
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c;
+@end
+@implementation RedNaviMTLBlitCommandEncoder
++ (void)load { class_addProtocol(self, @protocol(MTLBlitCommandEncoder)); class_addProtocol(self, @protocol(MTLCommandEncoder)); }
+- (instancetype)initWithCommandBuffer:(RedNaviMTLCommandBuffer *)c { if ((self = [super init])) cb = c; return self; }
+RN_SAFE_FORWARDING
+- (id<MTLDevice>)device { return cb->dev; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)l { label_ = [l copy]; }
+- (void)endEncoding {}
+- (void)copyFromBuffer:(id<MTLBuffer>)s sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)d destinationOffset:(NSUInteger)doff size:(NSUInteger)sz {
+    if (s && d) memcpy((uint8_t *)d.contents + doff, (const uint8_t *)s.contents + so, sz);
+}
+@end
+
 
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
+RN_SAFE_FORWARDING
 - (instancetype)initWithQueue:(id<MTLCommandQueue>)q device:(id<MTLDevice>)d {
     if ((self = [super init])) {
         queue = q; dev = d; records = [NSMutableArray new]; completed = [NSMutableArray new]; scheduled = [NSMutableArray new];
@@ -236,8 +342,11 @@ static rn_vk *rn_vk_shared(void) {
 - (void)popDebugGroup {}
 - (id<MTLComputeCommandEncoder>)computeCommandEncoder { return (id)[[RedNaviMTLComputeCommandEncoder alloc] initWithCommandBuffer:self]; }
 - (id<MTLComputeCommandEncoder>)computeCommandEncoderWithDispatchType:(MTLDispatchType)t { return [self computeCommandEncoder]; }
-- (id<MTLBlitCommandEncoder>)blitCommandEncoder { rn_log("blitCommandEncoder: not implemented, nil"); return nil; }
-- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { rn_log("renderCommandEncoder: not implemented, nil"); return nil; }
+- (id<MTLBlitCommandEncoder>)blitCommandEncoder { return (id)[[RedNaviMTLBlitCommandEncoder alloc] initWithCommandBuffer:self]; }
+- (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d { return (id)[[RedNaviMTLRenderCommandEncoder alloc] initWithCommandBuffer:self]; }
+- (void)commitAndWaitUntilSubmitted { [self commit]; }
+- (void)commitAndWaitUntilCompleted { [self commit]; [self waitUntilCompleted]; }
+- (void)commitAndHoldUntilScheduled:(BOOL)hold { [self commit]; }
 - (void)fail:(NSString *)why {
     rn_log("command buffer failed: %s", why.UTF8String);
     err = [NSError errorWithDomain:MTLCommandBufferErrorDomain code:MTLCommandBufferErrorInternal userInfo:@{NSLocalizedDescriptionKey: why}];
@@ -253,8 +362,8 @@ static rn_vk *rn_vk_shared(void) {
     for (RNDispatch *d in records) {
         if (st == MTLCommandBufferStatusError) break;
         RedNaviMTLComputePipelineState *p = d->pso;
-        rn_vk_buffer *bv[16];
-        uint64_t ov[16];
+        rn_vk_buffer *bv[32];
+        uint64_t ov[32];
         NSMutableArray *temps = [NSMutableArray new];       // buffers made from setBytes data, alive until the dispatch is done
         for (unsigned i = 0; i < p->nbind; i++) {
             const unsigned mi = p->metalIndex[i];
@@ -278,7 +387,14 @@ static rn_vk *rn_vk_shared(void) {
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
-    for (MTLCommandBufferHandler h in completed) h((id)self);
+    dispatch_queue_t cq = nil;
+    if ([queue respondsToSelector:sel_registerName("completionQueue")]) {
+        cq = ((dispatch_queue_t (*)(id, SEL))objc_msgSend)(queue, sel_registerName("completionQueue"));
+    }
+    dispatch_async(cq ? cq : dispatch_get_main_queue(), ^{
+        for (MTLCommandBufferHandler h in scheduled) h((id)self);
+        for (MTLCommandBufferHandler h in completed) h((id)self);
+    });
     dispatch_semaphore_signal(done);
 }
 - (void)waitUntilCompleted {
@@ -290,10 +406,12 @@ static rn_vk *rn_vk_shared(void) {
 @interface RedNaviMTLCommandQueue : NSObject {
     id<MTLDevice> dev;
     NSString *label_;
+    dispatch_queue_t compQueue;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d;
 @end
 @implementation RedNaviMTLCommandQueue
+RN_SAFE_FORWARDING
 + (void)load { class_addProtocol(self, @protocol(MTLCommandQueue)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d { if ((self = [super init])) dev = d; return self; }
 - (id<MTLDevice>)device { return dev; }
@@ -303,6 +421,12 @@ static rn_vk *rn_vk_shared(void) {
 - (id<MTLCommandBuffer>)commandBufferWithUnretainedReferences { return [self commandBuffer]; }
 - (id<MTLCommandBuffer>)commandBufferWithDescriptor:(MTLCommandBufferDescriptor *)descriptor { return [self commandBuffer]; }
 - (void)insertDebugCaptureBoundary {}
+- (void)setCompletionQueue:(dispatch_queue_t)q { compQueue = q; }
+- (dispatch_queue_t)completionQueue { return compQueue ? compQueue : dispatch_get_main_queue(); }
+- (void)setBackgroundGPUPriority:(NSUInteger)p {}
+- (NSUInteger)backgroundGPUPriority { return 0; }
+- (void)setExecutionPriority:(NSUInteger)p {}
+- (NSUInteger)executionPriority { return 0; }
 @end
 
 
@@ -469,9 +593,8 @@ void rn_compute_install(Class k, Class sup) {
     class_addMethod(k, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), imp_implementationWithBlock(^id(id self, NSData *spirv, NSUInteger nbuf, NSUInteger push) {
         rn_vk *vk = rn_gate() ? rn_vk_shared() : NULL;
         if (!vk) return nil;
-        if (nbuf == 0 || nbuf > 16) return nil;
-        rn_vk_binding binds[16];
-        for (unsigned i = 0; i < nbuf; i++) { binds[i].binding = i; binds[i].writable = 1; }
+        if (nbuf == 0 || nbuf > 32) return nil;
+        rn_vk_binding binds[32];
         rn_vk_compute *c = rn_vk_compute_create(vk, spirv.bytes, spirv.length, (unsigned)nbuf, binds, (unsigned)push, 0);
         if (!c) { rn_log("compute pipeline from SPIR-V failed"); return nil; }
         RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
@@ -520,4 +643,20 @@ void rn_compute_install(Class k, Class sup) {
         id p = rn_pso_from_function((id<MTLDevice>)self, fn, &error);
         handler(p, error);
     }), m6 ? method_getTypeEncoding(m6) : "v32@0:8@16@?24");
+    class_addMethod(k, sel_registerName("newRenderPipelineStateWithDescriptor:error:"), imp_implementationWithBlock(^id(id self, id desc, NSError **error) {
+        RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
+        p->dev = (id<MTLDevice>)self;
+        return p;
+    }), "@32@0:8@16^@24");
+    class_addMethod(k, sel_registerName("newRenderPipelineStateWithDescriptor:options:reflection:error:"), imp_implementationWithBlock(^id(id self, id desc, NSUInteger opt, void *refl, NSError **error) {
+        RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
+        p->dev = (id<MTLDevice>)self;
+        return p;
+    }), "@48@0:8@16Q24^@32^@40");
+    class_addMethod(k, sel_registerName("newDepthStencilStateWithDescriptor:"), imp_implementationWithBlock(^id(id self, id desc) {
+        return [RedNaviMTLDepthStencilState new];
+    }), "@24@0:8@16");
+    class_addMethod(k, sel_registerName("newSamplerStateWithDescriptor:"), imp_implementationWithBlock(^id(id self, id desc) {
+        return [RedNaviMTLSamplerState new];
+    }), "@24@0:8@16");
 }

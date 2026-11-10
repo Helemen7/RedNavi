@@ -12,6 +12,14 @@
  *   - no external handles (dma-buf, sync files, opaque fds), no user queues, no sensors, no timestamp.
  */
 #include "ac_apple_iokit.h"
+#ifndef BUILDING_MESA
+struct radeon_info {
+   bool has_vm_always_valid;
+   struct { uint16_t domain; uint8_t bus, dev, func; } pci;
+};
+#else
+#include "ac_gpu_info.h"
+#endif
 
 #include <IOKit/IOKitLib.h>
 #include <errno.h>
@@ -412,7 +420,8 @@ static void dev_release(struct ac_drm_device *dev)
 
 const char *ac_drm_get_marketing_name(ac_drm_device *device)
 {
-   (void)device;
+   if (device && device->dev_info.device_id == 0x1586)
+      return "AMD Radeon 8060S";
    return "AMD Radeon RX 7800 XT";
 }
 
@@ -425,6 +434,21 @@ int ac_apple_pci_bus_info(ac_drm_device *dev, uint16_t *domain, uint8_t *bus, ui
    *function = 0;
    return 0;
 }
+int ac_drm_query_pci_bus_info(ac_drm_device *dev, struct radeon_info *info)
+{
+   (void)dev;
+   info->pci.domain = 0;
+   info->pci.bus = 0;
+   info->pci.dev = 0;
+   info->pci.func = 0;
+   return 0;
+}
+void ac_drm_query_has_vm_always_valid(ac_drm_device *dev, struct radeon_info *info)
+{
+   (void)dev;
+   info->has_vm_always_valid = true;
+}
+
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- queries */
 

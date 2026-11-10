@@ -1,0 +1,4 @@
+
+select disk 2
+select partition 1
+delete partition override

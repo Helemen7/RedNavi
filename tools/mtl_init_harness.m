@@ -102,6 +102,7 @@ int main(int argc, char **argv) {
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 [enc setComputePipelineState:pso];
                 [enc setBuffer:buf offset:0 atIndex:0];
+                [enc setBuffer:buf offset:0 atIndex:30];
                 [enc setBytes:&add length:4 atIndex:1];
                 [enc dispatchThreadgroups:MTLSizeMake(4, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
                 [enc endEncoding];

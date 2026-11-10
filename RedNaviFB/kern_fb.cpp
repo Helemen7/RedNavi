@@ -20,8 +20,8 @@
 
 #define kRNFbMaxModes 32
 
-class RedNaviFB : public IOFramebuffer {
-    OSDeclareDefaultStructors(RedNaviFB)
+class AMDRedNaviFB : public IOFramebuffer {
+    OSDeclareDefaultStructors(AMDRedNaviFB)
 
     uint64_t scanoutPhys {0};          // CPU physical address of the surface (BAR0 + offset)
     uint32_t fbWidth {1920}, fbHeight {1080}, fbPitch {7680}, fbRefresh {60};   // the mode on the wire
@@ -38,6 +38,12 @@ class RedNaviFB : public IOFramebuffer {
     // Diagnostics, published as the fb-diag property: what WindowServer asks and whether the surface changes.
     IOTimerEventSource *diagTimer {nullptr};
     IOMemoryMap *diagMap {nullptr};
+    IOFBInterruptProc vblProc {nullptr};
+    OSObject *vblTarget {nullptr};
+    void *vblRef {nullptr};
+    bool vblEnabled {false};
+    IOTimerEventSource *vblTimer {nullptr};
+
     uint32_t calls[8] {};              // 0 aperture, 1 setAttr, 2 getAttr, 3 setConnAttr, 4 getConnAttr, 5 setMode, 6 cursor, 7 other
     uint32_t attrLog[16] {};           // ring of "kind << 28 | low 28 bits of selector"; selectors are fourcc, see attrRaw
     uint32_t attrRaw[16] {};
@@ -250,7 +256,7 @@ public:
         IOWorkLoop *wl = getWorkLoop();
         if (wl) {
             diagTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
-                RedNaviFB *self = static_cast<RedNaviFB *>(o);
+                AMDRedNaviFB *self = static_cast<AMDRedNaviFB *>(o);
                 if (!self->ghostGone && self->ghostTries < 300) {
                     self->ghostTries++;
                     if (self->removeBootFramebuffer(self->getProvider())) self->ghostGone = true;
@@ -259,6 +265,20 @@ public:
                 t->setTimeoutMS(1000);
             });
             if (diagTimer && wl->addEventSource(diagTimer) == kIOReturnSuccess) diagTimer->setTimeoutMS(1000);
+        }
+        if (wl && !vblTimer) {
+            vblTimer = IOTimerEventSource::timerEventSource(this, [](OSObject *o, IOTimerEventSource *t) {
+                AMDRedNaviFB *self = static_cast<AMDRedNaviFB *>(o);
+                if (self->vblEnabled && self->vblProc) {
+                    self->vblProc(self->vblTarget, self->vblRef);
+                }
+                uint32_t hz = self->fbRefresh ? self->fbRefresh : 60;
+                t->setTimeoutUS(1000000 / hz);
+            });
+            if (vblTimer && wl->addEventSource(vblTimer) == kIOReturnSuccess) {
+                uint32_t hz = fbRefresh ? fbRefresh : 60;
+                vblTimer->setTimeoutUS(1000000 / hz);
+            }
         }
         publishDiag();
         IOLog("RedNaviFB: enabled, %ux%u at physical 0x%llx\n", fbWidth, fbHeight, scanoutPhys);
@@ -277,6 +297,30 @@ public:
     IODeviceMemory *getVRAMRange() APPLE_KEXT_OVERRIDE {
         return getApertureRange(kIOFBSystemAperture);
     }
+    IOReturn registerForInterruptType(IOSelect interruptType, IOFBInterruptProc proc, OSObject *target, void *ref, void **interruptRef) APPLE_KEXT_OVERRIDE {
+        if (interruptType != kIOFBVBLInterruptType) return kIOReturnUnsupported;
+        vblProc = proc;
+        vblTarget = target;
+        vblRef = ref;
+        *interruptRef = this;
+        return kIOReturnSuccess;
+    }
+
+    IOReturn unregisterInterrupt(void *interruptRef) APPLE_KEXT_OVERRIDE {
+        if (interruptRef != this) return kIOReturnBadArgument;
+        vblProc = nullptr;
+        vblTarget = nullptr;
+        vblRef = nullptr;
+        vblEnabled = false;
+        return kIOReturnSuccess;
+    }
+
+    IOReturn setInterruptState(void *interruptRef, UInt32 state) APPLE_KEXT_OVERRIDE {
+        if (interruptRef != this) return kIOReturnBadArgument;
+        vblEnabled = (state != 0);
+        return kIOReturnSuccess;
+    }
+
 
     const char *getPixelFormats() APPLE_KEXT_OVERRIDE { return IO32BitDirectPixels; }
 
@@ -354,4 +398,4 @@ public:
     }
 };
 
-OSDefineMetaClassAndStructors(RedNaviFB, IOFramebuffer)
+OSDefineMetaClassAndStructors(AMDRedNaviFB, IOFramebuffer)

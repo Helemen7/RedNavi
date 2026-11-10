@@ -24,6 +24,9 @@
 #include <unistd.h>
 
 void rn_log(const char *fmt, ...) {
+    static int enabled = -1;
+    if (enabled < 0) enabled = (getenv("RN_METAL_LOG") != NULL) ? 1 : 0;
+    if (!enabled) return;
     static char name[64];
     if (!name[0]) { extern const char *getprogname(void); strlcpy(name, getprogname(), sizeof(name)); }
     char line[1024];
@@ -237,6 +240,24 @@ __attribute__((constructor)) static void rn_load(void) {
     class_addMethod(k, sel_registerName("featureProfile"), imp_implementationWithBlock(^unsigned long long(id self) {
         rn_log("featureProfile asked, answering 10002");
         return 10002ull;
+    }), "Q16@0:8");
+    class_addMethod(k, sel_registerName("name"), imp_implementationWithBlock(^NSString *(id self) {
+        return @"AMD Radeon 8060S";
+    }), "@@:");
+    class_addMethod(k, sel_registerName("hasUnifiedMemory"), imp_implementationWithBlock(^BOOL(id self) {
+        return YES;
+    }), "B16@0:8");
+    class_addMethod(k, sel_registerName("dedicatedMemorySize"), imp_implementationWithBlock(^unsigned long long(id self) {
+        return 96ULL * 1024 * 1024 * 1024;
+    }), "Q16@0:8");
+    class_addMethod(k, sel_registerName("sharedMemorySize"), imp_implementationWithBlock(^unsigned long long(id self) {
+        return 32ULL * 1024 * 1024 * 1024;
+    }), "Q16@0:8");
+    class_addMethod(k, sel_registerName("recommendedMaxWorkingSetSize"), imp_implementationWithBlock(^unsigned long long(id self) {
+        return 96ULL * 1024 * 1024 * 1024;
+    }), "Q16@0:8");
+    class_addMethod(k, sel_registerName("maxBufferLength"), imp_implementationWithBlock(^unsigned long long(id self) {
+        return 64ULL * 1024 * 1024 * 1024;
     }), "Q16@0:8");
     // Metal asserts [newDevice conformsToProtocol:@protocol(MTLDevice)] in MTLAddDevice, and a class made at run time declares no protocol (the log of 2026-11-04 showed
     // -initWithAcceleratorPort: succeeding and "conforms to MTLDevice: no"). The vendor classes declare it in their class metadata; here it is added by hand.

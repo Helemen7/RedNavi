@@ -29,7 +29,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<key>IOPCIPrimaryMatch</key>
-			<string>0x747E1002</string>
+			<string>0x747E1002 0x15861002</string>
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
 			<key>IOProbeScore</key>

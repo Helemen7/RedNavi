@@ -20,7 +20,7 @@ CXXFLAGS := $(ARCH) $(OPT) -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fn
 	-nostdinc -isystem $(SDK)/Headers -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE \
 	-DAPPLE -DNeXT -mmacosx-version-min=12.0 -Wall -Icompat/include
 # Optional local firmware component (python3 tools/gen_psp_fw_header.py ... RedNavi/psp_fw.h).
-ifneq ($(wildcard RedNavi/psp_fw.h RedNavi/dmub_fw.h),)
+ifneq ($(wildcard RedNavi/psp_fw.h),)
 CXXFLAGS += -DRN_HAVE_PSP_FW
 endif
 ifneq ($(wildcard RedNavi/smu_fw.h),)
@@ -108,7 +108,7 @@ $(ACCELKEXT): $(OUT)/accel_kern_accel.o $(OUT)/accel_kern_info.o RedNaviAccel/In
 	@echo "built $(ACCELKEXT)"
 
 # RedNaviAccel2 (M6): the same family dependency, but the family's own start() runs (docs/M6_ACCELERATOR_STUDY.md).
-$(OUT)/accel2_kern_accel2.o: RedNaviAccel2/kern_accel2.cpp RedNaviAccel/IOGraphicsAccelerator2.h
+$(OUT)/accel2_kern_accel2.o: RedNaviAccel2/kern_accel2.cpp RedNaviAccel2/stubs.inc RedNaviAccel2/IOAccelClasses.h RedNaviAccel/IOGraphicsAccelerator2.h
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
@@ -126,7 +126,7 @@ $(ACCEL2KEXT): $(OUT)/accel2_kern_accel2.o $(OUT)/accel2_kern_info.o RedNaviAcce
 MTLBUNDLE := $(OUT)/RedNaviMTLDriver.bundle
 $(MTLBUNDLE): RedNaviMTL/plugin.m RedNaviMTL/Info.plist
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
-	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -framework Foundation -framework Metal -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
+	clang -bundle -arch x86_64 -mmacosx-version-min=12.0 -fobjc-arc -I/opt/local/include -IRedNaviMTL/include -framework Foundation -framework Metal -framework IOKit RedNaviMTL/plugin.m RedNaviMTL/compute.m RedNaviMTL/metallib.c RedNaviMTL/rn_air.c RedNaviMTL/rn_vk.c RedNaviMTL/rn_vk_selftest.c -o $(MTLBUNDLE)/Contents/MacOS/RedNaviMTLDriver
 	cp RedNaviMTL/Info.plist $(MTLBUNDLE)/Contents/Info.plist
 	xattr -cr $(MTLBUNDLE)
 	codesign -f -s - $(MTLBUNDLE)

@@ -11,8 +11,20 @@ static_assert(sizeof(RedNaviVidMemory) == 272, "IOAccelVidMemory is 272 bytes in
 OSDefineMetaClassAndStructors(RedNaviVidMemory, IOAccelVidMemory)
 void RedNaviVidMemory::rnPad0() {} void RedNaviVidMemory::rnPad1() {} void RedNaviVidMemory::rnPad2() {} void RedNaviVidMemory::rnPad3() {}
 long RedNaviVidMemory::getPhysicalSegment(unsigned long long, unsigned long long*) { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::getPhysicalSegment called (stub, returns 0)"); } return 0; }
-long RedNaviVidMemory::allocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::allocPhysical called (stub, returns 0)"); } return 0; }
-long RedNaviVidMemory::deallocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::deallocPhysical called (stub, returns 0)"); } return 0; }
+long RedNaviVidMemory::allocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::allocPhysical called (returns 1)"); } return 1; }
+long RedNaviVidMemory::deallocPhysical() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviVidMemory::deallocPhysical called (returns 1)"); } return 1; }
+class RedNaviSysMemory : public IOAccelSysMemory {
+    OSDeclareDefaultStructors(RedNaviSysMemory)
+public:
+    long getPhysicalSegment(unsigned long long, unsigned long long*) override { return 0; }
+    virtual void rnPad0(); virtual void rnPad1(); virtual void rnPad2(); virtual void rnPad3();
+    virtual void rnPad4(); virtual void rnPad5();
+};
+static_assert(sizeof(RedNaviSysMemory) == 408, "IOAccelSysMemory is 408 bytes in the registry");
+OSDefineMetaClassAndStructors(RedNaviSysMemory, IOAccelSysMemory)
+void RedNaviSysMemory::rnPad0() {} void RedNaviSysMemory::rnPad1() {} void RedNaviSysMemory::rnPad2() {} void RedNaviSysMemory::rnPad3() {}
+void RedNaviSysMemory::rnPad4() {} void RedNaviSysMemory::rnPad5() {}
+
 
 class RedNaviResource2 : public IOAccelResource2 {
     OSDeclareDefaultStructors(RedNaviResource2)
@@ -48,9 +60,9 @@ public:
 static_assert(sizeof(RedNaviMemoryMap) == 280, "IOAccelMemoryMap is 280 bytes in the registry");
 OSDefineMetaClassAndStructors(RedNaviMemoryMap, IOAccelMemoryMap)
 void RedNaviMemoryMap::rnPad0() {} void RedNaviMemoryMap::rnPad1() {} void RedNaviMemoryMap::rnPad2() {} void RedNaviMemoryMap::rnPad3() {}
-long RedNaviMemoryMap::commitIntoGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::commitIntoGPUPageTable called (stub, returns 0)"); } return 0; }
-long RedNaviMemoryMap::releaseFromGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::releaseFromGPUPageTable called (stub, returns 0)"); } return 0; }
-long RedNaviMemoryMap::updateGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::updateGPUPageTable called (stub, returns 0)"); } return 0; }
+long RedNaviMemoryMap::commitIntoGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::commitIntoGPUPageTable called (returns 1)"); } return 1; }
+long RedNaviMemoryMap::releaseFromGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::releaseFromGPUPageTable called (returns 1)"); } return 1; }
+long RedNaviMemoryMap::updateGPUPageTable() { static bool seen; if (!seen) { seen = true; rnNote("RedNaviMemoryMap::updateGPUPageTable called (returns 1)"); } return 1; }
 
 class RedNaviGLContext2 : public IOAccelGLContext2 {
     OSDeclareDefaultStructors(RedNaviGLContext2)
