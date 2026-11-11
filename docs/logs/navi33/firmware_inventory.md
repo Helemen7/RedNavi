@@ -17,7 +17,7 @@ The log does show:
 
 These runtime messages support successful Linux initialization of those subsystems, but do not identify every exact blob file used.
 
-The older saved dmesg excerpt above is from a different boot and must not be paired with the DRM capture or with the package hashes collected later. A current-boot journal capture is documented in `firmware-runtime-current-boot.md`; it reports SMU 82.97.0 and DMUB `0x07003600`, which agree with the DRM capture in `linux-amdgpu-info-raw-2026-11-11.txt` (FW_VERSION types `0x0a` and `0x14`). The current journal also reports VCN ENC 1.24 / DEC 9 / revision 55. The nine SHA-256 values below describe the installed compressed files at inventory time only; they are not hashes of firmware loaded during the older boot. Neither the DRM capture nor the journal attests every requested blob filename.
+The older saved dmesg excerpt above is from a different boot and must not be paired with the DRM capture or with the package hashes collected later. A current-boot journal capture is documented in `firmware-runtime-current-boot.md`; it reports SMU 82.97.0 and DMUB `0x07003600`, which agree with the DRM capture in `rx7600-frame121/amdgpu_info_raw.txt` (FW_VERSION types `0x0a` and `0x14`). The current journal also reports VCN ENC 1.24 / DEC 9 / revision 55. The nine SHA-256 values below describe the installed compressed files at inventory time only; they are not hashes of firmware loaded during the older boot. Neither the DRM capture nor the journal attests every requested blob filename.
 
 ## Candidate files present
 

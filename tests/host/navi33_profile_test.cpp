@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: BSD-3-Clause
+// Copyright (c) 2026 Helemen7 and RedNavi contributors
 // Evidence-only structural test for the generated Navi 33 Linux INFO snapshot.
 // This does not register the profile with the live ASIC table.
 #include <cassert>

@@ -18,8 +18,3 @@
 2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 13 on hub 0
 2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
 2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
-2026-11-11T14:25:13+07:00 cachyos-x8664 kernel: amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x07003600
-2026-11-11T14:25:13+07:00 cachyos-x8664 kernel: amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 12 on hub 0
-2026-11-11T14:25:13+07:00 cachyos-x8664 kernel: amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 13 on hub 0
-2026-11-11T14:25:13+07:00 cachyos-x8664 kernel: amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
-2026-11-11T14:25:13+07:00 cachyos-x8664 kernel: amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8

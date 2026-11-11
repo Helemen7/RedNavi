@@ -4,7 +4,8 @@
 
 """Turn the raw DRM_AMDGPU_INFO answers of a Linux run (tools/linux_amdgpu_info_raw.py) into RedNavi/linux_info_<name>.h.
 
-    python3 tools/gen_linux_info_header.py docs/logs/navi33/linux-amdgpu-info-raw-2026-11-11.txt docs/logs/navi33/linux_info_navi33.h navi33
+    python3 tools/gen_linux_info_header.py docs/logs/linux-reference/amdgpu_info_raw_navi32.txt RedNavi/linux_info_navi32.h navi32
+    python3 tools/gen_linux_info_header.py docs/logs/navi33/rx7600-frame121/amdgpu_info_raw.txt docs/logs/navi33/linux_info_navi33.h navi33
 
 The third argument names the ASIC: every symbol of the header ends with it, so the headers of several ASICs can be built into
 one kext. The row of the ASIC in RedNavi/asic.cpp points at kRNLinuxInfo_<name>.

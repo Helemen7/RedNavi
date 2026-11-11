@@ -2,6 +2,7 @@
 
 **Device:** RX 7600, PCI BDF `0000:03:00.0`, PCI ID `1002:7480`
 **Kernel:** CachyOS `7.3.1-1-cachyos`
+**Capture host:** `cachyos` (the 20:15 boot associated with the DRM capture)
 **Capture:** current boot kernel journal, read-only; filtered lines are preserved in `firmware-runtime-current-boot.log`.
 
 ## Observed runtime results
@@ -18,6 +19,6 @@ This is stronger runtime evidence than package presence alone: the running Linux
 
 It still does **not** identify the exact firmware filename requested for each subsystem. The kernel log reports selected IP blocks and runtime versions, but does not print the requested blob paths for all components. Therefore the nine SHA-256-verified package files in `firmware_inventory.md` remain source-matched candidates, not per-file load attestations. Do not populate RedNavi's `rn_asic.firmware` field solely from this log.
 
-The current boot journal contains an initial boot-time timestamp of 20:15:38 +07 while the host clock was later corrected by time synchronization. The raw log is retained verbatim; do not use its wall-clock timestamps to correlate with other captures without checking the boot ID / monotonic timestamps.
+The retained lines all come from host `cachyos` and the 20:15 boot associated with the DRM capture. A separate 14:25 excerpt from host `cachyos-x8664` was excluded because it belongs to a different boot. The capture boot contains an initial timestamp of 20:15:38 +07 while the host clock was later corrected by time synchronization; do not correlate wall-clock timestamps with other captures without checking the boot ID / monotonic timestamps.
 
 No GPU registers were read or written by this capture. No firmware was copied, replaced, loaded manually, or modified. No GPU workload was submitted and no reset or reconfiguration was performed.

@@ -16,7 +16,6 @@ The authoritative interpretation and integration boundary are in [ASIC_PROFILE_D
 
 - [Raw IP Discovery capture and provenance](rx7600-frame121/README.md) — binary capture, checksums and parser validation.
 - [Decoded IP Discovery inventory](ip_discovery.txt) — 39 parsed IP records.
-- [Raw DRM_AMDGPU_INFO answers](linux-amdgpu-info-raw-2026-11-11.txt) — read-only Linux ioctl responses.
-- [Decoded DRM_AMDGPU_INFO answers](linux-amdgpu-info-decoded-2026-11-11.json) — parsed response map.
+- [Raw DRM_AMDGPU_INFO answers](rx7600-frame121/amdgpu_info_raw.txt) — read-only Linux ioctl responses.
 - [Generated Linux DRM info header](linux_info_navi33.h) — 440-byte DEV_INFO and captured metadata; not included by the live ASIC table.
 - [Linux ABI smoke test source](../../../tools/linux_amdgpu_abi_smoke.c) — parameterized, read-only DEV_INFO ioctl check.
