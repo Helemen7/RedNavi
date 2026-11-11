@@ -76,6 +76,12 @@ With `rednavi_fb=1` (and `rednavi_dcn_replay=14`) the probe publishes where the 
 
 Please post decoded output in an issue, together with your board and BIOS settings (Above 4G Decoding, Resizable BAR).
 
+## Credits & Contributors
+
+- **Helemen7** — Project founder, kernel display architecture, Metal/RADV translation layer.
+- **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
+
+
 ## Contributing
 
 We want contributors. Good first areas, each of which will get an issue:
