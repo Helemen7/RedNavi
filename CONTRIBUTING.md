@@ -17,6 +17,7 @@ Open an issue first for anything larger than a bug fix: a new chip, a new subsys
 - Generated files go in their own commit, together with the generator and the exact command that produced them, so the reviewer reads the generator and not the output.
 - The description says what the change does, how it was tested and on which machine, and what is still unverified. Do not write claims such as "no regressions" without naming what was run. A change that was not tested says so in its first lines: "not tested" is an acceptable statement, a claim without a test behind it is not.
 - CI must pass (`make`, `make DEBUG=1`, `make test`).
+- - **Credits in `README.md`**: Add yourself to the `Credits & Contributors` section in `README.md` (or update your entry) describing in one concise line what you contributed or tested. A contribution is not merged without proper attribution. If you did something more, add it so everything stays updated.
 
 A pull request that mixes topics or carries a commit too large to review will be sent back to be split. That is not a judgement on the work.
 
