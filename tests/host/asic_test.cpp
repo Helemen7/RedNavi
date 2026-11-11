@@ -99,6 +99,24 @@ static void testBad() {
     CHECK(!rn_asic_lookup(t.data(), static_cast<uint32_t>(t.size()), 0x747E, nullptr));
 }
 
+// A table captured from a real card of another die (docs/logs/navi33/rx7600-frame121, an RX 7600 on Linux; run from the repository root, as `make test` does).
+// It must read as GC 11.0.2 / DCN 3.2.1 / MP0 and MP1 13.0.7 / SDMA 6.0.2 and match no row, whatever the device ID is: such a card stays read-only.
+static void testRealNavi33() {
+    FILE *f = fopen("docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin", "rb");
+    if (!f) { printf("skipped: the Navi 33 capture is not in this checkout\n"); return; }
+    std::vector<uint8_t> t(1 << 16);
+    t.resize(fread(t.data(), 1, t.size(), f));
+    fclose(f);
+    uint32_t len = static_cast<uint32_t>(t.size());
+    rn_ip_version v = {};
+    CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_GC, &v) && v.major == 11 && v.minor == 0 && v.rev == 2);
+    CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_DMU, &v) && v.major == 3 && v.minor == 2 && v.rev == 1);
+    CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_MP0, &v) && v.major == 13 && v.minor == 0 && v.rev == 7);
+    CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_MP1, &v) && v.major == 13 && v.minor == 0 && v.rev == 7);
+    CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_SDMA0, &v) && v.major == 6 && v.minor == 0 && v.rev == 2);
+    for (uint16_t dev : {0x7480, 0x747E, 0x744C, 0x1586}) CHECK(!rn_asic_lookup(t.data(), len, dev, nullptr));
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) {
         FILE *f = fopen(argv[1], "rb");
@@ -121,6 +139,7 @@ int main(int argc, char **argv) {
     testVersions();
     testLookup();
     testBad();
+    testRealNavi33();
     printf(failures ? "%d FAILED\n" : "all asic tests passed\n", failures);
     return failures ? 1 : 0;
 }

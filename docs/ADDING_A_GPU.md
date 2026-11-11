@@ -18,7 +18,7 @@ It holds the five versions the probe read (`gc`, `dcn`, `mp0`, `mp1`, `sdma`) an
 
 ## What is in the table and what is not yet
 
-State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The read-only path for a card outside the table is host-tested only (`tests/host/asic_test.cpp`); it has not run on such a card since the change (unverified).
+State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The read-only path for a card outside the table is host-tested (`tests/host/asic_test.cpp`), including against the real IP discovery table of an RX 7600 captured on Linux (`docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin`: GC 11.0.2, DCN 3.2.1, MP0 and MP1 13.0.7, SDMA 6.0.2, no row matches, for any device ID). The kext itself has not run on a card outside the table since the change (unverified).
 
 Selected through the row (verified on the RX 7800 XT, one boot, 2026-11-11: DisplayPort trains through the row's path, the replay leaves the same eleven read-back differences as before, the display runs at 1920x1080 at 144 Hz, and `rn_test info` gets `DEV_INFO` and the firmware versions of the row's snapshot):
 
