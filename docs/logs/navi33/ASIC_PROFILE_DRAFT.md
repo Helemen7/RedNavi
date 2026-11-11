@@ -74,7 +74,7 @@ The decoded response map and raw bytes are retained in the contributor evidence 
 
 The DRM capture reports version/feature metadata for GFX, SDMA, PSP, VCN, DMCUB, MES and other firmware types. These are driver-reported metadata values, not proof that each image was loaded, started, or is operational.
 
-The host inventory now identifies version-matched firmware candidates and their installed-file SHA-256 values in `docs/logs/navi33/firmware_inventory.md`. Matching CachyOS source confirms several filename request paths, and the saved dmesg confirms SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA ring enumeration. However, the log does not attest every exact blob filename. Keep the final `rn_asic.firmware` field unset until each required and optional file is resolved against the matching kernel source and load path.
+The host inventory now identifies version-matched firmware candidates and their installed-file SHA-256 values in `docs/logs/navi33/firmware_inventory.md`. Matching CachyOS source confirms several filename request paths. The current-boot journal evidence in `docs/logs/navi33/firmware-runtime-current-boot.md` confirms SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA / VCN ring enumeration. However, the log does not attest every exact blob filename. Keep the final `rn_asic.firmware` field unset until each required and optional file is resolved against the matching kernel source and load path.
 
 ## 6. Register-header and implementation candidates
 

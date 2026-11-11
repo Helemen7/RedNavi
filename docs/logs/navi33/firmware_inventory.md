@@ -17,6 +17,8 @@ The log does show:
 
 These runtime messages support successful Linux initialization of those subsystems, but do not identify every exact blob file used.
 
+A separate current-boot journal capture was collected on 2026-11-11 and is documented in `firmware-runtime-current-boot.md`. It reports SMU 82.97.0, VCN ENC 1.24 / DEC 9 / revision 55, DMUB runtime version `0x07003600`, and SDMA / VCN ring enumeration. These values differ from the older saved dmesg excerpt above (SMU 82.92.0 and VCN ENC 1.23), so the captures are retained separately rather than silently merged. Neither capture prints every requested firmware filename.
+
 ## Candidate files present
 
 All hashes below are SHA-256 of the installed compressed `.bin.zst` files, not hashes of decompressed firmware payloads.
