@@ -2,9 +2,12 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2026 Helemen7 and RedNavi contributors
 
-"""Generate RedNavi/gc_regs.h from the AMD gc_11_0_0 register headers (MIT licence, see NOTICE).
+"""Generate RedNavi/gc_regs.h from the AMD gc_11_0_3 register headers (MIT licence, see NOTICE).
 
-    python3 tools/gen_gc_regs.py gc_11_0_0_offset.h gc_11_0_0_sh_mask.h tools/gc_regs_spec.txt gc_11_0_0_default.h > RedNavi/gc_regs.h
+    python3 tools/gen_gc_regs.py gc_11_0_3_offset.h gc_11_0_3_sh_mask.h tools/gc_regs_spec.txt gc_11_0_0_default.h > RedNavi/gc_regs.h
+
+The offsets and fields are those of GC 11.0.3 (Navi 32): its memory hub registers sit elsewhere than in gc_11_0_0. Linux has
+no gc_11_0_3_default.h, so the reset values come from gc_11_0_0_default.h.
 
 Only the registers and fields listed in tools/gc_regs_spec.txt are emitted, with their base index.
 """
@@ -14,7 +17,7 @@ import sys
 
 def main():
     # Optional trailing "--guard NAME --from TEXT" for the other IP blocks (OSSSYS, NBIO): the same generator, another header set.
-    args, guard, src = sys.argv[1:], "REDNAVI_GC_REGS_H", "the AMD gc_11_0_0 headers"
+    args, guard, src = sys.argv[1:], "REDNAVI_GC_REGS_H", "the AMD gc_11_0_3 headers, reset values from gc_11_0_0_default.h"
     while "--guard" in args:
         i = args.index("--guard"); guard = args[i + 1]; del args[i:i + 2]
     while "--from" in args:
