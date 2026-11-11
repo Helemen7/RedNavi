@@ -9,8 +9,10 @@ This directory collects the read-only evidence and documentation-only candidate 
 3. [Generated Linux DRM info snapshot](linux_info_navi33.h) — 440-byte DEV_INFO plus HW_IP_COUNT / HW_IP_INFO / firmware metadata from the captured Linux kernel. Not included by `RedNavi/asic.cpp`.
 4. [Firmware inventory](firmware_inventory.md) — installed package candidates, file hashes and source/load-state caveats.
 5. [Register-header references](register_header_references.md) — matching CachyOS source header families and Git blob provenance.
-6. [Validation record](VALIDATION.md) — host tests, generator reproducibility, hashes and platform limitation.
-7. [Raw IP Discovery evidence](rx7600-frame121/README.md) — capture provenance, SHA-256 and parser validation.
+6. [Live connector evidence](connectors-live-2026-11-11.md) — RX 7600 `card1` to PCI BDF mapping, DP-1 state and sanitized EDID details.
+7. [Linux ABI smoke test](../../../tools/linux_amdgpu_abi_smoke.c) — read-only live DEV_INFO ioctl test against matching kernel UAPI headers.
+8. [Validation record](VALIDATION.md) — host tests, live ABI / connector checks, generator reproducibility, hashes and platform limitation.
+9. [Raw IP Discovery evidence](rx7600-frame121/README.md) — capture provenance, SHA-256 and parser validation.
 
 ## Current identity candidate
 
