@@ -169,5 +169,6 @@ test:
 	./build/mode_regs_test
 	clang++ -std=c++17 -Wall tests/host/asic_test.cpp RedNavi/asic.cpp -o build/asic_test
 	./build/asic_test
+	python3 -I tests/host/compare_discovery_test.py
 
 .PHONY: all clean test mtl

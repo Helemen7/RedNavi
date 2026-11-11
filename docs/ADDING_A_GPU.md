@@ -63,7 +63,7 @@ Commit the report to `docs/logs/<chip>/` in its own pull request, with the machi
 Add the PCI device ID to `IOPCIPrimaryMatch` in `RedNavi/Info.plist.in`, build, and load the kext on a machine whose display does not depend on the card (`CONTRIBUTING.md`, "Safety"). The card is not in the table, so the probe only reads. Check:
 
 - the `asic` property shows five versions and `name` = `not in the table`;
-- `tools/decode_discovery.py` on the `ip-discovery` property agrees with the Linux `ip_discovery.txt` from step 0.
+- the `ip-discovery` property agrees with the Linux `ip_discovery.txt` from step 0: save `ioreg -rn RedNaviProbe -l -x` to a file and run `python3 tools/compare_discovery.py ioreg.txt ip_discovery.txt`. It prints `SAME` and exits 0 when every block has the same version and base addresses, and lists the differences otherwise (`tools/decode_discovery.py` prints the decoded table if you want to read it).
 
 You can check a table without booting anything: `make test` builds `build/asic_test`, and `build/asic_test table.bin 7480` prints the versions and the row a raw table would match.
 
