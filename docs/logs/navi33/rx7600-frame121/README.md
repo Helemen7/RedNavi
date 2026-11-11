@@ -59,3 +59,7 @@ The previously submitted PR artifact had the same first 1,280 bytes as this capt
 ## Suggested use
 
 Use the raw artifact to independently validate the Navi 33 IP block/instance/version inventory and inform asic.cpp / rn_asic_board definitions. Independently verify each mapping against Linux kernel sources and RedNavi's own abstractions before enabling hardware access.
+
+## Additional Linux DRM_AMDGPU_INFO evidence
+
+A separate read-only DRM_AMDGPU_INFO response snapshot was captured on 2026-11-11. See [amdgpu_info.md](amdgpu_info.md) for provenance, interpretation and limitations, and [amdgpu_info_raw.txt](amdgpu_info_raw.txt) for the original hexadecimal ioctl responses. This is separate from the IP Discovery binary capture above.

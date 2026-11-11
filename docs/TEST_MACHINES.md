@@ -52,3 +52,17 @@ What was tried before, and why it is not the fix:
 | a user-level disable (`SLSConfigureDisplayEnabled`) or a mirror at login | not done: it hides the display, it does not stop it from existing |
 
 `rednavi_kill_boot_fb` (mode 4 by default, `=0` to keep) stays in `RedNaviFB` as a fallback for a machine where the match category does not work. To undo the category change in an installed EFI: put back `Info.plist` (`IOProbeScore` 1000, no `IOMatchCategory`); on the desktop the old file is `EFI/OC/Info.plist.RedNavi.pre-category`. `rednavi_keep_boot_fb` is read by nothing.
+
+## RX 7600 evidence machine (Linux only)
+
+| Item | Value |
+|---|---|
+| Board | GIGABYTE A620M S2H |
+| CPU | AMD Ryzen 5 7500F |
+| RAM | 32 GB DDR5 |
+| Target GPU | PowerColor Radeon RX 7600, Navi 33, 1002:7480, subsystem 148C:2421, rev CF |
+| OS | CachyOS Linux, x86_64 |
+| Kernel | 7.3.1-1-cachyos |
+| Role | Linux read-only IP Discovery and DRM_AMDGPU_INFO evidence only; no RedNavi macOS run has been performed on this machine |
+
+This machine is the contributor's hardware for the Navi 33 evidence under docs/logs/navi33/rx7600-frame121/. The monitor is connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this machine.
