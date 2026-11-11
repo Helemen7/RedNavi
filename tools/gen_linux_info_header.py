@@ -9,8 +9,8 @@
 The third argument names the ASIC: every symbol of the header ends with it, so the headers of several ASICs can be built into
 one kext. The row of the ASIC in RedNavi/asic.cpp points at kRNLinuxInfo_<name>.
 
-The header holds what the Linux kernel told RADV on this card: the 448 bytes of DEV_INFO, the HW_IP_INFO and HW_IP_COUNT answers, the firmware versions and the
-MAX_IBS array. They are numbers and flags, no firmware. The kext's infoQuery answers with them (and overrides what macOS does differently).
+The header holds what the Linux kernel told RADV on this card: the exact DEV_INFO byte length returned by the capture kernel, the HW_IP_INFO and HW_IP_COUNT answers, the firmware versions and the
+MAX_IBS array. DEV_INFO size can vary with the kernel UAPI version; rn_drm_info carries that size and infoQuery copies the smaller of the caller buffer and captured payload. They are numbers and flags, no firmware. The kext's infoQuery answers with them (and overrides what macOS does differently).
 """
 import re
 import sys

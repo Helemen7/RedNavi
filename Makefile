@@ -169,5 +169,7 @@ test:
 	./build/mode_regs_test
 	clang++ -std=c++17 -Wall tests/host/asic_test.cpp RedNavi/asic.cpp -o build/asic_test
 	./build/asic_test
+	clang++ -std=c++17 -Wall -IRedNavi tests/host/navi33_profile_test.cpp -o build/navi33_profile_test
+	./build/navi33_profile_test
 
 .PHONY: all clean test mtl
