@@ -20,7 +20,7 @@ It holds the five versions the probe read (`gc`, `dcn`, `mp0`, `mp1`, `sdma`) an
 
 State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The read-only path for a card outside the table is host-tested only (`tests/host/asic_test.cpp`); it has not run on such a card since the change (unverified).
 
-Selected through the row (built and host-tested, not yet run on the card: unverified on hardware):
+Selected through the row (verified on the RX 7800 XT, one boot, 2026-11-11: DisplayPort trains through the row's path, the replay leaves the same eleven read-back differences as before, the display runs at 1920x1080 at 144 Hz, and `rn_test info` gets `DEV_INFO` and the firmware versions of the row's snapshot):
 
 - the `DRM_AMDGPU_INFO` answers (`drm_info` of the row, generated into `RedNavi/linux_info_<name>.h`). A card outside the table gets `kIOReturnUnsupported` for these queries;
 - the display replay table (`replay` of the board, `RedNavi/dcn_replay.h`);

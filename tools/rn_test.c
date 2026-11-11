@@ -538,7 +538,7 @@ gfxdone:;
         printf("HW_IP_COUNT compute: 0x%x, %u (expect 1)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf != 1) ok = 0;
         req.query_hw_ip.type = AMDGPU_HW_IP_GFX; bufSize = 4;
         kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
-        printf("HW_IP_COUNT gfx: 0x%x, %u (the kext submits to no graphics queue yet: expect 0)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf != 0) ok = 0;
+        printf("HW_IP_COUNT gfx: 0x%x, %u (1 when the graphics queue is mapped, 0 otherwise)\n", kr, *(uint32_t *)buf); if (kr || *(uint32_t *)buf > 1) ok = 0;
         memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_HW_IP_INFO; req.return_size = sizeof(struct drm_amdgpu_info_hw_ip); req.query_hw_ip.type = AMDGPU_HW_IP_COMPUTE; bufSize = req.return_size;
         kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
         struct drm_amdgpu_info_hw_ip *ip = (struct drm_amdgpu_info_hw_ip *)buf;
