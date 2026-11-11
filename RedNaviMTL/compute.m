@@ -2030,8 +2030,9 @@ static NSArray<NSDictionary *> *rn_capture_constants(MTLFunctionConstantValues *
         const void *p = ((const void *(*)(id, SEL))objc_msgSend)(v, @selector(data));
         if (!n || !p) { *why = [NSString stringWithFormat:@"function constant with data type %lu is not supported", (unsigned long)t]; return nil; }
         NSData *d = [NSData dataWithBytes:p length:n];
-        if (k) [out addObject:@{@"name": ((NSString *(*)(id, SEL))objc_msgSend)(v, @selector(name)), @"data": d}];
-        else [out addObject:@{@"index": @(((NSUInteger (*)(id, SEL))objc_msgSend)(v, @selector(index))), @"data": d}];
+        uint32_t ty = (uint32_t)t;
+        if (k) [out addObject:@{@"name": ((NSString *(*)(id, SEL))objc_msgSend)(v, @selector(name)), @"data": d, @"type": @(ty)}];
+        else [out addObject:@{@"index": @(((NSUInteger (*)(id, SEL))objc_msgSend)(v, @selector(index))), @"data": d, @"type": @(ty)}];
     }
     return out;
 }
@@ -2041,7 +2042,8 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     for (NSDictionary *d in fcs) {
         if (n >= max) break;
         NSData *data = d[@"data"];
-        out[n++] = (rn_air_const){d[@"index"] ? (int32_t)[d[@"index"] intValue] : -1, d[@"name"] ? [d[@"name"] UTF8String] : NULL, (uint32_t)data.length, data.bytes};
+        uint32_t ty = d[@"type"] ? [d[@"type"] unsignedIntValue] : 0;
+        out[n++] = (rn_air_const){d[@"index"] ? (int32_t)[d[@"index"] intValue] : -1, d[@"name"] ? [d[@"name"] UTF8String] : NULL, (uint32_t)data.length, data.bytes, ty};
     }
     return n;
 }

@@ -20,6 +20,10 @@ typedef int (*translate_stage_fn)(unsigned, const void *, size_t, const char *, 
 static translate_stage_fn g_translate;
 typedef int (*translate_fc_fn)(unsigned, const void *, size_t, const char *, const rn_air_const *, unsigned, rn_air_kernel_info *, uint32_t **, size_t *, char *, size_t);
 static translate_fc_fn g_translate_fc;
+typedef int (*translate_pipeline_fn)(const void *, size_t, const char *, const rn_air_const *, unsigned, rn_air_kernel_info *, uint32_t **, size_t *,
+                                    const void *, size_t, const char *, const rn_air_const *, unsigned, rn_air_kernel_info *, uint32_t **, size_t *,
+                                    char *, size_t);
+static translate_pipeline_fn g_translate_pipeline;
 static free_fn g_free;
 
 static int load(const char *dir, char *err, size_t errlen) {
@@ -46,6 +50,7 @@ static int load(const char *dir, char *err, size_t errlen) {
     }
     g_translate = (translate_stage_fn)dlsym(g_lib, "rn_air_translate_stage");
     g_translate_fc = (translate_fc_fn)dlsym(g_lib, "rn_air_translate_stage_fc");
+    g_translate_pipeline = (translate_pipeline_fn)dlsym(g_lib, "rn_air_translate_pipeline");
     g_free = (free_fn)dlsym(g_lib, "rn_air_free");
     if (!g_translate || !g_free) { snprintf(err, errlen, "%s does not export rn_air_translate_stage and rn_air_free", path); g_translate = NULL; return 1; }
     return 0;
@@ -166,6 +171,17 @@ int rn_air_translate_stage_fc(const char *dir, int stage, const void *bitcode, s
                            : g_translate((unsigned)stage, bitcode, bytes, entry, info, spirv, spirv_bytes, err, errlen);
     if (!rc && cdir) cache_store(cdir, key, info, *spirv, *spirv_bytes);
     return rc;
+}
+
+int rn_air_translate_pipeline(const char *dir,
+    const void *v_bitcode, size_t v_bytes, const char *v_entry, const rn_air_const *v_consts, unsigned v_nconsts, rn_air_kernel_info *v_info, uint32_t **v_spirv, size_t *v_spirv_bytes,
+    const void *f_bitcode, size_t f_bytes, const char *f_entry, const rn_air_const *f_consts, unsigned f_nconsts, rn_air_kernel_info *f_info, uint32_t **f_spirv, size_t *f_spirv_bytes,
+    char *err, size_t errlen) {
+    if (load(dir, err, errlen)) return 1;
+    if (!g_translate_pipeline) { snprintf(err, errlen, "the AIR translator library has no rn_air_translate_pipeline"); return 1; }
+    return g_translate_pipeline(v_bitcode, v_bytes, v_entry, v_consts, v_nconsts, v_info, v_spirv, v_spirv_bytes,
+                                f_bitcode, f_bytes, f_entry, f_consts, f_nconsts, f_info, f_spirv, f_spirv_bytes,
+                                err, errlen);
 }
 
 int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen) {
