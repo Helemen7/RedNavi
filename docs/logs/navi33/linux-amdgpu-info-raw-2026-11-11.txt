@@ -9,7 +9,7 @@ VIS_VRAM_USAGE                     8 bytes: 00606c3100000000
 NUM_BYTES_MOVED                    8 bytes: 0080aa0200000000
 NUM_EVICTIONS                      8 bytes: 0000000000000000
 NUM_VRAM_CPU_PAGE_FAULTS           8 bytes: 0000000000000000
-TIMESTAMP                          0 bytes: 
+TIMESTAMP                          0 bytes:
 MAX_IBS                           40 bytes: c00000007d0000003100000031000000310000003100000031000000310000001000000031000000
 GPUVM_FAULT                       16 bytes: 00000000000000000000000000000000
 HW_IP_COUNT 0                      4 bytes: 01000000

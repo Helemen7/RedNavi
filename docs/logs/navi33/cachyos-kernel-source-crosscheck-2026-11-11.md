@@ -1,9 +1,9 @@
 # CachyOS 7.3.1-1 amdgpu source cross-check — RX 7600 / Navi 33
 
-Date: 2026-11-11  
-Running kernel: `7.3.1-1-cachyos`  
-Matching CachyOS release tag: `cachyos-7.3.1-1`  
-Tag target commit: `36ae4c219cfbd02576048c7ca1d366cea5db8034`  
+- Date: 2026-11-11
+- Running kernel: `7.3.1-1-cachyos`
+- Matching CachyOS release tag: `cachyos-7.3.1-1`
+- Tag target commit: `36ae4c219cfbd02576048c7ca1d366cea5db8034`
 Release is based on Linux 7.3.1.
 
 ## Source provenance
