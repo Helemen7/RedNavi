@@ -1,0 +1,20 @@
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 0 <common_v1_0_0> (soc21_common)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 1 <gmc_v11_0_0> (gmc_v11_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 2 <ih_v6_0_0> (ih_v6_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 3 <psp_v13_0_0> (psp)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 4 <smu_v13_0_0> (smu)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 5 <dce_v1_0_0> (dm)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 6 <gfx_v11_0_0> (gfx_v11_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 7 <sdma_v6_0_0> (sdma_v6_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 8 <vcn_v4_0_0> (vcn_v4_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 9 <jpeg_v4_0_0> (jpeg_v4_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: detected ip block number 10 <mes_v11_0_0> (mes_v11_0)
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: [drm] Loading DMUB firmware via PSP: version=0x07003600
+2026-11-11T20:15:38+07:00 cachyos kernel: amdgpu 0000:03:00.0: [VCN instance 0] Found VCN firmware Version ENC: 1.24 DEC: 9 VEP: 0 Revision: 55
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: smu driver if version = 0x00000035, smu fw if version = 0x00000040, smu fw program = 0, smu fw version = 0x00526100 (82.97.0)
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: SMU is initialized successfully!
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: [drm] DMUB hardware initialized: version=0x07003600
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring sdma0 uses VM inv eng 12 on hub 0
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring sdma1 uses VM inv eng 13 on hub 0
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring vcn_unified_0 uses VM inv eng 0 on hub 8
+2026-11-11T20:15:39+07:00 cachyos kernel: amdgpu 0000:03:00.0: ring jpeg_dec uses VM inv eng 1 on hub 8
