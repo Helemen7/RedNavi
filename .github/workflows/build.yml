@@ -23,3 +23,10 @@ jobs:
           path: |
             build/${{ matrix.config }}/RedNavi.kext
             build/${{ matrix.config }}/RedNaviFB.kext
+
+  host-tests-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Host tests (compat layer, EDID, modes, ASIC table)
+        run: make test
