@@ -50,13 +50,13 @@ The two records that still lack semantic names are intentionally kept numeric:
 | 282 | 0 | 13.0.2 | Unmapped; do not guess |
 | 286 | 0 | 4.0.2 | Unmapped; do not guess |
 
-The complete per-record inventory is in the companion `navi33_ip_inventory.json` from the hardware-mapping evidence bundle. Base addresses are metadata only; this draft does not authorize register access.
+The complete per-record inventory is in `docs/logs/navi33/ip_discovery.txt`; the raw IP Discovery capture and its provenance are under `docs/logs/navi33/rx7600-frame121/`. Base addresses are metadata only; this draft does not authorize register access.
 
 ## 4. DRM_AMDGPU_INFO / DEV_INFO
 
 Read-only capture source:
 
-`Navi33-Hardware-Mapping-Project/evidence/linux-amdgpu-info-raw-2026-11-11.txt`
+`docs/logs/navi33/linux-amdgpu-info-raw-2026-11-11.txt`
 
 - Device node: `/dev/dri/renderD128`
 - `ACCEL_WORKING`: successful query, value 1. This is a driver status flag, not proof of a submitted/completed workload.
@@ -66,9 +66,9 @@ Read-only capture source:
 - `MAX_IBS`: 40 bytes (10 little-endian u32 values).
 - `FW_VERSION`: 45 response records were captured; generator selects index 0 per type.
 
-**DEV_INFO size investigation — resolved for this capture:** The matching CachyOS 7.3.1-1 UAPI header defines `struct drm_amdgpu_info_device` as 440 bytes; a small C compile-time/runtime size probe against that exact header reports `sizeof(...) == 440`. The older Navi 32 generated header is 448 bytes because it came from a different kernel UAPI snapshot; that size must not be imposed on every ASIC. RedNavi stores an explicit `rn_drm_info.dev_info_size`, and `infoQuery()` copies `min(caller_buffer_size, captured_size)` after zeroing the caller buffer, so the kernel-side response path is length-aware. The generated Navi 33 header below therefore retains all 440 captured bytes. A live Linux userspace ABI smoke test against the matching 440-byte kernel-build UAPI now passes, including a payload-boundary canary; see `tools/linux_amdgpu_abi_smoke.c` and `VALIDATION.md`. A macOS-side `infoQuery()` integration test remains required before enabling the row. The separately installed libdrm header on this host describes a 448-byte layout; it was not substituted for the matching kernel-build UAPI definition.
+**DEV_INFO size investigation — resolved for this capture:** The matching CachyOS 7.3.1-1 UAPI header defines `struct drm_amdgpu_info_device` as 440 bytes; a small C compile-time/runtime size probe against that exact header reports `sizeof(...) == 440`. The older Navi 32 generated header is 448 bytes because it came from a different kernel UAPI snapshot; that size must not be imposed on every ASIC. RedNavi stores an explicit `rn_drm_info.dev_info_size`, and `infoQuery()` copies `min(caller_buffer_size, captured_size)` after zeroing the caller buffer, so the kernel-side response path is length-aware. The generated Navi 33 header below therefore retains all 440 captured bytes. A live Linux userspace ABI smoke test against the matching 440-byte kernel-build UAPI now passes; see `tools/linux_amdgpu_abi_smoke.c` and `VALIDATION.md`. A macOS-side `infoQuery()` integration test remains required before enabling the row. The separately installed libdrm header on this host describes a 448-byte layout; it was not substituted for the matching kernel-build UAPI definition.
 
-The decoded response map and raw bytes are retained in the contributor evidence bundle. Reproduction command (run from the RedNavi repository root, with the raw capture from the contributor evidence bundle available locally): `python3 tools/gen_linux_info_header.py <path-to-contributor-evidence>/linux-amdgpu-info-raw-2026-11-11.txt docs/logs/navi33/linux_info_navi33.h navi33`. It produced a 440-byte DEV_INFO array and 16 unique firmware metadata types (index 0 per type). A host structural test checks the generated lengths and PCI ID. No firmware image is included in this draft.
+The decoded response map and raw query answers are committed alongside this document in `linux-amdgpu-info-decoded-2026-11-11.json` and `linux-amdgpu-info-raw-2026-11-11.txt`. Reproduction command (run from the RedNavi repository root): `python3 tools/gen_linux_info_header.py docs/logs/navi33/linux-amdgpu-info-raw-2026-11-11.txt docs/logs/navi33/linux_info_navi33.h navi33`. It produced a 440-byte DEV_INFO array and 16 unique firmware metadata types (index 0 per type). A host structural test checks the generated lengths and PCI ID. No firmware image is included in this draft.
 
 ## 5. Firmware observations — not a firmware selection list
 
@@ -78,7 +78,7 @@ The host inventory now identifies version-matched firmware candidates and their 
 
 ## 6. Register-header and implementation candidates
 
-The matching CachyOS 7.3.1-1 source and existing RedNavi generator banners are mapped in `docs/logs/navi33/register_header_references.md`. The Linux generic header families overlap with several headers already generated in RedNavi, but this does not establish that the current write sequence is safe on Navi 33. The current register-header candidates are:
+The matching CachyOS 7.3.1-1 source cross-check is committed as `docs/logs/navi33/cachyos-kernel-source-crosscheck-2026-11-11.md`; generated-header provenance and family comparisons are in `docs/logs/navi33/register_header_references.md`. The Linux generic header families overlap with several headers already generated in RedNavi, but this does not establish that the current write sequence is safe on Navi 33. The current register-header candidates are:
 
 - GC 11.0.2 — matching Linux GFX and SDMA sources include generic `gc_11_0_0` register headers. The existing RedNavi `gc_regs.h` banner also says it was generated from `gc_11_0_0`; however `asic.cpp` labels it `gc_11_0_3`, a metadata discrepancy recorded for maintainer review.
 - SDMA 6.0.2 — the matching Linux driver uses shared GC 11.0.0, HDP 6.0.0, NBIO v4.3 and SDMA v6.0 packet definitions; no `sdma_6_0_2_offset.h` / `sh_mask.h` was found in the matching source directory.
@@ -88,43 +88,7 @@ The matching CachyOS 7.3.1-1 source and existing RedNavi generator banners are m
 
 Do not copy or relabel the current Navi 32 generated register headers. Follow the repository's rule: generated headers must include the exact generator command and matching Linux header provenance.
 
-## 7. Proposed profile metadata (not integrated into the live ASIC table)
-
-```json
-{
-  "name": "Navi 33",
-  "match_versions": {
-    "gc": "11.0.2",
-    "dcn": "3.2.1",
-    "mp0": "13.0.7",
-    "mp1": "13.0.7",
-    "sdma": "6.0.2"
-  },
-  "candidate_boards": [
-    {
-      "pci_vendor": "0x1002",
-      "pci_device": "0x7480",
-      "subsystem": "0x148c:0x2421",
-      "revision": "0xcf",
-      "model": "AMD Radeon RX 7600",
-      "vram_mb": null,
-      "display_replay": null,
-      "dp_path": null,
-      "status": "evidence-only; not approved for ASIC lookup"
-    }
-  ],
-  "drm_info": {
-    "capture": "linux-amdgpu-info-raw-2026-11-11.txt",
-    "dev_info_bytes": 440,
-    "generated_header": "docs/logs/navi33/linux_info_navi33.h",
-    "status": "440-byte kernel UAPI verified; Linux live ioctl smoke test passed; macOS client integration pending"
-  },
-  "firmware": null,
-  "reg_headers": null
-}
-```
-
-## 8. Gaps before an upstream-ready ASIC row
+## 7. Gaps before an upstream-ready ASIC row
 
 1. Add / run a macOS-side `infoQuery()` integration test using the captured 440-byte payload and verify caller-buffer truncation / zero-fill behavior. Linux live ioctl ABI smoke test is now passed.
 2. Identify exact firmware filenames and source provenance for the observed IP versions; do not infer filenames from version numbers.
@@ -133,22 +97,18 @@ Do not copy or relabel the current Navi 32 generated register headers. Follow th
 5. Refactor all write stages to select their firmware, register headers, memory layout, and display data from the ASIC profile before adding a Navi 33 row to the live table.
 6. Add host tests proving the RX 7600 candidate remains unmatched / read-only until the complete profile and write-stage selection are implemented.
 
-## 9. Evidence provenance
+## 8. Evidence provenance
 
 - IP Discovery capture: `docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin`
 - IP Discovery report: `docs/logs/navi33/ip_discovery.txt`
 - Capture provenance and integrity: `docs/logs/navi33/rx7600-frame121/README.md`
-- DRM raw capture: contributor evidence bundle `linux-amdgpu-info-raw-2026-11-11.txt`
-- Offline decode: contributor evidence bundle `linux-amdgpu-info-decoded-2026-11-11.json`
+- DRM raw capture: `docs/logs/navi33/linux-amdgpu-info-raw-2026-11-11.txt`
+- Offline decode: `docs/logs/navi33/linux-amdgpu-info-decoded-2026-11-11.json`
+- Matching CachyOS kernel source cross-check: `docs/logs/navi33/cachyos-kernel-source-crosscheck-2026-11-11.md`
 - Generated DRM snapshot: `docs/logs/navi33/linux_info_navi33.h` (440-byte DEV_INFO; not referenced by the live ASIC table)
-- Live Linux ABI smoke test: `tools/linux_amdgpu_abi_smoke.c` (440-byte matching kernel UAPI; ioctl and boundary canary passed)
+- Live Linux ABI smoke test: `tools/linux_amdgpu_abi_smoke.c` (440-byte matching kernel UAPI; read-only ioctl passed)
 - Live connector / EDID evidence: `docs/logs/navi33/connectors-live-2026-11-11.md` (DP-1 connected; no register writes)
 - Structural host test: `tests/host/navi33_profile_test.cpp`
 - Firmware inventory: `docs/logs/navi33/firmware_inventory.md`
 - Register-header references: `docs/logs/navi33/register_header_references.md`
-- Kernel source cross-check: contributor evidence bundle `cachyos-kernel-source-crosscheck-2026-11-11.md`
 - Kernel source tag: `CachyOS/linux` `cachyos-7.3.1-1`, commit `36ae4c219cfbd02576048c7ca1d366cea5db8034`
-
-## Scope
-
-This is a documentation-only candidate profile. No RedNavi ASIC row, PCI match, firmware, register header, display replay, or kext behavior was changed. No GPU registers were accessed or written, no firmware was loaded or changed, no GPU work was submitted, and no device reset/reconfiguration was performed.

@@ -1,0 +1,1421 @@
+{
+  "schema_version": 1,
+  "capture_kind": "read-only DRM_AMDGPU_INFO response snapshot",
+  "device_node": "/dev/dri/renderD128",
+  "kernel_environment": {
+    "running_kernel_release": "7.3.1-1-cachyos",
+    "build_uapi_header": {
+      "path": "/usr/lib/modules/7.3.1-1-cachyos/build/include/uapi/drm/amdgpu_drm.h",
+      "exists": true,
+      "size_bytes": 53006,
+      "sha256": "ac7f6dae44b224f34591152123fbf2047d3486c35d39f3eb818a96ea47a6462a",
+      "hw_ip_instance_max_count": 1,
+      "has_ip_discovery_version_field": true,
+      "has_userq_num_slots_field": true
+    },
+    "amdgpu_kms_source": {
+      "path": "/usr/lib/modules/7.3.1-1-cachyos/build/drivers/gpu/drm/amd/amdgpu/amdgpu_kms.c",
+      "exists": false
+    }
+  },
+  "query_semantics": {
+    "hw_ip_type_ids": {
+      "0": "GFX",
+      "1": "COMPUTE",
+      "2": "DMA",
+      "3": "UVD",
+      "4": "VCE",
+      "5": "UVD_ENC",
+      "6": "VCN_DEC",
+      "7": "VCN_ENC",
+      "8": "VCN_JPEG",
+      "9": "VPE"
+    },
+    "firmware_type_ids": {
+      "0x01": "VCE",
+      "0x02": "UVD",
+      "0x03": "GMC",
+      "0x04": "GFX_ME",
+      "0x05": "GFX_PFP",
+      "0x06": "GFX_CE",
+      "0x07": "GFX_RLC",
+      "0x08": "GFX_MEC",
+      "0x0a": "SMC",
+      "0x0b": "SDMA",
+      "0x0c": "PSP_SOS",
+      "0x0d": "PSP_ASD",
+      "0x0e": "VCN",
+      "0x0f": "GFX_RLC_RESTORE_LIST_CNTL",
+      "0x10": "GFX_RLC_RESTORE_LIST_GPM_MEM",
+      "0x11": "GFX_RLC_RESTORE_LIST_SRM_MEM",
+      "0x12": "DMCU",
+      "0x13": "TA",
+      "0x14": "DMCUB",
+      "0x15": "TOC",
+      "0x16": "CAP",
+      "0x17": "GFX_RLCP",
+      "0x18": "GFX_RLCV",
+      "0x19": "MES_KIQ",
+      "0x1a": "MES",
+      "0x1b": "IMU",
+      "0x1c": "VPE"
+    },
+    "notes": [
+      "HW_IP_COUNT and HW_IP_INFO are separate queries with different semantics.",
+      "The public UAPI limits the HW_IP_INFO instance argument to 0; an argument of 1 is rejected before device lookup.",
+      "HW_IP_COUNT for DMA can report the number of SDMA instances; it is not the valid HW_IP_INFO instance-argument range.",
+      "A successful ACCEL_WORKING query is a driver status flag, not proof that a GPU workload was submitted.",
+      "Firmware version and feature are decoded as two little-endian u32 values; original bytes are retained.",
+      "Same-version inventory rows are comparison candidates, not proof that IP block names are identical."
+    ]
+  },
+  "scalar_queries": {
+    "ACCEL_WORKING": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000"
+    },
+    "DEV_INFO": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 440,
+      "raw_hex": "807400000000000010000000cf000000910000000200000002000000a08601001055220000000000a0261100000000002000000000000000ff000000ff0000000000000000000000ff000000ff00000000000000000000000000000000000000000000000000000000000000000000000000000000000000ff0000000800000008000000040000001800000000000000000001000000000000000000008000000010000000002000001000000000000009000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000200000000004000008000000080000002000000000070000200000000800000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000080ffff0000bfffffffffff0000000000000000000000000000000018e403000000000000770100000000002000000001000000100000002000000000010000000800000000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "VRAM_GTT": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 24,
+      "raw_hex": "00b069fc0100000000b069fc0100000000109be103000000"
+    },
+    "MEMORY": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 96,
+      "raw_hex": "000000ff0100000000b069fc0100000000606c310000000000444f7d01000000000000ff0100000000b069fc0100000000606c310000000000444f7d0100000000c071e20300000000109be1030000000010510400000000004c34e902000000"
+    },
+    "VRAM_USAGE": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "00606c3100000000"
+    },
+    "GTT_USAGE": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "0010510400000000"
+    },
+    "VIS_VRAM_USAGE": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "00606c3100000000"
+    },
+    "NUM_BYTES_MOVED": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "0080aa0200000000"
+    },
+    "NUM_EVICTIONS": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "0000000000000000"
+    },
+    "NUM_VRAM_CPU_PAGE_FAULTS": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 8,
+      "raw_hex": "0000000000000000"
+    },
+    "MAX_IBS": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "c00000007d0000003100000031000000310000003100000031000000310000001000000031000000"
+    },
+    "GPUVM_FAULT": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 16,
+      "raw_hex": "00000000000000000000000000000000"
+    },
+    "VBIOS size": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "query 0x1d": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "query 0x1f": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "00000000"
+    },
+    "query 0x20": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "query 0x21": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 192,
+      "raw_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001000000001000000010000000000001340000000000000001000000002000000011000000002002ba00000000000000010000000040000000400000000000100000000000000000010000000020000000110000000020020000000000000000010000000020000000110000000020020000000000000000"
+    },
+    "query 0x24": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 16,
+      "raw_hex": "0020010000010000e401000000010000"
+    },
+    "query 0x25": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "query 0x26": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "query 0x27": {
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "SENSOR GFX_SCLK": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "d0030000"
+    },
+    "SENSOR GFX_MCLK": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "60000000"
+    },
+    "SENSOR GPU_TEMP": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "b0b30000"
+    },
+    "SENSOR GPU_LOAD": {
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "06000000"
+    }
+  },
+  "hw_ip_counts": {
+    "0": {
+      "type_id": 0,
+      "type_name": "GFX",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000",
+      "count": 1
+    },
+    "1": {
+      "type_id": 1,
+      "type_name": "COMPUTE",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000",
+      "count": 1
+    },
+    "2": {
+      "type_id": 2,
+      "type_name": "DMA",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "02000000",
+      "count": 2
+    },
+    "3": {
+      "type_id": 3,
+      "type_name": "UVD",
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "4": {
+      "type_id": 4,
+      "type_name": "VCE",
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "5": {
+      "type_id": 5,
+      "type_name": "UVD_ENC",
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "6": {
+      "type_id": 6,
+      "type_name": "VCN_DEC",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000",
+      "count": 1
+    },
+    "7": {
+      "type_id": 7,
+      "type_name": "VCN_ENC",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000",
+      "count": 1
+    },
+    "8": {
+      "type_id": 8,
+      "type_name": "VCN_JPEG",
+      "status": "ok",
+      "errno": null,
+      "byte_length": 4,
+      "raw_hex": "01000000",
+      "count": 1
+    },
+    "9": {
+      "type_id": 9,
+      "type_name": "VPE",
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    }
+  },
+  "hw_ip_info": {
+    "0.0": {
+      "type_id": 0,
+      "type_name": "GFX",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "0b00000000000000000000000000000020000000200000000100000002000b000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 11,
+          "minor": 0,
+          "display": "11.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 32,
+        "ib_size_alignment_bytes": 32,
+        "available_rings_mask": 1,
+        "available_ring_indices": [
+          0
+        ],
+        "ip_discovery_version": {
+          "raw_u32": 720898,
+          "raw_hex": "0x000b0002",
+          "major": 11,
+          "minor": 0,
+          "revision": 2,
+          "display": "11.0.2"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "GC",
+          "hw_id": 11,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "0.1": {
+      "type_id": 0,
+      "type_name": "GFX",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "1.0": {
+      "type_id": 1,
+      "type_name": "COMPUTE",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "0b00000000000000000000000000000020000000200000000f00000002000b000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 11,
+          "minor": 0,
+          "display": "11.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 32,
+        "ib_size_alignment_bytes": 32,
+        "available_rings_mask": 15,
+        "available_ring_indices": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "ip_discovery_version": {
+          "raw_u32": 720898,
+          "raw_hex": "0x000b0002",
+          "major": 11,
+          "minor": 0,
+          "revision": 2,
+          "display": "11.0.2"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "GC",
+          "hw_id": 11,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "1.1": {
+      "type_id": 1,
+      "type_name": "COMPUTE",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "2.0": {
+      "type_id": 2,
+      "type_name": "DMA",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "06000000000000000000000000000000000100000400000003000000020006000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 6,
+          "minor": 0,
+          "display": "6.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 256,
+        "ib_size_alignment_bytes": 4,
+        "available_rings_mask": 3,
+        "available_ring_indices": [
+          0,
+          1
+        ],
+        "ip_discovery_version": {
+          "raw_u32": 393218,
+          "raw_hex": "0x00060002",
+          "major": 6,
+          "minor": 0,
+          "revision": 2,
+          "display": "6.0.2"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "LSDMA",
+          "hw_id": 91,
+          "instance": 0
+        },
+        {
+          "ip_name": "OSSSYS",
+          "hw_id": 40,
+          "instance": 0
+        },
+        {
+          "ip_name": "SDMA0",
+          "hw_id": 42,
+          "instance": 0
+        },
+        {
+          "ip_name": "SDMA1",
+          "hw_id": 43,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "2.1": {
+      "type_id": 2,
+      "type_name": "DMA",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "3.0": {
+      "type_id": 3,
+      "type_name": "UVD",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 0,
+          "minor": 0,
+          "display": "0.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 0,
+        "ib_size_alignment_bytes": 0,
+        "available_rings_mask": 0,
+        "available_ring_indices": [],
+        "ip_discovery_version": {
+          "raw_u32": 0,
+          "raw_hex": "0x00000000",
+          "major": 0,
+          "minor": 0,
+          "revision": 0,
+          "display": "0.0.0"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": true,
+      "same_version_ip_discovery_records": [],
+      "same_version_match_is_identity_proof": false
+    },
+    "3.1": {
+      "type_id": 3,
+      "type_name": "UVD",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "4.0": {
+      "type_id": 4,
+      "type_name": "VCE",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 0,
+          "minor": 0,
+          "display": "0.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 0,
+        "ib_size_alignment_bytes": 0,
+        "available_rings_mask": 0,
+        "available_ring_indices": [],
+        "ip_discovery_version": {
+          "raw_u32": 0,
+          "raw_hex": "0x00000000",
+          "major": 0,
+          "minor": 0,
+          "revision": 0,
+          "display": "0.0.0"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": true,
+      "same_version_ip_discovery_records": [],
+      "same_version_match_is_identity_proof": false
+    },
+    "4.1": {
+      "type_id": 4,
+      "type_name": "VCE",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "5.0": {
+      "type_id": 5,
+      "type_name": "UVD_ENC",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 0,
+          "minor": 0,
+          "display": "0.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 0,
+        "ib_size_alignment_bytes": 0,
+        "available_rings_mask": 0,
+        "available_ring_indices": [],
+        "ip_discovery_version": {
+          "raw_u32": 0,
+          "raw_hex": "0x00000000",
+          "major": 0,
+          "minor": 0,
+          "revision": 0,
+          "display": "0.0.0"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": true,
+      "same_version_ip_discovery_records": [],
+      "same_version_match_is_identity_proof": false
+    },
+    "5.1": {
+      "type_id": 5,
+      "type_name": "UVD_ENC",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "6.0": {
+      "type_id": 6,
+      "type_name": "VCN_DEC",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "04000000000000000000000000000000000100004000000000000000040004000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 4,
+          "minor": 0,
+          "display": "4.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 256,
+        "ib_size_alignment_bytes": 64,
+        "available_rings_mask": 0,
+        "available_ring_indices": [],
+        "ip_discovery_version": {
+          "raw_u32": 262148,
+          "raw_hex": "0x00040004",
+          "major": 4,
+          "minor": 0,
+          "revision": 4,
+          "display": "4.0.4"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "UVD",
+          "hw_id": 12,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "6.1": {
+      "type_id": 6,
+      "type_name": "VCN_DEC",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "7.0": {
+      "type_id": 7,
+      "type_name": "VCN_ENC",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "04000000000000000000000000000000000100000400000001000000040004000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 4,
+          "minor": 0,
+          "display": "4.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 256,
+        "ib_size_alignment_bytes": 4,
+        "available_rings_mask": 1,
+        "available_ring_indices": [
+          0
+        ],
+        "ip_discovery_version": {
+          "raw_u32": 262148,
+          "raw_hex": "0x00040004",
+          "major": 4,
+          "minor": 0,
+          "revision": 4,
+          "display": "4.0.4"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "UVD",
+          "hw_id": 12,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "7.1": {
+      "type_id": 7,
+      "type_name": "VCN_ENC",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "8.0": {
+      "type_id": 8,
+      "type_name": "VCN_JPEG",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "04000000000000000000000000000000000100004000000001000000040004000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 4,
+          "minor": 0,
+          "display": "4.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 256,
+        "ib_size_alignment_bytes": 64,
+        "available_rings_mask": 1,
+        "available_ring_indices": [
+          0
+        ],
+        "ip_discovery_version": {
+          "raw_u32": 262148,
+          "raw_hex": "0x00040004",
+          "major": 4,
+          "minor": 0,
+          "revision": 4,
+          "display": "4.0.4"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": false,
+      "same_version_ip_discovery_records": [
+        {
+          "ip_name": "UVD",
+          "hw_id": 12,
+          "instance": 0
+        }
+      ],
+      "same_version_match_is_identity_proof": false
+    },
+    "8.1": {
+      "type_id": 8,
+      "type_name": "VCN_JPEG",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    },
+    "9.0": {
+      "type_id": 9,
+      "type_name": "VPE",
+      "ip_instance_argument": 0,
+      "status": "ok",
+      "errno": null,
+      "byte_length": 40,
+      "raw_hex": "00000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "decoded": {
+        "hw_ip_version": {
+          "major": 0,
+          "minor": 0,
+          "display": "0.0"
+        },
+        "capabilities_flags": 0,
+        "capabilities_flags_hex": "0x0000000000000000",
+        "ib_start_alignment_bytes": 0,
+        "ib_size_alignment_bytes": 0,
+        "available_rings_mask": 0,
+        "available_ring_indices": [],
+        "ip_discovery_version": {
+          "raw_u32": 0,
+          "raw_hex": "0x00000000",
+          "major": 0,
+          "minor": 0,
+          "revision": 0,
+          "display": "0.0.0"
+        },
+        "userq_num_slots": 0,
+        "trailing_abi_padding_hex": "00000000"
+      },
+      "all_zero_response": true,
+      "same_version_ip_discovery_records": [],
+      "same_version_match_is_identity_proof": false
+    },
+    "9.1": {
+      "type_id": 9,
+      "type_name": "VPE",
+      "ip_instance_argument": 1,
+      "status": "error",
+      "errno": 22,
+      "byte_length": null,
+      "raw_hex": null
+    }
+  },
+  "firmware_versions": [
+    {
+      "type_id": 4,
+      "type_name": "GFX_ME",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "ec0900001d000000",
+      "version_u32": 2540,
+      "version_hex": "0x000009ec",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 4,
+      "type_name": "GFX_ME",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "ec0900001d000000",
+      "version_u32": 2540,
+      "version_hex": "0x000009ec",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 4,
+      "type_name": "GFX_ME",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "ec0900001d000000",
+      "version_u32": 2540,
+      "version_hex": "0x000009ec",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 5,
+      "type_name": "GFX_PFP",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "960a00001d000000",
+      "version_u32": 2710,
+      "version_hex": "0x00000a96",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 5,
+      "type_name": "GFX_PFP",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "960a00001d000000",
+      "version_u32": 2710,
+      "version_hex": "0x00000a96",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 5,
+      "type_name": "GFX_PFP",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "960a00001d000000",
+      "version_u32": 2710,
+      "version_hex": "0x00000a96",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 7,
+      "type_name": "GFX_RLC",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "6100000001000000",
+      "version_u32": 97,
+      "version_hex": "0x00000061",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 7,
+      "type_name": "GFX_RLC",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "6100000001000000",
+      "version_u32": 97,
+      "version_hex": "0x00000061",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 7,
+      "type_name": "GFX_RLC",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "6100000001000000",
+      "version_u32": 97,
+      "version_hex": "0x00000061",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 8,
+      "type_name": "GFX_MEC",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "e60a00001d000000",
+      "version_u32": 2790,
+      "version_hex": "0x00000ae6",
+      "feature_u32": 29,
+      "feature_hex": "0x0000001d"
+    },
+    {
+      "type_id": 10,
+      "type_name": "SMC",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0061520000000000",
+      "version_u32": 5398784,
+      "version_hex": "0x00526100",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 10,
+      "type_name": "SMC",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0061520000000000",
+      "version_u32": 5398784,
+      "version_hex": "0x00526100",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 10,
+      "type_name": "SMC",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0061520000000000",
+      "version_u32": 5398784,
+      "version_hex": "0x00526100",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 11,
+      "type_name": "SDMA",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "180000003c000000",
+      "version_u32": 24,
+      "version_hex": "0x00000018",
+      "feature_u32": 60,
+      "feature_hex": "0x0000003c"
+    },
+    {
+      "type_id": 11,
+      "type_name": "SDMA",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "180000003c000000",
+      "version_u32": 24,
+      "version_hex": "0x00000018",
+      "feature_u32": 60,
+      "feature_hex": "0x0000003c"
+    },
+    {
+      "type_id": 12,
+      "type_name": "PSP_SOS",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "2400330024003300",
+      "version_u32": 3342372,
+      "version_hex": "0x00330024",
+      "feature_u32": 3342372,
+      "feature_hex": "0x00330024"
+    },
+    {
+      "type_id": 12,
+      "type_name": "PSP_SOS",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "2400330024003300",
+      "version_u32": 3342372,
+      "version_hex": "0x00330024",
+      "feature_u32": 3342372,
+      "feature_hex": "0x00330024"
+    },
+    {
+      "type_id": 12,
+      "type_name": "PSP_SOS",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "2400330024003300",
+      "version_u32": 3342372,
+      "version_hex": "0x00330024",
+      "feature_u32": 3342372,
+      "feature_hex": "0x00330024"
+    },
+    {
+      "type_id": 13,
+      "type_name": "PSP_ASD",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1901002119010021",
+      "version_u32": 553648409,
+      "version_hex": "0x21000119",
+      "feature_u32": 553648409,
+      "feature_hex": "0x21000119"
+    },
+    {
+      "type_id": 13,
+      "type_name": "PSP_ASD",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1901002119010021",
+      "version_u32": 553648409,
+      "version_hex": "0x21000119",
+      "feature_u32": 553648409,
+      "feature_hex": "0x21000119"
+    },
+    {
+      "type_id": 13,
+      "type_name": "PSP_ASD",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1901002119010021",
+      "version_u32": 553648409,
+      "version_hex": "0x21000119",
+      "feature_u32": 553648409,
+      "feature_hex": "0x21000119"
+    },
+    {
+      "type_id": 14,
+      "type_name": "VCN",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "3780110900000000",
+      "version_u32": 152141879,
+      "version_hex": "0x09118037",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 14,
+      "type_name": "VCN",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "3780110900000000",
+      "version_u32": 152141879,
+      "version_hex": "0x09118037",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 14,
+      "type_name": "VCN",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "3780110900000000",
+      "version_u32": 152141879,
+      "version_hex": "0x09118037",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 20,
+      "type_name": "DMCUB",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0036000700000000",
+      "version_u32": 117454336,
+      "version_hex": "0x07003600",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 20,
+      "type_name": "DMCUB",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0036000700000000",
+      "version_u32": 117454336,
+      "version_hex": "0x07003600",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 20,
+      "type_name": "DMCUB",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0036000700000000",
+      "version_u32": 117454336,
+      "version_hex": "0x07003600",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 21,
+      "type_name": "TOC",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0c0000000c000000",
+      "version_u32": 12,
+      "version_hex": "0x0000000c",
+      "feature_u32": 12,
+      "feature_hex": "0x0000000c"
+    },
+    {
+      "type_id": 21,
+      "type_name": "TOC",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0c0000000c000000",
+      "version_u32": 12,
+      "version_hex": "0x0000000c",
+      "feature_u32": 12,
+      "feature_hex": "0x0000000c"
+    },
+    {
+      "type_id": 21,
+      "type_name": "TOC",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0c0000000c000000",
+      "version_u32": 12,
+      "version_hex": "0x0000000c",
+      "feature_u32": 12,
+      "feature_hex": "0x0000000c"
+    },
+    {
+      "type_id": 23,
+      "type_name": "GFX_RLCP",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1600000001000000",
+      "version_u32": 22,
+      "version_hex": "0x00000016",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 23,
+      "type_name": "GFX_RLCP",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1600000001000000",
+      "version_u32": 22,
+      "version_hex": "0x00000016",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 23,
+      "type_name": "GFX_RLCP",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1600000001000000",
+      "version_u32": 22,
+      "version_hex": "0x00000016",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 24,
+      "type_name": "GFX_RLCV",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1300000001000000",
+      "version_u32": 19,
+      "version_hex": "0x00000013",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 24,
+      "type_name": "GFX_RLCV",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1300000001000000",
+      "version_u32": 19,
+      "version_hex": "0x00000013",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 24,
+      "type_name": "GFX_RLCV",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1300000001000000",
+      "version_u32": 19,
+      "version_hex": "0x00000013",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 25,
+      "type_name": "MES_KIQ",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1301000006000000",
+      "version_u32": 275,
+      "version_hex": "0x00000113",
+      "feature_u32": 6,
+      "feature_hex": "0x00000006"
+    },
+    {
+      "type_id": 25,
+      "type_name": "MES_KIQ",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1301000006000000",
+      "version_u32": 275,
+      "version_hex": "0x00000113",
+      "feature_u32": 6,
+      "feature_hex": "0x00000006"
+    },
+    {
+      "type_id": 25,
+      "type_name": "MES_KIQ",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "1301000006000000",
+      "version_u32": 275,
+      "version_hex": "0x00000113",
+      "feature_u32": 6,
+      "feature_hex": "0x00000006"
+    },
+    {
+      "type_id": 26,
+      "type_name": "MES",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "9600000001000000",
+      "version_u32": 150,
+      "version_hex": "0x00000096",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 26,
+      "type_name": "MES",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "9600000001000000",
+      "version_u32": 150,
+      "version_hex": "0x00000096",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 26,
+      "type_name": "MES",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "9600000001000000",
+      "version_u32": 150,
+      "version_hex": "0x00000096",
+      "feature_u32": 1,
+      "feature_hex": "0x00000001"
+    },
+    {
+      "type_id": 27,
+      "type_name": "IMU",
+      "ip_instance": 0,
+      "index": 0,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0047210b00000000",
+      "version_u32": 186730240,
+      "version_hex": "0x0b214700",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 27,
+      "type_name": "IMU",
+      "ip_instance": 0,
+      "index": 1,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0047210b00000000",
+      "version_u32": 186730240,
+      "version_hex": "0x0b214700",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    },
+    {
+      "type_id": 27,
+      "type_name": "IMU",
+      "ip_instance": 0,
+      "index": 2,
+      "status": "ok",
+      "byte_length": 8,
+      "raw_hex": "0047210b00000000",
+      "version_u32": 186730240,
+      "version_hex": "0x0b214700",
+      "feature_u32": 0,
+      "feature_hex": "0x00000000"
+    }
+  ],
+  "coverage": {
+    "hw_ip_count_queries": {
+      "ok": 6,
+      "error": 4
+    },
+    "hw_ip_info_queries": {
+      "ok": 10,
+      "error": 10
+    },
+    "firmware_records": 45
+  },
+  "source_notes": [
+    "This decoder parses saved text only; it does not issue ioctls or access the GPU.",
+    "Public Linux references are cross-check sources, not proof of the exact CachyOS kernel source revision."
+  ]
+}
