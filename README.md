@@ -80,6 +80,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 
 - **Helemen7** — Project founder, kernel display architecture, Metal/RADV translation layer.
 - **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
+- **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
 
 
 ## Contributing
