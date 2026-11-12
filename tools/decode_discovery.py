@@ -20,6 +20,7 @@ import sys
 BINARY_SIGNATURE = 0x28211407
 DISCOVERY_TABLE_SIGNATURE = 0x53445049  # "IPDS"
 TABLE_NAMES = ["IP_DISCOVERY", "GC", "HARVEST_INFO", "VCN_INFO", "MALL_INFO", "NPS_INFO", "MEM_RESERVED_INFO"]
+V1_TABLE_COUNT = 6  # The v1 header has six table_info entries; v2 carries its count.
 
 # From drivers/gpu/drm/amd/include/soc15_hw_ip.h.
 HW_IDS = {
@@ -75,7 +76,7 @@ def main():
         num_tables, _ = struct.unpack_from("<HH", b, 12)
         tbl_base = 16
     else:
-        num_tables, tbl_base = len(TABLE_NAMES), 12
+        num_tables, tbl_base = V1_TABLE_COUNT, 12
     tables = {}
     for i in range(num_tables):
         off, tcsum, tsize, _ = struct.unpack_from("<HHHH", b, tbl_base + i * 8)
