@@ -74,7 +74,7 @@ The raw query answers are committed alongside this document in `rx7600-frame121/
 
 The DRM capture reports version/feature metadata for GFX, SDMA, PSP, VCN, DMCUB, MES and other firmware types. These are driver-reported metadata values, not proof that each image was loaded, started, or is operational.
 
-The host inventory now identifies version-matched firmware candidates and their installed-file SHA-256 values in `docs/logs/navi33/firmware_inventory.md`. Matching CachyOS source confirms several filename request paths. The current-boot journal evidence in `docs/logs/navi33/firmware-runtime-current-boot.md` confirms SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA / VCN ring enumeration. However, the log does not attest every exact blob filename. Keep the final `rn_asic.firmware` field unset until each required and optional file is resolved against the matching kernel source and load path.
+The host inventory records installed-file SHA-256 values and now includes a source-derived request-path matrix from the exact CachyOS 7.3.1-1 tag in `docs/logs/navi33/firmware_inventory.md`. The GFX, SDMA, SMU, VCN and DMUB request names can be derived from the observed IP versions and matching source branches; the VCN 4.0.4 request resolves through an installed compressed symlink to the 4.0.0 payload. A significant unresolved discrepancy remains: the matching MP0 13.0.7 source path requests `psp_13_0_7_ta.bin` as required for this non-kicker device, but no such file is present in the searched firmware paths. The saved current-boot journal confirms SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA / VCN ring enumeration, but does not attest every requested filename or reconcile the missing TA. Keep the final `rn_asic.firmware` field unset until this discrepancy and same-boot per-file load provenance are resolved.
 
 ## 6. Register-header and implementation candidates
 
@@ -91,7 +91,7 @@ Do not copy or relabel the current Navi 32 generated register headers. Follow th
 ## 7. Gaps before an upstream-ready ASIC row
 
 1. Add / run a macOS-side `infoQuery()` integration test using the captured 440-byte payload and verify caller-buffer truncation / zero-fill behavior. Linux live ioctl ABI smoke test is now passed.
-2. Identify exact firmware filenames and source provenance for the observed IP versions; do not infer filenames from version numbers.
+2. Resolve the required PSP 13.0.7 TA request versus missing installed blob, then capture same-boot per-file firmware provenance. Other request names and conditional branches are source-traced in `firmware_inventory.md`; do not treat source requests or package presence as load attestations.
 3. Identify the correct GC / SDMA / DCN / NBIO / MMHUB / OSSSYS register headers from the matching Linux source.
 4. Obtain a safe and independently verified DCN pipe / PHY / VBIOS connector mapping for the live DP-1 path; current connector + EDID evidence is not enough to define a display replay. No Navi 32 replay constants may be reused by assumption.
 5. Refactor all write stages to select their firmware, register headers, memory layout, and display data from the ASIC profile before adding a Navi 33 row to the live table.
