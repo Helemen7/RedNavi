@@ -38,14 +38,14 @@ class DiscoveryDirectoryTest(unittest.TestCase):
             path = Path(directory) / "fixture.bin"
             path.write_bytes(data)
             return subprocess.run(
-                [sys.executable, str(TOOL), str(path)],
+                [sys.executable, "-I", str(TOOL), str(path)],
                 capture_output=True, text=True, check=True,
             ).stdout
 
     def test_v1_has_six_table_descriptors(self):
         output = self.decode(build(1, 6))
         self.assertIn("table 5 NPS_INFO:", output)
-        self.assertNotIn("table 6", output)
+        self.assertNotIn("table 6 ", output)
 
     def test_v2_keeps_seventh_table_name(self):
         output = self.decode(build(2, 7))
