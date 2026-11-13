@@ -74,7 +74,7 @@ The raw query answers are committed alongside this document in `rx7600-frame121/
 
 The DRM capture reports version/feature metadata for GFX, SDMA, PSP, VCN, DMCUB, MES and other firmware types. These are driver-reported metadata values, not proof that each image was loaded, started, or is operational.
 
-The host inventory records installed-file SHA-256 values and now includes a source-derived request-path matrix from the exact CachyOS 7.3.1-1 tag in `docs/logs/navi33/firmware_inventory.md`. The GFX, SDMA, SMU, VCN and DMUB request names can be derived from the observed IP versions and matching source branches; the VCN 4.0.4 request resolves through an installed compressed symlink to the 4.0.0 payload. A significant unresolved discrepancy remains: the matching MP0 13.0.7 source path requests `psp_13_0_7_ta.bin` as required for this non-kicker device, but no such file is present in the searched firmware paths. The saved current-boot journal confirms SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA / VCN ring enumeration, but does not attest every requested filename or reconcile the missing TA. Keep the final `rn_asic.firmware` field unset until this discrepancy and same-boot per-file load provenance are resolved.
+The host inventory records installed-file SHA-256 values and now includes a source-derived request-path matrix from the exact CachyOS 7.3.1-1 tag in `docs/logs/navi33/firmware_inventory.md`. The GFX, SDMA, SMU, VCN and DMUB request names can be derived from the observed IP versions and matching source branches; the VCN 4.0.4 request resolves through an installed compressed symlink to the 4.0.0 payload. A significant unresolved discrepancy remains: the matching MP0 13.0.7 source path requests `psp_13_0_7_ta.bin` as required for this non-kicker device, but no such file is present in the searched firmware paths. The 2026-11-11 and 2026-11-14 runtime captures confirm SMU initialization, VCN firmware metadata, DMUB loading via PSP, and SDMA / VCN ring enumeration, but do not attest every requested filename or reconcile the missing base TA. Keep the final `rn_asic.firmware` field unset until this discrepancy and same-boot per-file load provenance are resolved.
 
 ## 6. Register-header and implementation candidates
 
@@ -107,7 +107,8 @@ Do not copy or relabel the current Navi 32 generated register headers. Follow th
 - Generated DRM snapshot: `docs/logs/navi33/linux_info_navi33.h` (440-byte DEV_INFO; not referenced by the live ASIC table)
 - Live Linux ABI smoke test: `tools/linux_amdgpu_abi_smoke.c` (440-byte matching kernel UAPI; read-only ioctl passed)
 - Live connector / EDID evidence: `docs/logs/navi33/connectors-live-2026-11-11.md` (DP-1 connected; no register writes)
-- Structural host test: `tests/host/navi33_profile_test.cpp`
+- Structural host test: `tests/host/navi33_profile_test.cpp` (included in `make test`)
+- Latest firmware runtime capture: `docs/logs/navi33/firmware-runtime-2026-11-14.md`
 - Firmware inventory: `docs/logs/navi33/firmware_inventory.md`
 - Register-header references: `docs/logs/navi33/register_header_references.md`
 - Kernel source tag: `CachyOS/linux` `cachyos-7.3.1-1`, commit `36ae4c219cfbd02576048c7ca1d366cea5db8034`
