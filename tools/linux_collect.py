@@ -62,8 +62,12 @@ def main():
         sys.exit("run as root: sudo python3 tools/linux_collect.py")
     dump = load("linux_dcn_pipe_dump")
     card, dev, bdf = dump.find_card()
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = "rednavi_report_%s_%s" % (dev, stamp)
+    n = 1
+    while os.path.exists(out):                        # two runs in the same second must not share (or overwrite) a directory
+        n += 1
+        out = "rednavi_report_%s_%s-%d" % (dev, stamp, n)
     os.makedirs(out)
     print("collecting into %s" % out)
 

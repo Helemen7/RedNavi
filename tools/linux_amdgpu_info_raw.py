@@ -6,6 +6,9 @@
 the answers as raw bytes, so that the kext (RedNavi/kern_probe.cpp, infoQuery) can answer them the way the Linux kernel does, field for field.
 
     sudo python3 tools/linux_amdgpu_info_raw.py > amdgpu_info_raw.txt
+    sudo python3 tools/linux_amdgpu_info_raw.py 0x1586 > amdgpu_info_raw.txt     # only the card with this device id (several amdgpu nodes)
+
+Without an argument it uses the first amdgpu render node that answers.
 
 Needs only python3. The size of a query's answer is found by running it twice with a buffer filled with 0x00 and then with 0xff: the bytes
 the kernel wrote are the same in both runs, the bytes it left alone are not.
@@ -48,6 +51,7 @@ def show(name, fd, qid, maxsize, extra=b""):
 
 
 def main():
+    want = int(sys.argv[1], 0) if len(sys.argv) > 1 else None
     fd = -1
     for path in sorted(glob.glob("/dev/dri/renderD*")):
         try:
@@ -55,13 +59,13 @@ def main():
         except OSError:
             continue
         rc, data = answer(f, 0x16, 2048)                 # DEV_INFO: device_id first
-        if rc == 0 and struct.unpack_from("<I", data)[0] == 0x747E:
+        if rc == 0 and (want is None or struct.unpack_from("<I", data)[0] == want):
             fd = f
-            print("device", path)
+            print("device", path, "id 0x%04x" % struct.unpack_from("<I", data)[0])
             break
         os.close(f)
     if fd < 0:
-        sys.exit("no amdgpu render node with device id 0x747e (are you root?)")
+        sys.exit("no amdgpu render node%s (are you root?)" % (" with device id 0x%04x" % want if want is not None else ""))
     show("ACCEL_WORKING", fd, 0x00, 64)
     show("DEV_INFO", fd, 0x16, 2048)
     show("VRAM_GTT", fd, 0x14, 64)

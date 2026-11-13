@@ -56,6 +56,8 @@ For the later steps also capture what the Linux driver answers to RADV:
 sudo python3 tools/linux_amdgpu_info_raw.py > amdgpu_info_raw.txt
 ```
 
+With several amdgpu cards (an APU next to a discrete card), name the one you mean: `sudo python3 tools/linux_amdgpu_info_raw.py 0x1586 > amdgpu_info_raw.txt`.
+
 Commit the report to `docs/logs/<chip>/` in its own pull request, with the machine added to `docs/TEST_MACHINES.md`. `docs/logs/navi33/` and `docs/logs/navi31/` are examples.
 
 ## Step 1: read-only run on macOS
