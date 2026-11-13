@@ -66,3 +66,15 @@ What was tried before, and why it is not the fix:
 | Role | Linux read-only IP Discovery and DRM_AMDGPU_INFO evidence only; no RedNavi macOS run has been performed on this machine |
 
 This machine is the contributor's hardware for the Navi 33 evidence under docs/logs/navi33/rx7600-frame121/. The monitor is connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this machine.
+
+## Ryzen AI Max+ 395 / Radeon 8060S test machine
+
+| Item | Value |
+|---|---|
+| Board | ASUS ROG Flow Z13 2025 (GZ302EA-DRU161W) |
+| CPU | AMD Ryzen AI Max+ 395 (16 cores, 32 threads, Zen 5) |
+| RAM | 128 GB LPDDR5X UMA @ 8000 MHz (256-bit bus, 256 GB/s) |
+| Target GPU | AMD Radeon 8060S Graphics (Strix Halo APU, GFX1151 / RDNA 3.5), `1002:1586`, subsystem `1043:1FB3`, rev `C1` |
+| Display | TL134ADXP03 (2560x1600 @ 60 Hz eDP internal panel, 16:10) |
+| OS | macOS Sequoia 15.8.2 (24H232), x86_64 |
+| Role | Contributor hardware for the Strix Halo RDNA 3.5 evidence under `docs/logs/strix-halo/flow-z13-naessah/`. Read-only IP Discovery capture only. No firmware bring-up, register writes or GPU queue submission is claimed for this capture. |
