@@ -15,8 +15,7 @@ static const struct rn_asic_board kNavi32Boards[] = {
     {0, nullptr, 0, nullptr, 0, {0, 0, 0, 0, 0}},
 };
 
-extern const struct rn_asic kRNAsics[] = {
-    {
+extern const struct rn_asic kRNAsicNavi32 = {
         "Navi 32",
         {11, 0, 3}, {3, 2, 0}, {13, 0, 10}, {13, 0, 10}, {6, 0, 3},
         kNavi32Boards,
@@ -26,7 +25,4 @@ extern const struct rn_asic kRNAsics[] = {
         "gc_regs.h (gc_11_0_3) mmhub_regs.h (mmhub_3_0_0) osssys_regs.h (osssys_6_0_0) nbio_regs.h (nbio_4_3_0) dcn_reglist.h (dcn_3_2_0)",
         "linux_info_navi32.h",
         "dcn_replay.h (docs/logs/linux-reference/dcn_pipe_linux.txt, 1920x1080 at 60 Hz on DP)",
-    },
 };
-
-extern const uint32_t kRNAsicCount = sizeof(kRNAsics) / sizeof(kRNAsics[0]);

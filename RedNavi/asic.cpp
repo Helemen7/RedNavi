@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Helemen7 and RedNavi contributors
 
-// The ASIC table and the IP discovery lookups it needs. No kernel dependencies:
-// this file is also built by the host tests (tests/host/asic_test.cpp).
+// The ASIC table and the IP discovery lookups it needs. No kernel dependencies: this file is also built by the
+// host tests (tests/host/asic_test.cpp).
 #include "asic.h"
+
+// Each ASIC translation unit exports one profile; add it to this registry.
+extern const struct rn_asic kRNAsicNavi32;
+static const struct rn_asic *const kRNAsics[] = {&kRNAsicNavi32};
 
 uint32_t rn_disc_find_ip(const uint8_t *b, uint32_t len, uint16_t hw_id, bool *base64) {
     if (!b) return 0;
@@ -45,8 +49,8 @@ static bool sameVersion(const uint8_t *table, uint32_t len, uint16_t hw_id, cons
 }
 
 const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board) {
-    for (uint32_t i = 0; i < kRNAsicCount; ++i) {
-        const struct rn_asic &a = kRNAsics[i];
+    for (const struct rn_asic *profile : kRNAsics) {
+        const struct rn_asic &a = *profile;
         if (!sameVersion(table, len, RN_HWID_GC, a.gc) || !sameVersion(table, len, RN_HWID_DMU, a.dcn) ||
             !sameVersion(table, len, RN_HWID_MP0, a.mp0) || !sameVersion(table, len, RN_HWID_MP1, a.mp1) ||
             !sameVersion(table, len, RN_HWID_SDMA0, a.sdma))

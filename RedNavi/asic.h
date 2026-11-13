@@ -72,9 +72,7 @@ struct rn_asic {
     const char *display_ref;                  // the Linux register capture the display replay is generated from
 };
 
-// ASIC profile data is kept in per-ASIC translation units, separate from lookup logic.
-extern const struct rn_asic kRNAsics[];
-extern const uint32_t kRNAsicCount;
+// Each ASIC translation unit exports one profile; the registry is kept in asic.cpp.
 
 // Position of the entry of instance 0 of a hardware ID in an IP discovery table, 0 when there is none.
 // *base64 says whether the base addresses after the entry are 64 bits wide. Every read is bounds-checked.

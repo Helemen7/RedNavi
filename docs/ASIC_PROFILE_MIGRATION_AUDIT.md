@@ -1,11 +1,11 @@
-﻿# ASIC profile migration audit — Navi 32 / Navi 33
+# ASIC profile migration audit — Navi 32 / Navi 33
 
 **Date:** 2026-11-12  
 **Scope:** source-only audit of the current `frame121/navi32-profile-data-split` branch. This document does not enable a new ASIC, alter a hardware path, or claim hardware validation.
 
 ## Current split boundary
 
-PR #19 moves the Navi 32 `rn_asic` row, board identity, DP path, replay reference, DRM snapshot reference, firmware names, and register provenance strings into `RedNavi/asic_navi32.cpp`. `RedNavi/asic.cpp` now contains discovery parsing and generic lookup. The Makefile links the new translation unit into the kext and host ASIC test.
+PR #19 moves the Navi 32 `rn_asic` profile, board identity, DP path, replay reference, DRM snapshot reference, firmware names, and register provenance strings into `RedNavi/asic_navi32.cpp`. Each ASIC translation unit exports one profile; `RedNavi/asic.cpp` owns the small registry and generic discovery/lookup logic. The Makefile links the new translation unit into the kext and host ASIC test.
 
 This is a **profile-data split**, not yet a complete architecture split. The profile's `firmware` and `reg_headers` members are descriptive strings; `asic.h` explicitly says firmware and register headers are compiled in and are not selected through the row yet.
 
