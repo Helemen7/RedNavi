@@ -78,3 +78,16 @@ This machine is the contributor's hardware for the Navi 33 evidence under docs/l
 | Display | TL134ADXP03 (2560x1600 @ 60 Hz eDP internal panel, 16:10) |
 | OS | macOS Sequoia 15.8.2 (24H232), x86_64 |
 | Role | Contributor hardware for the Strix Halo RDNA 3.5 evidence under `docs/logs/strix-halo/flow-z13-naessah/`. Read-only IP Discovery capture only. No firmware bring-up, register writes or GPU queue submission is claimed for this capture. |
+
+## RX 7700 XT evidence machine (Linux only)
+
+| Item | Value |
+|---|---|
+| Target GPU | Gigabyte Radeon RX 7700 XT 12GB, Navi 32, `1002:747E`, subsystem `1458:2414`, rev `FF` (54 CUs, 12272M VRAM, 16384M BAR) |
+| Displays | `DP-1` (3840x2160 @ 144 Hz -> `SYMCLKA` / `DIG0`), `DP-2` (2560x1440 @ 144 Hz -> `SYMCLKB` / `DIG1`) |
+| Link | PCIe 4.0 x16 (bus 3, device 0, function 0) |
+| OS | Ubuntu 24.04.5 LTS, x86_64 |
+| Kernel | 7.0.0-43-generic |
+| Role | Linux read-only IP Discovery, DCN pipe and DRM_AMDGPU_INFO evidence only; no RedNavi macOS run has been performed on this machine |
+
+This machine is the contributor's hardware for the Navi 32 RX 7700 XT evidence under `docs/logs/navi32/rx7700xt-gigabyte/`. Both monitors are connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this capture.
