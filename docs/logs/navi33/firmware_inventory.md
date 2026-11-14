@@ -49,7 +49,7 @@ These are present in the same installed package, but this inventory does not ass
 - `gc_11_0_2_rlc_kicker.bin.zst`
 - `psp_13_0_7_ta.bin.zst`
 
-The missing `gc_11_0_2_rlc_kicker.bin.zst` is not expected for this RX 7600: the matching kernel's kicker-device list contains only device/revision pairs `744b:00` and `7551:c8`, not `7480:cf`; the ordinary `gc_11_0_2_rlc.bin.zst` is present. The missing PSP TA is different: the source trace below identifies it as a required request on the observed MP0 13.0.7 non-kicker path. This is an unresolved source-versus-filesystem/runtime discrepancy, not an optional-file assumption.
+The missing `gc_11_0_2_rlc_kicker.bin.zst` is not expected for this RX 7600: the matching kernel's kicker-device list contains only device/revision pairs `744b:00` and `7551:c8`, not `7480:cf`; the ordinary `gc_11_0_2_rlc.bin.zst` is present. The PSP TA is also absent from the installed root-filesystem package inventory, but the same-boot DRM capture reports nonzero `AMDGPU_INFO_FW_TA` metadata, confirming that TA firmware was loaded. Its actual source path and payload hash remain unverified.
 
 ## Matching source provenance
 
@@ -71,7 +71,7 @@ A read-only sparse checkout of CachyOS tag `cachyos-7.3.1-1` was inspected at co
 | IP block observed on RX 7600 | Source-derived firmware request | Required / condition | Installed inventory result |
 |---|---|---|---|
 | GC 11.0.2 | `gc_11_0_2_pfp.bin`, `gc_11_0_2_me.bin`, `gc_11_0_2_rlc.bin`, `gc_11_0_2_mec.bin` | All marked `AMDGPU_UCODE_REQUIRED`; RLC uses the ordinary path because `1002:7480 rev cf` is not in the source's kicker-device list | All four compressed files present |
-| MP0 13.0.7 | `psp_13_0_7_sos.bin`, then `psp_13_0_7_ta.bin` | The 13.0.7 switch case calls both SOS and TA helpers; TA request is marked required. The kicker alternative is not selected for this device | SOS present; TA absent — unresolved blocker |
+| MP0 13.0.7 | `psp_13_0_7_sos.bin`, then `psp_13_0_7_ta.bin` | The 13.0.7 switch case calls both SOS and TA helpers; TA request is marked required. The kicker alternative is not selected for this device | SOS present; TA absent from rootfs package inventory, but nonzero `AMDGPU_INFO_FW_TA` metadata confirms TA firmware loaded in the captured boot; source path/hash unresolved |
 | SDMA0 6.0.2 | `sdma_6_0_2.bin` | Required request for instance 0; the v6.0 path duplicates the instance-0 firmware for its second SDMA instance | Present |
 | MP1 13.0.7 | `smu_13_0_7.bin` | Required on the non-SR-IOV path; kicker alternative is not selected | Present |
 | UVD / VCN 4.0.4 | `vcn_4_0_4.bin` | Required; IP-version decoder uses the `vcn_4_0_4` prefix. Discovery selects the generic VCN 4.0 / JPEG 4.0 block for 4.0.4 | `vcn_4_0_4.bin.zst` is a symlink to `vcn_4_0_0.bin.zst`; target hash is recorded above |
@@ -79,9 +79,9 @@ A read-only sparse checkout of CachyOS tag `cachyos-7.3.1-1` was inspected at co
 
 ### PSP TA discrepancy — do not silently waive
 
-The matching source's `psp_v13_0_init_microcode()` includes MP0 13.0.7 in the SOS-plus-TA branch. `psp_init_ta_microcode()` selects `psp_13_0_7_ta.bin` for a non-kicker device and marks the request `AMDGPU_UCODE_REQUIRED`. The source kicker list contains only `744b:00` and `7551:c8`, so this RX 7600 (`7480:cf`) does not select a TA kicker filename. A filesystem search of both `/usr/lib/firmware` and `/lib/firmware` found only `psp_13_0_7_sos.bin.zst`; no `psp_13_0_7_ta` file was found.
+The matching source's `psp_v13_0_init_microcode()` includes MP0 13.0.7 in the SOS-plus-TA branch. `psp_init_ta_microcode()` selects `psp_13_0_7_ta.bin` for a non-kicker device and marks the request `AMDGPU_UCODE_REQUIRED`. The source kicker list contains only `744b:00` and `7551:c8`, so this RX 7600 (`7480:cf`) does not select a TA kicker filename. A filesystem search of both `/usr/lib/firmware` and `/lib/firmware` found only `psp_13_0_7_sos.bin.zst`; no `psp_13_0_7_ta` file was found in those root-filesystem locations.
 
-The saved 2026-11-11 journal and the newer 2026-11-14 live-boot capture both report DMUB loading via PSP and successful SMU initialization, but neither prints the base TA request filename. The 2026-11-14 capture also reports that optional RAS, RAP and SecureDisplay TA microcode is unavailable; those optional sub-TA messages do not establish the status of the base `psp_13_0_7_ta.bin`. Its root-filesystem search found only the SOS file, while the boot initramfs was not inspected. The loaded module `srcversion` is recorded but does not attest that its binary was built from the inspected source commit. These facts do not reconcile the required-source-path / missing-rootfs-file discrepancy. Do not infer that the base TA is optional, invent a loaded blob, or mark PSP firmware provenance complete. Keep the Navi 33 profile unregistered until this is resolved.
+The 2026-11-14 DRM capture resolves the runtime half of the discrepancy: `AMDGPU_INFO_FW_TA` (`FW_VERSION` type `0x13`) returns nonzero metadata for indices 0, 1 and 2 (version `0x13`, feature `0x1`). Per the Linux UAPI, type `0x13` is PSP TA. This is positive evidence that TA firmware was loaded in that boot, consistent with the required source request. The ioctl does not disclose the firmware filename, filesystem path, initramfs origin, or payload hash. The boot initramfs was not inspected, so the source of the blob remains unknown. Optional RAS, RAP and SecureDisplay TA microcode notices are separate and do not negate the base TA evidence. The loaded module `srcversion` is recorded but does not attest that its binary was built from the inspected source commit. Do not call the base TA missing at runtime or optional; retain the unresolved file-origin/provenance question and do not claim a verified payload hash.
 
 ### Source blob provenance
 
