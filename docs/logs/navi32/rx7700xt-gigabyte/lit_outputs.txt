@@ -1,0 +1,2 @@
+SYMCLKA DIG front end 0
+SYMCLKB DIG front end 1
