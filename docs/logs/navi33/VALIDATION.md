@@ -38,7 +38,8 @@ The live test returned `device_id=0x7480`, `family=145`, `vram_type=9`, `vram_bi
 
 ## Full-suite result on CachyOS
 
-The full `make test` target passes on this CachyOS host, including the Navi 33 structural test and the IP Discovery comparison suite. The Navi 33 test is compiled with `-IRedNavi` so the generated evidence header can resolve the shared `asic.h` declarations. This is host-side structural and parser validation only; it does not exercise the macOS kext or perform GPU register writes. The maintainer independently confirmed that CI is green and `make test` passes on macOS.
+The full `make test` target passes on this CachyOS host, including the Navi 33 structural test and the IP Discovery comparison suite. The Navi 33 test is compiled with `-IRedNavi` so the generated evidence header can resolve the shared `asic.h` declarations. This is host-side structural and parser validation only; it does not exercise the macOS kext or perform GPU register writes.
+
 ## Not yet validated
 
 - macOS-side `infoQuery()` integration against the captured 440-byte payload.
