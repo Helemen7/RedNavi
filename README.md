@@ -42,7 +42,7 @@ For AMD that means: **amdgpu in a kext, RADV (ACO) in userspace, Metal -> SPIR-V
 
 ASUS ROG STRIX Z490-G GAMING, i7-10700K, **Intel UHD 630 as the primary display**, Sapphire RX 7800 XT as the development target (PCIe 4.0 x16). See [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md).
 
-Navi 32 boards (RX 7700 XT / 7800 XT) are in scope; reports from other 7000-series owners are welcome now that the probe works.
+The RX 7800 XT is the only board the kext writes to. The RX 7700 XT (same die and device ID, told apart by VRAM size) and the RX 7600 (Navi 33) are in the ASIC table from Linux captures only: the probe names them and stays read-only, and nobody has run it on them yet (unverified). Reports from other 7000-series owners are welcome.
 
 ## Building
 
