@@ -62,6 +62,10 @@ $(OUT)/asic.o: RedNavi/asic.cpp RedNavi/asic.h
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(OUT)/asic_navi32.o: RedNavi/asic_navi32.cpp RedNavi/asic.h RedNavi/dcn_replay.h RedNavi/linux_info_navi32.h
+	@mkdir -p $(OUT)
+	$(CXX) $(CXXFLAGS) -c $< -o $@
+
 $(OUT)/gfx11.o: RedNavi/gfx11.cpp $(wildcard RedNavi/*.h compat/include/*/*.h)
 	@mkdir -p $(OUT)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
@@ -82,9 +86,9 @@ $(OUT)/kern_info.o: RedNavi/kern_info.c
 	@mkdir -p $(OUT)
 	clang $(ARCH) $(OPT) -mkernel -nostdinc -isystem $(SDK)/Headers -DKERNEL -mmacosx-version-min=12.0 -c $< -o $@
 
-$(KEXT): $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(OUT)/asic.o $(COMPAT_OBJ) $(OUT)/kern_info.o RedNavi/Info.plist.in
+$(KEXT): $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(OUT)/asic.o $(OUT)/asic_navi32.o $(COMPAT_OBJ) $(OUT)/kern_info.o RedNavi/Info.plist.in
 	@mkdir -p $(KEXT)/Contents/MacOS
-	$(CXX) $(LDFLAGS) $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(OUT)/asic.o $(COMPAT_OBJ) $(OUT)/kern_info.o -o $(KEXT)/Contents/MacOS/RedNavi
+	$(CXX) $(LDFLAGS) $(OUT)/kern_probe.o $(OUT)/smu13.o $(OUT)/gfx11.o $(OUT)/edid.o $(OUT)/mode_regs.o $(OUT)/asic.o $(OUT)/asic_navi32.o $(COMPAT_OBJ) $(OUT)/kern_info.o -o $(KEXT)/Contents/MacOS/RedNavi
 	@if nm -u $(KEXT)/Contents/MacOS/RedNavi | grep -E "RedNavi|rn_|kRN|^ *_g[A-Z]" | grep -vE "_g(IO|OS)"; then echo "unresolved RedNavi symbols in the kext"; exit 1; fi
 	cp RedNavi/Info.plist.in $(KEXT)/Contents/Info.plist
 	$(call SIGN,$(KEXT))
@@ -167,7 +171,7 @@ test:
 	./build/edid_test
 	clang++ -std=c++17 -Wall tests/host/mode_regs_test.cpp RedNavi/mode_regs.cpp RedNavi/edid.cpp -o build/mode_regs_test
 	./build/mode_regs_test
-	clang++ -std=c++17 -Wall tests/host/asic_test.cpp RedNavi/asic.cpp -o build/asic_test
+	clang++ -std=c++17 -Wall tests/host/asic_test.cpp RedNavi/asic.cpp RedNavi/asic_navi32.cpp -o build/asic_test
 	./build/asic_test
 	python3 -I tests/host/compare_discovery_test.py
 	python3 -I tests/host/decode_discovery_test.py

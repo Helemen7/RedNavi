@@ -72,6 +72,8 @@ struct rn_asic {
     const char *display_ref;                  // the Linux register capture the display replay is generated from
 };
 
+// Each ASIC translation unit exports one profile; the registry is kept in asic.cpp.
+
 // Position of the entry of instance 0 of a hardware ID in an IP discovery table, 0 when there is none.
 // *base64 says whether the base addresses after the entry are 64 bits wide. Every read is bounds-checked.
 uint32_t rn_disc_find_ip(const uint8_t *table, uint32_t len, uint16_t hw_id, bool *base64);
