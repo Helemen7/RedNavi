@@ -83,11 +83,11 @@ This machine is the contributor's hardware for the Navi 33 evidence under docs/l
 
 | Item | Value |
 |---|---|
-| Target GPU | Gigabyte Radeon RX 7700 XT 12GB, Navi 32, `1002:747E`, subsystem `1458:2414`, rev `FF` (54 CUs, 12272M VRAM, 16384M BAR) |
-| Displays | `DP-1` (3840x2160 @ 144 Hz -> `SYMCLKA` / `DIG0`), `DP-2` (2560x1440 @ 144 Hz -> `SYMCLKB` / `DIG1`) |
+| Target GPU | Gigabyte Radeon RX 7700 XT 12GB, Navi 32, `1002:747E`, subsystem `1458:2414`, rev `FF` (from `lspci` in `system.txt`, `ip_discovery.txt` header, and `amdgpu_dmesg.txt`), 54 active CUs (from `SE 3, SH per SE 2, CU per SH 10, active_cu_number 54` in `amdgpu_dmesg.txt` and `DEV_INFO` `0x36` in `amdgpu_info_raw.txt`), 12272M VRAM, 16384M BAR |
+| Displays | `DP-1` (3840x2160 @ 144 Hz -> `SYMCLKA` / `DIG0`, non-stock: booted with `drm.edid_firmware=DP-1:edid/custom_edid.bin amdgpu.dcfeaturemask=0x10`), `DP-2` (2560x1440 @ 144 Hz -> `SYMCLKB` / `DIG1`) |
 | Link | PCIe 4.0 x16 (bus 3, device 0, function 0) |
 | OS | Ubuntu 24.04.5 LTS, x86_64 |
 | Kernel | 7.0.0-43-generic |
 | Role | Linux read-only IP Discovery, DCN pipe and DRM_AMDGPU_INFO evidence only; no RedNavi macOS run has been performed on this machine |
 
-This machine is the contributor's hardware for the Navi 32 RX 7700 XT evidence under `docs/logs/navi32/rx7700xt-gigabyte/`. Both monitors are connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this capture.
+This machine is the contributor's hardware for the Navi 32 RX 7700 XT evidence under `docs/logs/navi32/rx7700xt-gigabyte/` (see `docs/logs/navi32/rx7700xt-gigabyte/README.md` for generation commands and privacy redactions). Both monitors are connected over DisplayPort. **Note:** the kernel command line in `amdgpu_dmesg.txt` includes `drm.edid_firmware=DP-1:edid/custom_edid.bin amdgpu.dcfeaturemask=0x10`, so the `DP-1` modes and pipe state may not be those of a stock boot and should not be used as default reference data. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this capture.
