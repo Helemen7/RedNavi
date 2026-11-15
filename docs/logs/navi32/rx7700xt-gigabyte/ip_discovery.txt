@@ -1,0 +1,101 @@
+# /sys/class/drm/card1/device vendor 0x1002 device 0x747e revision 0xff
+1 inst 0 hw_id 1 num_instance 0 version 13.0.10 bases 0x00016000 0x00DC0000 0x00E00000 0x00E40000 0x0243FC00
+10 inst 0 hw_id 10 num_instance 0 version 9.0.0 bases 
+108 inst 0 hw_id 108 num_instance 0 version 4.3.0 bases 0x00000000 0x00000014 0x00000D20 0x00010400 0x0241B000 0x04040000
+11 inst 0 hw_id 11 num_instance 0 version 11.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+12 inst 0 hw_id 12 num_instance 0 version 4.0.0 bases 0x00007800 0x00007E00
+12 inst 1 hw_id 12 num_instance 1 version 4.0.1 bases 0x00007B00 0x00012000
+128 inst 0 hw_id 128 num_instance 0 version 2.3.0 bases 0x00000EA0 0x00500000 0x02420000
+150 inst 0 hw_id 150 num_instance 0 version 8.10.0 bases 0x0C004000 0x0C004400 0x0C400000 0x0C404000
+150 inst 1 hw_id 150 num_instance 1 version 8.10.0 bases 0x0C804000 0x0C804400 0x0CC00000 0x0CC04000
+150 inst 2 hw_id 150 num_instance 2 version 8.10.0 bases 0x0D004000 0x0D004400 0x0D400000 0x0D404000
+150 inst 3 hw_id 150 num_instance 3 version 8.10.0 bases 0x0D804000 0x0D804400 0x0DC00000 0x0DC04000
+170 inst 0 hw_id 170 num_instance 0 version 4.12.0 bases 0x0242A800 0x05B00000
+255 inst 0 hw_id 255 num_instance 0 version 13.0.10 bases 0x00016000 0x00DC0000 0x00E00000 0x00E40000 0x0243FC00
+271 inst 0 hw_id 271 num_instance 0 version 3.2.0 bases 0x00000012 0x000000C0 0x000034C0 0x00009000 0x02403C00
+272 inst 0 hw_id 272 num_instance 0 version 127.127.63 bases 0x02404000
+274 inst 0 hw_id 274 num_instance 0 version 127.127.63 bases 0x004C0000 0x02404800
+282 inst 0 hw_id 282 num_instance 0 version 13.0.3 bases 0x00BC0000
+286 inst 0 hw_id 286 num_instance 0 version 4.0.0 bases 0x02403000 0x02445000
+3 inst 0 hw_id 3 num_instance 0 version 13.0.0 bases 0x00016600 0x02400C00
+3 inst 1 hw_id 3 num_instance 1 version 13.0.5 bases 0x0C003400 0x0C020200
+3 inst 2 hw_id 3 num_instance 2 version 13.0.5 bases 0x0C803400 0x0C820200
+3 inst 3 hw_id 3 num_instance 3 version 13.0.5 bases 0x0D003400 0x0D020200
+3 inst 4 hw_id 3 num_instance 4 version 13.0.5 bases 0x0D803400 0x0D820200
+34 inst 0 hw_id 34 num_instance 0 version 3.0.0 bases 0x0001A000 0x02408800
+35 inst 0 hw_id 35 num_instance 0 version 3.0.0 bases 0x00000C00 0x02408C00
+36 inst 0 hw_id 36 num_instance 0 version 3.0.0 bases 0x000001C0 0x02409000
+37 inst 0 hw_id 37 num_instance 0 version 5.0.0 bases 0x00000580 0x02409400
+4 inst 0 hw_id 4 num_instance 0 version 13.0.6 bases 0x00016800 0x00016A00 0x02401000 0x03440000
+40 inst 0 hw_id 40 num_instance 0 version 6.0.0 bases 0x000010A0 0x0240A000
+41 inst 0 hw_id 41 num_instance 0 version 6.0.0 bases 0x00000F20 0x0240A400
+42 inst 0 hw_id 42 num_instance 0 version 6.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+43 inst 0 hw_id 43 num_instance 0 version 6.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+46 inst 0 hw_id 46 num_instance 0 version 4.3.0 bases 0x00007000 0x00C00000 0x0240B800 0x07C00000 0x12400000
+46 inst 1 hw_id 46 num_instance 1 version 4.2.1 bases 0x0C000000 0x0C021800 0x0C022000 0x0C2C0000 0x0C300000
+46 inst 2 hw_id 46 num_instance 2 version 4.2.1 bases 0x0C800000 0x0C821800 0x0C822000 0x0CAC0000 0x0CB00000
+46 inst 3 hw_id 46 num_instance 3 version 4.2.1 bases 0x0D000000 0x0D021800 0x0D022000 0x0D2C0000 0x0D300000
+46 inst 4 hw_id 46 num_instance 4 version 4.2.1 bases 0x0D800000 0x0D821800 0x0D822000 0x0DAC0000 0x0DB00000
+49 inst 0 hw_id 49 num_instance 0 version 2.0.0 bases 0x000005A0 0x00B80000 0x0240C400
+5 inst 0 hw_id 5 num_instance 0 version 13.0.0 bases 0x00017400 0x02401400
+5 inst 1 hw_id 5 num_instance 1 version 13.0.5 bases 0x0C002C00 0x0C020600
+5 inst 2 hw_id 5 num_instance 2 version 13.0.5 bases 0x0C802C00 0x0C820600
+5 inst 3 hw_id 5 num_instance 3 version 13.0.5 bases 0x0D002C00 0x0D020600
+5 inst 4 hw_id 5 num_instance 4 version 13.0.5 bases 0x0D802C00 0x0D820600
+6 inst 0 hw_id 6 num_instance 0 version 13.0.0 bases 0x00016C00 0x02401800
+6 inst 1 hw_id 6 num_instance 1 version 13.0.5 bases 0x0C000400 0x0C021000
+6 inst 2 hw_id 6 num_instance 2 version 13.0.5 bases 0x0C800400 0x0C821000
+6 inst 3 hw_id 6 num_instance 3 version 13.0.5 bases 0x0D000400 0x0D021000
+6 inst 4 hw_id 6 num_instance 4 version 13.0.5 bases 0x0D800400 0x0D821000
+70 inst 0 hw_id 70 num_instance 0 version 7.4.0 bases 0x00000000 0x00000014 0x00000D20 0x00010400 0x0241B000 0x04040000
+80 inst 0 hw_id 80 num_instance 0 version 4.1.0 bases 0x02414000 0x04680000
+91 inst 0 hw_id 91 num_instance 0 version 6.0.3 bases 0x00011400 0x02456800
+ATHUB inst 0 hw_id 35 num_instance 0 version 3.0.0 bases 0x00000C00 0x02408C00
+CLKA inst 0 hw_id 6 num_instance 0 version 13.0.0 bases 0x00016C00 0x02401800
+CLKA inst 1 hw_id 6 num_instance 1 version 13.0.5 bases 0x0C000400 0x0C021000
+CLKA inst 2 hw_id 6 num_instance 2 version 13.0.5 bases 0x0C800400 0x0C821000
+CLKA inst 3 hw_id 6 num_instance 3 version 13.0.5 bases 0x0D000400 0x0D021000
+CLKA inst 4 hw_id 6 num_instance 4 version 13.0.5 bases 0x0D800400 0x0D821000
+DAZ inst 0 hw_id 274 num_instance 0 version 127.127.63 bases 0x004C0000 0x02404800
+DBGU_NBIO inst 0 hw_id 36 num_instance 0 version 3.0.0 bases 0x000001C0 0x02409000
+DF inst 0 hw_id 46 num_instance 0 version 4.3.0 bases 0x00007000 0x00C00000 0x0240B800 0x07C00000 0x12400000
+DF inst 1 hw_id 46 num_instance 1 version 4.2.1 bases 0x0C000000 0x0C021800 0x0C022000 0x0C2C0000 0x0C300000
+DF inst 2 hw_id 46 num_instance 2 version 4.2.1 bases 0x0C800000 0x0C821800 0x0C822000 0x0CAC0000 0x0CB00000
+DF inst 3 hw_id 46 num_instance 3 version 4.2.1 bases 0x0D000000 0x0D021800 0x0D022000 0x0D2C0000 0x0D300000
+DF inst 4 hw_id 46 num_instance 4 version 4.2.1 bases 0x0D800000 0x0D821800 0x0D822000 0x0DAC0000 0x0DB00000
+DFX inst 0 hw_id 37 num_instance 0 version 5.0.0 bases 0x00000580 0x02409400
+DFX_DAP inst 0 hw_id 49 num_instance 0 version 2.0.0 bases 0x000005A0 0x00B80000 0x0240C400
+DIO inst 0 hw_id 272 num_instance 0 version 127.127.63 bases 0x02404000
+DMU inst 0 hw_id 271 num_instance 0 version 3.2.0 bases 0x00000012 0x000000C0 0x000034C0 0x00009000 0x02403C00
+FUSE inst 0 hw_id 5 num_instance 0 version 13.0.0 bases 0x00017400 0x02401400
+FUSE inst 1 hw_id 5 num_instance 1 version 13.0.5 bases 0x0C002C00 0x0C020600
+FUSE inst 2 hw_id 5 num_instance 2 version 13.0.5 bases 0x0C802C00 0x0C820600
+FUSE inst 3 hw_id 5 num_instance 3 version 13.0.5 bases 0x0D002C00 0x0D020600
+FUSE inst 4 hw_id 5 num_instance 4 version 13.0.5 bases 0x0D802C00 0x0D820600
+GC inst 0 hw_id 11 num_instance 0 version 11.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+HDP inst 0 hw_id 41 num_instance 0 version 6.0.0 bases 0x00000F20 0x0240A400
+LSDMA inst 0 hw_id 91 num_instance 0 version 6.0.3 bases 0x00011400 0x02456800
+MMHUB inst 0 hw_id 34 num_instance 0 version 3.0.0 bases 0x0001A000 0x02408800
+MP0 inst 0 hw_id 255 num_instance 0 version 13.0.10 bases 0x00016000 0x00DC0000 0x00E00000 0x00E40000 0x0243FC00
+MP1 inst 0 hw_id 1 num_instance 0 version 13.0.10 bases 0x00016000 0x00DC0000 0x00E00000 0x00E40000 0x0243FC00
+NBIF inst 0 hw_id 108 num_instance 0 version 4.3.0 bases 0x00000000 0x00000014 0x00000D20 0x00010400 0x0241B000 0x04040000
+OSSSYS inst 0 hw_id 40 num_instance 0 version 6.0.0 bases 0x000010A0 0x0240A000
+PCIE inst 0 hw_id 70 num_instance 0 version 7.4.0 bases 0x00000000 0x00000014 0x00000D20 0x00010400 0x0241B000 0x04040000
+PCS inst 0 hw_id 80 num_instance 0 version 4.1.0 bases 0x02414000 0x04680000
+PWR inst 0 hw_id 10 num_instance 0 version 9.0.0 bases 
+SDMA0 inst 0 hw_id 42 num_instance 0 version 6.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+SDMA1 inst 0 hw_id 43 num_instance 0 version 6.0.3 bases 0x00001260 0x0000A000 0x0001C000 0x02402C00
+SMUIO inst 0 hw_id 4 num_instance 0 version 13.0.6 bases 0x00016800 0x00016A00 0x02401000 0x03440000
+SYSTEMHUB inst 0 hw_id 128 num_instance 0 version 2.3.0 bases 0x00000EA0 0x00500000 0x02420000
+THM inst 0 hw_id 3 num_instance 0 version 13.0.0 bases 0x00016600 0x02400C00
+THM inst 1 hw_id 3 num_instance 1 version 13.0.5 bases 0x0C003400 0x0C020200
+THM inst 2 hw_id 3 num_instance 2 version 13.0.5 bases 0x0C803400 0x0C820200
+THM inst 3 hw_id 3 num_instance 3 version 13.0.5 bases 0x0D003400 0x0D020200
+THM inst 4 hw_id 3 num_instance 4 version 13.0.5 bases 0x0D803400 0x0D820200
+UMC inst 0 hw_id 150 num_instance 0 version 8.10.0 bases 0x0C004000 0x0C004400 0x0C400000 0x0C404000
+UMC inst 1 hw_id 150 num_instance 1 version 8.10.0 bases 0x0C804000 0x0C804400 0x0CC00000 0x0CC04000
+UMC inst 2 hw_id 150 num_instance 2 version 8.10.0 bases 0x0D004000 0x0D004400 0x0D400000 0x0D404000
+UMC inst 3 hw_id 150 num_instance 3 version 8.10.0 bases 0x0D804000 0x0D804400 0x0DC00000 0x0DC04000
+USB inst 0 hw_id 170 num_instance 0 version 4.12.0 bases 0x0242A800 0x05B00000
+UVD inst 0 hw_id 12 num_instance 0 version 4.0.0 bases 0x00007800 0x00007E00
+UVD inst 1 hw_id 12 num_instance 1 version 4.0.1 bases 0x00007B00 0x00012000
