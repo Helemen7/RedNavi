@@ -4,6 +4,8 @@ A native macOS display driver for AMD **Navi 32 (RDNA 3)** GPUs, starting with t
 
 > **For developers only.** This is a research prototype, not a driver you can install and use. It needs OpenCore, SIP turned off and boot-args, it writes to the GPU from the kernel, and it can hang or crash your machine. Run it only on a system whose display does not depend on this card, with a backup EFI. Vulkan (Mesa's RADV, through a bridge to the kext) runs on the card in test programs. Metal is at an early stage: on the development machine WindowServer composes the desktop on the GPU through our plug-in, with visible glitches.
 
+**Join the community:** [Discord](https://discord.gg/7G3bVnKgQM) for questions, test results and hardware support (RX 7600, RX 7700 XT, APUs), and the [issues](https://github.com/Helemen7/RedNavi/issues) for the work itself. Testers with a Linux or Hackintosh machine are welcome: the first step, a read-only capture, is in [docs/ADDING_A_GPU.md](docs/ADDING_A_GPU.md).
+
 Goal: a real framebuffer on the card, driven by our own kext (DCN 3.2 display engine), with no GOP, VESA or firmware framebuffer in the way, and then acceleration: RADV (Vulkan) on top of the kext, which runs compute and 3D tests today, and Metal on top of RADV, which has started (the desktop is composed on the GPU on the development machine) and is where we need help.
 
 ## Status
@@ -81,6 +83,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 - **Helemen7** — Project founder, kernel display architecture, Metal/RADV translation layer.
 - **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
 - **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
+- **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console.
 
 
 ## Contributing

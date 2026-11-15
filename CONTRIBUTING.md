@@ -4,6 +4,8 @@ Thank you for wanting to help. RedNavi writes to a real GPU from the kernel, so 
 
 Read `README.md`, `docs/ARCHITECTURE.md`, `docs/ROADMAP.md` and `CLAUDE.md` (layout, conventions and hard-won facts) before you start.
 
+Questions, test results and hardware talk are welcome in the [Discord](https://discord.gg/7G3bVnKgQM); design decisions and anything that changes the code are recorded in issues and pull requests, so they are not lost.
+
 ## Before you write code
 
 Open an issue first for anything larger than a bug fix: a new chip, a new subsystem, a change to the user client interface (`RedNavi/rn_uapi.h`) or to the build. Say what you plan to do and on which hardware you can test it. This avoids work that cannot be merged.
