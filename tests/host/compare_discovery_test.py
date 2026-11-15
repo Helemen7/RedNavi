@@ -114,6 +114,22 @@ class RealCapture(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("13.0.7 on macOS, 13.0.0 on Linux", r.stdout)
 
+    def test_two_boards_of_the_die_agree(self):
+        """Two RX 7600 boards (PowerColor, Gigabyte) report the same five versions that identify Navi 33."""
+        def versions(path):
+            out = {}
+            for line in open(path):
+                f = line.split()
+                if len(f) > 8 and f[1] == "inst" and f[2] == "0" and f[3] == "hw_id" and f[4].isdigit() and int(f[4]) in (11, 271, 255, 1, 42):
+                    out[int(f[4])] = f[f.index("version") + 1]
+            return out
+        a = os.path.join(ROOT, "docs/logs/navi33/ip_discovery.txt")
+        b = os.path.join(ROOT, "docs/logs/navi33/rx7600-gigabyte/ip_discovery.txt")
+        if not (os.path.exists(a) and os.path.exists(b)):
+            self.skipTest("a Navi 33 capture is not in this checkout")
+        self.assertEqual(versions(a), versions(b))
+        self.assertEqual(versions(b), {11: "11.0.2", 271: "3.2.1", 255: "13.0.7", 1: "13.0.7", 42: "6.0.2"})
+
     def test_unreadable_input_is_an_error(self):
         with tempfile.NamedTemporaryFile("w", suffix=".txt") as f:
             f.write("not a table\n")
