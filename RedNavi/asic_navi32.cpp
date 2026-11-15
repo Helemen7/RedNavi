@@ -11,7 +11,7 @@
 // die and reports the same PCI device ID; nobody has run it, so it is unverified.
 static const struct rn_asic_board kNavi32Boards[] = {
     // VBIOS path: DisplayPort on UNIPHY2 (transmitter E, phy id 4), HPD pin 5, AUX 4, 4 lanes.
-    {0x747E, "AMD Radeon RX 7800 XT", 16384, kRNReplay, sizeof(kRNReplay) / sizeof(kRNReplay[0]), {4, 4, 5, 19, 4}},
+    {0x747E, "AMD Radeon RX 7800 XT", 16384, kRNReplay, sizeof(kRNReplay) / sizeof(kRNReplay[0]), {4, 4, 5, 19, 4}, 15872},
     {0, nullptr, 0, nullptr, 0, {0, 0, 0, 0, 0}},
 };
 

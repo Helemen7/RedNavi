@@ -1737,11 +1737,12 @@ void RedNaviProbe::sendPspSetupTmr() {
     if (!bar0) { IOLog("RedNavi: PSP SETUP_TMR: no BAR0\n"); return; }
     uint64_t tmrOff = kRNPspTmrVramOffset;
     if (arg == 2) {
-        // 2: where the Linux run of the same board put it ("reserve ... from 0x8..." in dmesg, minus the VRAM MC base). Only the
-        // 16 GB RX 7800 XT is known (0x3e0000000); on any other VRAM size the offset must come from that board's Linux log.
+        // 2: where the Linux run of the same board put it ("reserve ... from 0x8..." in dmesg, minus the VRAM MC base), kept in the
+        // board's row (psp_tmr_mb). A board without it (or a 7700 XT, which matches the 7800 XT row with less VRAM) needs the offset
+        // from its own Linux log in rednavi_psp_tmr_off_mb.
         uint32_t offMb = 0;
         if (PE_parse_boot_argn("rednavi_psp_tmr_off_mb", &offMb, sizeof(offMb)) && offMb) tmrOff = static_cast<uint64_t>(offMb) << 20;
-        else if (vramMbytes == 16384) tmrOff = 0x3e0000000ull;
+        else if (board && board->psp_tmr_mb && vramMbytes == board->vram_mb) tmrOff = static_cast<uint64_t>(board->psp_tmr_mb) << 20;
         else { IOLog("RedNavi: PSP SETUP_TMR: %u MB of VRAM, offset unknown: set rednavi_psp_tmr_off_mb from the Linux log\n", vramMbytes); return; }
         if (tmrOff + pspTmrSize > (static_cast<uint64_t>(vramMbytes) << 20)) { IOLog("RedNavi: PSP SETUP_TMR: TMR 0x%llx + 0x%x is past the end of VRAM, not sent\n", tmrOff, pspTmrSize); return; }
     }

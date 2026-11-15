@@ -57,6 +57,7 @@ struct rn_asic_board {
     const struct RNReplayReg *replay;   // display registers of one lit pipe on this board, in programming order (dcnReplay)
     uint32_t replay_count;
     struct rn_dp_path dp;     // the DisplayPort path the replay table drives
+    uint32_t psp_tmr_mb;      // VRAM offset of the PSP TMR in MB (rednavi_psp_tmr=2): "reserve ... from 0x8..." in the Linux log of this board; 0 = not known
 };
 
 struct rn_asic {
