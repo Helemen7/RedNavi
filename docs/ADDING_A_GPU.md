@@ -97,3 +97,7 @@ For each stage the pull request says which boot-args were set, shows the propert
 ## What a pull request for a new chip looks like
 
 Small. The evidence commit is text logs. The row is a few lines. A generated header comes with its generator command. If a pull request for a chip carries thousands of hand-written lines or any binary file, it is doing several of the steps above at once and will be sent back to be split.
+
+## Known limit: the RX 7700 XT is not told apart from the RX 7800 XT
+
+The RX 7700 XT is the same die and reports the same device ID (`0x747E`) and the same five IP versions as the RX 7800 XT (GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3; Step 0 capture in `docs/logs/navi32/rx7700xt-gigabyte/`, once merged). The ASIC lookup therefore gives it the 7800 XT profile. Nobody has run RedNavi on one, and some write stages assume the 7800 XT layout with 16 GB of VRAM; the 7700 XT has 12272 MB. For example `rednavi_psp_tmr=2` places the TMR at VRAM offset `0x3e0000000`, past the end of VRAM on that card, where the Linux log of the same board puts it at `0x2e0000000`. Do not set write-stage boot-args on a 7700 XT until the layout is computed from the VRAM size. Read-only behaviour (no `rednavi_*` boot-arg) is unaffected. Status: unverified on hardware, read from the Linux log and the source.
