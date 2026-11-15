@@ -3847,6 +3847,13 @@ bool RedNaviProbe::start(IOService *provider) {
     }
 
     // System Information reads the GPU name and VRAM size from these properties of the PCI node.
+    // A board of the row has the memory size the layouts were built for (the 7800 XT row assumes 16 GB; the Linux log of the same board says 16368M,
+    // 16 MB under the register). A card with less memory behind the same IDs (the RX 7700 XT, 12272 MB) stays read-only until it has its own row.
+    if (asic && board && vramMbytes + 64 < board->vram_mb) {
+        IOLog("RedNavi: device 0x%04x has %u MB of VRAM, the row of %s has %u MB: read-only\n", pciDevice, vramMbytes, board->model, board->vram_mb);
+        asic = nullptr;
+        board = nullptr;
+    }
     {
         uint32_t vramMb = board->vram_mb;
         OSData *m = OSData::withBytes(board->model, static_cast<unsigned int>(strlen(board->model) + 1));
