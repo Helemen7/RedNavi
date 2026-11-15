@@ -524,6 +524,17 @@ void RedNaviProbe::dumpDiscovery() {
     uint32_t sig = vramRead(base);
     IOLog("RedNavi: discovery base=0x%llx sig=0x%08x (expect 0x%08x)\n", base, sig, kRNBinarySignature);
     if (sig != kRNBinarySignature) {
+        IODeviceMemory *bar0 = pci ? pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0) : nullptr;
+        if (bar0 && bar0->getLength() > kRNDiscoveryTmrOffset) {
+            uint64_t alt = bar0->getLength() - kRNDiscoveryTmrOffset;
+            if (vramRead(alt) == kRNBinarySignature) {
+                base = alt;
+                sig = kRNBinarySignature;
+                IOLog("RedNavi: IP discovery found at top of BAR0: 0x%llx\n", base);
+            }
+        }
+    }
+    if (sig != kRNBinarySignature) {
         IOLog("RedNavi: IP discovery signature not found\n");
         return;
     }
@@ -3830,6 +3841,11 @@ bool RedNaviProbe::start(IOService *provider) {
     asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board) : nullptr;
     publishAsic();
     if (!asic) {
+        if (pciDevice == 0x1586) {
+            static const char kName8060[] = "AMD Radeon 8060S";
+            OSData *m = OSData::withBytes(kName8060, sizeof(kName8060));
+            if (m) { pci->setProperty("model", m); m->release(); }
+        }
         IOLog("RedNavi: device 0x%04x is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice);
         dumpVbios();
         registerService();
