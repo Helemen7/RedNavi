@@ -595,6 +595,7 @@ void RedNaviProbe::publishAsic() {
     str("name", asic ? asic->name : "not in the table");
     if (asic) {
         str("model", board->model);
+        str("write-stages", board->write_ok ? "yes" : "no (known from a Linux capture, constants of this board not in the kext)");
         str("firmware", asic->firmware);
         str("reg-headers", asic->reg_headers);
         str("dev-info", asic->dev_info);
@@ -2765,9 +2766,11 @@ uint64_t RedNaviProbe::vmPageAlloc(int vmid) {
 // and the table are made. A directory entry is the VRAM offset of the next table with the VALID bit (amdgpu_vm_pde_update, gmc_v11_0_get_vm_pde).
 bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff) {
     uint64_t table = kVmTables + static_cast<uint64_t>(vmid - 1) * kVmPoolPages * 4096;   // the root is the first pool page
+    uint64_t badSlot = 0, badEntry = 0; int badShift = 0;
     for (int shift = 27; shift >= 9; shift -= 9) {
         const uint64_t slot = table + ((vaPage >> shift) & 0x1ff) * 8;
         uint64_t entry = rnRd64(&gpu, slot);
+        if ((entry & 1) && ((entry & 0x0000FFFFFFFFF000ull) < kVmTables || (entry & 0x0000FFFFFFFFF000ull) >= kVmTables + 7ull * kVmPoolPages * 4096) && !badSlot) { badSlot = slot; badEntry = entry; badShift = shift; }
         if (!(entry & 1)) {
             if (!create) return false;
             const uint64_t next = vmPageAlloc(vmid);
@@ -2776,6 +2779,13 @@ bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOf
             rn_vm_write_pte(&gpu, slot - ((vaPage >> shift) & 0x1ff) * 8, static_cast<uint32_t>((vaPage >> shift) & 0x1ff), entry);
         }
         table = entry & 0x0000FFFFFFFFF000ull;
+    }
+    // A table outside the page-table pools would have PTEs written over whatever lives there (the scanout, in the observed case): refused, and the first offenders are
+    // published as vm-bad-ptb so that the cause can be read off a boot.
+    if (table < kVmTables || table >= kVmTables + 7ull * kVmPoolPages * 4096) {
+        static uint32_t bad;
+        if (bad++ < 8) { char key[24]; snprintf(key, sizeof key, "vm-bad-ptb-%u", bad); char val[160]; snprintf(val, sizeof val, "vmid %d va page 0x%llx table 0x%llx shift %d slot 0x%llx entry 0x%llx", vmid, vaPage, table, badShift, badSlot, badEntry); setProperty(key, val); }
+        return false;
     }
     *ptbOff = table;
     return true;
@@ -3837,23 +3847,25 @@ bool RedNaviProbe::start(IOService *provider) {
     // number and firmware below belongs to the ASICs of the table, and nothing here has been checked on another die.
     dumpDiscovery();
     uint16_t pciDevice = pci->configRead16(kIOPCIConfigDeviceID);
-    asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board) : nullptr;
+    // The memory size picks the board among boards that share a device ID (the RX 7800 XT and the RX 7700 XT are both 1002:747E): the register says 16368 MB on the
+    // first and about 12272 MB on the second. A card whose size matches no board of its ID is not in the table.
+    asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board, vramMbytes) : nullptr;
+    if (!asic) board = nullptr;
     publishAsic();
     if (!asic) {
-        IOLog("RedNavi: device 0x%04x is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice);
+        IOLog("RedNavi: device 0x%04x with %u MB of VRAM is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice, vramMbytes);
+        dumpVbios();
+        registerService();
+        return true;
+    }
+    if (!board->write_ok) {      // a board known from a Linux capture: named and published, but the constants below are those of another board
+        IOLog("RedNavi: %s (%s) is in the ASIC table without write stages: read-only, IP discovery and VBIOS only\n", board->model, asic->name);
         dumpVbios();
         registerService();
         return true;
     }
 
     // System Information reads the GPU name and VRAM size from these properties of the PCI node.
-    // A board of the row has the memory size the layouts were built for (the 7800 XT row assumes 16 GB; the Linux log of the same board says 16368M,
-    // 16 MB under the register). A card with less memory behind the same IDs (the RX 7700 XT, 12272 MB) stays read-only until it has its own row.
-    if (asic && board && vramMbytes + 64 < board->vram_mb) {
-        IOLog("RedNavi: device 0x%04x has %u MB of VRAM, the row of %s has %u MB: read-only\n", pciDevice, vramMbytes, board->model, board->vram_mb);
-        asic = nullptr;
-        board = nullptr;
-    }
     {
         uint32_t vramMb = board->vram_mb;
         OSData *m = OSData::withBytes(board->model, static_cast<unsigned int>(strlen(board->model) + 1));

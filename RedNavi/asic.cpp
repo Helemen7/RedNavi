@@ -7,7 +7,8 @@
 
 // Each ASIC translation unit exports one profile; add it to this registry.
 extern const struct rn_asic kRNAsicNavi32;
-static const struct rn_asic *const kRNAsics[] = {&kRNAsicNavi32};
+extern const struct rn_asic kRNAsicNavi33;
+static const struct rn_asic *const kRNAsics[] = {&kRNAsicNavi32, &kRNAsicNavi33};
 
 uint32_t rn_disc_find_ip(const uint8_t *b, uint32_t len, uint16_t hw_id, bool *base64) {
     if (!b) return 0;
@@ -48,7 +49,7 @@ static bool sameVersion(const uint8_t *table, uint32_t len, uint16_t hw_id, cons
     return rn_disc_ip_version(table, len, hw_id, &v) && v.major == want.major && v.minor == want.minor && v.rev == want.rev;
 }
 
-const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board) {
+const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board, uint32_t vram_mb) {
     for (const struct rn_asic *profile : kRNAsics) {
         const struct rn_asic &a = *profile;
         if (!sameVersion(table, len, RN_HWID_GC, a.gc) || !sameVersion(table, len, RN_HWID_DMU, a.dcn) ||
@@ -57,6 +58,7 @@ const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_
             continue;
         for (const struct rn_asic_board *bd = a.boards; bd->pci_device; bd++) {
             if (bd->pci_device != pci_device) continue;
+            if (vram_mb && (vram_mb + 64 < bd->vram_mb || vram_mb > bd->vram_mb + 64)) continue;
             if (board) *board = bd;
             return &a;
         }

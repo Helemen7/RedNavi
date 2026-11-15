@@ -58,6 +58,9 @@ struct rn_asic_board {
     uint32_t replay_count;
     struct rn_dp_path dp;     // the DisplayPort path the replay table drives
     uint32_t psp_tmr_mb;      // VRAM offset of the PSP TMR in MB (rednavi_psp_tmr=2): "reserve ... from 0x8..." in the Linux log of this board; 0 = not known
+    // 1: the register offsets, firmware and layout constants compiled into the kext are those of this board, and the write stages may run on it (verified on the board).
+    // 0: the board is known (it is named in the "asic" property and its Linux data is kept in the row) and the probe stays read-only on it.
+    uint8_t write_ok;
 };
 
 struct rn_asic {
@@ -83,7 +86,9 @@ uint32_t rn_disc_find_ip(const uint8_t *table, uint32_t len, uint16_t hw_id, boo
 bool rn_disc_ip_version(const uint8_t *table, uint32_t len, uint16_t hw_id, struct rn_ip_version *out);
 
 // The row whose five IP versions all equal the table's and that lists the PCI device ID, or NULL.
+// Boards of one die can share a device ID (the RX 7800 XT and the RX 7700 XT are both 1002:747E): with vram_mb not 0, a board matches only when the memory size
+// the card reports (RCC_CONFIG_MEMSIZE, 16 MB under the nominal size on the boards seen) is within 64 MB of the row's. vram_mb 0 takes the first board of the ID.
 // *board, when not NULL, receives the matching board.
-const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board);
+const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board, uint32_t vram_mb = 0);
 
 #endif

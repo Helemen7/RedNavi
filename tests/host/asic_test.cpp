@@ -71,7 +71,17 @@ static void testLookup() {
     const rn_asic_board *board = nullptr;
     const rn_asic *a = rn_asic_lookup(t.data(), len, 0x747E, &board);
     CHECK(a && !strcmp(a->name, "Navi 32") && board && board->vram_mb == 16384 && !strcmp(board->model, "AMD Radeon RX 7800 XT"));
-    CHECK(!rn_asic_lookup(t.data(), len, 0x7480, nullptr));              // right versions, a board nobody has run
+    CHECK(!rn_asic_lookup(t.data(), len, 0x7480, nullptr));              // right versions, a device ID that is not a Navi 32 board
+    CHECK(board && board->write_ok == 1);
+    // Boards that share the device ID are told apart by the memory size the register reports (16368 MB on the 7800 XT, about 12272 MB on the 7700 XT).
+    const rn_asic_board *bd = nullptr;
+    bd = nullptr;
+    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 16368) && bd && !strcmp(bd->model, "AMD Radeon RX 7800 XT") && bd->write_ok == 1);
+    bd = nullptr;
+    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 12272) && bd && !strcmp(bd->model, "AMD Radeon RX 7700 XT") && bd->vram_mb == 12288 && bd->psp_tmr_mb == 11776 && bd->write_ok == 0 && !bd->replay);
+    CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 8176));        // a size that is no board of the ID
+    CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 24560));
+    CHECK(rn_asic_lookup(t.data(), len, 0x747E, nullptr, 16384) && rn_asic_lookup(t.data(), len, 0x747E, nullptr, 12288));
     // The data behind the row: the DRM_AMDGPU_INFO answers start with the device ID, and the board has its display registers.
     CHECK(a && a->drm_info && a->drm_info->dev_info_size == 448 && a->drm_info->dev_info[0] == 0x7e && a->drm_info->dev_info[1] == 0x74);
     CHECK(a && a->drm_info->fw_count == 16 && a->drm_info->max_ibs_count == 10 && a->drm_info->hw_ip_info[0][0] == 0x0b);
@@ -101,7 +111,8 @@ static void testBad() {
 }
 
 // A table captured from a real card of another die (docs/logs/navi33/rx7600-frame121, an RX 7600 on Linux; run from the repository root, as `make test` does).
-// It must read as GC 11.0.2 / DCN 3.2.1 / MP0 and MP1 13.0.7 / SDMA 6.0.2 and match no row, whatever the device ID is: such a card stays read-only.
+// It must read as GC 11.0.2 / DCN 3.2.1 / MP0 and MP1 13.0.7 / SDMA 6.0.2. It matches the Navi 33 row for the RX 7600 (1002:7480, 8176 MB of VRAM) and no other ID or
+// memory size; that board has no write stages, so the probe stays read-only on it.
 static void testRealNavi33() {
     FILE *f = fopen("docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin", "rb");
     if (!f) { printf("skipped: the Navi 33 capture is not in this checkout\n"); return; }
@@ -115,7 +126,14 @@ static void testRealNavi33() {
     CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_MP0, &v) && v.major == 13 && v.minor == 0 && v.rev == 7);
     CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_MP1, &v) && v.major == 13 && v.minor == 0 && v.rev == 7);
     CHECK(rn_disc_ip_version(t.data(), len, RN_HWID_SDMA0, &v) && v.major == 6 && v.minor == 0 && v.rev == 2);
-    for (uint16_t dev : {0x7480, 0x747E, 0x744C, 0x1586}) CHECK(!rn_asic_lookup(t.data(), len, dev, nullptr));
+    for (uint16_t dev : {0x747E, 0x744C, 0x1586}) CHECK(!rn_asic_lookup(t.data(), len, dev, nullptr));
+    const rn_asic_board *board = nullptr;
+    const rn_asic *a = rn_asic_lookup(t.data(), len, 0x7480, &board, 8176);
+    CHECK(a && !strcmp(a->name, "Navi 33") && board && !strcmp(board->model, "AMD Radeon RX 7600") && board->vram_mb == 8192);
+    CHECK(board && board->write_ok == 0 && !board->replay && board->psp_tmr_mb == 8128 && (uint64_t)board->psp_tmr_mb < board->vram_mb);
+    CHECK(a && a->drm_info && a->drm_info->dev_info[0] == 0x80 && a->drm_info->dev_info[1] == 0x74 && a->drm_info->fw_count == 16);
+    CHECK(!rn_asic_lookup(t.data(), len, 0x7480, nullptr, 16368));       // right ID, the memory of another card
+    CHECK(!rn_asic_lookup(t.data(), len, 0x7480, nullptr, 4080));
 }
 
 int main(int argc, char **argv) {
