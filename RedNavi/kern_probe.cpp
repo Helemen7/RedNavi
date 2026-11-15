@@ -1742,7 +1742,7 @@ void RedNaviProbe::sendPspSetupTmr() {
         // from its own Linux log in rednavi_psp_tmr_off_mb.
         uint32_t offMb = 0;
         if (PE_parse_boot_argn("rednavi_psp_tmr_off_mb", &offMb, sizeof(offMb)) && offMb) tmrOff = static_cast<uint64_t>(offMb) << 20;
-        else if (board && board->psp_tmr_mb && vramMbytes == board->vram_mb) tmrOff = static_cast<uint64_t>(board->psp_tmr_mb) << 20;
+        else if (board && board->psp_tmr_mb && vramMbytes + 64 >= board->vram_mb && vramMbytes <= board->vram_mb + 64) tmrOff = static_cast<uint64_t>(board->psp_tmr_mb) << 20;
         else { IOLog("RedNavi: PSP SETUP_TMR: %u MB of VRAM, offset unknown: set rednavi_psp_tmr_off_mb from the Linux log\n", vramMbytes); return; }
         if (tmrOff + pspTmrSize > (static_cast<uint64_t>(vramMbytes) << 20)) { IOLog("RedNavi: PSP SETUP_TMR: TMR 0x%llx + 0x%x is past the end of VRAM, not sent\n", tmrOff, pspTmrSize); return; }
     }
