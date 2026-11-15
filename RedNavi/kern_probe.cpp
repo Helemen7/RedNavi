@@ -1735,7 +1735,16 @@ void RedNaviProbe::sendPspSetupTmr() {
     if (!pspTmrSize) { IOLog("RedNavi: PSP SETUP_TMR: no TMR size from LOAD_TOC\n"); return; }
     IODeviceMemory *bar0 = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
     if (!bar0) { IOLog("RedNavi: PSP SETUP_TMR: no BAR0\n"); return; }
-    uint64_t tmrOff = arg == 2 ? 0x3e0000000ull : kRNPspTmrVramOffset;       // 2: where the Linux reference run put it
+    uint64_t tmrOff = kRNPspTmrVramOffset;
+    if (arg == 2) {
+        // 2: where the Linux run of the same board put it ("reserve ... from 0x8..." in dmesg, minus the VRAM MC base). Only the
+        // 16 GB RX 7800 XT is known (0x3e0000000); on any other VRAM size the offset must come from that board's Linux log.
+        uint32_t offMb = 0;
+        if (PE_parse_boot_argn("rednavi_psp_tmr_off_mb", &offMb, sizeof(offMb)) && offMb) tmrOff = static_cast<uint64_t>(offMb) << 20;
+        else if (vramMbytes == 16384) tmrOff = 0x3e0000000ull;
+        else { IOLog("RedNavi: PSP SETUP_TMR: %u MB of VRAM, offset unknown: set rednavi_psp_tmr_off_mb from the Linux log\n", vramMbytes); return; }
+        if (tmrOff + pspTmrSize > (static_cast<uint64_t>(vramMbytes) << 20)) { IOLog("RedNavi: PSP SETUP_TMR: TMR 0x%llx + 0x%x is past the end of VRAM, not sent\n", tmrOff, pspTmrSize); return; }
+    }
     uint64_t mc = kRNVramMcBase + tmrOff;                                      // GPU address
     uint64_t pa = static_cast<uint64_t>(bar0->getPhysicalAddress()) + tmrOff;  // CPU physical address of the same bytes (amdgpu_gmc_vram_pa)
     // cmd.cmd_setup_tmr: buf_phy_addr_lo/hi, buf_size, flags (bit 1 = virt_phy_addr), system_phy_addr_lo/hi
