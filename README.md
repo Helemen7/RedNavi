@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/images/logo.png" alt="RedNavi logo" width="256"></p>
+
 # RedNavi
 
 A native macOS display driver for AMD **Navi 32 (RDNA 3)** GPUs, starting with the **Radeon RX 7800 XT** (`1002:747E`).
@@ -83,7 +85,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 - **Helemen7** — Project founder, kernel display architecture, Metal/RADV translation layer.
 - **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
 - **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
-- **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console.
+- **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console, and the project logo.
 
 
 ## Contributing
