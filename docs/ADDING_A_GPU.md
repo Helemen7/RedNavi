@@ -66,6 +66,8 @@ Commit the report to `docs/logs/<chip>/` in its own pull request, with the machi
 
 ## Step 1: read-only run on macOS
 
+**RX 7700 XT and RX 7600 testers:** your device IDs are already in `IOPCIPrimaryMatch` and your boards have rows (`write_ok` 0), so there is nothing to add. Build, load the kext as below (display not on the card), and send `ioreg -rn RedNaviProbe -l -x > ioreg.txt` plus the output of `python3 tools/compare_discovery.py ioreg.txt <your ip_discovery.txt>`. What the `asic` property should show: RX 7700 XT `name` Navi 32, `model` AMD Radeon RX 7700 XT, `write-stages` starting with `no`; RX 7600 `name` Navi 33, `model` AMD Radeon RX 7600, `write-stages` starting with `no`. A `model` of the 7800 XT on a 7700 XT would be a bug in the VRAM lookup: say so. No boot-arg is needed and none should be set. The tracking issue is Helemen7/RedNavi#7.
+
 Add the PCI device ID to `IOPCIPrimaryMatch` in `RedNavi/Info.plist.in`, build, and load the kext on a machine whose display does not depend on the card (`CONTRIBUTING.md`, "Safety"). The card is not in the table, so the probe only reads. Check:
 
 - the `asic` property shows five versions and `name` = `not in the table`;
