@@ -67,6 +67,16 @@ What was tried before, and why it is not the fix:
 
 This machine is the contributor's hardware for the Navi 33 evidence under docs/logs/navi33/rx7600-frame121/. The monitor is connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this machine.
 
+## RX 7600 macOS machine (Mac Pro)
+
+| Item | Value |
+|---|---|
+| Machine | Mac Pro (exact model and macOS version not reported yet) |
+| Target GPU | AMD Radeon RX 7600, Navi 33, `1002:7480` |
+| Role | Contributor hardware for the first macOS run on Navi 33, under `docs/logs/navi33/rx7600-macos/`. Read-only probe only: no boot-arg set, no firmware bring-up, no register writes, no GPU queue submission is claimed. |
+
+Result (2026-11-16): `RedNavi.kext` loaded and matched, `asic` property Navi 33 / AMD Radeon RX 7600, and the IP discovery table read on macOS agrees with the Linux capture of the same board in all 39 blocks (`tools/compare_discovery.py`: SAME). The VBIOS property of the original `ioreg` output is left out of the committed log.
+
 ## Ryzen AI Max+ 395 / Radeon 8060S test machine
 
 | Item | Value |
