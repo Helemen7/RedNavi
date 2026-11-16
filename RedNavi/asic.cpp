@@ -4,6 +4,7 @@
 // The ASIC table and the IP discovery lookups it needs. No kernel dependencies: this file is also built by the
 // host tests (tests/host/asic_test.cpp).
 #include "asic.h"
+#include "gc_regs.h"
 
 // Each ASIC translation unit exports one profile; add it to this registry.
 extern const struct rn_asic kRNAsicNavi32;
@@ -64,4 +65,13 @@ const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_
         }
     }
     return nullptr;
+}
+
+const struct rn_gc_offsets *rn_gc = &kRNGcOffsets_primary;
+
+int rn_gc_select(struct rn_ip_version gc) {
+    if (gc.major != 11 || gc.minor != 0) return 0;
+    if (gc.rev == 3) { rn_gc = &kRNGcOffsets_primary; return 1; }
+    if (gc.rev <= 2) { rn_gc = &kRNGcOffsets_alt; return 1; }
+    return 0;
 }

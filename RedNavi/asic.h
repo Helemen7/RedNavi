@@ -96,4 +96,8 @@ bool rn_disc_ip_version(const uint8_t *table, uint32_t len, uint16_t hw_id, stru
 // *board, when not NULL, receives the matching board.
 const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board, uint32_t vram_mb = 0);
 
+// Select the GC register offsets (gc_regs.h, read through rn_gc) for a GC version: 11.0.3 has its own memory hub offsets; 11.0.0 to 11.0.2 use the gc_11_0_0 ones
+// (Linux has no gc_11_0_2 headers). Returns 0 for a version without a table. Until it is called rn_gc points at the 11.0.3 table.
+int rn_gc_select(struct rn_ip_version gc);
+
 #endif

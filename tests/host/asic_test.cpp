@@ -5,6 +5,7 @@
 // With a file argument (an IP discovery table as raw bytes) it prints what the lookup makes of it instead:
 //   build/asic_test table.bin [pci device ID in hex]
 #include "../../RedNavi/asic.h"
+#include "../../RedNavi/gc_regs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -160,6 +161,11 @@ int main(int argc, char **argv) {
     CHECK(rn_dig_off(0x250b, 0) == 0x210b);      // DP0_DP_CONFIG
     CHECK(rn_dig_off(0x24b1, 0) == 0x20b1);      // DIG0_DIG_BE_CNTL
     CHECK(rn_dig_off(0x248b, 1) == 0x218b);      // DIG1_DIG_FE_CNTL
+    // GC register offsets: 11.0.3 has its own memory hub offsets, 11.0.0 to 11.0.2 use the gc_11_0_0 ones
+    CHECK(regGCMC_VM_FB_LOCATION_BASE == 0x1688);   // the default table is 11.0.3's
+    CHECK(rn_gc_select({11, 0, 2}) == 1 && regGCMC_VM_FB_LOCATION_BASE == 0x1678 && regGCVM_L2_CNTL == 0x15bc);
+    CHECK(rn_gc_select({11, 0, 3}) == 1 && regGCMC_VM_FB_LOCATION_BASE == 0x1688 && regGCVM_L2_CNTL == 0x15c0);
+    CHECK(rn_gc_select({11, 5, 0}) == 0 && regGCMC_VM_FB_LOCATION_BASE == 0x1688);   // no table: the selection stays
     testVersions();
     testLookup();
     testBad();

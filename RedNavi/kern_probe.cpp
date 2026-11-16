@@ -3860,6 +3860,7 @@ bool RedNaviProbe::start(IOService *provider) {
     // first and about 12272 MB on the second. A card whose size matches no board of its ID is not in the table.
     asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board, vramMbytes) : nullptr;
     if (!asic) board = nullptr;
+    if (asic) rn_gc_select(asic->gc);                 // the GC register offsets of this ASIC's GC version (gc_regs.h)
     publishAsic();
     if (!asic) {
         IOLog("RedNavi: device 0x%04x with %u MB of VRAM is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice, vramMbytes);
