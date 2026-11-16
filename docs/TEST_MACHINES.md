@@ -72,7 +72,9 @@ This machine is the contributor's hardware for the Navi 33 evidence under docs/l
 | Item | Value |
 |---|---|
 | Machine | Reports a Mac Pro SMBIOS; the real board, CPU and macOS version are not reported yet |
-| Target GPU | AMD Radeon RX 7600, Navi 33, `1002:7480` |
+| Target GPU | AMD Radeon RX 7600, Navi 33, `1002:7480`, subsystem `1458:242B` (Gigabyte), rev `CF`, PCI node `GFX0` at 3:0:0 |
+| PCIe | Link status 0x1084 read from the node: 16 GT/s (Gen 4), x8. BAR0 (VRAM aperture) is 256 MB at 0x4000000000: the card is not using a resizable BAR under macOS |
+| Display | HKM 27" 1920x1080 at 165 Hz over HDMI (as reported; not read from the card) |
 | Role | Contributor hardware for the first macOS run on Navi 33, under `docs/logs/navi33/rx7600-macos/`. Read-only probe only: no boot-arg set, no firmware bring-up, no register writes, no GPU queue submission is claimed. |
 
 Result (2026-11-16): `RedNavi.kext` loaded and matched, `asic` property Navi 33 / AMD Radeon RX 7600, and the IP discovery table read on macOS agrees with the Linux capture of the same board in all 39 blocks (`tools/compare_discovery.py`: SAME). The VBIOS property of the original `ioreg` output is left out of the committed log.
