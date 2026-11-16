@@ -36,12 +36,12 @@ Navi 32 constants still outside the table:
 
 | What | Where | Tied to |
 | --- | --- | --- |
-| GC and SDMA register offsets | `RedNavi/gc_regs.h` (generated from the `gc_11_0_3` headers) | GC version. The memory hub registers differ between 11.0.0 and 11.0.3 |
+| GC and SDMA register offsets | `RedNavi/gc_regs.h` (generated from the `gc_11_0_3` headers) | GC version. The memory hub registers differ between 11.0.0 and 11.0.3. Linux has no `gc_11_0_2` headers: Navi 33 (GC 11.0.2) is built from `gc_11_0_0_offset.h`, and 385 of the 5494 register offsets common to `gc_11_0_0` and `gc_11_0_3` differ (checked 2026-11-16 on the Linux master headers, not run). A second header needs `tools/gen_gc_regs.py` with the `gc_11_0_0` files, and every register use in `gfx11.cpp` and `kern_probe.cpp` is a compile-time constant today, so the code has to be taken through a per-row table of offsets first |
 | Display register offsets | `RedNavi/dcn_reglist.h`, offsets in `kern_probe.cpp` | DCN 3.2.0 |
 | Firmware | `RedNavi/psp_fw.h`, `smu_fw.h`, `gc_fw.h`, `dmub_fw.h` (generated locally, git-ignored) | PSP, SMU, GC, SDMA and DCN versions |
 | Display replay generator | `tools/gen_dcn_replay.py` (its register list) | DCN 3.2, pipe 0 on DIG4 / DP4. The table it writes is selected through the board; `--name <asic>_<device id>` writes a second board's table under its own symbol and file name |
 | (done) DIG and DP back-end registers | `kern_probe.cpp` | Now selected through the board's `dp.dig` (see above). What remains for a second board is its own replay table and the DIG/PHY ids from its capture |
-| MES, doorbell and memory layout constants | `RedNavi/gfx11.cpp`, `kern_probe.cpp` | GC 11.0.3 with MES; the VRAM offsets assume 16 GB |
+| MES, doorbell and memory layout constants | `RedNavi/gfx11.cpp`, `kern_probe.cpp` | GC 11.0.3 with MES. The end of the VRAM aperture the GMC is given is now read from `FB_LOCATION_TOP` (verified on the RX 7800 XT, one boot, 2026-11-16: same value, `rn_test_new` PASS); the fixed low-VRAM offsets (display, GART table, MES areas, DMCUB block) are below 1.5 GB and fit any board with 8 GB or more |
 | Kext matches | `RedNavi/Info.plist.in`, `RedNaviAccel2/Info.plist.in` (`IOPCIPrimaryMatch`) | PCI device ID. The probe lists every card that may be read; the accelerator lists only boards in the table |
 
 ## Step 0: collect the evidence on Linux

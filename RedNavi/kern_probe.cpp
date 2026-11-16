@@ -3168,7 +3168,14 @@ void RedNaviProbe::sdmaTest() {
     // engines work at 192 MB: page table 0x0C100000, default and fault pages 0x0C200000/0x0C201000, SDMA ring 0x0C000000, target 0x0C002000.
     // The GART window: 16384 pages (64 MB) at GPU address 0x2000000000 (outside the VRAM aperture), the page table at VRAM 0x0C100000.
     const uint64_t kGartVa = 0x2000000000ull;
-    struct rn_gmc gmc = {kRNVramMcBase, kRNVramMcBase + 0x3FFFFFFFFull, kGartVa, kGartVa + 16384ull * 4096 - 1, 0x0C100000, 0x0C200000, 0x0C201000};
+    // End of the VRAM aperture: what the VBIOS left in FB_LOCATION_TOP (16 MB units; 0x83ff on the RX 7800 XT, which is base + 16 GB - 1), not a 16 GB constant, so that a board with
+    // less memory gets its own end. The 16 GB value stays as the fallback when the register reads back something that cannot be a top for this base.
+    uint64_t fbEnd = kRNVramMcBase + 0x3FFFFFFFFull;
+    {
+        const uint32_t top = RREG32_SOC15(RN_GC, 0, regGCMC_VM_FB_LOCATION_TOP);
+        if (top >= (kRNVramMcBase >> 24) && top != 0xFFFFFFFFu && ((static_cast<uint64_t>(top) + 1) << 24) - 1 <= fbEnd) fbEnd = ((static_cast<uint64_t>(top) + 1) << 24) - 1;
+    }
+    struct rn_gmc gmc = {kRNVramMcBase, fbEnd, kGartVa, kGartVa + 16384ull * 4096 - 1, 0x0C100000, 0x0C200000, 0x0C201000};
     
     // Does CPU access to VRAM through MM_INDEX/MM_DATA survive the memory hub being switched on? Two probe locations, read right
     // after writing and again 50 ms later, before and after rn_gfxhub_enable.
