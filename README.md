@@ -1,8 +1,22 @@
-<p align="center"><img src="docs/images/logo.png" alt="RedNavi logo" width="256"></p>
+<div align="center">
+
+<img src="docs/images/logo.png" alt="RedNavi logo" width="200">
 
 # RedNavi
 
-A native macOS display driver for AMD **Navi 32 (RDNA 3)** GPUs, starting with the **Radeon RX 7800 XT** (`1002:747E`).
+**A native macOS display driver for AMD Navi 32 (RDNA 3) GPUs.**
+Starting with the Radeon RX 7800 XT (`1002:747E`): native display, Vulkan through RADV, and Metal on the way.
+
+[![GitHub](https://img.shields.io/badge/GITHUB-Helemen7%2FRedNavi-d9072d?style=for-the-badge&logo=github&logoColor=white&labelColor=555)](https://github.com/Helemen7/RedNavi)
+[![Licence](https://img.shields.io/badge/LICENCE-BSD--3--Clause-a8123a?style=for-the-badge&labelColor=555)](LICENSE)
+[![Status](https://img.shields.io/badge/STATUS-EXPERIMENTAL-a8123a?style=for-the-badge&labelColor=555)](#)
+[![Discord](https://img.shields.io/badge/DISCORD-JOIN-d9072d?style=for-the-badge&logo=discord&logoColor=white&labelColor=555)](https://discord.gg/7G3bVnKgQM)
+
+*Research first, hardware claims backed by evidence.*
+
+</div>
+
+---
 
 > **For developers only.** This is a research prototype, not a driver you can install and use. It needs OpenCore, SIP turned off and boot-args, it writes to the GPU from the kernel, and it can hang or crash your machine. Run it only on a system whose display does not depend on this card, with a backup EFI. Vulkan (Mesa's RADV, through a bridge to the kext) runs on the card in test programs. Metal is at an early stage: on the development machine WindowServer composes the desktop on the GPU through our plug-in, with visible glitches.
 
