@@ -13,9 +13,9 @@ Starting with the Radeon RX 7800 XT (`1002:747E`): native display, Vulkan throug
 
 *Research first, hardware claims backed by evidence.*
 
-</div>
+<hr>
 
----
+</div>
 
 > **For developers only.** This is a research prototype, not a driver you can install and use. It needs OpenCore, SIP turned off and boot-args, it writes to the GPU from the kernel, and it can hang or crash your machine. Run it only on a system whose display does not depend on this card, with a backup EFI. Vulkan (Mesa's RADV, through a bridge to the kext) runs on the card in test programs. Metal is at an early stage: on the development machine WindowServer composes the desktop on the GPU through our plug-in, with visible glitches.
 
