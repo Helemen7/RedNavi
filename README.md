@@ -7,7 +7,6 @@
 **A native macOS display driver for AMD Navi 32 (RDNA 3) GPUs.**
 Starting with the Radeon RX 7800 XT (`1002:747E`): native display, Vulkan through RADV, and Metal on the way.
 
-[![GitHub](https://img.shields.io/badge/GITHUB-Helemen7%2FRedNavi-d9072d?style=for-the-badge&logo=github&logoColor=white&labelColor=555)](https://github.com/Helemen7/RedNavi)
 [![Licence](https://img.shields.io/badge/LICENCE-BSD--3--Clause-a8123a?style=for-the-badge&labelColor=555)](LICENSE)
 [![Status](https://img.shields.io/badge/STATUS-EXPERIMENTAL-a8123a?style=for-the-badge&labelColor=555)](#)
 [![Discord](https://img.shields.io/badge/DISCORD-JOIN-d9072d?style=for-the-badge&logo=discord&logoColor=white&labelColor=555)](https://discord.gg/7G3bVnKgQM)
