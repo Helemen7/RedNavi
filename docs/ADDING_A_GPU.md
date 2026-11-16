@@ -28,7 +28,7 @@ Selected through the row (verified on the RX 7800 XT, one boot, 2026-11-11: Disp
 
 - the `DRM_AMDGPU_INFO` answers (`drm_info` of the row, generated into `RedNavi/linux_info_<name>.h`). A card outside the table gets `kIOReturnUnsupported` for these queries;
 - the display replay table (`replay` of the board, `RedNavi/dcn_replay.h`);
-- the DisplayPort path (`dp` of the board): the AUX engine, the PHY id, the HPD pin, the connector id and the lane count that `dpInit`, `dpTx` and `dpTrain` send. The values of the RX 7800 XT are the ones that were literals before.
+- the DisplayPort path (`dp` of the board): the AUX engine, the PHY id, the HPD pin, the connector id, the lane count and the DIG back end instance (`dig`, 4 on the RX 7800 XT). The DIG and DP register offsets of `dpTrain`, `dcnReplay`, `quiescePipe` and `programLive` are the DIG4/DP4 offsets moved to that instance with `rn_dig_off` (stride 0x100 dwords in `dcn_3_2_0_offset.h`); `rn_mode_register` accepts the DP block of any instance in a replay table's names. Verified on the RX 7800 XT, one boot, 2026-11-16: DP training `cr_ok` `eq_ok`, the replay leaves the same eleven read-back differences, `rn_test_new` PASS. The offsets for another instance are host-tested only (unverified).
 
 Not done yet: the row's `firmware` and `reg_headers` fields are names, not data the code selects from. The register headers and the firmware headers are compiled in for Navi 32, and the code that uses them does not look at the row. So a second row is not enough to run another die: the Navi 32 constants listed below have to move behind the row first, one block at a time, each with a boot on the RX 7800 XT that shows nothing changed. Issue #7 tracks this.
 
@@ -40,7 +40,7 @@ Navi 32 constants still outside the table:
 | Display register offsets | `RedNavi/dcn_reglist.h`, offsets in `kern_probe.cpp` | DCN 3.2.0 |
 | Firmware | `RedNavi/psp_fw.h`, `smu_fw.h`, `gc_fw.h`, `dmub_fw.h` (generated locally, git-ignored) | PSP, SMU, GC, SDMA and DCN versions |
 | Display replay generator | `tools/gen_dcn_replay.py` (its register list) | DCN 3.2, pipe 0 on DIG4 / DP4. The table it writes is selected through the board; `--name <asic>_<device id>` writes a second board's table under its own symbol and file name |
-| DIG and DP back-end registers | `kern_probe.cpp` (`dpTrain` and `dcnReplay`: the DP4 and DIG4 register offsets as literal numbers) | The DIG the connector is on. The AUX engine, PHY id, HPD pin and lane count are in the board row; the register block is not |
+| (done) DIG and DP back-end registers | `kern_probe.cpp` | Now selected through the board's `dp.dig` (see above). What remains for a second board is its own replay table and the DIG/PHY ids from its capture |
 | MES, doorbell and memory layout constants | `RedNavi/gfx11.cpp`, `kern_probe.cpp` | GC 11.0.3 with MES; the VRAM offsets assume 16 GB |
 | Kext matches | `RedNavi/Info.plist.in`, `RedNaviAccel2/Info.plist.in` (`IOPCIPrimaryMatch`) | PCI device ID. The probe lists every card that may be read; the accelerator lists only boards in the table |
 

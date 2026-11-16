@@ -87,7 +87,7 @@ static void testLookup() {
     CHECK(a && a->drm_info->fw_count == 16 && a->drm_info->max_ibs_count == 10 && a->drm_info->hw_ip_info[0][0] == 0x0b);
     CHECK(board && board->replay && board->replay_count > 100);
     CHECK(board && board->psp_tmr_mb == 15872 && (uint64_t)board->psp_tmr_mb < board->vram_mb);
-    CHECK(board && board->dp.aux == 4 && board->dp.phy_id == 4 && board->dp.hpd_sel == 5 && board->dp.connector_id == 19 && board->dp.lanes == 4);
+    CHECK(board && board->dp.aux == 4 && board->dp.phy_id == 4 && board->dp.hpd_sel == 5 && board->dp.connector_id == 19 && board->dp.lanes == 4 && board->dp.dig == 4);
 
     std::vector<Ip> other = navi32();
     other[3].rev = 2;                                                     // GC 11.0.2 is Navi 33
@@ -155,6 +155,11 @@ int main(int argc, char **argv) {
         printf("device 0x%04x: %s\n", dev, a ? a->name : "not in the ASIC table (read-only)");
         return 0;
     }
+    // rn_dig_off: the DIG4/DP4 offsets of the 7800 XT move to other instances at a stride of 0x100 (dcn_3_2_0_offset.h)
+    CHECK(rn_dig_off(0x250b, 4) == 0x250b);
+    CHECK(rn_dig_off(0x250b, 0) == 0x210b);      // DP0_DP_CONFIG
+    CHECK(rn_dig_off(0x24b1, 0) == 0x20b1);      // DIG0_DIG_BE_CNTL
+    CHECK(rn_dig_off(0x248b, 1) == 0x218b);      // DIG1_DIG_FE_CNTL
     testVersions();
     testLookup();
     testBad();

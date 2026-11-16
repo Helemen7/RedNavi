@@ -78,6 +78,11 @@ unsigned rn_pitch_pixels(unsigned width) { return (width + 63u) & ~63u; }
 
 int rn_mode_register(const char *name, uint32_t base, const struct rn_mode_ctx *c, uint32_t *out) {
     const rn_mode &m = *c->mode;
+    // The replay tables name the DP block of their board (DP4_..., DP0_...); the values do not depend on which one it is.
+    char canon[96];
+    if (name[0] == 'D' && name[1] == 'P' && name[2] >= '0' && name[2] <= '9' && name[3] == '_' && strlen(name) < sizeof canon) {
+        memcpy(canon, name, strlen(name) + 1); canon[2] = '4'; name = canon;
+    }
     const bool isBase = m.pclk_khz == kBase.pclk_khz && m.htotal == kBase.htotal && m.vtotal == kBase.vtotal &&
                         m.hactive == kBase.hactive && m.vactive == kBase.vactive;
     const uint32_t hblank = m.hsync + m.hbp, vblank = m.vsync + m.vbp;
