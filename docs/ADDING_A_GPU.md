@@ -22,7 +22,7 @@ It holds the five versions the probe read (`gc`, `dcn`, `mp0`, `mp1`, `sdma`) an
 
 ## What is in the table and what is not yet
 
-State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The read-only path for a card outside the table is host-tested (`tests/host/asic_test.cpp`), including against the real IP discovery table of an RX 7600 captured on Linux (`docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin`: GC 11.0.2, DCN 3.2.1, MP0 and MP1 13.0.7, SDMA 6.0.2, no row matches, for any device ID). The kext itself has not run on a card outside the table since the change (unverified).
+State of the lookup: verified on the RX 7800 XT (2026-11-10): the card matches the Navi 32 row, the `asic` property shows GC 11.0.3, DCN 3.2.0, MP0 and MP1 13.0.10, SDMA 6.0.3, and the display, the framebuffer and RADV come up as before. The lookup and read-only profile path are host-tested (`tests/host/asic_test.cpp`) against the real RX 7600 IP discovery table (`docs/logs/navi33/rx7600-frame121/amdgpu_discovery.bin`: GC 11.0.2, DCN 3.2.1, MP0 and MP1 13.0.7, SDMA 6.0.2). The capture now matches the Navi 33 row for PCI ID `1002:7480` and the RX 7600 VRAM size; the test asserts `write_ok == 0` and no display replay. The kext has not been run on the RX 7600, so its macOS probe behavior remains unverified.
 
 Selected through the row (verified on the RX 7800 XT, one boot, 2026-11-11: DisplayPort trains through the row's path, the replay leaves the same eleven read-back differences as before, the display runs at 1920x1080 at 144 Hz, and `rn_test info` gets `DEV_INFO` and the firmware versions of the row's snapshot):
 
@@ -66,7 +66,7 @@ Commit the report to `docs/logs/<chip>/` in its own pull request, with the machi
 
 ## Step 1: read-only run on macOS
 
-Add the PCI device ID to `IOPCIPrimaryMatch` in `RedNavi/Info.plist.in`, build, and load the kext on a machine whose display does not depend on the card (`CONTRIBUTING.md`, "Safety"). The card is not in the table, so the probe only reads. Check:
+For a new, not-yet-registered card, add its PCI device ID to `IOPCIPrimaryMatch` in `RedNavi/Info.plist.in`, build, and load the kext on a machine whose display does not depend on the card (`CONTRIBUTING.md`, "Safety"). Before an ASIC row exists, the probe only reads and reports `name = not in the table`. **RX 7600 has already completed this identification step:** its ID is in the probe match list and its Navi 33 row is registered, but `write_ok = 0` keeps it on the read-only path. For a new card, check:
 
 - the `asic` property shows five versions and `name` = `not in the table`;
 - the `ip-discovery` property agrees with the Linux `ip_discovery.txt` from step 0: save `ioreg -rn RedNaviProbe -l -x` to a file and run `python3 tools/compare_discovery.py ioreg.txt ip_discovery.txt`. It prints `SAME` and exits 0 when every block has the same version and base addresses, and lists the differences otherwise (`tools/decode_discovery.py` prints the decoded table if you want to read it).
@@ -81,7 +81,7 @@ Compare your versions with the per-ASIC profiles (for example, `RedNavi/asic_nav
 
 **Same five versions as an existing row** (another board of the same die, for example a second Navi 32 card): add a line to that ASIC profile's board list in its `RedNavi/asic_<asic>.cpp` file with your device ID, the model name, the VRAM size and the TMR offset from your Linux log, with `write_ok` 0. If the device ID is already in the list, the VRAM size is what tells the boards apart (the lookup accepts the register value within 64 MB of the row's size). Before you boot it with the write stages enabled, compare the board-specific parts with your Linux report: which DIG, PHY, AUX channel and HPD pin your monitor is on (the replay table drives DIG4 / UNIPHY2 / AUX 0x94), and the VRAM size (the layout assumes 16 GB). If the same device ID is used by boards that differ in these, the board list needs a second key (the PCI revision) first; say so in the issue.
 
-**Different versions**: a new profile translation unit, `RedNavi/asic_<asic>.cpp`. Export its profile, give it the versions, board list and provenance, then add the profile to the registry in `RedNavi/asic.cpp`. A new row makes the probe stop treating the card as read-only, so it may only be merged together with, or after, the code that makes each write stage use that row's data. Until the constants above have moved behind the profile, keep the new profile in your branch.
+**Different versions**: a new profile translation unit, `RedNavi/asic_<asic>.cpp`. Export its profile, give it the versions, board list and provenance, then add the profile to the registry in `RedNavi/asic.cpp`. A row with `write_ok = 0` makes the probe identify and publish the board but still return before write stages. Do not set `write_ok = 1` until every write-stage dependency uses that ASIC's selected data and the required hardware validation has been completed. RX 7600 is the current example of a registered, read-only profile.
 
 ## Step 3: bring-up, one block per pull request
 
