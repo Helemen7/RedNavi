@@ -1275,9 +1275,14 @@ void RedNaviProbe::dcnDump() {
     uint32_t regLen = static_cast<uint32_t>(regs->getLength());
     OSData *blob = OSData::withCapacity(kRNDcnRegCount * 4);
     if (!blob) return;
+    // DCN 3.2.1 (Navi 33) does not define 17 registers of the list: they are not read there (the blob keeps its layout, the value stays 0xDEADBEEF).
+    const bool dcn321 = asic && asic->dcn.major == 3 && asic->dcn.minor == 2 && asic->dcn.rev == 1;
+    uint32_t nextAbsent = 0;
     for (uint32_t i = 0; i < kRNDcnRegCount; i++) {
         uint32_t off = (dmu + kRNDcnRegs[i]) * 4, v = 0xDEADBEEF;
-        if (off + 4 <= regLen) v = rd(off);
+        bool skip = false;
+        if (dcn321 && nextAbsent < kRNDcnRegAbsent321Count && kRNDcnRegAbsent321[nextAbsent] == i) { skip = true; nextAbsent++; }
+        if (!skip && off + 4 <= regLen) v = rd(off);
         blob->appendBytes(&v, 4);
     }
     setProperty("dcn-dump", blob);

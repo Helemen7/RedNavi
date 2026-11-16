@@ -8,7 +8,10 @@ Reads dcn_3_2_0_offset.h (Linux, MIT) and writes
   tools/dcn32_reglist.txt   one "NAME dword_offset" per line, for tools/linux_dcn_dump.py
   RedNavi/dcn_reglist.h     the offsets as a C array, for the probe's rednavi_dcn_dump=1
 
-    python3 tools/gen_dcn_reglist.py dcn_3_2_0_offset.h
+    python3 tools/gen_dcn_reglist.py dcn_3_2_0_offset.h [dcn_3_2_1_offset.h]
+
+With the 3.2.1 header (Navi 33) the probe also gets kRNDcnRegAbsent321: the indices of the registers that DCN 3.2.1 does not define
+or places elsewhere; the dump does not read them on a 3.2.1 part.
 """
 import re
 import sys
@@ -17,7 +20,7 @@ SKIP = ("DMCUB", "AZ", "AZF0", "AZALIA")   # the DMCUB is ours to drive; audio b
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) not in (2, 3):
         sys.exit(__doc__)
     regs, base = {}, {}
     for line in open(sys.argv[1]):
@@ -42,6 +45,22 @@ def main():
         for j in range(0, len(out), 12):
             f.write("    " + ", ".join(f"0x{o:x}" for o, _ in out[j:j + 12]) + ",\n")
         f.write("};\n")
+        if len(sys.argv) == 3:
+            regs1, base1 = {}, {}
+            for line in open(sys.argv[2]):
+                m = re.match(r"#define reg(\w+)_BASE_IDX\s+(\d+)", line)
+                if m:
+                    base1[m.group(1)] = int(m.group(2))
+                    continue
+                m = re.match(r"#define reg(\w+)\s+(0x[0-9a-fA-F]+)", line)
+                if m:
+                    regs1[m.group(1)] = int(m.group(2), 16)
+            absent = [i for i, (o, n) in enumerate(out) if regs1.get(n) != o or base1.get(n) != 2]
+            f.write("// Registers of the list that DCN 3.2.1 (dcn_3_2_1_offset.h) does not define or places elsewhere, as indices into kRNDcnRegs.\n")
+            f.write(f"#define kRNDcnRegAbsent321Count {len(absent)}u\nstatic const unsigned short kRNDcnRegAbsent321[] = {{\n")
+            for j in range(0, len(absent), 12):
+                f.write("    " + ", ".join(str(i) for i in absent[j:j + 12]) + ",\n")
+            f.write("};\n")
     print(len(out), "registers, max offset", hex(out[-1][0]))
 
 
