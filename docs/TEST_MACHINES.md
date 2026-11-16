@@ -67,11 +67,11 @@ What was tried before, and why it is not the fix:
 
 This machine is the contributor's hardware for the Navi 33 evidence under docs/logs/navi33/rx7600-frame121/. The monitor is connected over DisplayPort. No macOS probe, firmware bring-up, register writes or GPU queue submission is claimed for this machine.
 
-## RX 7600 macOS machine (Mac Pro)
+## RX 7600 macOS machine (Mac Pro SMBIOS)
 
 | Item | Value |
 |---|---|
-| Machine | Mac Pro (exact model and macOS version not reported yet) |
+| Machine | Reports a Mac Pro SMBIOS; the real board, CPU and macOS version are not reported yet |
 | Target GPU | AMD Radeon RX 7600, Navi 33, `1002:7480` |
 | Role | Contributor hardware for the first macOS run on Navi 33, under `docs/logs/navi33/rx7600-macos/`. Read-only probe only: no boot-arg set, no firmware bring-up, no register writes, no GPU queue submission is claimed. |
 

@@ -57,7 +57,7 @@ For AMD that means: **amdgpu in a kext, RADV (ACO) in userspace, Metal -> SPIR-V
 
 ASUS ROG STRIX Z490-G GAMING, i7-10700K, **Intel UHD 630 as the primary display**, Sapphire RX 7800 XT as the development target (PCIe 4.0 x16). See [docs/TEST_MACHINES.md](docs/TEST_MACHINES.md).
 
-The RX 7800 XT is the only board the kext writes to. The RX 7700 XT (same die and device ID, told apart by VRAM size) and the RX 7600 (Navi 33) are in the ASIC table from Linux captures, and the probe stays read-only on them. The RX 7600 has run once on macOS (2026-11-16, a Mac Pro, thanks to GGBBZZS): the kext loaded, the probe named the card Navi 33 and the IP discovery table it read agrees with the Linux capture in all 39 blocks (`docs/logs/navi33/rx7600-macos/`). That is a read-only result: no display, no firmware and no register writes on that card yet. The RX 7700 XT has not run on macOS (unverified). Reports from other 7000-series owners are welcome.
+The RX 7800 XT is the only board the kext writes to. The RX 7700 XT (same die and device ID, told apart by VRAM size) and the RX 7600 (Navi 33) are in the ASIC table from Linux captures, and the probe stays read-only on them. The RX 7600 has run once on macOS (2026-11-16, on a machine that reports a Mac Pro SMBIOS, thanks to GGBBZZS): the kext loaded, the probe named the card Navi 33 and the IP discovery table it read agrees with the Linux capture in all 39 blocks (`docs/logs/navi33/rx7600-macos/`). That is a read-only result: no display, no firmware and no register writes on that card yet. The RX 7700 XT has not run on macOS (unverified). Reports from other 7000-series owners are welcome.
 
 ## Building
 
@@ -98,7 +98,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 - **Helemen7** — Project founder, kernel display architecture, Metal/RADV translation layer.
 - **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
 - **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
-- **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console, and the project logo; the first macOS run on an RX 7600 (Mac Pro), which confirmed the Navi 33 IP discovery table on macOS.
+- **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console, and the project logo; the first macOS run on an RX 7600 (Mac Pro SMBIOS), which confirmed the Navi 33 IP discovery table on macOS.
 
 
 ## Contributing

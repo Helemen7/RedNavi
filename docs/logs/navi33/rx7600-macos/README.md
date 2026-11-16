@@ -1,6 +1,6 @@
 # RX 7600 on macOS (read-only probe)
 
-First macOS run of the probe on an RX 7600 (Navi 33, `1002:7480`) in a Mac Pro, 2026-11-16, reported by a tester. No boot-arg was set, so the probe only reads.
+First macOS run of the probe on an RX 7600 (Navi 33, `1002:7480`) on a machine with a Mac Pro SMBIOS, 2026-11-16, reported by a tester. No boot-arg was set, so the probe only reads.
 
 - `ioreg.txt`: `ioreg -rn RedNaviProbe -l -x` as sent, with the `vbios` property removed (vendor firmware, not committed).
 - `compare_discovery.txt`: `python3 tools/compare_discovery.py ioreg.txt ../rx7600-gigabyte/ip_discovery.txt` (the Linux table of the same board): SAME, 39 blocks, versions and base addresses agree.
