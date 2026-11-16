@@ -79,7 +79,8 @@ static void testLookup() {
     bd = nullptr;
     CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 16368) && bd && !strcmp(bd->model, "AMD Radeon RX 7800 XT") && bd->write_ok == 1);
     bd = nullptr;
-    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 12272) && bd && !strcmp(bd->model, "AMD Radeon RX 7700 XT") && bd->vram_mb == 12288 && bd->psp_tmr_mb == 11776 && bd->write_ok == 0 && !bd->replay);
+    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 12272) && bd && !strcmp(bd->model, "AMD Radeon RX 7700 XT") && bd->vram_mb == 12288 && bd->psp_tmr_mb == 11776 && bd->write_ok == 0 && bd->replay && bd->replay_count == 57 && !strncmp(bd->replay[0].name, "DP_DTO0_PHASE", 13) && bd->dp.dig == 0);
+    for (uint32_t i = 0; bd && bd->replay && i < bd->replay_count; i++) CHECK(!strstr(bd->replay[i].name, "DIG4") && !strstr(bd->replay[i].name, "DP4_") && bd->replay[i].group <= 9);
     CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 8176));        // a size that is no board of the ID
     CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 24560));
     CHECK(rn_asic_lookup(t.data(), len, 0x747E, nullptr, 16384) && rn_asic_lookup(t.data(), len, 0x747E, nullptr, 12288));
