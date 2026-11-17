@@ -127,6 +127,15 @@ void rn_vk_bandwidth_probe(rn_vk *vk, int format, unsigned n, double *up_ms, dou
 void *rn_vk_symbol(rn_vk *vk, const char *name);   // dlsym in the Vulkan driver library
 void rn_vk_batch_begin(rn_vk *vk);      // render passes are recorded and submitted together at rn_vk_batch_end (0, or the failure of the submit); calls that need the card's results submit earlier
 int rn_vk_batch_end(rn_vk *vk);
+// Debug aid for a pass capture: while rn_vk_snap_on is set, a render pass into a window-sized BGRA8 target copies the target after some of its draws (the first six, every 16th, the last) and
+// hands the pixels to rn_vk_snap_hook once the batch has run. It shows which draw of a pass changes a given region.
+extern int rn_vk_snap_on, rn_vk_snap_small; extern unsigned rn_vk_snap_seq;
+extern void (*rn_vk_snap_hook)(unsigned seq, unsigned draw, uint32_t w, uint32_t h, const uint8_t *bgra);
+int rn_vk_image_hist(rn_vk_image *img, const uint8_t **rec, const uint8_t **sub, const uint8_t **aft);   // aft: the card's copy right after the upload, or NULL
+int rn_vk_image_verify(rn_vk *vk, rn_vk_image *im, size_t *ndiff, size_t *first, uint8_t **host, uint8_t **card);   // pass-capture aid: the image read back from the card against its host copy (0 = compared)
+void rn_vk_host_lock(void);             // experiment: serialise a host write to an image's host copy with the batches (marker /Users/Shared/rednavi-hostlock); unlock after rn_vk_image_host_wrote
+void rn_vk_host_unlock(void);
+void rn_vk_batch_sync(rn_vk *vk);       // submits what is recorded and waits for it (a host access to a buffer a recorded pass reads or writes calls this first)
 int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // rn_vk_image_copy at the end of the open batch (the same submit)
 int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // whole image to an image of the same size and format on the card, waited for
 int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);   // a rectangle between two images of the same format on the card

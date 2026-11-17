@@ -107,6 +107,8 @@ static void rn_sites_report(void) {                    // the four sites with th
 
 static int rn_vk_format_of(MTLPixelFormat pf);
 static rn_vk_image *rn_display_vram_peek(void *tex);
+static void rn_srcdump(IOSurfaceRef surf, const uint8_t *src, size_t pitch, size_t w, size_t h);
+static void rn_cmpdump(IOSurfaceRef surf, size_t w, size_t h, const uint8_t *gpu, unsigned seq);
 static void rn_display_host_write_note(void *tex, const char *how);
 static rn_vk *rn_vk_shared(void) {
     static rn_vk *vk;
@@ -340,15 +342,34 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     }
     return self;
 }
+// The host copy is written under the batch lock, like replaceRegion and syncFromBuffer: a batch that records the upload of this image on another thread must not read the rows half written (torn
+// rows) or clear the dirty flag after the new rows are in but before the flag is set (a lost update that leaves the old picture). The lock comes before the IOSurface lock, as everywhere.
 - (void)syncFromSurface {
+    if (!surf || zeroCopy) return;
+    rn_vk_host_lock();
+    [self syncFromSurfaceLocked];
+    rn_vk_host_unlock();
+}
+- (void)syncFromSurfaceLocked {
     if (!surf || zeroCopy) return;
     // The seed only changes for writes made under IOSurfaceLock; surfaces are also written by other means (WindowServer's own compositor, the GPU of other processes), so every use copies
     // the surface again. A seed shortcut for small surfaces left stale titlebars and small rectangles in the picture.
-    if (IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return;
+    { const IOReturn lr = IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+      if (lr != kIOReturnSuccess) { static unsigned said; if (said++ < 40) rn_log("iosurface %u plane %lu: lock failed (0x%x), the texture keeps its old pixels", (unsigned)IOSurfaceGetID(surf), (unsigned long)surfPlane, (unsigned)lr); return; } }
     const bool planar = IOSurfaceGetPlaneCount(surf) > 0;
     const uint8_t *src = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
     const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surf, surfPlane) : IOSurfaceGetBytesPerRow(surf);
     uint8_t *dst = rn_vk_image_staging(img);
+    {   // Experiment switch /Users/Shared/rednavi-yuvgrey: the planes of a planar surface are mid grey (luma and neutral chroma) instead of the surface's contents
+        static int grey = -1;
+        if (grey < 0) grey = access("/Users/Shared/rednavi-yuvgrey", F_OK) == 0;
+        if (grey && planar) {
+            IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+            if (dst[0] != 0x80) { memset(dst, 0x80, w * h * texel); rn_vk_image_host_wrote(img); }
+            return;
+        }
+    }
+    if (!planar && texel == 4 && w >= 256) rn_srcdump(surf, src, pitch, w, h);      // experiment: the surface's own bytes, to compare with what the card holds (only while a pass capture runs)
     BOOL changed = NO;      // rows that are the same are not written, and an image that did not change is not uploaded to the card again
     for (NSUInteger y = 0; y < h; y++) {
         uint8_t *d = dst + y * w * texel; const uint8_t *r = src + y * pitch;
@@ -357,13 +378,21 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
     surfSeed = IOSurfaceGetSeed(surf);
     if (changed) rn_vk_image_host_wrote(img);
+    if ((w == 161 || w == 249) && w == h && texel == 4) {   // the window shadow textures: when their bytes change, and the seed (who writes them is not known; a hash that never changes after the first use means the
+        static uint64_t seen[8]; static uint32_t seenId[8]; static unsigned nseen;   // notch in their outline was there from the start)
+        uint64_t hsh = 1469598103934665603ull; for (size_t i = 0; i < (size_t)w * h * texel; i++) hsh = (hsh ^ dst[i]) * 1099511628211ull;
+        const uint32_t sid = (uint32_t)IOSurfaceGetID(surf); unsigned k = 0; while (k < nseen && seenId[k] != sid) k++;
+        if (k == nseen && nseen < 8) { seenId[nseen] = sid; seen[nseen++] = 0; }
+        if (k < 8 && seen[k] != hsh) { rn_log("shadow texture surface %u %lux%lu: bytes %016llx (were %016llx), seed %u, rows %s", sid, (unsigned long)w, (unsigned long)h, (unsigned long long)hsh, (unsigned long long)seen[k], (unsigned)surfSeed, changed ? "rewritten" : "same as the host copy"); seen[k] = hsh; }
+    }
 }
 - (void)syncToSurface {
-    if (!surf || zeroCopy || IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return;
+    if (!surf || zeroCopy) return;
+    const uint8_t *src = rn_vk_image_staging(img);      // before the IOSurface lock: it can take the batch lock, and syncFromSurface takes the batch lock first
+    if (IOSurfaceLock(surf, 0, NULL) != kIOReturnSuccess) return;
     const bool planar = IOSurfaceGetPlaneCount(surf) > 0;
     uint8_t *dst = planar ? IOSurfaceGetBaseAddressOfPlane(surf, surfPlane) : IOSurfaceGetBaseAddress(surf);
     const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(surf, surfPlane) : IOSurfaceGetBytesPerRow(surf);
-    const uint8_t *src = rn_vk_image_staging(img);
     for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * pitch, src + y * w * texel, w * texel);
     {   // measurement: how much of what the GPU wrote is not black (4096 sampled texels of a 4-byte format), for the first writes and then every 400th
         static unsigned n; unsigned k = n++;
@@ -378,6 +407,7 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
 }
 - (void)syncFromBuffer {
     if (!srcBuf && !srcRaw) return;
+    rn_vk_host_lock();
     const uint8_t *src = srcBuf ? (const uint8_t *)[(id<MTLBuffer>)srcBuf contents] + srcOff : srcRaw;
     uint8_t *dst = rn_vk_image_staging(img);
     // Only what differs is written, and an image that did not change is not uploaded to the card again. The caller's memory is read through the kernel copy (it can vanish under us), a row at a time.
@@ -397,6 +427,7 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
         if (!ok) { static unsigned said; if (said++ < 20) rn_log("texture over caller memory %p: row %lu cannot be read, skipped", (const void *)src, (unsigned long)y); break; }
     }
     if (changed) rn_vk_image_host_wrote(img);
+    rn_vk_host_unlock();
 }
 - (id<MTLDevice>)device { return dev; }
 - (NSString *)label { return label_; }
@@ -480,12 +511,15 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
     if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     rn_tex_wait_idle(self);
+    rn_vk_host_lock();
     uint8_t *dst = rn_vk_image_staging(img);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
             memcpy(dst + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
+    rn_vk_host_unlock();
+    if ((w == 161 || w == 249) && w == h) rn_log("shadow texture %lux%lu: replaceRegion (%lu,%lu %lux%lu) from %p", (unsigned long)w, (unsigned long)h, (unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width, (unsigned long)region.size.height, __builtin_return_address(0));
     rn_display_host_write_note((__bridge void *)self, "replaceRegion");
     [self syncToSurface];
 }
@@ -701,6 +735,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     int tfmt[8];
     rn_vk_blend blend[8];
     NSString *names[2];                              // vertex and fragment function names (for logs)
+    NSString *variant[2];                            // per stage: the function constants it was specialised with and the kinds of its bindings (pass dumps)
     unsigned nvattr, nvlayout;
     rn_vk_vattr vattr[16];
     rn_vk_vlayout vlayout[16];
@@ -943,7 +978,8 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     BOOL ran;                                   // the body has started
     BOOL scanCopied;                            // the scanout copy was recorded in the batch
     BOOL handlersRun;                           // the completed handlers have been called
-    NSArray *queuedTex;                         // the textures counted as in use from the commit until the body has run (rn_tex_wait_idle)
+    BOOL useCounted;                            // rednavi-usecount: the surfaces of queuedTex had their use count raised at the commit
+    NSArray *queuedTex;                       // the textures counted as in use from the commit until the body has run (rn_tex_wait_idle)
     NSError *err;
     NSString *label_;
     dispatch_semaphore_t done;
@@ -1049,6 +1085,8 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 
 static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL create);
 static NSString *rn_run_blit(RNBlit *b) {
+    // Render passes of the same command buffer are only recorded until the batch ends; a blit that reads or writes a buffer on the host runs now, so what was recorded before it must have run first.
+    if (b->kind != 2) { rn_vk *bvk = rn_vk_shared(); if (bvk) rn_vk_batch_sync(bvk); }
     switch (b->kind) {
     case 0: case 1: {
         RedNaviMTLTexture *t = b->kind == 0 ? b->dt : b->st;
@@ -1329,13 +1367,19 @@ extern uint64_t rn_vk_imgstat[3];
 static _Atomic uint64_t g_ph[8];
 static inline void rn_ph(int i, uint64_t t0) { atomic_fetch_add(&g_ph[i], mach_absolute_time() - t0); }
 static _Atomic uint64_t g_frames, g_framegapmax, g_framelast, g_framelong, g_passes;   // frames that reached the scanout, the longest gap between two (ticks), gaps over 12 ms, render passes
-static void rn_frame_note(void) {
+// Measurement: a frame that comes from the same card copy as the one before it. CoreDisplay goes round its ring, so two in a row from one surface mean that one frame of the
+// compositor was spread over two command buffers, and the first copy put an unfinished picture on the screen. Counted in all, and those less than 4 ms after the one before.
+static _Atomic uint64_t g_framesame, g_framesamefast;
+static _Atomic(void *) g_framesrc;
+static void rn_frame_note(void *src) {
     static mach_timebase_info_data_t tb;
     if (!tb.denom) mach_timebase_info(&tb);
     const uint64_t now = mach_absolute_time(), last = atomic_exchange(&g_framelast, now);
+    const BOOL same = atomic_exchange(&g_framesrc, src) == src;
     atomic_fetch_add(&g_frames, 1);
     if (!last) return;
     const uint64_t gap = (now - last) * tb.numer / tb.denom;          // ns
+    if (same) { atomic_fetch_add(&g_framesame, 1); if (gap < 4000000ull) atomic_fetch_add(&g_framesamefast, 1); }
     uint64_t m = atomic_load(&g_framegapmax);
     while (gap > m && !atomic_compare_exchange_weak(&g_framegapmax, &m, gap)) {}
     if (gap > 12000000ull) atomic_fetch_add(&g_framelong, 1);
@@ -1356,12 +1400,385 @@ static void rn_commit_stats(uint64_t ticks) {
           rn_log("buffer cache: %llu hits, %llu small misses, %llu big (largest %llu bytes), %llu kept, %llu dropped", bs[0], bs[1], bs[2], bs[5], bs[3], bs[4]); }
         { uint64_t is[3]; for (int i = 0; i < 3; i++) is[i] = __atomic_exchange_n(&rn_vk_imgstat[i], 0, __ATOMIC_RELAXED);
           rn_log("images: %llu reused from the pool, %llu made, %llu kept on free", is[0], is[1], is[2]); }
-        rn_log("frames: %llu reached the scanout in 5 s, longest gap %.1f ms, %llu gaps over 12 ms, %llu render passes", (unsigned long long)atomic_exchange(&g_frames, 0), (double)atomic_exchange(&g_framegapmax, 0) / 1e6, (unsigned long long)atomic_exchange(&g_framelong, 0), (unsigned long long)atomic_exchange(&g_passes, 0));
+        rn_log("frames: %llu reached the scanout in 5 s, longest gap %.1f ms, %llu gaps over 12 ms, %llu render passes, %llu from the same surface as the frame before (%llu of them within 4 ms)", (unsigned long long)atomic_exchange(&g_frames, 0), (double)atomic_exchange(&g_framegapmax, 0) / 1e6, (unsigned long long)atomic_exchange(&g_framelong, 0), (unsigned long long)atomic_exchange(&g_passes, 0), (unsigned long long)atomic_exchange(&g_framesame, 0), (unsigned long long)atomic_exchange(&g_framesamefast, 0));
         rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst; textures alive %ld (%lu MB), made so far %ld", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6, (long)g_tex_live, (unsigned long)g_tex_bytes >> 20, (long)g_tex_made);
         sum = worst = count = 0; since = now;
         rn_sites_report();
     }
     os_unfair_lock_unlock(&lock);
+}
+
+// Pass-by-pass capture (touch /Users/Shared/rednavi-passdump-arm: each touch makes one capture per process): every render pass of the next frame
+// that has a target of 48 pixels or more on both sides is written as /private/var/tmp/rnpass/<n>_<w>x<h>.png (its first target as the card has it after the pass, read back through the host
+// copy), with a line in index.txt (shaders of the first and last draw, formats, load and store, count of NaN and Inf texels of a 16-bit float target; those texels are drawn magenta and cyan).
+// The next 80 passes, in the order they ran (a window that redraws, like Activity Monitor with its graphs, gives its own passes, then the final pass into the scanout).
+static int g_pd_left; static unsigned g_pd_seq;
+// The last source bytes rn_srcdump read, per IOSurface (RGBA, rows packed), for rn_cmpdump.
+static struct { unsigned id; uint8_t *px; size_t w, h, pitch; BOOL compared; } g_src_cache[8]; static unsigned g_src_next;
+static pthread_mutex_t g_src_lock = PTHREAD_MUTEX_INITIALIZER;   // commit bodies of several queues can reach the capture code at once
+static float rn_half(uint16_t h) {
+    const uint32_t e = (h >> 10) & 31, m = h & 1023; float f;
+    if (!e) f = ldexpf((float)m, -24); else if (e == 31) f = m ? NAN : INFINITY; else f = ldexpf((float)(m | 1024), (int)e - 25);
+    return (h & 0x8000) ? -f : f;
+}
+static char g_pd_dir[64];
+// Called by rn_vk once the batch has run: the target of pass <seq> after draw <draw>, as <dir>/snap_<seq>_d<draw>.png.
+static void rn_snap_write(unsigned seq, unsigned draw, uint32_t w, uint32_t h, const uint8_t *bgra) {
+    if (!g_pd_dir[0]) return;
+    uint8_t *px = malloc((size_t)w * h * 4);
+    if (!px) return;
+    for (size_t i = 0; i < (size_t)w * h; i++) { px[i * 4] = bgra[i * 4 + 2]; px[i * 4 + 1] = bgra[i * 4 + 1]; px[i * 4 + 2] = bgra[i * 4]; px[i * 4 + 3] = 255; }
+    if (w == h && w <= 256) {   // a shadow pass: the target with its alpha, as the card has it after this draw
+        char rp_[128]; snprintf(rp_, sizeof(rp_), "%s/snap_%03u_d%03u_%ux%u.raw", g_pd_dir, seq, draw, w, h);
+        FILE *rf = fopen(rp_, "wb"); if (rf) { fwrite(bgra, 4, (size_t)w * h, rf); fclose(rf); chmod(rp_, 0644); }
+    }
+    char path[128]; snprintf(path, sizeof(path), "%s/snap_%03u_d%03u.png", g_pd_dir, seq, draw);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, (size_t)w * h * 4, NULL);
+    CGImageRef im = CGImageCreate(w, h, 8, 32, (size_t)w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+    CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+    if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+    CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    free(px);
+}
+// A texture whose card copy differs from its host copy, as <dir>/tex_<pass>_d<draw>.png: host copy on the left, card copy on the right, eight times larger (one byte per texel as grey,
+// two as red and green, four as colour on the top row and alpha as grey on the bottom row).
+static void rn_tex_pair_png(unsigned seq, unsigned draw, uint32_t w, uint32_t h, unsigned texel, const uint8_t *hc, const uint8_t *cc) {
+    if (!g_pd_dir[0] || !w || !h || (texel != 1 && texel != 2 && texel != 4)) return;
+    const unsigned S = 8, G = 16, rows = texel == 4 ? 2 : 1;
+    const size_t W = (size_t)w * S * 2 + G, H = (size_t)h * S * rows;
+    uint8_t *px = calloc(W * H, 4);
+    if (!px) return;
+    for (int side = 0; side < 2; side++) {
+        const uint8_t *src = side ? cc : hc;
+        for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) {
+            const uint8_t *t = src + (y * w + x) * texel; uint8_t c[4] = {0, 0, 0, 255}, a[4] = {0, 0, 0, 255};
+            if (texel == 1) { c[0] = c[1] = c[2] = t[0]; }
+            else if (texel == 2) { c[0] = t[0]; c[1] = t[1]; }
+            else { c[0] = t[2]; c[1] = t[1]; c[2] = t[0]; a[0] = a[1] = a[2] = t[3]; }
+            for (unsigned r = 0; r < rows; r++) for (unsigned dy = 0; dy < S; dy++) for (unsigned dx = 0; dx < S; dx++) {
+                uint8_t *d = px + (((y + r * h) * S + dy) * W + (side ? w * S + G : 0) + x * S + dx) * 4;
+                memcpy(d, r ? a : c, 4);
+            }
+        }
+    }
+    char path[128]; snprintf(path, sizeof(path), "%s/tex_%03u_d%03u.png", g_pd_dir, seq, draw);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, W * H * 4, NULL);
+    CGImageRef im = CGImageCreate(W, H, 8, 32, W * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+    CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+    if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+    CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    free(px);
+}
+static BOOL rn_passdump_on(void) {
+    if (g_pd_left > 0) return YES;
+    // A touch of the file arms one capture: the file's modification time is compared with the one this process last acted on (WindowServer runs as _windowserver and cannot remove
+    // a file of the user in /Users/Shared). Each process writes into its own directory, /private/var/tmp/rnpass/<pid>.
+    static time_t seen; struct stat st;
+    if (stat("/Users/Shared/rednavi-passdump-arm", &st) != 0 || st.st_mtime == seen) return NO;
+    seen = st.st_mtime;
+    mkdir("/private/var/tmp/rnpass", 0755); chmod("/private/var/tmp/rnpass", 0755);
+    snprintf(g_pd_dir, sizeof(g_pd_dir), "/private/var/tmp/rnpass/%d", (int)getpid());
+    mkdir(g_pd_dir, 0755); chmod(g_pd_dir, 0755);
+    g_pd_left = 160; g_pd_seq = 0;
+    rn_vk_snap_hook = rn_snap_write;
+    return YES;
+}
+static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
+    RedNaviMTLTexture *t = rp->tex[0];
+    if (!t || !img || t->w < 48 || t->h < 48) return;
+    const uint8_t *src = rn_vk_image_staging(img);
+    if (!src) return;
+    const size_t n = t->w * t->h;
+    const MTLPixelFormat pf = t->pf;
+    uint8_t *px = malloc(n * 4);
+    if (!px) return;
+    unsigned long nan = 0, inf = 0; BOOL ok = YES;
+    if (pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB || pf == MTLPixelFormatRGBA8Unorm || pf == MTLPixelFormatRGBA8Unorm_sRGB) {
+        const BOOL bgra = pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB;
+        for (size_t i = 0; i < n; i++) { px[4*i] = src[4*i + (bgra ? 2 : 0)]; px[4*i+1] = src[4*i+1]; px[4*i+2] = src[4*i + (bgra ? 0 : 2)]; px[4*i+3] = 255; }
+    } else if (pf == MTLPixelFormatRGBA16Float) {
+        const uint16_t *h = (const uint16_t *)src;
+        for (size_t i = 0; i < n; i++) {
+            float c[4]; for (int k = 0; k < 4; k++) c[k] = rn_half(h[4*i + k]);
+            if (c[0] != c[0] || c[1] != c[1] || c[2] != c[2]) { nan++; px[4*i] = 255; px[4*i+1] = 0; px[4*i+2] = 255; px[4*i+3] = 255; continue; }
+            if (isinf(c[0]) || isinf(c[1]) || isinf(c[2])) { inf++; px[4*i] = 0; px[4*i+1] = 255; px[4*i+2] = 255; px[4*i+3] = 255; continue; }
+            for (int k = 0; k < 3; k++) { float v = c[k] < 0 ? 0 : c[k] > 1 ? 1 : c[k]; px[4*i + k] = (uint8_t)(v * 255.f + .5f); }
+            px[4*i+3] = 255;
+        }
+    } else if (pf == MTLPixelFormatR8Unorm) {
+        for (size_t i = 0; i < n; i++) { px[4*i] = px[4*i+1] = px[4*i+2] = src[i]; px[4*i+3] = 255; }
+    } else ok = NO;
+    char path[96]; snprintf(path, sizeof(path), "%s/%03u_%lux%lu.png", g_pd_dir, g_pd_seq, (unsigned long)t->w, (unsigned long)t->h);
+    if (ok) {
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, n * 4, NULL);
+        CGImageRef im = CGImageCreate(t->w, t->h, 8, 32, t->w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+        CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+        if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+        CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    }
+    if (t->w == t->h && t->w >= 93 && t->w <= 256 && (pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB || pf == MTLPixelFormatRGBA8Unorm)) {   // the shadow shapes: the PNG drops the alpha, so the target as the card has it
+        char rpth[112]; snprintf(rpth, sizeof(rpth), "%s/%03u_%lux%lu_target.raw", g_pd_dir, g_pd_seq, (unsigned long)t->w, (unsigned long)t->h);
+        FILE *rf = fopen(rpth, "wb"); if (rf) { fwrite(src, 4, n, rf); fclose(rf); chmod(rpth, 0644); }
+    }
+    if (ok && t->surf && (pf == MTLPixelFormatBGRA8Unorm || pf == MTLPixelFormatBGRA8Unorm_sRGB)) rn_cmpdump(t->surf, t->w, t->h, px, g_pd_seq);
+    free(px);
+    RNDraw *d0 = nd ? rp->draws[0] : nil, *d1 = nd ? rp->draws[nd - 1] : nil;
+    char ipath[96]; snprintf(ipath, sizeof(ipath), "%s/index.txt", g_pd_dir);
+    FILE *f = fopen(ipath, "a");
+    if (f) {
+        fprintf(f, "%03u %lux%lu pf %lu %s: %lu draws, first %s + %s, last %s + %s, blend %d, targets %u, clear %d store %d, surf %u%s%s\n", g_pd_seq, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)pf, ok ? "png" : "FORMAT NOT DUMPED", (unsigned long)nd,
+                d0 && d0->pso && d0->pso->names[0] ? d0->pso->names[0].UTF8String : "-", d0 && d0->pso && d0->pso->names[1] ? d0->pso->names[1].UTF8String : "-",
+                d1 && d1->pso && d1->pso->names[0] ? d1->pso->names[0].UTF8String : "-", d1 && d1->pso && d1->pso->names[1] ? d1->pso->names[1].UTF8String : "-",
+                d0 && d0->pso ? d0->pso->blend[0].enabled : 0, rp->nt, rp->clear[0], rp->store[0], t->surf ? (unsigned)IOSurfaceGetID(t->surf) : 0u, nan ? " NaN" : "", inf ? " Inf" : "");
+        if (nan || inf) fprintf(f, "    %lu NaN texels, %lu Inf texels\n", nan, inf);
+        fclose(f); chmod(ipath, 0644);
+    }
+    {   // every draw of the pass: shaders, the rectangle it covers (viewport and scissor), blend, and the textures it samples (size, format, IOSurface), as <n>_draws.txt
+        char dpath[112]; snprintf(dpath, sizeof(dpath), "%s/%03u_draws.txt", g_pd_dir, g_pd_seq);
+        FILE *df = fopen(dpath, "w");
+        if (df) {
+            for (NSUInteger k = 0; k < nd; k++) {
+                RNDraw *d = rp->draws[k];
+                int x0 = 0, y0 = 0, x1 = (int)t->w, y1 = (int)t->h;
+                if (d->hasViewport) { x0 = (int)d->viewport[0]; y0 = (int)d->viewport[1]; x1 = (int)(d->viewport[0] + d->viewport[2]); y1 = (int)(d->viewport[1] + d->viewport[3]); }
+                if (d->hasScissor) { int a = (int)d->scissor[0], b = (int)d->scissor[1], c = a + (int)d->scissor[2], e = b + (int)d->scissor[3]; if (a > x0) x0 = a; if (b > y0) y0 = b; if (c < x1) x1 = c; if (e < y1) y1 = e; }
+                fprintf(df, "%3lu %s + %s [%s ; %s] rect (%d,%d)-(%d,%d) blend %d %u verts x %u inst:", (unsigned long)k, d->pso && d->pso->names[0] ? d->pso->names[0].UTF8String : "-", d->pso && d->pso->names[1] ? d->pso->names[1].UTF8String : "-", d->pso && d->pso->variant[0] ? d->pso->variant[0].UTF8String : "-", d->pso && d->pso->variant[1] ? d->pso->variant[1].UTF8String : "-",
+                        x0, y0, x1, y1, d->pso ? d->pso->blend[0].enabled : 0, (unsigned)d->vertexCount, (unsigned)d->instanceCount);
+                for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                    RedNaviMTLTexture *tx = d->texs[st][i];
+                    if (tx) fprintf(df, " %c%d=%lux%lu/pf%lu/surf%u%s", st ? 'f' : 'v', i, (unsigned long)tx->w, (unsigned long)tx->h, (unsigned long)tx->pf, tx->surf ? (unsigned)IOSurfaceGetID(tx->surf) : 0u, tx->img && rn_vk_image_is_host(tx->img) ? "H" : "");
+                }
+                fputc('\n', df);
+                const BOOL shadowDraw = d->pso && ((d->pso->names[0] && [d->pso->names[0] containsString:@"Shadow"]) || (d->pso->names[1] && [d->pso->names[1] containsString:@"Shadow"]) || (t->w == t->h && (t->w == 93 || t->w == 137 || t->w == 161 || t->w == 174 || t->w == 249 || t->w == 256)));   // the window shadow: its draws, and every draw into a square target of shadow size
+                if (d->pso && (shadowDraw || (d->pso->variant[1] && ([d->pso->variant[1] containsString:@"fc_image_function0=0a"] || [d->pso->variant[1] containsString:@"fc_image_function0=0b"] || [d->pso->variant[1] containsString:@"fc_image_function0=a"])))) {
+                    // the analytic (border and disc) draws, whole, for an offline replay: <n>_d<k>.bin = u32 magic RND1, u32 vertices, u32 instances, u32 blend, i32 x0 y0 x1 y1, u32 target w h, u32 buffers,
+                    // then per buffer u32 stage, u32 index, u32 length, the bytes (at most 32 KB), then per stage (vertex, fragment) u32 count and per binding u32 binding, kind, Metal index, then the vertex attributes and layouts; and the two SPIR-V modules of the pipeline as <n>_d<k>_v.spv and _f.spv
+                    char bpath[128]; snprintf(bpath, sizeof(bpath), "%s/%03u_d%lu.bin", g_pd_dir, g_pd_seq, (unsigned long)k);
+                    FILE *bf = fopen(bpath, "w");
+                    if (bf) {
+                        uint32_t nb = 0, hdr[12] = {0x31444e52u, (uint32_t)d->vertexCount, (uint32_t)d->instanceCount, (uint32_t)(d->pso->blend[0].enabled), (uint32_t)x0, (uint32_t)y0, (uint32_t)x1, (uint32_t)y1, (uint32_t)t->w, (uint32_t)t->h, 0, 0};
+                        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->bufs[st][i] || d->bytesAt[st][i]) nb++;
+                        hdr[10] = nb; fwrite(hdr, 4, 12, bf);
+                        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                            const uint8_t *bp = NULL; NSUInteger len = 0;
+                            if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                            else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
+                            if (!bp) continue;
+                            if (len > 32768) len = 32768;
+                            uint32_t h3[3] = {(uint32_t)st, (uint32_t)i, (uint32_t)len}; fwrite(h3, 4, 3, bf); fwrite(bp, 1, len, bf);
+                        }
+                        for (int s2 = 0; s2 < 2; s2++) {    // the bindings of each stage: u32 count, then per binding u32 descriptor binding, kind (RN_VK_*), Metal index
+                            uint32_t cnt = d->pso->n[s2]; fwrite(&cnt, 4, 1, bf);
+                            for (unsigned q = 0; q < cnt; q++) { uint32_t h3[3] = {d->pso->binds[s2][q].binding, d->pso->binds[s2][q].kind, d->pso->mi[s2][q]}; fwrite(h3, 4, 3, bf); }
+                        }
+                        { uint32_t cnt = d->pso->nvattr; fwrite(&cnt, 4, 1, bf);       // the vertex input: u32 count, per attribute u32 location, binding, format (VkFormat), offset; then u32 count, per layout u32 binding, stride, per instance
+                          for (unsigned q = 0; q < cnt; q++) { uint32_t h4[4] = {d->pso->vattr[q].location, d->pso->vattr[q].binding, d->pso->vattr[q].format, d->pso->vattr[q].offset}; fwrite(h4, 4, 4, bf); }
+                          cnt = d->pso->nvlayout; fwrite(&cnt, 4, 1, bf);
+                          for (unsigned q = 0; q < cnt; q++) { uint32_t h3[3] = {d->pso->vlayout[q].binding, d->pso->vlayout[q].stride, d->pso->vlayout[q].per_instance}; fwrite(h3, 4, 3, bf); } }
+                        { double vp[6] = {d->hasViewport ? d->viewport[0] : 0, d->hasViewport ? d->viewport[1] : 0, d->hasViewport ? d->viewport[2] : (double)t->w, d->hasViewport ? d->viewport[3] : (double)t->h, d->hasViewport ? d->viewport[4] : 0, d->hasViewport ? d->viewport[5] : 1};
+                          uint32_t sc[4] = {d->hasScissor ? (uint32_t)d->scissor[0] : 0, d->hasScissor ? (uint32_t)d->scissor[1] : 0, d->hasScissor ? (uint32_t)d->scissor[2] : (uint32_t)t->w, d->hasScissor ? (uint32_t)d->scissor[3] : (uint32_t)t->h};
+                          const rn_vk_blend *bl = &d->pso->blend[0];
+                          uint32_t st[12] = {(uint32_t)bl->enabled, bl->src_rgb, bl->dst_rgb, bl->op_rgb, bl->src_a, bl->dst_a, bl->op_a, bl->write_mask, (uint32_t)d->prim, (uint32_t)d->cull, (uint32_t)d->clockwise, 0};
+                          fwrite(vp, 8, 6, bf); fwrite(sc, 4, 4, bf); fwrite(st, 4, 12, bf); }       // the state of the draw: viewport (6 doubles), scissor (4 u32), then blend enabled, src rgb, dst rgb, op rgb, src a, dst a, op a, write mask, primitive, cull, clockwise, 0
+                        {   // the indexing: u32 indexed (0 or 1), u32 32-bit indices, i32 base vertex, u32 first vertex, u32 index bytes (at most 64 KB), the index bytes (vertices is then the index count)
+                            uint32_t ix[5] = {d->indexBuf ? 1u : 0u, d->index32 ? 1u : 0u, (uint32_t)d->baseVertex, (uint32_t)d->vertexStart, 0};
+                            NSUInteger ilen = d->indexBuf ? (NSUInteger)d->vertexCount * (d->index32 ? 4 : 2) : 0;
+                            if (d->indexBuf && d->indexOffset + ilen > d->indexBuf->len) ilen = d->indexBuf->len > d->indexOffset ? d->indexBuf->len - d->indexOffset : 0;
+                            if (ilen > 65536) ilen = 65536;
+                            ix[4] = (uint32_t)ilen; fwrite(ix, 4, 5, bf);
+                            if (ilen) fwrite(rn_vk_buffer_contents(d->indexBuf->b) + d->indexOffset, 1, ilen, bf);
+                        }
+                        fclose(bf); chmod(bpath, 0644);
+                    }
+                    for (int s2 = 0; s2 < 2; s2++) if (d->pso->spv[s2]) {
+                        char sp[128]; snprintf(sp, sizeof(sp), "%s/%03u_d%lu_%c.spv", g_pd_dir, g_pd_seq, (unsigned long)k, s2 ? 'f' : 'v');
+                        [d->pso->spv[s2] writeToFile:[NSString stringWithUTF8String:sp] atomically:NO]; chmod(sp, 0644);
+                    }
+                    // the textures the draw binds, as raw bytes (at most 1 MB each): <n>_d<k>_t<stage><index>_<w>x<h>_pf<format>.raw is the host copy the card is given (w * h * texel bytes) and, for a texture over an
+                    // IOSurface, ..._surf.raw is the surface's own bytes (rows are the surface's pitch apart: the pitch is in the name). Compare the two to see whether the upload changed anything.
+                    for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                        RedNaviMTLTexture *tx = d->texs[st][i];
+                        if (!tx || !tx->img || tx->d > 1 || !shadowDraw) continue;   // the shadow draws only
+                        const size_t nbt = (size_t)tx->w * tx->h * tx->texel;
+                        if (!nbt || nbt > (1u << 20)) continue;
+                        const uint8_t *hp = rn_vk_image_staging(tx->img);
+                        char tp[192]; snprintf(tp, sizeof(tp), "%s/%03u_d%lu_t%c%d_%lux%lu_pf%lu.raw", g_pd_dir, g_pd_seq, (unsigned long)k, st ? 'f' : 'v', i, (unsigned long)tx->w, (unsigned long)tx->h, (unsigned long)tx->pf);
+                        if (hp) { FILE *tf = fopen(tp, "w"); if (tf) { fwrite(hp, 1, nbt, tf); fclose(tf); chmod(tp, 0644); } }
+                        if (tx->surf && IOSurfaceGetPlaneCount(tx->surf) == 0 && IOSurfaceLock(tx->surf, kIOSurfaceLockReadOnly, NULL) == kIOReturnSuccess) {
+                            const size_t pitch = IOSurfaceGetBytesPerRow(tx->surf), sh = IOSurfaceGetHeight(tx->surf);
+                            snprintf(tp, sizeof(tp), "%s/%03u_d%lu_t%c%d_%lux%lu_pf%lu_pitch%lu_surf.raw", g_pd_dir, g_pd_seq, (unsigned long)k, st ? 'f' : 'v', i, (unsigned long)tx->w, (unsigned long)tx->h, (unsigned long)tx->pf, (unsigned long)pitch);
+                            if (pitch * sh <= (1u << 20)) { FILE *tf = fopen(tp, "w"); if (tf) { fwrite(IOSurfaceGetBaseAddress(tx->surf), 1, pitch * sh, tf); fclose(tf); chmod(tp, 0644); } }
+                            IOSurfaceUnlock(tx->surf, kIOSurfaceLockReadOnly, NULL);
+                        }
+                    }
+                }
+                if (k < 8 || d->vertexCount > 6) {      // what is bound at each buffer index of the first draws: setBytes data or a client buffer, the first 64 bytes as floats and the size
+                    // the first six draws are dumped in full (the six vertices of a quad with their stride), the others as 16 floats
+                    for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                        const uint8_t *bp = NULL; NSUInteger len = 0;
+                        if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                        else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
+                        if (!bp) continue;
+                        fprintf(df, "      %c%d %s %lu bytes:", st ? 'f' : 'v', i, d->bufs[st][i] ? "buffer" : "bytes", (unsigned long)len);
+                        for (NSUInteger j = 0; j < (k < 6 ? 96 : 16) && (j + 1) * 4 <= len; j++) { float fv; memcpy(&fv, bp + 4 * j, 4); fprintf(df, " %g", fv); }
+                        fputc('\n', df);
+                    }
+                }
+            }
+            fclose(df); chmod(dpath, 0644);
+        }
+    }
+    {   // textures the pass sampled, read back from the card and compared with the host copy they came from: <dir>/verify.txt (mismatches, and one summary line per pass)
+        RedNaviMTLTexture *seen[96]; unsigned ns = 0, checked = 0, bad = 0, skipped = 0;
+        char vpath[112]; snprintf(vpath, sizeof(vpath), "%s/verify.txt", g_pd_dir);
+        FILE *vf = fopen(vpath, "a");
+        for (NSUInteger k = 0; k < nd && vf; k++) {
+            RNDraw *d = rp->draws[k];
+            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                RedNaviMTLTexture *tx = d->texs[st][i];
+                if (!tx || !tx->img || tx == t) continue;
+                BOOL dup = NO; for (unsigned q = 0; q < ns; q++) if (seen[q] == tx) dup = YES;
+                if (dup || ns >= 96) continue;
+                seen[ns++] = tx;
+                size_t nd_ = 0, first = 0;
+                uint8_t *hc = NULL, *cc = NULL;
+                if (rn_vk_image_verify(rn_vk_shared(), tx->img, &nd_, &first, &hc, &cc)) { skipped++; continue; }
+                checked++;
+                if (nd_) { bad++; fprintf(vf, "pass %03u draw %lu %c%d %lux%lu pf%lu surf %u: %lu bytes differ, first at byte %lu\n", g_pd_seq, (unsigned long)k, st ? 'f' : 'v', i, (unsigned long)tx->w, (unsigned long)tx->h, (unsigned long)tx->pf, tx->surf ? (unsigned)IOSurfaceGetID(tx->surf) : 0u, (unsigned long)nd_, (unsigned long)first);
+                    if (hc && cc) {   // where: per row the count of bytes that differ and the first and last column, then the first 32 differing bytes (host copy, card), and how the texture was made
+                        fprintf(vf, "    made over %s; %u bytes per texel\n", tx->srcBuf ? "a buffer" : (tx->srcRaw ? "client memory" : "replaceRegion/blit"), tx->texel);
+                        for (NSUInteger y = 0; y < tx->h; y++) { unsigned cnt = 0; long c0 = -1, c1 = -1; for (NSUInteger x = 0; x < tx->w * tx->texel; x++) if (hc[y * tx->w * tx->texel + x] != cc[y * tx->w * tx->texel + x]) { cnt++; if (c0 < 0) c0 = (long)x; c1 = (long)x; } if (cnt) fprintf(vf, "    row %lu: %u differ, columns %ld..%ld\n", (unsigned long)y, cnt, c0, c1); }
+                        if (tx->srcBuf || tx->srcRaw) {   // who is behind: the caller's memory now, against the host copy and against the card's copy
+                            const uint8_t *csrc = tx->srcBuf ? (const uint8_t *)[(id<MTLBuffer>)tx->srcBuf contents] + tx->srcOff : tx->srcRaw;
+                            unsigned long okRows = 0, eqHost = 0, eqCard = 0; uint8_t row[4096];
+                            for (NSUInteger y = 0; y < tx->h && tx->w * tx->texel <= sizeof(row); y++) {
+                                if (!rn_copy_from_caller(row, csrc + y * tx->srcBpr, tx->w * tx->texel)) continue;
+                                okRows++;
+                                if (!memcmp(row, hc + y * tx->w * tx->texel, tx->w * tx->texel)) eqHost++;
+                                if (!memcmp(row, cc + y * tx->w * tx->texel, tx->w * tx->texel)) eqCard++;
+                            }
+                            fprintf(vf, "    caller's memory now: %lu rows read, %lu equal the host copy, %lu equal the card's copy (of %lu rows)\n", okRows, eqHost, eqCard, (unsigned long)tx->h);
+                        }
+                        {   // the host copy when the upload was recorded and when it was submitted, against the card's copy and the host copy now
+                            const uint8_t *rec, *sb, *af; const size_t nb = (size_t)tx->w * tx->h * tx->texel;
+                            if (!rn_vk_image_hist(tx->img, &rec, &sb, &af) && af) fprintf(vf, "    card copy right after the upload: %s the host copy now, %s the card's copy now\n", !memcmp(af, hc, nb) ? "equals" : "differs from", !memcmp(af, cc, nb) ? "equals" : "differs from");
+                            if (!rn_vk_image_hist(tx->img, &rec, &sb, &af))
+                                fprintf(vf, "    at the last upload: recorded copy %s the host copy now and %s the card's copy; copy at submit %s the host copy now and %s the card's copy\n", !memcmp(rec, hc, nb) ? "equals" : "differs from", !memcmp(rec, cc, nb) ? "equals" : "differs from", !memcmp(sb, hc, nb) ? "equals" : "differs from", !memcmp(sb, cc, nb) ? "equals" : "differs from");
+                            else fprintf(vf, "    no upload recorded during the capture for this image\n");
+                        }
+                        {   // does the card's copy equal the host copy of another texture of this pass (aliasing), or share its VkImage?
+                            const size_t nb = (size_t)tx->w * tx->h * tx->texel;
+                            for (unsigned q = 0; q < ns; q++) {
+                                RedNaviMTLTexture *o = seen[q];
+                                if (o == tx) continue;
+                                if (o->img == tx->img) fprintf(vf, "    shares the image with another texture of this pass: %lux%lu pf%lu\n", (unsigned long)o->w, (unsigned long)o->h, (unsigned long)o->pf);
+                                if ((size_t)o->w * o->h * o->texel == nb && rn_vk_image_staging(o->img) && !memcmp(rn_vk_image_staging(o->img), cc, nb)) fprintf(vf, "    card copy equals the host copy of another texture: %lux%lu pf%lu\n", (unsigned long)o->w, (unsigned long)o->h, (unsigned long)o->pf);
+                            }
+                        }
+                        rn_tex_pair_png(g_pd_seq, (unsigned)k, (uint32_t)tx->w, (uint32_t)tx->h, tx->texel, hc, cc);
+                        unsigned shown = 0; for (size_t q = 0; q < (size_t)tx->w * tx->h * tx->texel && shown < 32; q++) if (hc[q] != cc[q]) { fprintf(vf, "    byte %lu: host %02x card %02x\n", (unsigned long)q, hc[q], cc[q]); shown++; }
+                    }
+                }
+                free(hc); free(cc);
+            }
+        }
+        if (vf) { fprintf(vf, "pass %03u: %u textures, %u compared, %u differ, %u not compared\n", g_pd_seq, ns, checked, bad, skipped); fclose(vf); chmod(vpath, 0644); }
+    }
+    g_pd_seq++; g_pd_left--;
+}
+// The bytes of an IOSurface as the plug-in reads them in syncFromSurface (BGRA8 only), as <dir>/src_<surface id>_<n>.png, at most 60 per capture and only while a capture is running (g_pd_left).
+// Pass <n> of the same surface is then compared with the last src_ file written before it: a glitch already in the source is not made by the card.
+static void rn_srcdump(IOSurfaceRef surf, const uint8_t *src, size_t pitch, size_t w, size_t h) {
+    static unsigned done; static int dirpid;
+    if (g_pd_left <= 0 || !g_pd_dir[0]) return;
+    if (dirpid != (int)getpid()) { dirpid = (int)getpid(); done = 0; }
+    const OSType fmt = IOSurfaceGetPixelFormat(surf);
+    if (fmt != 'BGRA') return;
+    uint8_t *px = malloc(w * h * 4);
+    if (!px) return;
+    for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *s = src + y * pitch + x * 4; uint8_t *d = px + (y * w + x) * 4; d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = 255; }
+    // The src_ PNG is written for at most 60 sources (and not for the big full-screen ones); the bytes are always kept for rn_cmpdump, so a window surface that is read late in a capture is still compared.
+    if (done < 60 && w * h <= 1500000) {
+        char path[112]; snprintf(path, sizeof(path), "%s/src_%u_%02u_p%03u.png", g_pd_dir, (unsigned)IOSurfaceGetID(surf), done++, g_pd_seq);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, w * h * 4, NULL);
+        CGImageRef im = CGImageCreate(w, h, 8, 32, w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+        CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+        CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+        if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+        CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    }
+    // keep the surface's bytes (RGBA, rows packed) for rn_cmpdump: the cache holds the last source of up to 8 surfaces
+    {
+        int slot = -1;
+        pthread_mutex_lock(&g_src_lock);
+        for (int i = 0; i < 8; i++) if (g_src_cache[i].id == (unsigned)IOSurfaceGetID(surf)) { slot = i; break; }
+        if (slot < 0) { slot = (int)(g_src_next++ % 8); }
+        free(g_src_cache[slot].px);
+        g_src_cache[slot].px = px; g_src_cache[slot].id = (unsigned)IOSurfaceGetID(surf); g_src_cache[slot].w = w; g_src_cache[slot].h = h;
+        g_src_cache[slot].pitch = pitch; g_src_cache[slot].compared = NO;
+        pthread_mutex_unlock(&g_src_lock);
+    }
+}
+
+// Side by side: the first render pass into a surface that rn_srcdump saw is compared with the bytes of that surface as the CPU had them just before (IOSurface locked read-only, rows read at
+// IOSurfaceGetBytesPerRow, the padding of a row never looked at). Written as <dir>/cmp_<surface id>_p<pass>.png: source | card after the pass | red where they differ, and a line in
+// <dir>/cmp.txt: texels that differ, the first and last row with a difference, how many rows differ over more than half of their width, and the longest run of such rows. A pass that loads the
+// surface and draws two rectangles (what a window's first pass is) should leave most texels equal: horizontal dark bands then show as full-width rows of differences, either already
+// in the source (the CPU side of the upload) or only after the pass (the card).
+static void rn_cmpdump_body(IOSurfaceRef surf, size_t w, size_t h, const uint8_t *gpu, unsigned seq);
+static void rn_cmpdump(IOSurfaceRef surf, size_t w, size_t h, const uint8_t *gpu, unsigned seq) {
+    pthread_mutex_lock(&g_src_lock); rn_cmpdump_body(surf, w, h, gpu, seq); pthread_mutex_unlock(&g_src_lock);
+}
+static void rn_cmpdump_body(IOSurfaceRef surf, size_t w, size_t h, const uint8_t *gpu, unsigned seq) {
+    const unsigned id = (unsigned)IOSurfaceGetID(surf);
+    int slot = -1;
+    for (int i = 0; i < 8; i++) if (g_src_cache[i].id == id && g_src_cache[i].px) { slot = i; break; }
+    if (slot < 0 || g_src_cache[slot].compared || g_src_cache[slot].w != w || g_src_cache[slot].h != h) return;
+    g_src_cache[slot].compared = YES;
+    if (w * h > 1500000) return; // a full-screen pass rewrites the whole surface: the comparison says nothing there
+    const uint8_t *sp = g_src_cache[slot].px;
+    const BOOL three = w * 3 <= 16384;
+    const size_t ow = w * (three ? 3 : 2);
+    uint8_t *out = malloc(ow * h * 4);
+    if (!out) return;
+    unsigned long diff = 0, bandRows = 0, runLen = 0, maxRun = 0; long firstRow = -1, lastRow = -1;
+    for (size_t y = 0; y < h; y++) {
+        unsigned long rowDiff = 0;
+        for (size_t x = 0; x < w; x++) {
+            const uint8_t *a = sp + (y * w + x) * 4, *b = gpu + (y * w + x) * 4;
+            uint8_t *o = out + (y * ow + x) * 4, *o2 = out + (y * ow + w + x) * 4;
+            memcpy(o, a, 4); memcpy(o2, b, 4);
+            const BOOL ne = a[0] != b[0] || a[1] != b[1] || a[2] != b[2];
+            if (ne) rowDiff++;
+            if (three) { uint8_t *o3 = out + (y * ow + 2 * w + x) * 4; o3[0] = ne ? 255 : 0; o3[1] = 0; o3[2] = 0; o3[3] = 255; }
+        }
+        diff += rowDiff;
+        if (rowDiff) { if (firstRow < 0) firstRow = (long)y; lastRow = (long)y; }
+        if (rowDiff * 2 > w) { bandRows++; runLen++; if (runLen > maxRun) maxRun = runLen; } else runLen = 0;
+    }
+    char path[128]; snprintf(path, sizeof(path), "%s/cmp_%u_p%03u.png", g_pd_dir, id, seq);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, out, ow * h * 4, NULL);
+    CGImageRef im = CGImageCreate(ow, h, 8, 32, ow * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(NULL, (const UInt8 *)path, strlen(path), false);
+    CGImageDestinationRef dst = im ? CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, NULL) : NULL;
+    if (dst) { CGImageDestinationAddImage(dst, im, NULL); CGImageDestinationFinalize(dst); CFRelease(dst); chmod(path, 0644); }
+    CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
+    free(out);
+    char cpath[112]; snprintf(cpath, sizeof(cpath), "%s/cmp.txt", g_pd_dir);
+    FILE *f = fopen(cpath, "a");
+    if (f) {
+        fprintf(f, "surf %u pass %03u %lux%lu (source pitch %lu bytes, packed %lu): %lu texels differ, rows %ld..%ld, %lu rows differ over more than half their width (longest run %lu)\n",
+                id, seq, (unsigned long)w, (unsigned long)h, (unsigned long)g_src_cache[slot].pitch, (unsigned long)(w * 4), diff, firstRow, lastRow, bandRows, maxRun);
+        fclose(f); chmod(cpath, 0644);
+    }
 }
 
 // Trace aid (only with /Users/Shared/rednavi-trace): the picture a big render pass left in its IOSurface, as /private/var/tmp/rednavi-trace-<n>.png, at most one every three seconds.
@@ -1520,6 +1937,11 @@ static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL c
         // A new ring surface starts with whatever the card's memory held, and CoreDisplay draws only what changed into it: the picture on the screen is its best starting point.
         rn_vk_image *shown = rn_scanout_image(vk, rt->w, rt->h);
         if (shown && rn_vk_image_copy(vk, shown, img) != 0) rn_log("direct scanout: the card copy for IOSurface %u could not be filled from the scanout", (unsigned)IOSurfaceGetID(rt->surf));
+        {   // Experiment switch /Users/Shared/rednavi-magenta: a new ring surface starts as bright magenta instead of the picture on the screen, so that tiles CoreDisplay never draws show up.
+            static int mag = -1;
+            if (mag < 0) mag = access("/Users/Shared/rednavi-magenta", F_OK) == 0;
+            if (mag) { rn_vk_target t = {.image = img, .clear = 1, .color = {1.f, 0.f, 1.f, 1.f}}; rn_vk_render_pass(vk, &t, 1, NULL, 0); }
+        }
         rn_log("direct scanout: card copy for IOSurface %u (%lux%lu)", (unsigned)IOSurfaceGetID(rt->surf), (unsigned long)rt->w, (unsigned long)rt->h);
         return img;
     }
@@ -1544,6 +1966,36 @@ static void rn_display_host_write_note(void *tp, const char *how) {
     if (!rt->displayScan || !rn_scanout_image(rn_vk_shared(), rt->w, rt->h)) return;
     static atomic_uint said; const unsigned n = atomic_fetch_add(&said, 1);
     if (n < 20 || n % 1000 == 0) rn_log("direct scanout: %s writes the host image of scanout IOSurface %u, the card copy does not get it (%u such writes so far)", how, rt->surf ? (unsigned)IOSurfaceGetID(rt->surf) : 0u, n + 1);
+}
+static void rn_frame_done(void);
+static void rn_scan_dump(rn_vk_image *src, size_t w, size_t h);
+// A frame of the compositor can be spread over more than one command buffer into the same ring surface (measured: 40% of the copies came from the surface of the copy before, all
+// within 4 ms), and a copy after the first of them shows an unfinished picture. The copy into the scanout therefore waits: it is made when a command buffer draws into another
+// surface, or when nothing more was drawn into this one for 3 ms. /Users/Shared/rednavi-nodefer keeps the copy at the end of every command buffer.
+static int rn_defer_on(void) { static int v = -1; if (v < 0) v = access("/Users/Shared/rednavi-nodefer", F_OK) != 0; return v; }
+static os_unfair_lock g_defer_lock = OS_UNFAIR_LOCK_INIT;
+static rn_vk_image *g_defer_src; static size_t g_defer_w, g_defer_h; static uint64_t g_defer_gen;
+static void rn_defer_copy(rn_vk_image *src, size_t w, size_t h) {
+    rn_vk *vk = rn_vk_shared();
+    rn_vk_image *scan = rn_scanout_image(vk, w, h);
+    if (scan && rn_vk_image_copy(vk, src, scan) == 0) { rn_frame_note(src); rn_scan_dump(src, w, h); }
+}
+static void rn_defer_frame(rn_vk_image *src, size_t w, size_t h) {
+    static dispatch_queue_t q; static dispatch_once_t once;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("rednavi.scanout", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)); });
+    os_unfair_lock_lock(&g_defer_lock);
+    rn_vk_image *old = g_defer_src != src ? g_defer_src : NULL; const size_t ow = g_defer_w, oh = g_defer_h;
+    g_defer_src = src; g_defer_w = w; g_defer_h = h;
+    const uint64_t gen = ++g_defer_gen;
+    os_unfair_lock_unlock(&g_defer_lock);
+    if (old) rn_defer_copy(old, ow, oh);         // the surface before this one is finished
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_MSEC), q, ^{
+        os_unfair_lock_lock(&g_defer_lock);
+        rn_vk_image *mine = g_defer_gen == gen ? g_defer_src : NULL; const size_t mw = g_defer_w, mh = g_defer_h;
+        if (mine) g_defer_src = NULL;
+        os_unfair_lock_unlock(&g_defer_lock);
+        if (mine) rn_defer_copy(mine, mw, mh);
+    });
 }
 static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the bridge's present call (selector RN_UC_PRESENT)
     static int (*present)(uint32_t, int); static dispatch_once_t once;
@@ -1650,6 +2102,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             if (props) CFRelease(props);
         }
     }
+    // /Users/Shared/rednavi-logdraws (looked at on every pass, so it can be made and removed while the client runs): the draws of the passes into display surfaces, with their buffers
+    BOOL logPass = NO;
+    if (direct) { static _Atomic unsigned budget; struct stat lst; if (stat("/Users/Shared/rednavi-logdraws", &lst) == 0) { if (atomic_fetch_add(&budget, 1) < 400) { logPass = YES; rn_log("logdraws: pass into IOSurface %u, %lu draws, clear %d", rp->tex[0]->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->surf) : (rp->tex[0]->parent && rp->tex[0]->parent->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->parent->surf) : 0u), (unsigned long)nd, rp->clear[0]); } } else atomic_store(&budget, 0); }
     const NSUInteger na = nd ? nd : 1;               // a pass without draws still runs: its clears are done
     rn_vk_draw *dr = calloc(na, sizeof(*dr));
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
@@ -1660,12 +2115,19 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
-        if (getenv("RN_LOG_DRAWS")) {
+        if (logPass || getenv("RN_LOG_DRAWS")) {
             char tb[400] = ""; int o = 0;
             for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
-            rn_log("draw %lu: %s + %s, prim %u, %u vertices%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
+            rn_log("draw %lu: %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
         }
-        if (getenv("RN_LOG_BUFFERS")) {                       // debugging: what is bound at every buffer index, with the first bytes
+        if (logPass && d->indexBuf) {                                    // the indices of the draw, as the card will read them
+            const uint8_t *ip = rn_vk_buffer_contents(d->indexBuf->b) + d->indexOffset;
+            const unsigned isz = d->index32 ? 4 : 2;
+            char ix[200] = ""; int io = 0;
+            for (unsigned j = 0; j < d->vertexCount && j < 12 && io < 180; j++) { unsigned v = isz == 4 ? ((const uint32_t *)ip)[j] : ((const uint16_t *)ip)[j]; io += snprintf(ix + io, sizeof(ix) - io, " %u", v); }
+            rn_log("  indices (%s, offset %llu, buffer %lu bytes):%s", d->index32 ? "uint32" : "uint16", (unsigned long long)d->indexOffset, (unsigned long)d->indexBuf->len, ix);
+        }
+        if (logPass || getenv("RN_LOG_BUFFERS")) {                       // debugging: what is bound at every buffer index, with the first bytes
             for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
                 const uint8_t *bp = NULL; NSUInteger len = 0;
                 if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
@@ -1707,11 +2169,24 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
     }
     const uint64_t phv = mach_absolute_time();
+    rn_vk_snap_small = g_pd_dir[0] && nd < 16 && tg[0].image && rp->tex[0] && rp->tex[0]->w == rp->tex[0]->h && (rp->tex[0]->w == 93 || rp->tex[0]->w == 137 || rp->tex[0]->w == 161 || rp->tex[0]->w == 174 || rp->tex[0]->w == 249 || rp->tex[0]->w == 256);
+    rn_vk_snap_on = (g_pd_left > 0 && nd >= 16) || rn_vk_snap_small; rn_vk_snap_seq = g_pd_seq;   // pass capture running: snapshots of the target after some draws (rn_snap_write)
     int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
+    rn_vk_snap_on = 0; rn_vk_snap_small = 0;
     rn_ph(1, phv);
     if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
+    if (!bad && !rc && rp->nt) {
+        BOOL dump = rn_passdump_on();
+        // The window shadow is made once, early (the first blur passes ran before the 160 passes of a capture were over): a pass into a square target of shadow size is captured when
+        // the capture is armed even after the budget is spent, up to 120 of them.
+        static int shadowLeft = 200;
+        if (!dump && g_pd_dir[0] && shadowLeft > 0 && rp->tex[0] && rp->tex[0]->w == rp->tex[0]->h && (rp->tex[0]->w == 93 || rp->tex[0]->w == 137 || rp->tex[0]->w == 161 || rp->tex[0]->w == 174 || rp->tex[0]->w == 249 || rp->tex[0]->w == 256)) { dump = YES; shadowLeft--; }
+        if (dump) rn_passdump(rp, tg[0].image, nd);
+    }
     if (direct && !rc) {         // a pass that only fills the surface with a colour (CoreDisplay clears a surface before it draws into it) is not a finished frame; any other is, and goes to the scanout
-        BOOL onlyFills = nd > 0;     // every draw is looked at: a pass that starts with a fill and then draws content is a frame, and one left out stays off the screen until the next change
+        static int noskip = -1;      // experiment switch /Users/Shared/rednavi-noframeskip: every pass into a scanout surface is a frame
+        if (noskip < 0) noskip = access("/Users/Shared/rednavi-noframeskip", F_OK) == 0;
+        BOOL onlyFills = nd > 0 && !noskip;     // every draw is looked at: a pass that starts with a fill and then draws content is a frame, and one left out stays off the screen until the next change
         for (NSUInteger k = 0; k < nd && onlyFills; k++) { RNDraw *dk = rp->draws[k]; onlyFills = dk->pso && dk->pso->names[1] && [dk->pso->names[1] hasPrefix:@"ColorFill"]; }
         if (!onlyFills) {
             RedNaviMTLTexture *rt = rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0];
@@ -1782,9 +2257,22 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         [self eachTexture:^(RedNaviMTLTexture *t, BOOL written) { if (t) [used addObject:t->parent ? t->parent : t]; }];
         for (RedNaviMTLTexture *t in used) atomic_fetch_add(&t->queued_, 1);
         queuedTex = used.array;
+        {   // An IOSurface counts as in use (IOSurfaceIsInUse) from the commit until the body has run, as it does for Apple's own GPU drivers, so that a client does not draw its next frame into a
+            // surface that is still waiting to be read. Switch /Users/Shared/rednavi-nousecount turns it off.
+            static int on = -1;
+            if (on < 0) on = access("/Users/Shared/rednavi-nousecount", F_OK) != 0;
+            if (on) for (RedNaviMTLTexture *t in queuedTex) if (t->surf) IOSurfaceIncrementUseCount(t->surf);
+            useCounted = on;
+        }
     }
     st = MTLCommandBufferStatusCommitted;       // visible at once; the body sets the final state
     dispatch_async(q, run);
+    {   // Experiment switch /Users/Shared/rednavi-synccommit: every commit returns only when its body has run, so that nothing the client does after the commit (reusing a buffer, drawing into a surface)
+        // can happen before the card has read what the commit referenced.
+        static int sync = -1;
+        if (sync < 0) sync = access("/Users/Shared/rednavi-synccommit", F_OK) == 0;
+        if (sync) wait = YES;
+    }
     if (wait) [self waitUntilCompleted];
 }
 // Every texture the records use (nil entries included), with whether the record writes it.
@@ -1810,6 +2298,14 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
     if (ran) return;
     ran = YES;
+    {   static dispatch_once_t swonce;       // which experiment switches this process runs with, so that what is seen on the screen can be tied to a configuration
+        dispatch_once(&swonce, ^{
+            static const char *const sw[] = {"nodirectscan", "nozerocopy", "fullbarrier", "noframeskip", "nopool", "passsubmit", "yuvgrey", "nodefer", "dcc"};
+            char line[160] = ""; char path[64];
+            for (unsigned i = 0; i < sizeof(sw) / sizeof(*sw); i++) { snprintf(path, sizeof(path), "/Users/Shared/rednavi-%s", sw[i]); if (access(path, F_OK) == 0) { strlcat(line, " ", sizeof(line)); strlcat(line, sw[i], sizeof(line)); } }
+            rn_log("experiment switches:%s; RADV_DEBUG=%s", line[0] ? line : " none", getenv("RADV_DEBUG") ? getenv("RADV_DEBUG") : "(unset)");
+        });
+    }
     st = MTLCommandBufferStatusCommitted;
     NSArray *schedHandlers; @synchronized(scheduled) { st = MTLCommandBufferStatusCommitted; schedHandlers = [scheduled copy]; [scheduled removeAllObjects]; }
     for (MTLCommandBufferHandler h in schedHandlers) h((id)self);
@@ -1904,7 +2400,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
-    if (vk && scanSrc && st != MTLCommandBufferStatusError) {       // the scanout copy rides in the same submit as the passes
+    if (vk && scanSrc && st != MTLCommandBufferStatusError && !rn_defer_on()) {       // the scanout copy rides in the same submit as the passes
         rn_vk_image *scan = rn_scanout_image(vk, scanW, scanH);
         if (scan && rn_vk_batch_copy(vk, scanSrc, scan) == 0) scanCopied = YES;
     }
@@ -1916,14 +2412,15 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
     }
     { const uint64_t ph4 = mach_absolute_time(); if (st != MTLCommandBufferStatusError) [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:NO]; rn_ph(4, ph4); }
-    if (scanSrc && st != MTLCommandBufferStatusError) {      // the frame reaches the scanout before the buffer is reported complete: a completion handler lets the client reuse the surface
+    if (scanSrc && st != MTLCommandBufferStatusError && rn_defer_on()) { rn_frame_done(); rn_defer_frame(scanSrc, scanW, scanH); }
+    else if (scanSrc && st != MTLCommandBufferStatusError) {      // the frame reaches the scanout before the buffer is reported complete: a completion handler lets the client reuse the surface
         rn_vk_image *scan = scanCopied ? NULL : rn_scanout_image(rn_vk_shared(), scanW, scanH);
-        if (scanCopied || (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0)) { rn_frame_done(); rn_frame_note(); rn_scan_dump(scanSrc, scanW, scanH); }
+        if (scanCopied || (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0)) { rn_frame_done(); rn_frame_note(scanSrc); rn_scan_dump(scanSrc, scanW, scanH); }
         else { static unsigned said; if (said++ < 20) rn_log("direct scanout: the finished frame (%lux%lu) could not be copied into the scanout", (unsigned long)scanW, (unsigned long)scanH); }
     }
     if (queuedTex) {        // the card's work is done and the surfaces are written back: host accesses to the textures may go on
         pthread_mutex_lock(&g_texq_mu);
-        for (RedNaviMTLTexture *t in queuedTex) atomic_fetch_sub(&t->queued_, 1);
+        for (RedNaviMTLTexture *t in queuedTex) { atomic_fetch_sub(&t->queued_, 1); if (useCounted && t->surf) IOSurfaceDecrementUseCount(t->surf); }
         pthread_cond_broadcast(&g_texq_cv);
         pthread_mutex_unlock(&g_texq_mu);
         queuedTex = nil;
@@ -2259,6 +2756,15 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             break;
         }
         p->names[s] = fn[s]->name;
+        if (s && access("/Users/Shared/rednavi-finederiv", F_OK) == 0) {   // experiment: the derivatives of a fragment stage are asked for in the fine variant (the plain ones leave the choice to the GPU, which may give one value per 2x2 quad)
+            uint32_t *w = (uint32_t *)spv; const size_t nw = spvBytes / 4;
+            for (size_t i = 5; i < nw;) {
+                const uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+                if (!wc || i + wc > nw) break;
+                if (op >= 207 && op <= 209) w[i] = (w[i] & 0xffff0000u) | (op + 3);   // OpDPdx, OpDPdy, OpFwidth -> the Fine ones
+                i += wc;
+            }
+        }
         p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
         if (getenv("RN_SPV_OVERRIDE_DIR") || getenv("RN_DUMP_SPV")) {              // debugging: a module is known by the FNV-1a hash of its SPIR-V; a file <hash>.spv in the override directory replaces it
             uint32_t h = 2166136261u; for (size_t b = 0; b < spvBytes; b++) h = (h ^ ((const uint8_t *)spv)[b]) * 16777619u;
@@ -2276,6 +2782,21 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
         rn_air_free(spv, spvBytes);
         unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
         p->n[s] = n;
+        {
+            NSMutableString *vs = [NSMutableString stringWithFormat:@"fc%u", nfc];
+            for (unsigned c = 0; c < nfc; c++) {
+                if (fcc[c].index >= 0) [vs appendFormat:@" %d=", fcc[c].index]; else [vs appendFormat:@" %s=", fcc[c].name];
+                for (uint32_t b = 0; b < fcc[c].size && b < 8; b++) [vs appendFormat:@"%02x", ((const uint8_t *)fcc[c].data)[b]];
+            }
+            unsigned nk[8] = {0};
+            for (unsigned b = 0; b < n; b++) if (info.bindings[b].kind < 8) nk[info.bindings[b].kind]++;
+            [vs appendFormat:@" | buf%u tex%u stor%u smp%u static%u null%u in%u", nk[0], nk[1], nk[2], nk[3], nk[4], nk[5], nk[6]];
+            for (unsigned b = 0; b < n; b++) {   // the constexpr samplers of the shader: index, filters (min/mag/mip), address modes, unnormalized coordinates
+                const rn_air_binding *sb = &info.bindings[b];
+                if (sb->kind == RN_AIR_STATIC_SAMPLER) [vs appendFormat:@" ss%u=f%u%u%u,a%u%u%u,px%u", sb->metal_index, sb->min_filter, sb->mag_filter, sb->mip_filter, sb->address[0], sb->address[1], sb->address[2], sb->pixel_coords];
+            }
+            p->variant[s] = vs;
+        }
         for (unsigned i = 0; i < n; i++) {
             const rn_air_binding *ab = &info.bindings[i];
             p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind == RN_AIR_NULL_TEXTURE ? RN_VK_SAMPLED_IMAGE : ab->kind, NULL};
