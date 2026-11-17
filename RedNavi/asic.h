@@ -47,7 +47,12 @@ struct rn_dp_path {
     uint8_t hpd_sel;          // hpdsel of the same structure (HPD pin id)
     uint8_t connector_id;     // connector object id (19 is DisplayPort)
     uint8_t lanes;            // lanes wired to the connector
+    uint8_t dig;              // DIG back end (and DP block) instance the connector's transmitter drives; the DIGn and DPn registers sit 0x100 dwords apart
 };
+
+// A DIG or DP register offset of instance `dig`, from the offset it has on instance 4 (the RX 7800 XT's, what the code was written with).
+// dcn_3_2_0_offset.h places DIG0..DIG4 and DP0..DP4 at a stride of 0x100 dwords (DIG0_DIG_FE_CNTL 0x208b, DIG4_DIG_FE_CNTL 0x248b).
+static inline uint32_t rn_dig_off(uint32_t dig4_offset, uint8_t dig) { return dig4_offset + (static_cast<int32_t>(dig) - 4) * 0x100; }
 
 // One board of an ASIC that somebody has run the driver on.
 struct rn_asic_board {
@@ -90,5 +95,9 @@ bool rn_disc_ip_version(const uint8_t *table, uint32_t len, uint16_t hw_id, stru
 // the card reports (RCC_CONFIG_MEMSIZE, 16 MB under the nominal size on the boards seen) is within 64 MB of the row's. vram_mb 0 takes the first board of the ID.
 // *board, when not NULL, receives the matching board.
 const struct rn_asic *rn_asic_lookup(const uint8_t *table, uint32_t len, uint16_t pci_device, const struct rn_asic_board **board, uint32_t vram_mb = 0);
+
+// Select the GC register offsets (gc_regs.h, read through rn_gc) for a GC version: 11.0.3 has its own memory hub offsets; 11.0.0 to 11.0.2 use the gc_11_0_0 ones
+// (Linux has no gc_11_0_2 headers). Returns 0 for a version without a table. Until it is called rn_gc points at the 11.0.3 table.
+int rn_gc_select(struct rn_ip_version gc);
 
 #endif

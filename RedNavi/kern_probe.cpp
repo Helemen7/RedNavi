@@ -89,6 +89,7 @@
 #include <IOKit/IODeviceTreeSupport.h>
 #include "edid.h"
 #include "mode_regs.h"
+#define RN_DIG(off) rn_dig_off((off), board ? board->dp.dig : 4)   // a DIG/DP back end register of the board's DIG instance (asic.h)
 #include "smu13.h"
 #include <IOKit/IODMACommand.h>
 #include <IOKit/IOInterruptEventSource.h>
@@ -805,9 +806,10 @@ void RedNaviProbe::dpTrain() {
     PE_parse_boot_argn("rednavi_dp_rate", &rateArg, sizeof(rateArg));
     const uint32_t aux = board->dp.aux, lanes = board->dp.lanes, rateCode = rateArg, symclk10k = rateCode * 27000 / 10;
     uint32_t dmu = dmubDmu;
-    // DP4 back end and DIG4 registers (dcn_3_2_0_offset.h, base index 2)
-    const uint32_t DP_CONFIG = 0x250b, DP_LINK_CNTL = 0x2508, DP_DPHY_CNTL = 0x2517, DP_PATTERN_SEL = 0x2518, DP_SCRAM = 0x251e;
-    const uint32_t DIG_BE_CNTL = 0x24b1;
+    // DP and DIG back end registers of the board's DIG instance (dcn_3_2_0_offset.h, base index 2; the literals are the DP4/DIG4 ones, rn_dig_off moves them)
+    const uint8_t dig = board->dp.dig;
+    const uint32_t DP_CONFIG = rn_dig_off(0x250b, dig), DP_LINK_CNTL = rn_dig_off(0x2508, dig), DP_DPHY_CNTL = rn_dig_off(0x2517, dig), DP_PATTERN_SEL = rn_dig_off(0x2518, dig), DP_SCRAM = rn_dig_off(0x251e, dig);
+    const uint32_t DIG_BE_CNTL = rn_dig_off(0x24b1, dig);
     auto R = [&](uint32_t d) { return rd((dmu + d) * 4); };
     auto W = [&](uint32_t d, uint32_t v) { wr((dmu + d) * 4, v); };
     auto U = [&](uint32_t d, uint32_t mask, uint32_t v) { W(d, (R(d) & ~mask) | (v & mask)); };
@@ -1158,13 +1160,13 @@ void RedNaviProbe::dcnReplay() {
     // State found before we touch anything (the VBIOS may have lit the pipe already), then quiesce it:
     // DC assumes the display is disabled before it programs the timing.
     {
-        const uint32_t pre[16][2] = {{2, 0x1b41}, {2, 0x1b2a}, {2, 0x1b2f}, {2, 0x250c}, {2, 0x248b}, {2, 0x24b1}, {2, 0x24b2}, {2, 0x2511}, {2, 0x2512}, {1, 0x81}, {1, 0x64}, {1, 0x99}, {1, 0xb6}, {2, 0x475}, {2, 0x476}, {2, 0x46f}};
+        const uint32_t pre[16][2] = {{2, 0x1b41}, {2, 0x1b2a}, {2, 0x1b2f}, {2, RN_DIG(0x250c)}, {2, RN_DIG(0x248b)}, {2, RN_DIG(0x24b1)}, {2, RN_DIG(0x24b2)}, {2, RN_DIG(0x2511)}, {2, RN_DIG(0x2512)}, {1, 0x81}, {1, 0x64}, {1, 0x99}, {1, 0xb6}, {2, 0x475}, {2, 0x476}, {2, 0x46f}};
         const char *pn[16] = {"otg_control", "h_total", "v_total", "vid_stream_cntl", "fe_cntl", "be_cntl", "be_en", "vid_n", "vid_m", "dp_dto0_phase", "dentist_dispclk", "dppclk0_dto", "dppclk_dto_ctrl", "vm_fb_base", "vm_fb_top", "sdpif_cfg0"};
         uint32_t pv[16];
         for (int i = 0; i < 16; i++) pv[i] = rd((base[pre[i][0]] + pre[i][1]) * 4);
         RN_STEP("RedNavi: replay before: OTG_CONTROL=0x%08x H_TOTAL=0x%x V_TOTAL=0x%x VID_STREAM=0x%08x FE=0x%08x BE=0x%08x BE_EN=0x%08x VID_N=0x%x VID_M=0x%x DTO0=0x%08x\n", pv[0], pv[1], pv[2], pv[3], pv[4], pv[5], pv[6], pv[7], pv[8], pv[9]);
         rnPublish(this, "dcn-replay-pre", pn, pv, 16);
-        uint32_t vidReg = (base[2] + 0x250c) * 4, otgReg = (base[2] + 0x1b41) * 4;
+        uint32_t vidReg = (base[2] + RN_DIG(0x250c)) * 4, otgReg = (base[2] + 0x1b41) * 4;
         if (maxGroup >= 3) {
             if (rd(vidReg) & 1) {                                           // stop the DP video stream first
                 wr(vidReg, rd(vidReg) & ~1u);
@@ -1254,8 +1256,8 @@ void RedNaviProbe::dcnReplay() {
     IOSleep(2);
     uint32_t pos1 = rd((base[2] + 0x1b4a) * 4);
     uint32_t otgCtl = rd((base[2] + 0x1b41) * 4), otgStatus = rd((base[2] + 0x1b49) * 4);
-    uint32_t vid = rd((base[2] + 0x250c) * 4), dpg = rd((base[2] + 0x185b) * 4), link = rd((base[2] + 0x2508) * 4);
-    uint32_t beEn = rd((base[2] + 0x24b2) * 4), fe = rd((base[2] + 0x248b) * 4);
+    uint32_t vid = rd((base[2] + RN_DIG(0x250c)) * 4), dpg = rd((base[2] + 0x185b) * 4), link = rd((base[2] + RN_DIG(0x2508)) * 4);
+    uint32_t beEn = rd((base[2] + RN_DIG(0x24b2)) * 4), fe = rd((base[2] + RN_DIG(0x248b)) * 4);
     IOLog("RedNavi: replay done: %u mismatches; OTG_CONTROL=0x%08x STATUS=0x%08x POS 0x%08x -> 0x%08x; DP_VID_STREAM_CNTL=0x%08x DPG_STATUS=0x%08x DP_LINK_CNTL=0x%08x BE_EN=0x%08x FE=0x%08x\n",
           mismatches, otgCtl, otgStatus, pos0, pos1, vid, dpg, link, beEn, fe);
     const char *n[12] = {"groups", "mismatches", "otg_control", "otg_status", "pos0", "pos1", "vid_stream_cntl", "dpg_status", "dp_link_cntl", "be_en", "fe_cntl", "otg_moving"};
@@ -1273,9 +1275,14 @@ void RedNaviProbe::dcnDump() {
     uint32_t regLen = static_cast<uint32_t>(regs->getLength());
     OSData *blob = OSData::withCapacity(kRNDcnRegCount * 4);
     if (!blob) return;
+    // DCN 3.2.1 (Navi 33) does not define 17 registers of the list: they are not read there (the blob keeps its layout, the value stays 0xDEADBEEF).
+    const bool dcn321 = asic && asic->dcn.major == 3 && asic->dcn.minor == 2 && asic->dcn.rev == 1;
+    uint32_t nextAbsent = 0;
     for (uint32_t i = 0; i < kRNDcnRegCount; i++) {
         uint32_t off = (dmu + kRNDcnRegs[i]) * 4, v = 0xDEADBEEF;
-        if (off + 4 <= regLen) v = rd(off);
+        bool skip = false;
+        if (dcn321 && nextAbsent < kRNDcnRegAbsent321Count && kRNDcnRegAbsent321[nextAbsent] == i) { skip = true; nextAbsent++; }
+        if (!skip && off + 4 <= regLen) v = rd(off);
         blob->appendBytes(&v, 4);
     }
     setProperty("dcn-dump", blob);
@@ -1404,7 +1411,7 @@ void RedNaviProbe::trace(const char *what) {
 void RedNaviProbe::quiescePipe() {
     uint32_t b2 = 0;
     if (!ipBase(kRNHwIdDmu, &b2, 2)) return;
-    uint32_t vidReg = (b2 + 0x250c) * 4, otgReg = (b2 + 0x1b41) * 4;
+    uint32_t vidReg = (b2 + RN_DIG(0x250c)) * 4, otgReg = (b2 + 0x1b41) * 4;
     if (rd(vidReg) & 1) {
         wr(vidReg, rd(vidReg) & ~1u);
         for (int i = 0; i < 100 && (rd(vidReg) & (1u << 16)); i++) IOSleep(1);
@@ -1413,7 +1420,7 @@ void RedNaviProbe::quiescePipe() {
         wr(otgReg, rd(otgReg) & ~1u);
         for (int i = 0; i < 200 && (rd(otgReg) & (1u << 16)); i++) IOSleep(1);
     }
-    wr((b2 + 0x248b) * 4, 0);                   // DIG4_DIG_FE_CNTL: the VBIOS state the replay starts from has the front end off
+    wr((b2 + RN_DIG(0x248b)) * 4, 0);                   // DIG4_DIG_FE_CNTL: the VBIOS state the replay starts from has the front end off
     IOSleep(5);
 }
 
@@ -1434,7 +1441,7 @@ bool RedNaviProbe::programLive(const rn_mode &m) {
     uint32_t b2 = 0;
     if (!ipBase(kRNHwIdDmu, &b2, 2)) return false;
     for (int i = 0; i < 100; i++) {
-        if (rd((b2 + 0x250c) * 4) & (1u << 16)) return true;
+        if (rd((b2 + RN_DIG(0x250c)) * 4) & (1u << 16)) return true;
         IOSleep(2);
     }
     return false;
@@ -3166,7 +3173,14 @@ void RedNaviProbe::sdmaTest() {
     // engines work at 192 MB: page table 0x0C100000, default and fault pages 0x0C200000/0x0C201000, SDMA ring 0x0C000000, target 0x0C002000.
     // The GART window: 16384 pages (64 MB) at GPU address 0x2000000000 (outside the VRAM aperture), the page table at VRAM 0x0C100000.
     const uint64_t kGartVa = 0x2000000000ull;
-    struct rn_gmc gmc = {kRNVramMcBase, kRNVramMcBase + 0x3FFFFFFFFull, kGartVa, kGartVa + 16384ull * 4096 - 1, 0x0C100000, 0x0C200000, 0x0C201000};
+    // End of the VRAM aperture: what the VBIOS left in FB_LOCATION_TOP (16 MB units; 0x83ff on the RX 7800 XT, which is base + 16 GB - 1), not a 16 GB constant, so that a board with
+    // less memory gets its own end. The 16 GB value stays as the fallback when the register reads back something that cannot be a top for this base.
+    uint64_t fbEnd = kRNVramMcBase + 0x3FFFFFFFFull;
+    {
+        const uint32_t top = RREG32_SOC15(RN_GC, 0, regGCMC_VM_FB_LOCATION_TOP);
+        if (top >= (kRNVramMcBase >> 24) && top != 0xFFFFFFFFu && ((static_cast<uint64_t>(top) + 1) << 24) - 1 <= fbEnd) fbEnd = ((static_cast<uint64_t>(top) + 1) << 24) - 1;
+    }
+    struct rn_gmc gmc = {kRNVramMcBase, fbEnd, kGartVa, kGartVa + 16384ull * 4096 - 1, 0x0C100000, 0x0C200000, 0x0C201000};
     
     // Does CPU access to VRAM through MM_INDEX/MM_DATA survive the memory hub being switched on? Two probe locations, read right
     // after writing and again 50 ms later, before and after rn_gfxhub_enable.
@@ -3851,6 +3865,7 @@ bool RedNaviProbe::start(IOService *provider) {
     // first and about 12272 MB on the second. A card whose size matches no board of its ID is not in the table.
     asic = disc ? rn_asic_lookup(static_cast<const uint8_t *>(disc->getBytesNoCopy()), disc->getLength(), pciDevice, &board, vramMbytes) : nullptr;
     if (!asic) board = nullptr;
+    if (asic) rn_gc_select(asic->gc);                 // the GC register offsets of this ASIC's GC version (gc_regs.h)
     publishAsic();
     if (!asic) {
         IOLog("RedNavi: device 0x%04x with %u MB of VRAM is not in the ASIC table, read-only: IP discovery and VBIOS only\n", pciDevice, vramMbytes);

@@ -5,6 +5,7 @@
 // With a file argument (an IP discovery table as raw bytes) it prints what the lookup makes of it instead:
 //   build/asic_test table.bin [pci device ID in hex]
 #include "../../RedNavi/asic.h"
+#include "../../RedNavi/gc_regs.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -78,7 +79,8 @@ static void testLookup() {
     bd = nullptr;
     CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 16368) && bd && !strcmp(bd->model, "AMD Radeon RX 7800 XT") && bd->write_ok == 1);
     bd = nullptr;
-    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 12272) && bd && !strcmp(bd->model, "AMD Radeon RX 7700 XT") && bd->vram_mb == 12288 && bd->psp_tmr_mb == 11776 && bd->write_ok == 0 && !bd->replay);
+    CHECK(rn_asic_lookup(t.data(), len, 0x747E, &bd, 12272) && bd && !strcmp(bd->model, "AMD Radeon RX 7700 XT") && bd->vram_mb == 12288 && bd->psp_tmr_mb == 11776 && bd->write_ok == 0 && bd->replay && bd->replay_count == 57 && !strncmp(bd->replay[0].name, "DP_DTO0_PHASE", 13) && bd->dp.dig == 0);
+    for (uint32_t i = 0; bd && bd->replay && i < bd->replay_count; i++) CHECK(!strstr(bd->replay[i].name, "DIG4") && !strstr(bd->replay[i].name, "DP4_") && bd->replay[i].group <= 9);
     CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 8176));        // a size that is no board of the ID
     CHECK(!rn_asic_lookup(t.data(), len, 0x747E, nullptr, 24560));
     CHECK(rn_asic_lookup(t.data(), len, 0x747E, nullptr, 16384) && rn_asic_lookup(t.data(), len, 0x747E, nullptr, 12288));
@@ -87,7 +89,7 @@ static void testLookup() {
     CHECK(a && a->drm_info->fw_count == 16 && a->drm_info->max_ibs_count == 10 && a->drm_info->hw_ip_info[0][0] == 0x0b);
     CHECK(board && board->replay && board->replay_count > 100);
     CHECK(board && board->psp_tmr_mb == 15872 && (uint64_t)board->psp_tmr_mb < board->vram_mb);
-    CHECK(board && board->dp.aux == 4 && board->dp.phy_id == 4 && board->dp.hpd_sel == 5 && board->dp.connector_id == 19 && board->dp.lanes == 4);
+    CHECK(board && board->dp.aux == 4 && board->dp.phy_id == 4 && board->dp.hpd_sel == 5 && board->dp.connector_id == 19 && board->dp.lanes == 4 && board->dp.dig == 4);
 
     std::vector<Ip> other = navi32();
     other[3].rev = 2;                                                     // GC 11.0.2 is Navi 33
@@ -155,6 +157,16 @@ int main(int argc, char **argv) {
         printf("device 0x%04x: %s\n", dev, a ? a->name : "not in the ASIC table (read-only)");
         return 0;
     }
+    // rn_dig_off: the DIG4/DP4 offsets of the 7800 XT move to other instances at a stride of 0x100 (dcn_3_2_0_offset.h)
+    CHECK(rn_dig_off(0x250b, 4) == 0x250b);
+    CHECK(rn_dig_off(0x250b, 0) == 0x210b);      // DP0_DP_CONFIG
+    CHECK(rn_dig_off(0x24b1, 0) == 0x20b1);      // DIG0_DIG_BE_CNTL
+    CHECK(rn_dig_off(0x248b, 1) == 0x218b);      // DIG1_DIG_FE_CNTL
+    // GC register offsets: 11.0.3 has its own memory hub offsets, 11.0.0 to 11.0.2 use the gc_11_0_0 ones
+    CHECK(regGCMC_VM_FB_LOCATION_BASE == 0x1688);   // the default table is 11.0.3's
+    CHECK(rn_gc_select({11, 0, 2}) == 1 && regGCMC_VM_FB_LOCATION_BASE == 0x1678 && regGCVM_L2_CNTL == 0x15bc);
+    CHECK(rn_gc_select({11, 0, 3}) == 1 && regGCMC_VM_FB_LOCATION_BASE == 0x1688 && regGCVM_L2_CNTL == 0x15c0);
+    CHECK(rn_gc_select({11, 5, 0}) == 0 && regGCMC_VM_FB_LOCATION_BASE == 0x1688);   // no table: the selection stays
     testVersions();
     testLookup();
     testBad();

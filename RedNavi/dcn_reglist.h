@@ -367,3 +367,9 @@ static const unsigned short kRNDcnRegs[] = {
     0x38ef, 0x38f0, 0x38f1, 0x38f2, 0x38f3, 0x38f4, 0x38f5, 0x38f6, 0x38f7, 0x38f8, 0x38f9, 0x38fa,
     0x38ff, 0x3900, 0x3901, 0x3902, 0x3903, 0x3904, 0x3905, 0x3906, 0x3907, 0x3908,
 };
+// Registers of the list that DCN 3.2.1 (dcn_3_2_1_offset.h) does not define or places elsewhere, as indices into kRNDcnRegs.
+#define kRNDcnRegAbsent321Count 17u
+static const unsigned short kRNDcnRegAbsent321[] = {
+    3383, 3442, 3501, 3560, 3619, 3723, 3724, 3725, 3776, 3777, 3778, 3829,
+    3830, 3831, 3882, 3883, 3884,
+};

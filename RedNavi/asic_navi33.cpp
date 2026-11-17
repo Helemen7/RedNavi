@@ -10,8 +10,8 @@
 static const struct rn_asic_board kNavi33Boards[] = {
     // Gigabyte RX 7600: the Linux log says 8176M of VRAM and "reserve 0x1300000 from 0x81fc000000 for PSP TMR", so the TMR is at 0x1fc000000 = 8128 MB.
     // No display replay yet: the capture lights DIG front end 0 (SYMCLKA), the Navi 32 table drives DIG4, and the DCN version is 3.2.1, not the 3.2.0 of that table.
-    {0x7480, "AMD Radeon RX 7600", 8192, nullptr, 0, {0, 0, 0, 0, 0}, 8128, 0},
-    {0, nullptr, 0, nullptr, 0, {0, 0, 0, 0, 0}, 0, 0},
+    {0x7480, "AMD Radeon RX 7600", 8192, nullptr, 0, {0, 0, 0, 0, 0, 0}, 8128, 0},
+    {0, nullptr, 0, nullptr, 0, {0, 0, 0, 0, 0, 0}, 0, 0},
 };
 
 extern const struct rn_asic kRNAsicNavi33 = {
