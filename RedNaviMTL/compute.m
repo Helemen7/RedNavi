@@ -1483,7 +1483,7 @@ static BOOL rn_passdump_on(void) {
     mkdir("/private/var/tmp/rnpass", 0755); chmod("/private/var/tmp/rnpass", 0755);
     snprintf(g_pd_dir, sizeof(g_pd_dir), "/private/var/tmp/rnpass/%d", (int)getpid());
     mkdir(g_pd_dir, 0755); chmod(g_pd_dir, 0755);
-    g_pd_left = 160; g_pd_seq = 0;
+    g_pd_left = 240; g_pd_seq = 0;
     rn_vk_snap_hook = rn_snap_write;
     return YES;
 }
@@ -2177,11 +2177,14 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
     if (!bad && !rc && rp->nt) {
         BOOL dump = rn_passdump_on();
+        const BOOL smallPass = rp->tex[0] && (size_t)rp->tex[0]->w * rp->tex[0]->h < 40000;      // icon, glyph and menu passes (64x64, 160x64, 352x64 ...) have a budget of their own: they used up the main one before a window was drawn, but a tab or hover layer can be one of them
+        static int smallLeft = 400;
+        if (dump && smallPass && smallLeft-- <= 0) dump = NO;
         // The window shadow is made once, early (the first blur passes ran before the 160 passes of a capture were over): a pass into a square target of shadow size is captured when
         // the capture is armed even after the budget is spent, up to 120 of them.
         static int shadowLeft = 200;
         if (!dump && g_pd_dir[0] && shadowLeft > 0 && rp->tex[0] && rp->tex[0]->w == rp->tex[0]->h && (rp->tex[0]->w == 93 || rp->tex[0]->w == 137 || rp->tex[0]->w == 161 || rp->tex[0]->w == 174 || rp->tex[0]->w == 249 || rp->tex[0]->w == 256)) { dump = YES; shadowLeft--; }
-        if (dump) rn_passdump(rp, tg[0].image, nd);
+        if (dump) { rn_passdump(rp, tg[0].image, nd); if (smallPass) g_pd_left++; }      // a small pass is not counted against the main budget
     }
     if (direct && !rc) {         // a pass that only fills the surface with a colour (CoreDisplay clears a surface before it draws into it) is not a finished frame; any other is, and goes to the scanout
         static int noskip = -1;      // experiment switch /Users/Shared/rednavi-noframeskip: every pass into a scanout surface is a frame
