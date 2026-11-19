@@ -3258,7 +3258,10 @@ void RedNaviProbe::sdmaTest() {
         // kernel tables at 0x0C000000, and above those (the MES area and the GART table end well before 0x0D000000) up to the aperture's end.
         bar0Mem = pci->getDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNVramBar * 4);
         const uint64_t apLen = bar0Mem ? static_cast<uint64_t>(bar0Mem->getLength()) : 0;
-        devPool.init(kVmTables + 7ull * kVmPoolPages * 4096, 0x3D0000000ull - (kVmTables + 7ull * kVmPoolPages * 4096));
+        // The pool ends 256 MB below the PSP TMR (the 7800 XT: TMR at 15.5 GB, pool end 0x3D0000000); a board without a known TMR offset keeps 768 MB free at the top.
+        const uint64_t devTop = (board && board->psp_tmr_mb ? static_cast<uint64_t>(board->psp_tmr_mb) << 20 : (static_cast<uint64_t>(vramMbytes) << 20) - 0x20000000ull) - 0x10000000ull;
+        const uint64_t devBase = kVmTables + 7ull * kVmPoolPages * 4096;
+        if (devTop > devBase) devPool.init(devBase, devTop - devBase);
         if (apLen >= 0x10000000ull) {
             visPool.init(kRNCursorVramOff + kRNCursorVramSize, 0x0C000000ull - (kRNCursorVramOff + kRNCursorVramSize));
             visPool.add(0x0D000000ull, 0x10000000ull - 0x0D000000ull);
@@ -3903,7 +3906,7 @@ bool RedNaviProbe::start(IOService *provider) {
         return true;
     }
     uint32_t ladder = 0;
-    if (!board->write_ok && asic == &kRNAsicNavi33 && PE_parse_boot_argn("rednavi_ladder33", &ladder, sizeof(ladder)) && (ladder >= 1 && ladder <= 3)) {
+    if (!board->write_ok && asic == &kRNAsicNavi33 && PE_parse_boot_argn("rednavi_ladder33", &ladder, sizeof(ladder)) && (ladder >= 1 && ladder <= 4)) {
         runLadder33(ladder);     // rung 1 of the RX 7600 bring-up: PSP and SMU only; rung 2 adds the GC firmware and the RLC autoload. No display block is read or written
         registerService();
         return true;
@@ -3966,8 +3969,8 @@ bool RedNaviProbe::start(IOService *provider) {
 // rednavi-trace first, so after a hang and a power cycle `nvram rednavi-trace` names the last step reached. Nothing here has run on a Navi 33: it is the Navi 32 sequence with the row's
 // TMR offset and the 13.0.7 firmware (docs/NAVI33_LADDER.md).
 void RedNaviProbe::runLadder33(uint32_t rung) {
-    IOLog("RedNavi: Navi 33 ladder, rung %u: %s\n", rung, rung == 3 ? "PSP, SMU, GC firmware, GFXHUB and an SDMA0 write test" : rung == 2 ? "PSP, SMU, GC firmware and RLC autoload" : "PSP and SMU only");
-    setProperty("ladder33", rung == 3 ? "rung3-start" : rung == 2 ? "rung2-start" : "rung1-start");
+    IOLog("RedNavi: Navi 33 ladder, rung %u: %s\n", rung, rung == 4 ? "PSP, SMU, GC firmware, GFXHUB, SDMA0, the graphics and compute ring tests and the MES" : rung == 3 ? "PSP, SMU, GC firmware, GFXHUB and an SDMA0 write test" : rung == 2 ? "PSP, SMU, GC firmware and RLC autoload" : "PSP and SMU only");
+    setProperty("ladder33", rung == 4 ? "rung4-start" : rung == 3 ? "rung3-start" : rung == 2 ? "rung2-start" : "rung1-start");
     trace("ladder33: vbios");
     dumpVbios();
     trace("ladder33: mailbox-regs");
@@ -4001,13 +4004,22 @@ void RedNaviProbe::runLadder33(uint32_t rung) {
             OSDictionary *gs = OSDictionary::withCapacity(16);
             if (gs) { gcStatus(gs, "", 3000); setProperty("gc-status-late", gs); gs->release(); }
             setProperty("ladder33", "rung2-done");
-            if (rung == 3) {
+            if (rung >= 3) {
+                // Rung 4 (rednavi_ladder33=4) is rung 3 with the later stages that sdmaTest() chains on their own boot-args: rednavi_gc_init, rednavi_gfx_test, rednavi_compute_test,
+                // rednavi_gc_awake, rednavi_mes_clean and rednavi_mes_step=5 (the 7800 XT order). "ladder33-args" publishes what the kernel parsed of them, so a typo in a name shows up as unset.
+                {
+                    static const char *const an[] = {"sdma_test", "gc_init", "gfx_test", "compute_test", "gc_awake", "mes_clean", "mes_step", "mmhub", "mes_host"};
+                    static const char *const bn[] = {"rednavi_sdma_test", "rednavi_gc_init", "rednavi_gfx_test", "rednavi_compute_test", "rednavi_gc_awake", "rednavi_mes_clean", "rednavi_mes_step", "rednavi_mmhub", "rednavi_mes_host"};
+                    uint32_t av[9];
+                    for (int i = 0; i < 9; i++) { uint32_t x = 0; av[i] = PE_parse_boot_argn(bn[i], &x, sizeof(x)) ? x : 0xffffffffu; }   // 0xffffffff: not set
+                    rnPublish(this, "ladder33-args", an, av, 9);
+                }
                 // Rung 3 (rednavi_ladder33=3 and rednavi_sdma_test=1): sdmaTest() as on the 7800 XT, without the MMHUB stage (rednavi_mmhub must stay unset: its register table is that of MMHUB 3.0.0,
                 // the Navi 33 one is MMHUB 3.0.2, kRNMmhubRegs302): the GC memory hub (GFXHUB) is switched on with the 11.0.0 offsets, SDMA0 gets a ring in VRAM and writes a magic value that the CPU reads.
-                // Not run on a Navi 33. The VRAM pools sdmaTest sets up for the user client reach 15.25 GB, which an 8 GB board does not have: nothing allocates from them in this rung.
+                // The device-local VRAM pool now ends 256 MB below the PSP TMR of the board (7.69 GB on the RX 7600).
                 trace("ladder33: sdma test");
                 sdmaTest();
-                setProperty("ladder33", getProperty("sdma-skip") ? "rung3-skipped: see sdma-skip" : "rung3-done");
+                setProperty("ladder33", getProperty("sdma-skip") ? "rung3-skipped: see sdma-skip" : rung == 4 ? "rung4-done" : "rung3-done");
             }
         } else {
             trace("ladder33: smu messages");

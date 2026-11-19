@@ -90,3 +90,15 @@ Unverified: the GC offsets of 11.0.2 against the real card (the Linux dump above
 `rednavi_ladder33=3 rednavi_sdma_test=1` on top of the rung 2 boot-args. After the rung 2 steps it runs `sdmaTest()` as on the 7800 XT: DisallowGfxOff, a probe of CPU access to VRAM, `rn_gfxhub_enable` (GC memory hub on VRAM and a GART window, with the gc_11_0_0 offsets), then SDMA0 gets a ring in VRAM at 0x0C000000 (192 MB) and writes 0xDEADBEEF to 0x0C002000, which the CPU reads. Results are the properties `sdma-test`, `gcvm-readback`, `vram-persist`, `sdma-scan` and `sdma-smu`. **Leave `rednavi_mmhub` unset:** its register table is MMHUB 3.0.0, the Navi 33 one is 3.0.2 (offsets 0x80 lower, `kRNMmhubRegs302`). The VRAM pools that `sdmaTest` sets up for the user client reach 15.25 GB, more than the 8 GB board has; nothing allocates from them in this rung, and they must be sized from the board before rung 4 (compute).
 
 Linux reference for the GFXHUB registers of this card: `docs/logs/navi33/rx7600-gigabyte/gc_sdma_regs_linux.txt` (for example `GCVM_L2_CNTL` 0x80e01, `GCMC_VM_FB_LOCATION_BASE` 0x8000, `GCVM_CONTEXT0_CNTL` 0x1fffe01). Risk: the GFXHUB writes are the first writes of the kext to the memory hub of a Navi 33; the tester's display is on the iGPU, so the card is not driving it.
+
+## Rung 4: graphics ring, compute ring and the MES (built 2026-11-19, not run)
+
+`rednavi_ladder33=4` is rung 3 with the later stages that `sdmaTest()` chains on their own boot-args, in the order of the 7800 XT. Nothing here has run on a Navi 33; the GC offsets are those of gc_11_0_0 (`rn_gc_select`), and the NBIO and doorbell registers used by the compute stage are the tables of the 7800 XT (NBIO 4.3.0): that is the main unknown. The device-local VRAM pool now ends 256 MB below the board's PSP TMR (7.69 GB on the RX 7600), so nothing is handed out past the end of the 8 GB. `ladder33-args` publishes what the kernel parsed of the stage boot-args (`0xffffffff` means not set), so a mistyped name is visible (rung 3 was first run with `rednavi_sdmal_test`).
+
+Run it in steps, one boot each, adding to the rung 3 boot-args (keep `rednavi_mmhub` unset):
+
+- 4a: `rednavi_ladder33=4 rednavi_gc_init=1 rednavi_gfx_test=1`. Properties: `gfx-test` (`ok` 1, `scratch`), `gfx-trace`.
+- 4b: 4a plus `rednavi_compute_test=1 rednavi_gc_awake=1`. Property `compute-test` (`ok` 1).
+- 4c: 4b plus `rednavi_mes_clean=1 rednavi_mes_step=5`. Properties `mes-progress`, `mes-state` and the MES result properties (the compute queue is mapped by the MES, `ok` set when the queue is active).
+
+After a hang: `nvram rednavi-trace` and the last lines of the verbose log. Not verified: every register of these stages on Navi 33.
