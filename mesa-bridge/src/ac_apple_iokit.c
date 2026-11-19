@@ -415,8 +415,11 @@ static void dev_release(struct ac_drm_device *dev)
 
 const char *ac_drm_get_marketing_name(ac_drm_device *device)
 {
-   (void)device;
-   return "AMD Radeon RX 7800 XT";
+   switch (device->dev_info.device_id) {
+   case 0x7480: return "AMD Radeon RX 7600";
+   case 0x747e: return "AMD Radeon RX 7800 XT";
+   default: return "AMD Radeon Graphics";
+   }
 }
 
 int ac_apple_pci_bus_info(ac_drm_device *dev, uint16_t *domain, uint8_t *bus, uint8_t *device, uint8_t *function)

@@ -116,7 +116,8 @@ int main(void)
    CHECK(r == 0 && ip.hw_ip_version_major == 11 && ip.available_rings == 1, "hw ip info %d", r);
    uint32_t ver, feat;
    r = ac_drm_query_firmware_version(dev, AMDGPU_INFO_FW_GFX_ME, 0, 0, &ver, &feat);
-   CHECK(r == 0 && ver == 0x9a6 && feat == 29, "ME firmware %d 0x%x %u", r, ver, feat);
+   // 0x9a6 is the 7800 XT's ME version; another board loads the firmware of its own die, so only the feature level is checked there.
+   CHECK(r == 0 && (ver == 0x9a6 || gi.asic_id != 0x747e) && feat == 29, "ME firmware %d 0x%x %u", r, ver, feat);
    uint32_t hi = 0;
    r = ac_drm_query_sw_info(dev, amdgpu_sw_info_address32_hi, &hi);
    CHECK(r == 0 && hi == 0xffff8000u, "address32_hi %d 0x%x", r, hi);
