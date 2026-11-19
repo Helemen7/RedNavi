@@ -525,7 +525,8 @@ gfxdone:;
             IOServiceClose(c2);
         }
     }
-    if (ok && argc > 1 && !strcmp(argv[1], "info")) {          // the INFO queries, in the structures DRM_AMDGPU_INFO uses
+    if (ok && argc > 1 && !strcmp(argv[1], "info")) {
+        uint32_t devId = 0;          // the INFO queries, in the structures DRM_AMDGPU_INFO uses
         struct drm_amdgpu_info req;
         uint8_t buf[256];
         size_t bufSize;
@@ -568,7 +569,11 @@ gfxdone:;
             printf("DEV_INFO: 0x%x, device 0x%x, family %u, %u SE x %u SA, %u CU, rb mask 0x%x, clock %llu kHz, va 0x%llx-0x%llx, high va 0x%llx-0x%llx, mall %llu MB\n", kr, d->device_id,
                    d->family, d->num_shader_engines, d->num_shader_arrays_per_engine, d->cu_active_number, d->enabled_rb_pipes_mask, d->max_engine_clock, d->virtual_address_offset,
                    d->virtual_address_max, d->high_va_offset, d->high_va_max, d->mall_size >> 20);
-            if (kr || d->device_id != 0x747e || d->family != 145 || d->num_shader_engines != 3 || d->cu_active_number != 60 || d->virtual_address_offset != 0x10000) ok = 0;
+            devId = d->device_id;
+            // The numbers are those of the Linux capture of each board (RX 7800 XT 0x747e, RX 7600 0x7480): a card outside these two is only printed.
+            if (kr || d->family != 145 || d->virtual_address_offset != 0x10000) ok = 0;
+            if (devId == 0x747e && (d->num_shader_engines != 3 || d->cu_active_number != 60)) ok = 0;
+            if (devId == 0x7480 && (d->num_shader_engines != 2 || d->cu_active_number != 32)) ok = 0;
         }
         {   // firmware versions, as the kernel reports the ones it loaded (the kext loads the same set)
             static const struct { uint32_t type, ver, feat; const char *name; } fw[] = {{AMDGPU_INFO_FW_GFX_ME, 0x9a6, 29, "ME"}, {AMDGPU_INFO_FW_GFX_PFP, 0xa50, 29, "PFP"},
@@ -577,7 +582,7 @@ gfxdone:;
                 memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_FW_VERSION; req.return_size = 8; req.query_fw.fw_type = fw[i].type; bufSize = 8;
                 kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
                 printf("FW_VERSION %s: 0x%x, version 0x%x feature %u (expect 0x%x and %u)\n", fw[i].name, kr, ((uint32_t *)buf)[0], ((uint32_t *)buf)[1], fw[i].ver, fw[i].feat);
-                if (kr || ((uint32_t *)buf)[0] != fw[i].ver || ((uint32_t *)buf)[1] != fw[i].feat) ok = 0;
+                if (kr || (devId == 0x747e && (((uint32_t *)buf)[0] != fw[i].ver || ((uint32_t *)buf)[1] != fw[i].feat))) ok = 0;   // the expected versions are the 7800 XT's
             }
             memset(&req, 0, sizeof(req)); req.query = AMDGPU_INFO_FW_VERSION; req.return_size = 8; req.query_fw.fw_type = 0x7f; bufSize = 8;
             kr = IOConnectCallStructMethod(c, RN_UC_INFO_QUERY, &req, sizeof(req), buf, &bufSize);
