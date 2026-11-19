@@ -3140,11 +3140,11 @@ void RedNaviProbe::watchStep() {
 
 void RedNaviProbe::sdmaTest() {
     uint32_t arg = 0;
-    if (!PE_parse_boot_argn("rednavi_sdma_test", &arg, sizeof(arg)) || arg != 1) return;
+    if (!PE_parse_boot_argn("rednavi_sdma_test", &arg, sizeof(arg)) || arg != 1) { setProperty("sdma-skip", "rednavi_sdma_test is not 1"); return; }
     uint32_t gc1 = 0;
-    if (!ipBase(kRNHwIdGc, &gc1, 1)) return;
+    if (!ipBase(kRNHwIdGc, &gc1, 1)) { setProperty("sdma-skip", "no GC base in the discovery table"); return; }
     uint32_t boot = rd((gc1 + 0x4e82) * 4);
-    if (!(boot & 0x80000000u)) { IOLog("RedNavi: SDMA test: the RLC has not booted (BOOTLOAD_STATUS 0x%08x), skipping\n", boot); return; }
+    if (!(boot & 0x80000000u)) { IOLog("RedNavi: SDMA test: the RLC has not booted (BOOTLOAD_STATUS 0x%08x), skipping\n", boot); setProperty("sdma-skip", "the RLC has not booted (BOOTLOAD_STATUS bit 31 clear)"); return; }
     // With the SMU features on, GFXOFF powers the graphics block down when it is idle and its registers read back as zero (the SDMA
     // status did). Linux brackets register access with amdgpu_gfx_off_ctrl; here GFXOFF is simply disallowed for the test.
     struct rn_device *adev = &gpu;                                         // the RREG32 macros expect this name
@@ -4007,7 +4007,7 @@ void RedNaviProbe::runLadder33(uint32_t rung) {
                 // Not run on a Navi 33. The VRAM pools sdmaTest sets up for the user client reach 15.25 GB, which an 8 GB board does not have: nothing allocates from them in this rung.
                 trace("ladder33: sdma test");
                 sdmaTest();
-                setProperty("ladder33", "rung3-done");
+                setProperty("ladder33", getProperty("sdma-skip") ? "rung3-skipped: see sdma-skip" : "rung3-done");
             }
         } else {
             trace("ladder33: smu messages");

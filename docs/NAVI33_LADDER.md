@@ -81,7 +81,11 @@ What a good result looks like (the 7800 XT and the Linux dump of the RX 7600, `d
 
 Unverified: the GC offsets of 11.0.2 against the real card (the Linux dump above reads sensible values at the addresses of `gc_regs_navi33.h`, which supports them), that the 13.0.7 PSP takes the same GC `LOAD_IP_FW` types as 13.0.10, and that `EnableAllSmuFeatures` and the other SMU messages of `smuProbe` behave on 13.0.7.
 
-## Rung 3: GFXHUB and an SDMA0 write test (built 2026-11-18, not run)
+## Rung 3: GFXHUB and an SDMA0 write test (ran on the RX 7600 2026-11-19: passes)
+
+**Result on the tester's RX 7600:** `sdma-test` `ok` 1, `step` 5, `rptr` = `wptr` = 0x14, `fault_status` 0, `freeze` 0, and the CPU reads `value` 0xdeadbeef where it had left 0xcafedead (`sdma-scan` `target_after` 0xdeadbeef): SDMA0 wrote to VRAM through the GFXHUB with the gc_11_0_0 offsets. `sdma-smu` shows SMU version 0x526100. The first attempt did not run the test: the tester had typed `rednavi_sdmal_test=1`, and `sdmaTest()` returned without a trace while `ladder33` still said `rung3-done`. Since then the early returns publish `sdma-skip` (the reason) and `ladder33` reads `rung3-skipped: see sdma-skip`. The memory-hub readbacks match the Linux dump (`gcvm-readback`: `ctx0_cntl` 0x1fffe01, `l2_cntl` 0x80e01, `fb_base` 0x8000) and the CPU writes to VRAM persist (`vram-persist`).
+
+(Built 2026-11-18, before the run:)
 
 `rednavi_ladder33=3 rednavi_sdma_test=1` on top of the rung 2 boot-args. After the rung 2 steps it runs `sdmaTest()` as on the 7800 XT: DisallowGfxOff, a probe of CPU access to VRAM, `rn_gfxhub_enable` (GC memory hub on VRAM and a GART window, with the gc_11_0_0 offsets), then SDMA0 gets a ring in VRAM at 0x0C000000 (192 MB) and writes 0xDEADBEEF to 0x0C002000, which the CPU reads. Results are the properties `sdma-test`, `gcvm-readback`, `vram-persist`, `sdma-scan` and `sdma-smu`. **Leave `rednavi_mmhub` unset:** its register table is MMHUB 3.0.0, the Navi 33 one is 3.0.2 (offsets 0x80 lower, `kRNMmhubRegs302`). The VRAM pools that `sdmaTest` sets up for the user client reach 15.25 GB, more than the 8 GB board has; nothing allocates from them in this rung, and they must be sized from the board before rung 4 (compute).
 
