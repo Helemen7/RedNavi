@@ -1473,7 +1473,24 @@ static void rn_tex_pair_png(unsigned seq, unsigned draw, uint32_t w, uint32_t h,
     CFRelease(url); if (im) CGImageRelease(im); CGDataProviderRelease(dp); CGColorSpaceRelease(cs);
     free(px);
 }
+static int g_pd_small = 400;        // passes of small targets that may still be dumped (they do not count against g_pd_left)
 static BOOL rn_passdump_on(void) {
+    // /Users/Shared/rednavi-passdump-live: while the file exists the budgets are refilled whenever they run out, so a long gesture (dragging a window, 60 frames a second) is captured whole.
+    // The captures are large (a few MB a frame): create the file, do the gesture for a few seconds, remove it.
+    static struct timespec lastLive; struct timespec nowt; clock_gettime(CLOCK_MONOTONIC, &nowt);
+    if (g_pd_left <= 0 && (nowt.tv_sec - lastLive.tv_sec) * 1000 + (nowt.tv_nsec - lastLive.tv_nsec) / 1000000 >= 20) {
+        lastLive = nowt;
+        struct stat lst;
+        if (stat("/Users/Shared/rednavi-passdump-live", &lst) == 0) {
+            if (!g_pd_dir[0]) {
+                mkdir("/private/var/tmp/rnpass", 0755); chmod("/private/var/tmp/rnpass", 0755);
+                snprintf(g_pd_dir, sizeof(g_pd_dir), "/private/var/tmp/rnpass/%d", (int)getpid());
+                mkdir(g_pd_dir, 0755); chmod(g_pd_dir, 0755);
+                g_pd_seq = 0; rn_vk_snap_hook = rn_snap_write;
+            }
+            g_pd_left = 240; g_pd_small = 400;
+        }
+    }
     if (g_pd_left > 0) return YES;
     // A touch of the file arms one capture: the file's modification time is compared with the one this process last acted on (WindowServer runs as _windowserver and cannot remove
     // a file of the user in /Users/Shared). Each process writes into its own directory, /private/var/tmp/rnpass/<pid>.
@@ -1483,7 +1500,7 @@ static BOOL rn_passdump_on(void) {
     mkdir("/private/var/tmp/rnpass", 0755); chmod("/private/var/tmp/rnpass", 0755);
     snprintf(g_pd_dir, sizeof(g_pd_dir), "/private/var/tmp/rnpass/%d", (int)getpid());
     mkdir(g_pd_dir, 0755); chmod(g_pd_dir, 0755);
-    g_pd_left = 240; g_pd_seq = 0;
+    g_pd_left = 240; g_pd_small = 400; g_pd_seq = 0;
     rn_vk_snap_hook = rn_snap_write;
     return YES;
 }
@@ -1704,7 +1721,7 @@ static void rn_srcdump(IOSurfaceRef surf, const uint8_t *src, size_t pitch, size
     if (!px) return;
     for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *s = src + y * pitch + x * 4; uint8_t *d = px + (y * w + x) * 4; d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = 255; }
     // The src_ PNG is written for at most 60 sources (and not for the big full-screen ones); the bytes are always kept for rn_cmpdump, so a window surface that is read late in a capture is still compared.
-    if (done < 60 && w * h <= 1500000) {
+    if (done < 60 && w * h <= 2200000) {
         char path[112]; snprintf(path, sizeof(path), "%s/src_%u_%02u_p%03u.png", g_pd_dir, (unsigned)IOSurfaceGetID(surf), done++, g_pd_seq);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, w * h * 4, NULL);
@@ -2178,8 +2195,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (!bad && !rc && rp->nt) {
         BOOL dump = rn_passdump_on();
         const BOOL smallPass = rp->tex[0] && (size_t)rp->tex[0]->w * rp->tex[0]->h < 40000;      // icon, glyph and menu passes (64x64, 160x64, 352x64 ...) have a budget of their own: they used up the main one before a window was drawn, but a tab or hover layer can be one of them
-        static int smallLeft = 400;
-        if (dump && smallPass && smallLeft-- <= 0) dump = NO;
+        if (dump && smallPass && g_pd_small-- <= 0) dump = NO;
         // The window shadow is made once, early (the first blur passes ran before the 160 passes of a capture were over): a pass into a square target of shadow size is captured when
         // the capture is armed even after the budget is spent, up to 120 of them.
         static int shadowLeft = 200;

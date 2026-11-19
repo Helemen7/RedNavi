@@ -24,7 +24,7 @@
 extern "C" {
 #endif
 
-#define RN_AIR_MAX_BINDINGS 32
+#define RN_AIR_MAX_BINDINGS 64
 
 typedef struct {
     uint32_t metal_index;      // [[buffer(n)]]
