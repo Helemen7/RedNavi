@@ -99,6 +99,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 - **Frame121** — Navi 33 (RX 7600) Linux IP-discovery capture, directory layout parsing, and test evidence.
 - **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
 - **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console, and the project logo; the first macOS run on an RX 7600 (Mac Pro SMBIOS), which confirmed the Navi 33 IP discovery table on macOS.
+- **porcelainhorse** — RX 7700 XT (Gigabyte, Navi 32) Linux captures: IP discovery, raw DRM info, DisplayPort registers, and linear scanout plane registers from a text console.
 
 
 ## Contributing
