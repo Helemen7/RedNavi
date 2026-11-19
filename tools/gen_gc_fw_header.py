@@ -12,8 +12,13 @@ GFX_CMD_ID_LOAD_IP_FW when the firmware load type is PSP, which is the default f
 amdgpu_gfx_cp_init_microcode / amdgpu_gfx_rlc_init_microcode / imu_v11_0_init_microcode / mes_v11_0_init_microcode /
 sdma_v6_0_init_microcode in the Linux kernel. Needs gc_11_0_3_{pfp,me,mec,rlc,imu,mes_2,mes1}.bin and sdma_6_0_3.bin.
 """
+import os
 import struct
 import sys
+
+# Firmware names of another die: GC_FW=11_0_2 SDMA_FW=6_0_2 python3 tools/gen_gc_fw_header.py ... (default: the 7800 XT, GC 11.0.3 and SDMA 6.0.3)
+GC_FW = os.environ.get("GC_FW", "11_0_3")
+SDMA_FW = os.environ.get("SDMA_FW", "6_0_3")
 
 # GFX_FW_TYPE values (psp_gfx_if.h)
 T = {"RLC_V": 7, "RLC_G": 8, "RLC_RESTORE_LIST_GPM_MEM": 20, "RLC_RESTORE_LIST_SRM_MEM": 21, "RLC_RESTORE_LIST_SRM_CNTL": 22,
@@ -31,8 +36,8 @@ def manifest(fwdir):
     def rd(name):
         return open(f"{fwdir}/{name}", "rb").read()
 
-    pfp, me, mec, rlc, imu = (rd(f"gc_11_0_3_{n}.bin") for n in ("pfp", "me", "mec", "rlc", "imu"))
-    mes, mes1, sdma = rd("gc_11_0_3_mes_2.bin"), rd("gc_11_0_3_mes1.bin"), rd("sdma_6_0_3.bin")
+    pfp, me, mec, rlc, imu = (rd(f"gc_{GC_FW}_{n}.bin") for n in ("pfp", "me", "mec", "rlc", "imu"))
+    mes, mes1, sdma = rd(f"gc_{GC_FW}_mes_2.bin"), rd(f"gc_{GC_FW}_mes1.bin"), rd(f"sdma_{SDMA_FW}.bin")
     out = []
 
     def add(name, typ, data, off, size):
@@ -112,11 +117,11 @@ def main():
         f.write("};\n")
         # program counter start of the RS64 CP firmware (gfx_firmware_header_v2_0: ucode_start_addr_lo/hi at 52/56), for gfx11.cpp
         for n in ("pfp", "me", "mec"):
-            d = open(f"{sys.argv[1]}/gc_11_0_3_{n}.bin", "rb").read()
+            d = open(f"{sys.argv[1]}/gc_{GC_FW}_{n}.bin", "rb").read()
             f.write(f"#define kRNGc{n.capitalize()}StartLo 0x{u32(d, 52):x}u\n#define kRNGc{n.capitalize()}StartHi 0x{u32(d, 56):x}u\n")
         # MES: program counter start of the two pipes (mes_firmware_header_v1_0: mes_uc_start_addr_lo/hi at 56/60), 64-bit, for gfx11.cpp
         for n, fn in (("0", "mes_2"), ("1", "mes1")):
-            d = open(f"{sys.argv[1]}/gc_11_0_3_{fn}.bin", "rb").read()
+            d = open(f"{sys.argv[1]}/gc_{GC_FW}_{fn}.bin", "rb").read()
             f.write(f"#define kRNMes{n}StartLo 0x{u32(d, 56):x}u\n#define kRNMes{n}StartHi 0x{u32(d, 60):x}u\n")
         f.write("static const unsigned char kRNGcFwBlob[] = {\n")
         blob = b"".join(d for _, _, d in items)

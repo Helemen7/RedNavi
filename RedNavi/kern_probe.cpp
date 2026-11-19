@@ -103,18 +103,30 @@
 #include "gc_regs.h"
 #include "asic.h"
 
+// The firmware headers are generated locally and belong to one die. The Makefile can point these at another directory (make RN_FW_DIR=<dir> RN_FW_ASIC="Navi 33") so a build for a
+// second die does not touch the headers of the first; start() refuses the write stages when the card's die is not the one the headers were made for.
+#ifndef RN_PSP_FW_H
+#define RN_PSP_FW_H "psp_fw.h"
+#define RN_SMU_FW_H "smu_fw.h"
+#define RN_GC_FW_H "gc_fw.h"
+#define RN_DMUB_FW_H "dmub_fw.h"
+#endif
+#ifndef RN_FW_ASIC
+#define RN_FW_ASIC "Navi 32"
+#endif
 #ifdef RN_HAVE_PSP_FW
-#include "psp_fw.h"
+#include RN_PSP_FW_H
 #endif
 #ifdef RN_HAVE_SMU_FW
-#include "smu_fw.h"
+#include RN_SMU_FW_H
 #endif
 #ifdef RN_HAVE_GC_FW
-#include "gc_fw.h"
+#include RN_GC_FW_H
 #endif
 #ifdef RN_HAVE_DMUB_FW
-#include "dmub_fw.h"
+#include RN_DMUB_FW_H
 #endif
+extern const struct rn_asic kRNAsicNavi33;
 
 // Log a step and give the console time to print it, so a hang shows the last step reached on screen.
 #define RN_STEP(...) do { IOLog(__VA_ARGS__); IOSleep(40); } while (0)
@@ -221,6 +233,15 @@ static const RNMailboxReg kRNMmhubRegs[] = {
     {"MMHUB_AGP_BASE",         kRNHwIdMmhub, 0x8f0},
     {"MMHUB_AGP_BOT",          kRNHwIdMmhub, 0x8ef},
     {"MMHUB_AGP_TOP",          kRNHwIdMmhub, 0x8ee},
+};
+// MMHUB 3.0.2 (Navi 33, ip_discovery of the RX 7600): the same registers at an offset 0x80 lower than in 3.0.0/3.0.1 (Linux mmhub_3_0_2_offset.h: regMMMC_VM_FB_LOCATION_BASE 0x086c against 0x08ec). Read from the Linux headers, not yet run on a Navi 33: the first run read 0xffffffff with the 3.0.0 offsets.
+static const RNMailboxReg kRNMmhubRegs302[] = {
+    {"MMHUB_FB_LOCATION_BASE", kRNHwIdMmhub, 0x86c},
+    {"MMHUB_FB_LOCATION_TOP",  kRNHwIdMmhub, 0x86d},
+    {"MMHUB_FB_OFFSET",        kRNHwIdMmhub, 0x857},
+    {"MMHUB_AGP_BASE",         kRNHwIdMmhub, 0x870},
+    {"MMHUB_AGP_BOT",          kRNHwIdMmhub, 0x86f},
+    {"MMHUB_AGP_TOP",          kRNHwIdMmhub, 0x86e},
 };
 
 // DMCUB registers (dcn_3_2_0_offset.h), relative to base index 2 of the DMU block. DMCUB_SCRATCH0 is
@@ -445,6 +466,7 @@ private:
     void applyMode(const rn_mode &m);
     void quiescePipe();
     void trace(const char *what);
+    void runLadder33(uint32_t rung);
     bool programLive(const rn_mode &m);
     IOReturn setModeLive(uint32_t index);
     // Hardware cursor: the HUBP0 cursor plane and the DPP0 cursor input, fed by RedNaviFB through the platform functions "rednavi-cursor-image" and "rednavi-cursor-state". The image is
@@ -3873,6 +3895,19 @@ bool RedNaviProbe::start(IOService *provider) {
         registerService();
         return true;
     }
+    if (strcmp(asic->name, RN_FW_ASIC) != 0) {      // the firmware headers compiled into this build are those of another die
+        IOLog("RedNavi: this build carries the firmware of %s, the card is a %s: no write stages\n", RN_FW_ASIC, asic->name);
+        setProperty("fw-die-mismatch", asic->name);
+        dumpVbios();
+        registerService();
+        return true;
+    }
+    uint32_t ladder = 0;
+    if (!board->write_ok && asic == &kRNAsicNavi33 && PE_parse_boot_argn("rednavi_ladder33", &ladder, sizeof(ladder)) && (ladder >= 1 && ladder <= 3)) {
+        runLadder33(ladder);     // rung 1 of the RX 7600 bring-up: PSP and SMU only; rung 2 adds the GC firmware and the RLC autoload. No display block is read or written
+        registerService();
+        return true;
+    }
     if (!board->write_ok) {      // a board known from a Linux capture: named and published, but the constants below are those of another board
         IOLog("RedNavi: %s (%s) is in the ASIC table without write stages: read-only, IP discovery and VBIOS only\n", board->model, asic->name);
         dumpVbios();
@@ -3891,7 +3926,8 @@ bool RedNaviProbe::start(IOService *provider) {
 
     dumpVbios();
     dumpRegs(kRNMailboxRegs, sizeof(kRNMailboxRegs) / sizeof(kRNMailboxRegs[0]), "mailbox-regs");
-    dumpRegs(kRNMmhubRegs, sizeof(kRNMmhubRegs) / sizeof(kRNMmhubRegs[0]), "mmhub-regs");
+    if (asic == &kRNAsicNavi33) dumpRegs(kRNMmhubRegs302, sizeof(kRNMmhubRegs302) / sizeof(kRNMmhubRegs302[0]), "mmhub-regs");
+    else dumpRegs(kRNMmhubRegs, sizeof(kRNMmhubRegs) / sizeof(kRNMmhubRegs[0]), "mmhub-regs");
     dumpRegs(kRNDmcubRegs, sizeof(kRNDmcubRegs) / sizeof(kRNDmcubRegs[0]), "dmcub-regs");
     dumpRegs(kRNHpdRegs, sizeof(kRNHpdRegs) / sizeof(kRNHpdRegs[0]), "hpd-regs");
     smuProbe("smu-info-early", false);   // registers only, before any stage that writes to the card
@@ -3922,6 +3958,66 @@ bool RedNaviProbe::start(IOService *provider) {
     publishFramebuffer();
     registerService();
     return true;
+}
+
+// First rung of the RX 7600 (Navi 33) bring-up, opt-in with rednavi_ladder33=1 on top of the stage boot-args (rednavi_psp_load, rednavi_psp_ring, rednavi_psp_cmd, rednavi_psp_toc,
+// rednavi_psp_tmr=2, rednavi_smu_load, rednavi_smu). It is the start() sequence of the verified boards cut after the SMU: no DCN register is read or written (the display of the tester is on
+// another GPU, so the display blocks of this card are gated and reading them hangs it), and no GC, SDMA, MES or compute stage runs. Every step is written to the NVRAM variable
+// rednavi-trace first, so after a hang and a power cycle `nvram rednavi-trace` names the last step reached. Nothing here has run on a Navi 33: it is the Navi 32 sequence with the row's
+// TMR offset and the 13.0.7 firmware (docs/NAVI33_LADDER.md).
+void RedNaviProbe::runLadder33(uint32_t rung) {
+    IOLog("RedNavi: Navi 33 ladder, rung %u: %s\n", rung, rung == 3 ? "PSP, SMU, GC firmware, GFXHUB and an SDMA0 write test" : rung == 2 ? "PSP, SMU, GC firmware and RLC autoload" : "PSP and SMU only");
+    setProperty("ladder33", rung == 3 ? "rung3-start" : rung == 2 ? "rung2-start" : "rung1-start");
+    trace("ladder33: vbios");
+    dumpVbios();
+    trace("ladder33: mailbox-regs");
+    dumpRegs(kRNMailboxRegs, sizeof(kRNMailboxRegs) / sizeof(kRNMailboxRegs[0]), "mailbox-regs");
+    trace("ladder33: mmhub-regs");
+    if (asic == &kRNAsicNavi33) dumpRegs(kRNMmhubRegs302, sizeof(kRNMmhubRegs302) / sizeof(kRNMmhubRegs302[0]), "mmhub-regs");
+    else dumpRegs(kRNMmhubRegs, sizeof(kRNMmhubRegs) / sizeof(kRNMmhubRegs[0]), "mmhub-regs");
+    trace("ladder33: smu-info-early");
+    smuProbe("smu-info-early", false);
+    trace("ladder33: psp chain");
+    loadPspChain();
+    trace("ladder33: psp ring");
+    if (createPspRing()) {
+        trace("ladder33: psp boot cfg");
+        sendPspBootCfgGet();
+        trace("ladder33: psp toc");
+        sendPspLoadToc();
+        trace("ladder33: psp tmr");
+        sendPspSetupTmr();
+        trace("ladder33: smu firmware");
+        loadSmuFw();
+        if (rung >= 2) {
+            // Rung 2 (opt-in with rednavi_ladder33=2, rednavi_gc_load=1 and rednavi_smu_enable=1, a build with the gc_11_0_2 firmware headers): the GC firmware goes in through the PSP and
+            // the RLC autoload is asked for, then the SMU features are enabled (the RLC boot waits for them on the 7800 XT) and the GC is only read: CP_STAT, RLC_RLCS_BOOTLOAD_STATUS, SDMA0_VERSION.
+            // No SDMA, MES, ring or memory hub register is written. Not run on a Navi 33 yet.
+            trace("ladder33: gc firmware");
+            loadGcFw();
+            trace("ladder33: smu messages");
+            smuProbe("smu-info", true);
+            trace("ladder33: gc status");
+            OSDictionary *gs = OSDictionary::withCapacity(16);
+            if (gs) { gcStatus(gs, "", 3000); setProperty("gc-status-late", gs); gs->release(); }
+            setProperty("ladder33", "rung2-done");
+            if (rung == 3) {
+                // Rung 3 (rednavi_ladder33=3 and rednavi_sdma_test=1): sdmaTest() as on the 7800 XT, without the MMHUB stage (rednavi_mmhub must stay unset: its register table is that of MMHUB 3.0.0,
+                // the Navi 33 one is MMHUB 3.0.2, kRNMmhubRegs302): the GC memory hub (GFXHUB) is switched on with the 11.0.0 offsets, SDMA0 gets a ring in VRAM and writes a magic value that the CPU reads.
+                // Not run on a Navi 33. The VRAM pools sdmaTest sets up for the user client reach 15.25 GB, which an 8 GB board does not have: nothing allocates from them in this rung.
+                trace("ladder33: sdma test");
+                sdmaTest();
+                setProperty("ladder33", "rung3-done");
+            }
+        } else {
+            trace("ladder33: smu messages");
+            smuProbe("smu-info", true);
+            setProperty("ladder33", "rung1-done");
+        }
+    } else {
+        setProperty("ladder33", "rung1-stopped: no PSP ring");
+    }
+    trace("ladder33: done");
 }
 
 void RedNaviProbe::stop(IOService *provider) {

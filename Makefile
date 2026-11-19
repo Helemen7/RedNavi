@@ -12,7 +12,9 @@ OPT := -Os
 endif
 
 SDK := MacKernelSDK
-OUT := build/$(CONFIG)
+# RN_OUT_SUFFIX keeps a build for another die (see RN_FW_DIR below) out of build/<Config>: make RN_OUT_SUFFIX=-navi33 ...
+RN_OUT_SUFFIX ?=
+OUT := build/$(CONFIG)$(RN_OUT_SUFFIX)
 # Every kext is signed at build time (ad hoc by default, no Team ID: an ad hoc signature is all the test machines need with SIP and AMFI relaxed), so nothing has to be signed
 # again where it is installed. RN_SIGN_ID=<identity> signs with a certificate instead (an Apple Development one gives a Team ID, but changes nothing for loading here).
 RN_SIGN_ID ?= -
@@ -28,16 +30,24 @@ CXXFLAGS := $(ARCH) $(OPT) -std=c++17 -fno-rtti -fno-exceptions -fno-builtin -fn
 	-nostdinc -isystem $(SDK)/Headers -DKERNEL -DKERNEL_PRIVATE -DDRIVER_PRIVATE \
 	-DAPPLE -DNeXT -mmacosx-version-min=12.0 -Wall -Icompat/include
 # Optional local firmware component (python3 tools/gen_psp_fw_header.py ... RedNavi/psp_fw.h).
-ifneq ($(wildcard RedNavi/psp_fw.h RedNavi/dmub_fw.h),)
+# A build for another die takes its generated headers from another directory and goes to its own output directory, so the headers of the first die are never touched:
+#   make RN_FW_DIR=/path/to/fw33 RN_FW_ASIC="Navi 33" RN_OUT_SUFFIX=-navi33        (docs/NAVI33_LADDER.md)
+RN_FW_DIR ?= RedNavi
+RN_FW_ASIC ?= Navi 32
+ifneq ($(RN_FW_DIR),RedNavi)
+CXXFLAGS += -DRN_PSP_FW_H='"$(abspath $(RN_FW_DIR))/psp_fw.h"' -DRN_SMU_FW_H='"$(abspath $(RN_FW_DIR))/smu_fw.h"' -DRN_GC_FW_H='"$(abspath $(RN_FW_DIR))/gc_fw.h"' -DRN_DMUB_FW_H='"$(abspath $(RN_FW_DIR))/dmub_fw.h"'
+endif
+CXXFLAGS += -DRN_FW_ASIC='"$(RN_FW_ASIC)"'
+ifneq ($(wildcard $(RN_FW_DIR)/psp_fw.h),)
 CXXFLAGS += -DRN_HAVE_PSP_FW
 endif
-ifneq ($(wildcard RedNavi/smu_fw.h),)
+ifneq ($(wildcard $(RN_FW_DIR)/smu_fw.h),)
 CXXFLAGS += -DRN_HAVE_SMU_FW
 endif
-ifneq ($(wildcard RedNavi/gc_fw.h),)
+ifneq ($(wildcard $(RN_FW_DIR)/gc_fw.h),)
 CXXFLAGS += -DRN_HAVE_GC_FW
 endif
-ifneq ($(wildcard RedNavi/dmub_fw.h),)
+ifneq ($(wildcard $(RN_FW_DIR)/dmub_fw.h),)
 CXXFLAGS += -DRN_HAVE_DMUB_FW
 endif
 LDFLAGS := $(ARCH) -Xlinker -kext -nostdlib -lkmod -L$(SDK)/Library -lkmodc++ -lcc_kext \
