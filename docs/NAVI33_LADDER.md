@@ -91,7 +91,7 @@ Unverified: the GC offsets of 11.0.2 against the real card (the Linux dump above
 
 Linux reference for the GFXHUB registers of this card: `docs/logs/navi33/rx7600-gigabyte/gc_sdma_regs_linux.txt` (for example `GCVM_L2_CNTL` 0x80e01, `GCMC_VM_FB_LOCATION_BASE` 0x8000, `GCVM_CONTEXT0_CNTL` 0x1fffe01). Risk: the GFXHUB writes are the first writes of the kext to the memory hub of a Navi 33; the tester's display is on the iGPU, so the card is not driving it.
 
-## Rung 4: graphics ring, compute ring and the MES (built 2026-11-19, not run)
+## Rung 4: graphics ring, compute ring and the MES (4a and 4b ran on the RX 7600 2026-11-19: pass)
 
 `rednavi_ladder33=4` is rung 3 with the later stages that `sdmaTest()` chains on their own boot-args, in the order of the 7800 XT. Nothing here has run on a Navi 33; the GC offsets are those of gc_11_0_0 (`rn_gc_select`), and the NBIO and doorbell registers used by the compute stage are the tables of the 7800 XT (NBIO 4.3.0): that is the main unknown. The device-local VRAM pool now ends 256 MB below the board's PSP TMR (7.69 GB on the RX 7600), so nothing is handed out past the end of the 8 GB. `ladder33-args` publishes what the kernel parsed of the stage boot-args (`0xffffffff` means not set), so a mistyped name is visible (rung 3 was first run with `rednavi_sdmal_test`).
 
@@ -102,3 +102,5 @@ Run it in steps, one boot each, adding to the rung 3 boot-args (keep `rednavi_mm
 - 4c: 4b plus `rednavi_mes_clean=1 rednavi_mes_step=5`. Properties `mes-progress`, `mes-state` and the MES result properties (the compute queue is mapped by the MES, `ok` set when the queue is active).
 
 After a hang: `nvram rednavi-trace` and the last lines of the verbose log. Not verified: every register of these stages on Navi 33.
+
+**4a and 4b on the RX 7600:** `gfx-test` `ok` 1 (`scratch` 0xdeadbeef, `rptr_shadow` = `wptr` = 8, no fault) and `compute-test` `ok` 1 (`scratch` 0xdeadbeef, queue active, `rptr` = `wptr` = 8, no fault). The first 4c run did nothing: `rn_mes_start` returns at once without a doorbell map, so 4c also needs `rednavi_doorbell_test=1 rednavi_doorbell_s2a=1` (as on the 7800 XT; this writes the NBIO doorbell aperture and S2A entries, an unverified block on NBIF 4.3.1). The kext now publishes `mes-skip` when the map is missing.

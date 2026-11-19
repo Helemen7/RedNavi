@@ -3539,6 +3539,7 @@ void RedNaviProbe::sdmaTest() {
                     }
                 }
                 gMesBaseUsed = mesBase;
+                if (!doorbellMap) setProperty("mes-skip", "no doorbell map: rn_mes_start does nothing without it, add rednavi_doorbell_test=1 rednavi_doorbell_s2a=1");
                 rn_mes_start(&gpu, kRNVramMcBase, mesBase, &gmc, start, mesStep,
                                  [](void *ctx, uint32_t step) {
                                      RedNaviProbe *self = static_cast<RedNaviProbe *>(ctx);
