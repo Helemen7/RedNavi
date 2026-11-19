@@ -1712,17 +1712,19 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
 // The bytes of an IOSurface as the plug-in reads them in syncFromSurface (BGRA8 only), as <dir>/src_<surface id>_<n>.png, at most 60 per capture and only while a capture is running (g_pd_left).
 // Pass <n> of the same surface is then compared with the last src_ file written before it: a glitch already in the source is not made by the card.
 static void rn_srcdump(IOSurfaceRef surf, const uint8_t *src, size_t pitch, size_t w, size_t h) {
-    static unsigned done; static int dirpid;
+    static unsigned done, doneBig; static int dirpid;
     if (g_pd_left <= 0 || !g_pd_dir[0]) return;
-    if (dirpid != (int)getpid()) { dirpid = (int)getpid(); done = 0; }
+    if (dirpid != (int)getpid()) { dirpid = (int)getpid(); done = 0; doneBig = 0; }
     const OSType fmt = IOSurfaceGetPixelFormat(surf);
     if (fmt != 'BGRA') return;
     uint8_t *px = malloc(w * h * 4);
     if (!px) return;
     for (size_t y = 0; y < h; y++) for (size_t x = 0; x < w; x++) { const uint8_t *s = src + y * pitch + x * 4; uint8_t *d = px + (y * w + x) * 4; d[0] = s[2]; d[1] = s[1]; d[2] = s[0]; d[3] = 255; }
     // The src_ PNG is written for at most 60 sources (and not for the big full-screen ones); the bytes are always kept for rn_cmpdump, so a window surface that is read late in a capture is still compared.
-    if (done < 60 && w * h <= 2200000) {
-        char path[112]; snprintf(path, sizeof(path), "%s/src_%u_%02u_p%03u.png", g_pd_dir, (unsigned)IOSurfaceGetID(surf), done++, g_pd_seq);
+    // Window-sized sources (over 0.6 M pixels: an app window) have a budget of their own, 24 per process, so the ring surfaces of full-screen size cannot use up the 60.
+    const BOOL big = w * h > 600000;
+    if ((big ? doneBig < 24 : done < 60) && w * h <= 9000000) {
+        char path[112]; snprintf(path, sizeof(path), "%s/src_%u_%02u_p%03u.png", g_pd_dir, (unsigned)IOSurfaceGetID(surf), big ? 100 + doneBig++ : done++, g_pd_seq);
         CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
         CGDataProviderRef dp = CGDataProviderCreateWithData(NULL, px, w * h * 4, NULL);
         CGImageRef im = CGImageCreate(w, h, 8, 32, w * 4, cs, kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault, dp, NULL, false, kCGRenderingIntentDefault);
