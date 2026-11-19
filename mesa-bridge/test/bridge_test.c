@@ -98,7 +98,9 @@ int main(void)
    CHECK(r == 0, "query_gpu_info %d", r);
    printf("gpu info: asic 0x%x family %u, %u SE x %u SA, %u CU, GB_ADDR_CONFIG 0x%x, clock %llu kHz\n", gi.asic_id, gi.family_id, gi.num_shader_engines,
           gi.num_shader_arrays_per_engine, gi.cu_active_number, gi.gb_addr_cfg, (unsigned long long)gi.max_engine_clk);
-   CHECK(gi.asic_id == 0x747e && gi.family_id == 145 && gi.cu_active_number == 60 && gi.gb_addr_cfg == 0x444, "gpu info values");
+   // The values are those of the Linux capture of each board; the RX 7600 (0x7480) has 32 CU and the capture's GB_ADDR_CONFIG is only printed above.
+   if (gi.asic_id == 0x7480) CHECK(gi.family_id == 145 && gi.cu_active_number == 32, "gpu info values");
+   else CHECK(gi.asic_id == 0x747e && gi.family_id == 145 && gi.cu_active_number == 60 && gi.gb_addr_cfg == 0x444, "gpu info values");
    struct amdgpu_heap_info heap;
    r = ac_drm_query_heap_info(dev, AMDGPU_GEM_DOMAIN_VRAM, 0, &heap);
    CHECK(r == 0 && heap.heap_size > (1ull << 30), "vram heap %d", r);
