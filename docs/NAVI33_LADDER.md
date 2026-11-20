@@ -120,3 +120,7 @@ Verified on the tester's RX 7600 (device `0x7480`), with the rung 4c kext: `vulk
 With `rednavi_gfx_queue=1` added to the rung 4c boot-args (the same as on the 7800 XT) the graphics queue is mapped: `rn_test info` reports `HW_IP_COUNT gfx: 1` and passes, and `vk_draw` (a triangle pair on the graphics queue, family flags `0xf`) reads back `PASS: 7140 pixels checked, red upper-left half, blue lower-right half`. Without that boot-arg the queue family has no graphics (flags `0xe`). Run as root, through `run_tool.sh` (a bare `./vk_draw` finds no driver).
 
 Not verified on this card: presentation (`vk_present`, `vk_swapchain`), `vk_stress`, textures (`vk_texcopy`), the Metal plug-in. The framebuffer is not used on this card (the tester's display is on another GPU).
+
+### Stress and repeatability on the RX 7600, 2026-11-20
+
+Reported by the tester, output not seen by the maintainer: `rn_test`, `rn_test vm`, `vk_dispatch`, `vk_draw` and `vk_stress` (`burst 2000`, `barrier 2000`, `multi 5`, `saturate 20`) all passed, no error and no hang, on three reboots with 2 minutes idle before each run (rung 4c + `rednavi_gfx_queue=1`). The same four stress modes pass on the 7800 XT. This is a small run next to the 7800 XT stress record (20000 submits, `saturate 600`); the first boot after a kext change on the 7800 XT once lost a whole `saturate` run, so longer runs and more boots are still worth doing.
