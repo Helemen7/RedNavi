@@ -10,6 +10,7 @@
 #           libzstd.1.dylib and what they need (the folder of an installed plug-in has them all). It also takes libvulkan_radeon.dylib if the Mesa build is not given below.
 #   OUTDIR  where the package folder is made (must not exist).
 # Environment: RADV=path/to/libvulkan_radeon.dylib  a Mesa build to use instead of the one in VKDIR (its MacPorts references are rewritten to the files in VKDIR, or to /usr/lib)
+#              HARNESS=path/to/mtl_init_harness       the Metal compute test program, put in the package with run_metal_test.sh
 #              CONFIG=Debug|Release                   which build of the kext and the plug-in to take (default Debug; run make first, `make mtl` builds the plug-in)
 # Nothing in the package is signed for distribution: it is ad hoc signed, the target runs install.sh as root.
 set -e
@@ -56,6 +57,17 @@ done
 bad=$(for f in "$V"/*.dylib; do [ -L "$f" ] && continue; otool -L "$f" | tail -n +2 | awk -v f="$(basename "$f")" '$1 ~ /^\/opt\/local|^\/Users\// {print f": "$1}'; done)
 [ -z "$bad" ] || { echo "references to the build machine remain:"; echo "$bad"; exit 1; }
 for f in "$V"/*.dylib; do [ -L "$f" ] || codesign -f -s - "$f" >/dev/null 2>&1; done
+# The Metal test program (tools/mtl_init_harness.m, built by hand: clang -fobjc-arc -framework Foundation -framework Metal -framework IOKit -framework IOSurface); given with HARNESS=.
+if [ -n "$HARNESS" ]; then
+  cp "$HARNESS" "$OUT/mtl_init_harness"; codesign -f -s - "$OUT/mtl_init_harness" >/dev/null 2>&1
+  cat > "$OUT/run_metal_test.sh" <<'EOT'
+#!/bin/sh
+# Runs a small compute test through the official Metal API, on the plug-in installed by install.sh. Needs the boot-args of README.txt and a boot that got through. Run as: sudo sh run_metal_test.sh
+cd "$(dirname "$0")"
+V=/Library/GPUBundles/RedNaviMTLDriver.bundle/Contents/Resources/vk
+RN_METAL_COMPUTE=1 RN_COMPUTE_TEST=1 RN_VK_SELFTEST=1 RN_VK_DIR=$V DYLD_LIBRARY_PATH=$V VK_ICD_FILENAMES=$V/rn_icd.json ./mtl_init_harness /Library/GPUBundles/RedNaviMTLDriver.bundle
+EOT
+fi
 xattr -cr "$OUT/RedNaviMTLDriver.bundle"
 codesign -f -s - "$OUT/RedNaviMTLDriver.bundle"
 codesign --verify --strict "$OUT/RedNaviMTLDriver.bundle"
@@ -98,6 +110,7 @@ Needs: the RedNavi kext loaded with the stages of its rung 4c plus rednavi_gfx_q
      ioreg -rc IOAccelerator -l | grep -E "RedNaviAccel2|registered"
      ioreg -rc IOPCIDevice -n GFX0 -l | grep rednavi-accel2-log
    (if the card is not GFX0 in your ioreg, the node with the vendor id 1002 and the rednavi-accel2-log property)
+4. Only if step 3 shows the accelerator registered and the machine is fine: sudo sh run_metal_test.sh   and send me the whole output (it makes a Metal device from the card and runs a compute kernel).
 To remove: sudo rm -rf /Library/Extensions/RedNaviAccel2.kext /Library/GPUBundles/RedNaviMTLDriver.bundle, remove the two boot-args, reboot.
 EOF
 echo "package in $OUT"
