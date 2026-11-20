@@ -721,6 +721,11 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
 // any pipe existed (bit 5 of rednavi_accel2_exp moves it to the end of the display bring-up).
 static bool provNumber(IOService *prov, const char *key, uint64_t *out);
 static void rnPublishCaps(IOService *a) {
+    // A card that drives no display here (no boot-arg rednavi_fb=1: the tester's display is on another GPU) must not say it has a display pipe: WindowServer opens one for every
+    // accelerator that does, and there is no framebuffer, scanout or timing behind it on such a card (the first run on a Navi 33 froze when the desktop appeared).
+    uint32_t fbArg = 0;
+    PE_parse_boot_argn("rednavi_fb", &fbArg, sizeof(fbArg));
+    if (fbArg != 1) { rnNote("no rednavi_fb=1: no display pipe capabilities published (headless card)"); return; }
     OSDictionary *caps = OSDictionary::withCapacity(2);
     if (caps) {
         caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
