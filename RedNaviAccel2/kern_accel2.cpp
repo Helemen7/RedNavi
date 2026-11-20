@@ -719,6 +719,7 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
 
 // IOAccelDisplayPipeCapabilities and AccelCaps. The reference driver publishes them only after the heads are registered and the transactions can be served; start() used to do it, before
 // any pipe existed (bit 5 of rednavi_accel2_exp moves it to the end of the display bring-up).
+static bool provNumber(IOService *prov, const char *key, uint64_t *out);
 static void rnPublishCaps(IOService *a) {
     OSDictionary *caps = OSDictionary::withCapacity(2);
     if (caps) {
@@ -733,7 +734,9 @@ static void rnPublishCaps(IOService *a) {
     // Bit 6: what the reference driver sets at this point (IOGLBundleName) and a size the Intel accelerator publishes and the display code may read (VRAM,totalMB, in MB).
     if (accelExp() & 64) {
         a->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
-        OSNumber *vm = OSNumber::withNumber(16384ULL, 32);
+        uint64_t mb = 0;
+        if (!provNumber(gProv, "rednavi-vram-mb", &mb) || !mb) mb = 16384;      // the probe publishes the real size; 16 GB only if it did not
+        OSNumber *vm = OSNumber::withNumber(mb, 32);
         if (vm) { a->setProperty("VRAM,totalMB", vm); vm->release(); }
         rnNote("published IOGLBundleName and VRAM,totalMB (rednavi_accel2_exp bit 6)");
     }

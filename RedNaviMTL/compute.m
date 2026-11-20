@@ -3121,7 +3121,7 @@ void rn_compute_install(Class k, Class sup) {
         }), ma ? method_getTypeEncoding(ma) : "v32@0:8@16@?24");
     }
     // Capabilities. The base class answers these from tables its own driver fills in, which a device made by this plug-in does not have (calling -supportsFamily: ended in a call through
-    // a null pointer inside QuartzCore's Metal context setup), so they are answered here: what a discrete Navi 32 on macOS supports as far as the plug-in and the translator go. The Apple
+    // a null pointer inside QuartzCore's Metal context setup), so they are answered here: what a discrete RDNA 3 card on macOS supports as far as the plug-in and the translator go (nothing here is read from the card; checked on the 7800 XT only). The Apple
     // GPU families, tile shaders, memoryless targets, raster order groups, SIMD-group operations and YCbCr formats are NO; native FP16 is NO so that the float variants of shaders are asked for.
     {
         SEL sfam = sel_registerName("supportsFamily:"), sfs = sel_registerName("supportsFeatureSet:");
@@ -3167,8 +3167,8 @@ void rn_compute_install(Class k, Class sup) {
         }
     }
     // Limits: the base class reads them from tables the vendor driver fills in, so a device made by this plug-in answers 0 (a 128 x 128 texture descriptor failed validation as "greater than
-    // the maximum allowed size of 0" inside QuartzCore's context setup). Values are those of a Navi 32 as far as they are known (texture sizes and binding counts of Vulkan/RADV on this
-    // card, alignments of its memory); the type of each answer is the type the base class method returns.
+    // the maximum allowed size of 0" inside QuartzCore's context setup). The values are fixed, not read from the card: what is known of a macOS AMD device and of RADV on the 7800 XT (texture sizes and binding counts, alignments of its memory);
+    // they are not checked on any other card (RADV's own limits on a Navi 33 are to be compared, docs/NAVI33_LADDER.md). The type of each answer is the type the base class method returns.
     {
         static const struct { const char *name; double value; } limits[] = {
             {"maxTextureWidth1D", 16384}, {"maxTextureWidth2D", 16384}, {"maxTextureHeight2D", 16384}, {"maxTextureWidth3D", 2048}, {"maxTextureHeight3D", 2048}, {"maxTextureDepth3D", 2048},

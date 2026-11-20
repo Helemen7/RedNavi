@@ -542,6 +542,8 @@ void RedNaviProbe::dumpDiscovery() {
         IOLog("RedNavi: memsize register unusable, assuming %u MB\n", vramMB);
     }
     vramMbytes = vramMB;
+    // The accelerator (RedNaviAccel2) publishes the card's memory size from this; it is on the PCI device because that is the one object both kexts have.
+    if (pci) pci->setProperty("rednavi-vram-mb", static_cast<uint64_t>(vramMB), 32);
 
     uint64_t base = ((uint64_t)vramMB << 20) - kRNDiscoveryTmrOffset;
     uint32_t sig = vramRead(base);
