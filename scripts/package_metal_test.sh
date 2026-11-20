@@ -65,7 +65,9 @@ if [ -n "$HARNESS" ]; then
 # Runs a small compute test through the official Metal API, on the plug-in installed by install.sh. Needs the boot-args of README.txt and a boot that got through. Run as: sudo sh run_metal_test.sh
 cd "$(dirname "$0")"
 V=/Library/GPUBundles/RedNaviMTLDriver.bundle/Contents/Resources/vk
-RN_METAL_COMPUTE=1 RN_COMPUTE_TEST=1 RN_VK_SELFTEST=1 RN_VK_DIR=$V DYLD_LIBRARY_PATH=$V VK_ICD_FILENAMES=$V/rn_icd.json ./mtl_init_harness /Library/GPUBundles/RedNaviMTLDriver.bundle
+# No DYLD_LIBRARY_PATH: the folder has a libiconv.2.dylib that would replace the system's (dyld prints "missing from root that overrides"); the libraries find each other by @loader_path.
+echo "boot-args with rednavi: $(sysctl -n kern.bootargs | tr ' ' '\n' | grep -c rednavi_) (rednavi_gfx_queue=1 is needed for the graphics queue: $(sysctl -n kern.bootargs | tr ' ' '\n' | grep -c '^rednavi_gfx_queue=1$') found)"
+RN_METAL_COMPUTE=1 RN_COMPUTE_TEST=1 RN_VK_SELFTEST=1 RN_VK_DIR=$V VK_ICD_FILENAMES=$V/rn_icd.json ./mtl_init_harness /Library/GPUBundles/RedNaviMTLDriver.bundle
 EOT
 fi
 xattr -cr "$OUT/RedNaviMTLDriver.bundle"
