@@ -776,7 +776,10 @@ bool RedNaviAccel2::start(IOService *provider) {
         // (no MaxPowerState in its IOPowerManagement: it never registers a power driver), so the notification is made here (rednavi_accel2_pipe=0 skips it).
         uint32_t pipe = 1;
         PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
-        if (pipe && gMachine) {
+        // No framebuffer, no display pipe: every call below that reads the pipe (isFramebufferActive, getDisplayPipe(0)->...) dereferences null on a card that drives no display. The first
+        // Navi 33 run panicked here, IOAccelDisplayPipe::isActive with this = 0 (2026-11-20, CR2 0x298).
+        if (!gFb) rnNote("no framebuffer: display bring-up skipped (headless card)");
+        if (pipe && gMachine && gFb) {
             RedNaviAccel2 *self = static_cast<RedNaviAccel2 *>(gSelf);
             rnNote("display machine before: framebuffers %u, active(0) %d, deferred(0) %d", gMachine->getFramebufferCount(), gMachine->isFramebufferActive(0), gMachine->isDeferred(0));
             // The display machine starts with no framebuffer (count 0) and registers a head through found_framebuffer (it makes the pipe and fills its table); isFramebufferActive stays 0 until then.
