@@ -78,7 +78,11 @@ rm -rf /Library/GPUBundles/RedNaviMTLDriver.bundle
 cp -R RedNaviMTLDriver.bundle /Library/GPUBundles/RedNaviMTLDriver.bundle
 chown -R root:wheel /Library/GPUBundles/RedNaviMTLDriver.bundle
 codesign -f -s - /Library/GPUBundles/RedNaviMTLDriver.bundle
-kmutil load -p /Library/Extensions/RedNaviAccel2.kext
+# A kext of the same name already in the auxiliary kernel collection is kept by `kmutil load` (the first Navi 33 test kept running the old build): rebuild the collection.
+kmutil install --update-all || echo "kmutil install --update-all failed: run it again by hand"
+echo "installed kext build (the UUID the boot must load, see kmutil showloaded --list-only | grep -i rednavi):"
+dwarfdump -u /Library/Extensions/RedNaviAccel2.kext/Contents/MacOS/RedNaviAccel2
+ls -la /Library/KernelCollections/
 echo "installed. Approve the kext in System Settings > Privacy & Security if it asks, set the boot-arg and reboot."
 EOF
 chmod +x "$OUT/install.sh"
