@@ -102,6 +102,7 @@ Please post decoded output in an issue, together with your board and BIOS settin
 - **Naessah** — Strix Halo (Ryzen AI Max+ 395 / Radeon 8060S) RDNA 3.5 live IP-discovery capture, UMA APU architecture, and hardware evidence.
 - **GGBBZZS** — RX 7600 (Gigabyte, Navi 33) Linux captures: IP discovery, firmware answers and the HDMI display and plane registers from a text console, and the project logo; the first macOS run on an RX 7600 (Mac Pro SMBIOS), which confirmed the Navi 33 IP discovery table on macOS.
 - **darrenintr** — The AIR to SPIR-V translator library the Metal plug-in loads, the Navi 33 (RX 7600) desktop work in [RedNavi_navi33](https://github.com/darrenintr/RedNavi_navi33), and the find that ended the glitches of the GPU-composed desktop: blended draws in one pass need an explicit colour barrier on this stack, found with an offscreen CoreAnimation test checked pixel by pixel against Core Graphics.
+- **porcelainhorse** — RX 7700 XT (Gigabyte, Navi 32) Linux captures: IP discovery, raw DRM info, DisplayPort registers, and linear scanout plane registers from a text console.
 
 
 ## Contributing
