@@ -22,6 +22,23 @@ index 356df4d..fff4be6 100644
    },
  }
  
+diff --git a/src/amd/common/ac_gpu_info.c b/src/amd/common/ac_gpu_info.c
+index 9741b41..8e830c8 100644
+--- a/src/amd/common/ac_gpu_info.c
++++ b/src/amd/common/ac_gpu_info.c
+@@ -1663,8 +1663,12 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
+    /* BIG_PAGE is supported since gfx10.3 and requires VRAM. VRAM is only guaranteed
+     * with AMDGPU_GEM_CREATE_DISCARDABLE.
+     */
++#ifdef __APPLE__
++   info->discardable_allows_big_page = false;
++#else
+    info->discardable_allows_big_page = info->gfx_level >= GFX10_3 && info->gfx_level < GFX12 &&
+                                        info->has_dedicated_vram;
++#endif
+ 
+    /* Compute the scratch WAVESIZE granularity in bytes. */
+    info->scratch_wavesize_granularity_shift = info->gfx_level >= GFX11 ? 8 : 10;
 diff --git a/src/amd/common/apple/ac_apple_iokit.c b/src/amd/common/apple/ac_apple_iokit.c
 new file mode 100644
 index 0000000..a9f6d4d

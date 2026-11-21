@@ -81,6 +81,16 @@ Written while the test machine had no working display; none of this has run on t
 - A blit between display surfaces ended the open batch with a submit and a wait of its own; it is now recorded in the batch.
 - A host write into a scanout surface (`replaceRegion`, a blit from a buffer, a blit between different pixel formats) reaches only the texture's own image. Not handled: the plug-in logs `direct scanout: ... writes the host image of scanout IOSurface` when it happens, so the next run says whether a client does it.
 
+## Trails while a window minimizes: the attribute ring's BIG_PAGE (2026-11-21)
+
+During the Genie minimize animation a few small rectangles of old pixels flashed along the path of the window. On the RX 7800 XT the two compositor buffers differed exactly there and the rectangles lay outside CoreAnimation's damage, so they were wrong pixels drawn by the card, not missed updates; barriers, synchronous commits, depth/stencil and texture barriers were ruled out, and screenshots never show them because a capture composes the screen again.
+
+darrenintr found the cause on an RX 7600 (Navi 33, GC 11.0.2). Mesa's `ac_query_gpu_info` sets `discardable_allows_big_page` on GFX10.3 to GFX11 with dedicated VRAM, and `ac_emit_cp_gfx11_ge_rings` then sets `BIG_PAGE` in `SPI_ATTRIBUTE_RING_SIZE` (0x3111C). Our GPU page tables map 4 KB pages (fragment 0, L2 fragment processing off), so the attribute ring is not in big pages, and reads of the ring across shader engines go wrong whenever one draw spans more than one NGG workgroup (more than 256 line vertices or 252 triangle vertices): a Genie mesh or a `CAShapeLayer` ring. The RADV patch (`mesa-bridge/patches/0001-radv-darwin-iokit.patch`) now sets `discardable_allows_big_page = false` on macOS. On the RX 7600 he measured 0 bad results in multi-workgroup line (19 runs) and triangle (30 runs) draws, 60 animated `CAShapeLayer` runs and a 1200-frame dynamic UI test, and a clean live minimize.
+
+His commit also changes the eviction order of an image cache in `rn_vk.c` (keep GPU-authoritative scanout images longer); this tree has no such cache, so that part does not apply here.
+
+On the RX 7800 XT (GC 11.0.3, the same ring code), **verified 2026-11-21**: with RADV rebuilt with the change, the trails of the minimize animation are gone from the live desktop. The rebuilt library must be relinked before it goes into the plug-in's bundle (libz to `/usr/lib`, the others to `@loader_path`, as `scripts/package_metal_test.sh` does); straight from the Mesa build it links MacPorts' libraries, WindowServer gets no Metal device and CoreDisplay aborts at every start. `scripts/rn_install_plugin.sh` now refuses such a library.
+
 ## Tools added
 
 `tools/ws_*.sh`, `tools/k_*.sh`: dtrace scripts, run as root on the desktop, each a single question (comments at the top say what and how to run). `tools/ws_msgs_decode.py` turns selector addresses into names on the same boot. `tools/rn_iopmap.c` calls `IOPresentmentGetMap`. `tools/rn_peek*.c` read the scanout through the probe's user client: heavy, they stalled the desktop's network once; do not run them while the machine is in use. `scripts/rn_install.sh` and `scripts/rn_install_plugin.sh` install the kexts and the plug-in executable from `/Users/Shared`.
