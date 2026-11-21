@@ -39,6 +39,7 @@ enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA
 unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknown format
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
 rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth);   // depth > 1: a 3D image (sampled only); staging is depth slices of width * height texels
+rn_vk_image *rn_vk_image_create_layers(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth, int array);   // array: depth is the layer count of a 2D array (sampled only), staged like a 3D image
 rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t width, uint32_t height, void *ptr, size_t pitch, size_t bytes);   // linear image over page-aligned host memory (an IOSurface's), zero copy; NULL: keep copying
 int rn_vk_image_is_host(rn_vk_image *img);                          // 1: made by rn_vk_image_from_host, no host copy exists, rn_vk_image_staging is the memory itself
 void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows packed (width * texel bytes)

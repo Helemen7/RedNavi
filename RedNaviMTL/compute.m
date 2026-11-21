@@ -290,14 +290,23 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     if (rc) { if (atomic_fetch_add(&late, 1) < 20) rn_log("texture %lux%lu: a host access did not wait for the command buffers that use it (2 s passed)", (unsigned long)r->w, (unsigned long)r->h); }
     else if (n < 8 || n % 1000 == 0) rn_log("texture %lux%lu: host access waited for a committed command buffer (%u such waits so far)", (unsigned long)r->w, (unsigned long)r->h, n + 1);
 }
+// The rows of a texture's host copy: a 2D array keeps its slices one after the other, so a blit to slice s is one to rows s * h and on.
+static NSUInteger rn_tex_rows(RedNaviMTLTexture *t) { return t->ttype == MTLTextureType2DArray ? t->h * t->d : t->h; }
+static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) {
+    if (!t) return NO;
+    if (t->ttype == MTLTextureType2DArray && slice < t->d) { o->y += slice * t->h; return YES; }
+    if (t->alen > 1 && slice < t->alen) { o->y += slice; return YES; }
+    return NO;
+}
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
     if (!(self = [super init])) return nil;
     const BOOL is3d = desc.textureType == MTLTextureType3D;
+    const BOOL is2da = desc.textureType == MTLTextureType2DArray;   // OpenGL's GL_TEXTURE_2D_ARRAY (kitty's glyph atlas): the slices are kept like the depth of a 3D texture
     const BOOL is1d = desc.textureType == MTLTextureType1D || desc.textureType == MTLTextureType1DArray;
     ttype = desc.textureType; alen = desc.textureType == MTLTextureType1DArray ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
-    if ((desc.textureType != MTLTextureType2D && !is3d && !is1d) || (desc.arrayLength > 1 && desc.textureType != MTLTextureType1DArray) || desc.sampleCount > 1 || (!is3d && desc.depth > 1)) {
+    if ((desc.textureType != MTLTextureType2D && !is3d && !is1d && !is2da) || (desc.arrayLength > 1 && desc.textureType != MTLTextureType1DArray && !is2da) || desc.sampleCount > 1 || (!is3d && desc.depth > 1)) {
         rn_log("texture: only plain 2D textures are supported (type %ld, array %lu, samples %lu)", (long)desc.textureType, (unsigned long)desc.arrayLength, (unsigned long)desc.sampleCount);
         return nil;
     }
@@ -305,9 +314,10 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     const int f = rn_vk_format_of(desc.pixelFormat);
     rn_vk *vk = f ? rn_vk_shared() : NULL;
     const NSUInteger rows = is1d ? alen : desc.height;
-    img = vk ? rn_vk_image_create3d(vk, f, (uint32_t)desc.width, (uint32_t)rows, is3d ? (uint32_t)desc.depth : 1) : NULL;
+    const NSUInteger slices = is3d ? desc.depth : is2da ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
+    img = vk ? rn_vk_image_create_layers(vk, f, (uint32_t)desc.width, (uint32_t)rows, (uint32_t)slices, is2da) : NULL;
     if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported (%s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, f ? (vk ? rn_vk_image_last_error() : "RADV is not available") : "no Vulkan format for it"); return nil; }
-    dev = d; pf = desc.pixelFormat; w = desc.width; h = rows; self->d = is3d ? desc.depth : 1; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
+    dev = d; pf = desc.pixelFormat; w = desc.width; h = rows; self->d = slices; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
     site_ = rn_site_enter('T');
     counted_ = YES; atomic_fetch_add(&g_tex_live, 1); atomic_fetch_add(&g_tex_made, 1); atomic_fetch_add(&g_tex_bytes, (unsigned long)w * h * self->d * texel);
     return self;
@@ -477,29 +487,40 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     return t;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf { return (id)[self viewWithPixelFormat:newPf swizzle:NULL]; }
+// A view must cover the whole texture: all its slices, one level, the same type (a 2D array of one slice may also be viewed as 2D).
+static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange levels, NSRange slices) {
+    const MTLTextureType own = t.textureType;
+    const NSUInteger n = own == MTLTextureType2DArray ? t.arrayLength : 1;
+    if ((type == own || (type == MTLTextureType2D && own == MTLTextureType2DArray && n == 1)) && levels.location == 0 && levels.length == 1 && slices.location == 0 && slices.length == n) return YES;
+    rn_log("texture view: only the whole of a texture of one level can be viewed (type %ld of %ld, slices %lu+%lu)", (long)type, (long)own, (unsigned long)slices.location, (unsigned long)slices.length);
+    return NO;
+}
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
-    if (type != MTLTextureType2D || levels.location != 0 || levels.length != 1 || slices.location != 0 || slices.length != 1) { rn_log("texture view: only the whole of a 2D texture of one level can be viewed"); return nil; }
+    if (!rn_whole_view(self, type, levels, slices)) return nil;
     return [self newTextureViewWithPixelFormat:newPf];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
-    if (type != MTLTextureType2D || levels.location != 0 || levels.length != 1 || slices.location != 0 || slices.length != 1) { rn_log("texture view: only the whole of a 2D texture of one level can be viewed"); return nil; }
+    if (!rn_whole_view(self, type, levels, slices)) return nil;
     return (id)[self viewWithPixelFormat:newPf swizzle:&swizzle];
 }
 - (MTLTextureSwizzleChannels)swizzle { return swz.red == swz.green && swz.green == swz.blue && swz.blue == swz.alpha && swz.red == 0 && !parent ? (MTLTextureSwizzleChannels){MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha} : swz; }
+// Private: the swizzle packed one channel per byte, red in the low byte (identity 0x05040302). AppleMetalOpenGLRenderer compares it with the swizzle a GL texture wants before it
+// makes a view; the generic answer 0 is no valid swizzle, and the renderer then gave up on the view ("unhandled ... diffSwizzleKey").
+- (uint32_t)swizzleKey { const MTLTextureSwizzleChannels c = [self swizzle]; return (uint32_t)c.red | (uint32_t)c.green << 8 | (uint32_t)c.blue << 16 | (uint32_t)c.alpha << 24; }
 - (MTLTextureCompressionType)compressionType { return MTLTextureCompressionTypeLossless; }
 - (MTLResourceID)gpuResourceID { MTLResourceID r = {0}; return r; }
 - (kern_return_t)setOwnerWithIdentity:(task_id_token_t)token { return 0; }
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device { rn_log("newRemoteTextureViewForDevice: not supported"); return nil; }
 - (MTLSharedTextureHandle *)newSharedTextureHandle { rn_log("newSharedTextureHandle: not supported (an IOSurface-backed texture is shared through its IOSurface)"); return nil; }
 - (id<MTLTexture>)remoteStorageTexture { return nil; }
-- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
+- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) || ttype == MTLTextureType2DArray ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
 - (MTLPixelFormat)pixelFormat { return pf; }
 - (NSUInteger)width { return w; }
 - (NSUInteger)height { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) ? 1 : h; }
-- (NSUInteger)depth { return d; }
+- (NSUInteger)depth { return ttype == MTLTextureType2DArray ? 1 : d; }
 - (NSUInteger)mipmapLevelCount { return 1; }
 - (NSUInteger)sampleCount { return 1; }
-- (NSUInteger)arrayLength { return alen ? alen : 1; }
+- (NSUInteger)arrayLength { return ttype == MTLTextureType2DArray ? d : alen ? alen : 1; }
 - (MTLTextureUsage)usage { return usage_; }
 - (BOOL)isShareable { return NO; }
 - (BOOL)isFramebufferOnly { return NO; }
@@ -511,6 +532,7 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z + r.size.depth <= d;
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
+    if (ttype == MTLTextureType2DArray && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }   // a slice of a 2D array is stored like a depth slice
     if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     rn_tex_wait_idle(self);
     rn_vk_host_lock();
@@ -529,6 +551,7 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
+    if (ttype == MTLTextureType2DArray && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }
     if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     rn_tex_wait_idle(self);
     [self syncFromSurface];
@@ -628,6 +651,17 @@ static BOOL rn_slot_ok(NSUInteger index, const char *what) {
 // The resources a Metal encoder has bound, turned into the rn_vk arguments of a pipeline's bindings (compute, vertex and fragment stages all use it). Returns an error text or nil.
 // setBytes data becomes a small buffer that is kept in `temps` until the work is done.
 static NSMutableArray *rn_batch_keep(void) { static NSMutableArray *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [NSMutableArray new]; }); return k; }
+// A texture of zeros for a texture argument with nothing behind it, by the translator's dimension (rn_air_binding.dim): 3D 1 x 1 x 2, a 2D array of one slice, otherwise 2D 1 x 1.
+// Made once each; they are never written.
+static rn_vk_image *rn_null_image(unsigned dim) {
+    static rn_vk_image *img[3];
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    const int k = dim == 2 ? 1 : dim == 9 ? 2 : 0;
+    os_unfair_lock_lock(&lock);
+    if (!img[k]) { rn_vk *vk = rn_vk_shared(); img[k] = vk ? rn_vk_image_create_layers(vk, RN_VK_RGBA8, 1, 1, k == 1 ? 2 : 1, k == 2) : NULL; }
+    os_unfair_lock_unlock(&lock);
+    return img[k];
+}
 static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kind, const unsigned *mi, RedNaviMTLBuffer *const *bufs, const uint64_t *offs, NSData *const *bytesAt,
                               RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps) {
     for (unsigned i = 0; i < n; i++) {
@@ -643,23 +677,38 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
                 av[i].buffer = t->b;
                 break;
             }
-            return [NSString stringWithFormat:@"no buffer bound at index %u", m];
+            {
+                // Nothing bound: Metal lets an app leave a buffer of the function unbound when the code does not reach it, and AppleMetalOpenGLRenderer does so with the uniform
+                // buffer of a GL program that has no uniforms (2026-11-21). The translator still lists the argument, so it gets a buffer of zeros, made once per process.
+                static RedNaviMTLBuffer *zeros;
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{ zeros = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:65536 options:0]; if (zeros) memset(rn_vk_buffer_contents(zeros->b), 0, 65536); });
+                if (!zeros) return [NSString stringWithFormat:@"no buffer bound at index %u", m];
+                av[i].buffer = zeros->b;
+                av[i].offset = 0;
+                break;
+            }
         case RN_AIR_COLOR_INPUT: break;                      // framebuffer fetch: the render target, set by the pass (runRenderPass)
         case RN_AIR_NULL_TEXTURE: {
             // a placeholder the translator adds for a texture that is absent in this variant: a texture of zeros of the dimension the shader declares (2D 1 x 1, or 3D 1 x 1 x 2), made once
-            static rn_vk_image *nullImage[2];
-            const int is3d = (kind[i] >> 8) == 2;
-            if (!nullImage[is3d]) { rn_vk *vk = rn_vk_shared(); nullImage[is3d] = vk ? rn_vk_image_create3d(vk, RN_VK_RGBA8, 1, 1, is3d ? 2 : 1) : NULL; }
-            if (!nullImage[is3d]) return @"no memory for a placeholder texture";
-            av[i].image = nullImage[is3d];
+            if (!(av[i].image = rn_null_image(kind[i] >> 8))) return @"no memory for a placeholder texture";
             break;
         }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
-            if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (rn_diag && getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
+            if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (rn_diag && getenv("RN_EXP_NULL_F0") && m == 0 && (kind[i] & 0xff) == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
+            // Nothing bound: AppleMetalOpenGLRenderer leaves a texture unit of its fixed-function shaders unbound when no GL texture is there (2026-11-21); Metal does not check it.
+            // A sampled image gets a texture of zeros of the shader's dimension.
+            if ((kind[i] & 0xff) == RN_VK_SAMPLED_IMAGE && (av[i].image = rn_null_image(kind[i] >> 8))) break;
             return [NSString stringWithFormat:@"no texture bound at index %u", m];
         case RN_VK_SAMPLER:
             if (m < RN_MTL_SLOTS && samps[m]) { av[i].sampler = samps[m]->s; break; }
+            {   // nothing bound (an unbound GL texture unit, as for textures above): a nearest, clamp-to-edge sampler, made once
+                static rn_vk_sampler *def;
+                static dispatch_once_t once;
+                dispatch_once(&once, ^{ rn_vk *vk = rn_vk_shared(); rn_vk_sampler_desc sd = {0, 0, 0, {1, 1, 1}, 0, 0, 0.0f, 1000.0f}; def = vk ? rn_vk_sampler_create(vk, &sd) : NULL; });
+                if (def) { av[i].sampler = def; break; }
+            }
             return [NSString stringWithFormat:@"no sampler state bound at index %u", m];
         default: break;
         }
@@ -710,6 +759,46 @@ static unsigned rn_vk_vertex_format(MTLVertexFormat f) {
     }
 }
 
+// The numeric type of each vertex shader input by its Location, read from the SPIR-V: 0 float (or not found), 1 unsigned, 2 signed integer. Metal converts a vertex attribute to the
+// type the shader declares (UChar into a uint input stays an integer, into a float input becomes a float); Vulkan takes the type from the format, so an integer input needs the
+// UINT or SINT format where rn_vk_vertex_format gives the scaled one (Kitty's cell attributes through the OpenGL renderer are UChar and UInt into uint inputs).
+static void rn_spv_input_types(NSData *spv, uint8_t types[16]) {
+    memset(types, 0, 16);
+    const uint32_t *w = spv.bytes; const size_t n = spv.length / 4;
+    if (n < 5 || w[0] != 0x07230203) return;
+    const uint32_t bound = w[3];
+    if (!bound || bound > (1u << 22)) return;
+    uint32_t *loc = calloc(bound, 4), *ptr = calloc(bound, 4), *kind = calloc(bound, 4);   // loc: Location + 1; ptr: pointee of an Input pointer type; kind: 1 uint, 2 int, 3 float, or a vector's component type + 0x100
+    for (size_t i = 5; loc && ptr && kind && i < n; ) {
+        const uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) break;
+        if (op == 71 && wc >= 4 && w[i + 2] == 30 && w[i + 1] < bound) loc[w[i + 1]] = w[i + 3] + 1;                 // OpDecorate id Location n
+        else if (op == 21 && wc >= 4 && w[i + 1] < bound) kind[w[i + 1]] = w[i + 3] ? 2 : 1;                         // OpTypeInt id width signedness
+        else if (op == 22 && wc >= 3 && w[i + 1] < bound) kind[w[i + 1]] = 3;                                        // OpTypeFloat
+        else if (op == 23 && wc >= 4 && w[i + 1] < bound && w[i + 2] < bound) kind[w[i + 1]] = 0x100 | (kind[w[i + 2]] & 0xff);   // OpTypeVector id component count
+        else if (op == 32 && wc >= 4 && w[i + 2] == 1 && w[i + 1] < bound) ptr[w[i + 1]] = w[i + 3] + 1;             // OpTypePointer id Input type
+        i += wc;
+    }
+    // OpVariable (result type, id, storage class Input 1) comes after the decorations and types, in a second pass
+    for (size_t i = 5; loc && ptr && kind && i < n; ) {
+        const uint32_t op = w[i] & 0xffff, wc = w[i] >> 16;
+        if (!wc || i + wc > n) break;
+        if (op == 59 && wc >= 4 && w[i + 3] == 1 && w[i + 1] < bound && w[i + 2] < bound && loc[w[i + 2]] && loc[w[i + 2]] <= 16 && ptr[w[i + 1]]) {
+            const uint32_t t = ptr[w[i + 1]] - 1, k = t < bound ? kind[t] & 0xff : 0;
+            types[loc[w[i + 2]] - 1] = k == 1 ? 1 : k == 2 ? 2 : 0;
+        }
+        i += wc;
+    }
+    free(loc); free(ptr); free(kind);
+}
+// The integer variant of a scaled VkFormat (USCALED + 2 is UINT, SSCALED + 2 is SINT, for 8- and 16-bit formats), or the format itself.
+static unsigned rn_vk_vertex_format_int(unsigned vf) {
+    switch (vf) {
+    case 11: case 12: case 18: case 19: case 25: case 26: case 39: case 40: case 72: case 73: case 79: case 80: case 86: case 87: case 93: case 94: return vf + 2;
+    default: return vf;
+    }
+}
+
 // MTLBlendFactor / MTLBlendOperation / MTLColorWriteMask to Vulkan's values.
 static int rn_vk_blend_factor(MTLBlendFactor f, unsigned *out) {
     switch (f) {
@@ -751,6 +840,8 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     rn_vk_vattr vattr[16];
     rn_vk_vlayout vlayout[16];
     rn_vk_render *byKey[5 * 6];                     // by primitive type, cull mode and winding
+
+    NSArray<NSDictionary *> *args[2];                // per stage: the arguments for the reflection (rn_render_reflection)
 
     id<MTLDevice> dev;
     NSString *label_;
@@ -846,6 +937,9 @@ static const char *rn_selector_types(SEL sel) {
     return NULL;
 }
 static BOOL rn_resolve_default(id self, SEL _cmd, SEL sel) {
+    // -originalObject belongs to Metal's tool and capture wrappers (as for the device in plugin.m): AppleMetalOpenGLRenderer asks respondsToSelector: and then talks to the answer, so
+    // a stub answering nil sent its texture bindings to nil (2026-11-21). Not answering it makes the caller use the object itself.
+    if (sel == sel_registerName("originalObject")) return NO;
     const char *types = rn_selector_types(sel);
     const char *r = types ? types : "Q16@0:8";
     while (*r == 'r' || *r == 'n' || *r == 'N' || *r == 'o' || *r == 'O' || *r == 'R' || *r == 'V') r++;
@@ -1108,7 +1202,8 @@ static NSString *rn_run_blit(RNBlit *b) {
             static int said; if (said < 40) { said++; rn_log("blit kind %d failed: texture %p (alen %lu, %lux%lu fmt %lu type %ld), buffer %p, region %lux%lu at (%lu,%lu), bpr %lu", b->kind, (__bridge void *)t, t ? (unsigned long)t->alen : 0ul, t ? (unsigned long)t->w : 0ul, t ? (unsigned long)t->h : 0ul, t ? (unsigned long)t->pf : 0ul, t ? (long)t->ttype : -1l, (__bridge void *)bf, (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)o.x, (unsigned long)o.y, (unsigned long)bpr); }
             return @"blit: a texture or buffer is missing";
         }
-        if (o.z || b->sz.depth > 1 || o.x + b->sz.width > t->w || o.y + b->sz.height > t->h) return @"blit: the region is outside the texture";
+        if (rn_diag && getenv("RN_LOG_ARRAYS") && t->ttype == MTLTextureType2DArray) rn_log("blit kind %d: 2D array %lux%lux%lu, region %lux%lux%lu at (%lu,%lu,%lu), buffer %p offset %lu bpr %lu, first bytes %08x", b->kind, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)t->d, (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)b->sz.depth, (unsigned long)o.x, (unsigned long)o.y, (unsigned long)o.z, (__bridge void *)bf, (unsigned long)off, (unsigned long)bpr, *(const uint32_t *)((const uint8_t *)rn_vk_buffer_contents(bf->b) + off + 6 * bpr + 8));
+        if (o.z || b->sz.depth > 1 || o.x + b->sz.width > t->w || o.y + b->sz.height > rn_tex_rows(t)) return @"blit: the region is outside the texture";
         if (!b->sz.width || !b->sz.height) return nil;
         if (bpr < b->sz.width * t->texel) return @"blit: bytesPerRow is smaller than a row of the region";
         if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
@@ -1125,7 +1220,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         RedNaviMTLTexture *s2 = b->st, *d2 = b->dt;
         if (!s2 || !d2) return @"blit: a texture is missing";
         if (s2->texel != d2->texel) return @"blit: the textures have different texel sizes";
-        if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > s2->w || b->so.y + b->sz.height > s2->h || b->dorg.x + b->sz.width > d2->w || b->dorg.y + b->sz.height > d2->h)
+        if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > s2->w || b->so.y + b->sz.height > rn_tex_rows(s2) || b->dorg.x + b->sz.width > d2->w || b->dorg.y + b->sz.height > rn_tex_rows(d2))
             return @"blit: the region is outside a texture";
         {   // A CoreDisplay scanout surface lives on the card (direct scanout renders into its VRAM copy): a copy into it, or out of it into a surface the CPU reads, is done there. A memmove on the
             // host copy would leave the picture the card draws on unchanged, and the pixels the blit meant to carry over stay as they were.
@@ -1187,7 +1282,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     RNBlit *b = [self add:0];
     b->sb = (RedNaviMTLBuffer *)buf; b->soff = so; b->sbpr = bpr; b->dt = (RedNaviMTLTexture *)tex; b->dorg = origin; b->sz = size;
     if (level) { b->dt = nil; rn_log("blit buffer->texture: level %lu asked, slice %lu", (unsigned long)level, (unsigned long)slice); }                           // reported as an error at commit
-    else if (slice) { if (b->dt && b->dt->alen > 1 && slice < b->dt->alen) b->dorg.y += slice; else b->dt = nil; }   // a slice of a 1D array is a row of the image
+    else if (slice) { if (!rn_slice_rows(b->dt, slice, &b->dorg)) b->dt = nil; }   // a slice of a 1D array is a row of the image, one of a 2D array h rows
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)tex
       destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin options:(MTLBlitOption)options {
@@ -1198,7 +1293,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     RNBlit *b = [self add:1];
     b->st = (RedNaviMTLTexture *)tex; b->so = origin; b->sz = size; b->db = (RedNaviMTLBuffer *)buf; b->doff = doff; b->dbpr = bpr;
     if (level) b->st = nil;
-    else if (slice) { if (b->st && b->st->alen > 1 && slice < b->st->alen) b->so.y += slice; else b->st = nil; }
+    else if (slice) { if (!rn_slice_rows(b->st, slice, &b->so)) b->st = nil; }
 }
 - (void)copyFromTexture:(id<MTLTexture>)tex sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)buf
       destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi options:(MTLBlitOption)options {
@@ -1210,8 +1305,8 @@ static NSString *rn_run_blit(RNBlit *b) {
     b->st = (RedNaviMTLTexture *)src; b->so = so; b->sz = size; b->dt = (RedNaviMTLTexture *)dst; b->dorg = dorg;
     if (sl || dl) b->dt = nil;
     else {
-        if (ss) { if (b->st && b->st->alen > 1 && ss < b->st->alen) b->so.y += ss; else b->dt = nil; }
-        if (ds) { if (b->dt && b->dt->alen > 1 && ds < b->dt->alen) b->dorg.y += ds; else b->dt = nil; }
+        if (ss && !rn_slice_rows(b->st, ss, &b->so)) b->dt = nil;
+        if (ds && !rn_slice_rows(b->dt, ds, &b->dorg)) b->dt = nil;
     }
 }
 - (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst {
@@ -1287,14 +1382,17 @@ static NSString *rn_run_blit(RNBlit *b) {
 }
 - (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[1][index] = offset; }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:1]; }
-- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[0][i] = (RedNaviMTLTexture *)t; }
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[1][i] = (RedNaviMTLTexture *)t; }
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_diag && getenv("RN_LOG_BUFFERS")) rn_log("trace: setVertexTexture %p (%s) idx %lu", t, t ? class_getName(object_getClass(t)) : "-", (unsigned long)i); if (rn_slot_ok(i, "texture")) texs[0][i] = (RedNaviMTLTexture *)t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_diag && getenv("RN_LOG_BUFFERS")) rn_log("trace: setFragmentTexture %p (%s) idx %lu", t, t ? class_getName(object_getClass(t)) : "-", (unsigned long)i); if (rn_slot_ok(i, "texture")) texs[1][i] = (RedNaviMTLTexture *)t; }
 - (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexTexture:t[i] atIndex:r.location + i]; }
 - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentTexture:t[i] atIndex:r.location + i]; }
 - (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (rn_slot_ok(i, "sampler")) samps[0][i] = (RedNaviMTLSamplerState *)s; }
 - (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (rn_slot_ok(i, "sampler")) samps[1][i] = (RedNaviMTLSamplerState *)s; }
 - (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexSamplerState:s[i] atIndex:r.location + i]; }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentSamplerState:s[i] atIndex:r.location + i]; }
+// The LOD clamps of the encoder (OpenGL's GL_TEXTURE_MIN_LOD/MAX_LOD) are not applied: the sampler's own clamps are used.
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setVertexSamplerState:s atIndex:i]; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s lodMinClamp:(float)lo lodMaxClamp:(float)hi atIndex:(NSUInteger)i { [self setFragmentSamplerState:s atIndex:i]; }
 - (void)setViewport:(MTLViewport)v {
     hasViewport = YES;
     viewport[0] = v.originX; viewport[1] = v.originY; viewport[2] = v.width; viewport[3] = v.height; viewport[4] = v.znear; viewport[5] = v.zfar;
@@ -2153,7 +2251,16 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         if (logPass || (rn_diag && getenv("RN_LOG_DRAWS"))) {
             char tb[400] = ""; int o = 0;
             for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
-            rn_log("draw %lu: %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
+            char vl[200] = ""; int vo = 0;
+            for (unsigned q = 0; q < p->nvattr && vo < 180; q++) vo += snprintf(vl + vo, sizeof(vl) - vo, " a%u=b%u+%u/f%u", p->vattr[q].location, p->vattr[q].binding, p->vattr[q].offset, p->vattr[q].format);
+            for (unsigned q = 0; q < p->nvlayout && vo < 180; q++) vo += snprintf(vl + vo, sizeof(vl) - vo, " b%u:%u%s", p->vlayout[q].binding, p->vlayout[q].stride, p->vlayout[q].per_instance ? "i" : "v");
+            rn_log("draw %lu: base instance %u, vertex input:%s", (unsigned long)k, d->baseInstance, vl);
+            if (getenv("RN_LOG_ARRAYS") && d->texs[0][0] && d->texs[0][0]->texel == 4) {      // debugging: the first texels of vertex texture 0
+                const uint32_t *tv = (const uint32_t *)rn_vk_image_staging(d->texs[0][0]->img); char tx[300] = ""; int to = 0;
+                for (unsigned q = 0; q < 24 && q < d->texs[0][0]->w * d->texs[0][0]->h && to < 280; q++) to += snprintf(tx + to, sizeof(tx) - to, " %x", tv[q]);
+                rn_log("draw %lu: vertex texture 0 (%lux%lu type %ld):%s", (unsigned long)k, (unsigned long)d->texs[0][0]->w, (unsigned long)d->texs[0][0]->h, (long)d->texs[0][0]->ttype, tx);
+            }
+            rn_log("draw %lu: pso %p %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
         }
         if (logPass && d->indexBuf) {                                    // the indices of the draw, as the card will read them
             const uint8_t *ip = rn_vk_buffer_contents(d->indexBuf->b) + d->indexOffset;
@@ -2234,6 +2341,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (!bad && !rc && rn_diag && getenv("RN_DUMP_PASSES") && rp->nt && rp->tex[0]->texel == 4 && rp->store[0]) {   // debugging: every pass's first target as a PNG in the directory named by the variable
         static unsigned seq;
         RedNaviMTLTexture *t = rp->tex[0];
+        rn_vk_batch_sync(vk);                                           // the pass is only recorded; its pixels reach the host copy when the batch has run
         const uint8_t *src = rn_vk_image_staging(t->img);
         const size_t n = t->w * t->h;
         uint8_t *px = malloc(n * 4);
@@ -2269,6 +2377,8 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 // One commit at a time: the Vulkan queue and command pool are the process's single ones and are not thread safe, and the textures and buffers a commit copies are shared with the others.
 // Recursive: a completion handler may commit another command buffer.
 - (void)commit { [self commitAsync:NO]; }
+// Private: AppleMetalOpenGLRenderer commits with it (it also keeps the buffer for the renderer's own bookkeeping, which needs nothing here).
+- (void)commitAndHold { [self commitAsync:NO]; }
 // Commit order is kept by one serial queue; the caller goes on while the card works. The completion handlers, the presents and the semaphore run at the end of the body, on the queue.
 // A buffer that waits for an event runs on the caller's thread after the queue is drained: the signal may come from a buffer committed later by another thread, and the queue must not block on it.
 - (void)commitAsync:(BOOL)wait {
@@ -2588,6 +2698,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     id<MTLDevice> dev;
     NSString *label_;
     NSArray<NSDictionary *> *fcs;                    // function constants: @"index" (NSNumber) or @"name", and @"data" (NSData)
+    NSArray<NSDictionary *> *args;                   // OpenGL functions: the buffers, textures and samplers of the AIR metadata (rn_gl_args), for the pipeline reflection
 }
 @end
 @implementation RedNaviMTLFunction
@@ -2757,6 +2868,70 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
     return nil;
 }
 
+// The pipeline reflection (MTLRenderPipelineReflection): its vertexArguments and fragmentArguments, one RNArgument (an MTLArgument and MTLBinding look-alike) per buffer, texture and
+// sampler of the stage. AppleMetalOpenGLRenderer asks for it and binds only the arguments it lists.
+@interface RNArgument : NSObject { @public NSDictionary *d; NSString *name_; }
+@end
+@implementation RNArgument
++ (void)initialize { if (self == [RNArgument class]) rn_add_default_resolver(self); }
+- (NSString *)name { return name_; }
+- (MTLArgumentType)type { return (MTLArgumentType)[d[@"type"] unsignedIntegerValue]; }
+- (NSUInteger)index { return [d[@"index"] unsignedIntegerValue]; }
+- (BOOL)isActive { return YES; }
+- (BOOL)isUsed { return YES; }
+- (BOOL)isArgument { return NO; }
+- (MTLBindingAccess)access { return [d[@"writable"] boolValue] ? MTLBindingAccessReadWrite : MTLBindingAccessReadOnly; }
+- (NSUInteger)bufferAlignment { return 16; }
+- (NSUInteger)bufferDataSize { return [d[@"size"] unsignedIntegerValue]; }
+- (MTLDataType)bufferDataType { return self.type == MTLArgumentTypeBuffer ? MTLDataTypeStruct : MTLDataTypeNone; }
+- (MTLStructType *)bufferStructType { return nil; }
+- (MTLPointerType *)bufferPointerType { return nil; }
+- (MTLTextureType)textureType { return (MTLTextureType)[d[@"textureType"] unsignedIntegerValue]; }
+- (MTLDataType)textureDataType { return self.type == MTLArgumentTypeTexture ? (MTLDataType)[d[@"dataType"] unsignedIntegerValue] : MTLDataTypeNone; }
+- (BOOL)isDepthTexture { return [d[@"depth"] boolValue]; }
+- (NSUInteger)arrayLength { return 1; }
+- (NSUInteger)threadgroupMemoryAlignment { return 0; }
+- (NSUInteger)threadgroupMemoryDataSize { return 0; }
+@end
+@interface RNRenderReflection : NSObject { @public NSArray *stage[2]; }
+@end
+@implementation RNRenderReflection
++ (void)initialize { if (self == [RNRenderReflection class]) rn_add_default_resolver(self); }
+- (NSArray *)vertexArguments { return stage[0]; }
+- (NSArray *)fragmentArguments { return stage[1]; }
+- (NSArray *)vertexBindings { return stage[0]; }
+- (NSArray *)fragmentBindings { return stage[1]; }
+- (NSArray *)tileArguments { return @[]; }
+- (NSArray *)tileBindings { return @[]; }
+@end
+static id rn_render_reflection(id pso) {
+    if (![pso isKindOfClass:[RedNaviMTLRenderPipelineState class]]) return nil;
+    RedNaviMTLRenderPipelineState *p = pso;
+    RNRenderReflection *r = [RNRenderReflection new];
+    for (int s = 0; s < 2; s++) {
+        NSMutableArray *a = [NSMutableArray array];
+        for (NSDictionary *d in p->args[s]) {
+            RNArgument *x = [RNArgument new];
+            x->d = d;
+            const unsigned t = [d[@"type"] unsignedIntValue], idx = [d[@"index"] unsignedIntValue];
+            if ([d[@"gl"] boolValue]) {
+                // The names AppleMetalOpenGLRenderer's processReflection looks for (2026-11-21, read from its binary): a stage prefix (vs_, fs_), then tex_<n> and smp_<n> for the
+                // sampler of GL texture slot n (the AIR index), uniform_buffer for the program's default uniform block (AIR buffer 0) and ubo_<k> for uniform block k, which the
+                // GL code generator puts at AIR buffer 18 + k (seen with Kitty: block 0 ColorTable at 18, block 1 CellRenderData at 19). Other buffers keep a plain name.
+                const char *pf = s ? "fs_" : "vs_";
+                if (t == MTLArgumentTypeTexture) x->name_ = [NSString stringWithFormat:@"%stex_%u", pf, idx];
+                else if (t == MTLArgumentTypeSampler) x->name_ = [NSString stringWithFormat:@"%ssmp_%u", pf, idx];
+                else if (idx == 0) x->name_ = [NSString stringWithFormat:@"%suniform_buffer", pf];
+                else if (idx >= 18) x->name_ = [NSString stringWithFormat:@"%subo_%u", pf, idx - 18];
+            }
+            if (!x->name_) x->name_ = [NSString stringWithFormat:@"%s%u", t == MTLArgumentTypeBuffer ? "buffer" : t == MTLArgumentTypeTexture ? "texture" : "sampler", idx];
+            [a addObject:x];
+        }
+        r->stage[s] = a;
+    }
+    return r;
+}
+
 // A render pipeline state from a descriptor: both functions go to the translator (vertex module in set 0, fragment module in set 1) and the Vulkan pipeline for triangles is built.
 static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error);
 static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error) {
@@ -2765,17 +2940,192 @@ static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDesc
     rn_ph(5, ph5);
     return r;
 }
+// OpenGL (2026-11-21). AppleMetalOpenGLRenderer makes its functions with -newFunctionWithGLCoreIR:inputsDescription:functionType:, which the base class answers with an
+// _MTLFunctionInternal whose bitcodeData (bitcodeType 1) is not LLVM bitcode but the request the GL front end left: a uint32 kind (1 vertex state, 2 fragment state, 3 a GLSL
+// program, 4 an ARB program) and its data. Apple's own libGLVMPlugin turns it into an AIR module (oglCodeGenServiceGenerateIR, the entry MTLCompiler uses), Apple's LLVM writes it
+// as bitcode, and the function goes on as one of our own: entry "#main", no function constants. Results are kept by request, since the renderer asks for the same functions again
+// with every change of pipeline state.
+// The LLVM C API of libLLVMContainer that reads the AIR metadata of a module (rn_gl_args).
+static struct {
+    unsigned (*nmd_count)(void *, const char *);
+    void (*nmd_ops)(void *, const char *, void **);
+    unsigned (*md_count)(void *);
+    void (*md_ops)(void *, void **);
+    const char *(*md_string)(void *, unsigned *);
+    void *(*is_int)(void *);
+    unsigned long long (*int_value)(void *);
+} rn_llvm_md;
+// The arguments of an OpenGL function as the AIR metadata lists them (the third operand of the air.vertex or air.fragment node): one dictionary per air.buffer, air.texture
+// and air.sampler with @"type" (MTLArgumentType), @"index" (air.location_index), @"size" (air.buffer_size) and for textures @"textureType" and @"dataType", from air.arg_type_name.
+// AppleMetalOpenGLRenderer binds only what the pipeline reflection lists (2026-11-21: without it no uniform buffer and no texture reached a draw).
+static NSArray<NSDictionary *> *rn_gl_args(void *mod) {
+    if (!rn_llvm_md.nmd_count || !rn_llvm_md.nmd_ops || !rn_llvm_md.md_count || !rn_llvm_md.md_ops || !rn_llvm_md.md_string || !rn_llvm_md.is_int || !rn_llvm_md.int_value) return nil;
+    const char *stage = rn_llvm_md.nmd_count(mod, "air.vertex") ? "air.vertex" : rn_llvm_md.nmd_count(mod, "air.fragment") ? "air.fragment" : NULL;
+    if (!stage) return nil;
+    void *fnode = NULL;
+    rn_llvm_md.nmd_ops(mod, stage, &fnode);
+    if (!fnode || rn_llvm_md.md_count(fnode) < 3) return nil;
+    void *fops[3] = {0};
+    rn_llvm_md.md_ops(fnode, fops);
+    if (!fops[2]) return nil;
+    const unsigned na = rn_llvm_md.md_count(fops[2]);
+    void **aops = calloc(na ? na : 1, sizeof(void *));
+    rn_llvm_md.md_ops(fops[2], aops);
+    NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
+    for (unsigned a = 0; a < na; a++) {
+        const unsigned no = aops[a] ? rn_llvm_md.md_count(aops[a]) : 0;
+        if (!no || no > 64) continue;
+        void *ops[64] = {0};
+        rn_llvm_md.md_ops(aops[a], ops);
+        int type = -1;
+        unsigned long long index = 0, size = 0;
+        NSString *tname = nil;
+        for (unsigned o = 0; o < no; o++) {
+            unsigned len = 0;
+            const char *str = ops[o] ? rn_llvm_md.md_string(ops[o], &len) : NULL;
+            if (!str) continue;
+            NSString *k = [[NSString alloc] initWithBytes:str length:len encoding:NSUTF8StringEncoding];
+            void *next = o + 1 < no ? ops[o + 1] : NULL;
+            const BOOL nextInt = next && rn_llvm_md.is_int(next);
+            if ([k isEqualToString:@"air.buffer"]) type = MTLArgumentTypeBuffer;
+            else if ([k isEqualToString:@"air.texture"]) type = MTLArgumentTypeTexture;
+            else if ([k isEqualToString:@"air.sampler"]) type = MTLArgumentTypeSampler;
+            else if ([k isEqualToString:@"air.location_index"] && nextInt) index = rn_llvm_md.int_value(next);
+            else if ([k isEqualToString:@"air.buffer_size"] && nextInt) size = rn_llvm_md.int_value(next);
+            else if ([k isEqualToString:@"air.arg_type_name"] && next) { unsigned l2 = 0; const char *t = rn_llvm_md.md_string(next, &l2); if (t) tname = [[NSString alloc] initWithBytes:t length:l2 encoding:NSUTF8StringEncoding]; }
+        }
+        if (type < 0) continue;
+        NSMutableDictionary *d = [@{@"type": @(type), @"index": @(index), @"size": @(size), @"gl": @YES} mutableCopy];
+        if (type == MTLArgumentTypeTexture) {
+            MTLTextureType tt = MTLTextureType2D;
+            if ([tname hasPrefix:@"texture2d_array"]) tt = MTLTextureType2DArray;
+            else if ([tname hasPrefix:@"texture2d_ms"]) tt = MTLTextureType2DMultisample;
+            else if ([tname hasPrefix:@"texture1d_array"]) tt = MTLTextureType1DArray;
+            else if ([tname hasPrefix:@"texture1d"]) tt = MTLTextureType1D;
+            else if ([tname hasPrefix:@"texture3d"]) tt = MTLTextureType3D;
+            else if ([tname hasPrefix:@"texturecube_array"]) tt = MTLTextureTypeCubeArray;
+            else if ([tname hasPrefix:@"texturecube"]) tt = MTLTextureTypeCube;
+            else if ([tname hasPrefix:@"texture_buffer"]) tt = MTLTextureTypeTextureBuffer;
+            else if ([tname hasPrefix:@"depth2d_array"]) { tt = MTLTextureType2DArray; d[@"depth"] = @YES; }
+            else if ([tname hasPrefix:@"depthcube"]) { tt = MTLTextureTypeCube; d[@"depth"] = @YES; }
+            else if ([tname hasPrefix:@"depth2d"]) { d[@"depth"] = @YES; }
+            MTLDataType dt = MTLDataTypeFloat;
+            if ([tname containsString:@"<uint"]) dt = MTLDataTypeUInt;
+            else if ([tname containsString:@"<int"]) dt = MTLDataTypeInt;
+            else if ([tname containsString:@"<half"]) dt = MTLDataTypeHalf;
+            d[@"textureType"] = @(tt);
+            d[@"dataType"] = @(dt);
+        }
+        [out addObject:d];
+    }
+    free(aops);
+    return out;
+}
+
+static RedNaviMTLFunction *rn_gl_function(id f, id<MTLDevice> dev, NSString **why) {
+    static void *(*ctx_create)(void), (*ctx_dispose)(void *), (*mod_dispose)(void *);
+    static int (*to_fd)(void *, int, int, int);
+    static void *(*gen)(void *, const void *, uint32_t);
+    static dispatch_once_t once;
+    static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+    static NSMutableDictionary<NSData *, NSArray *> *cache;     // request -> @[bitcode, arguments]
+    dispatch_once(&once, ^{
+        void *gl = dlopen("/System/Library/Frameworks/OpenGL.framework/Versions/A/Libraries/libGLVMPlugin.dylib", RTLD_NOW | RTLD_LOCAL);
+        void *ll = dlopen("/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/A/Libraries/libLLVMContainer.dylib", RTLD_NOW | RTLD_LOCAL);
+        if (gl && ll) {
+            ctx_create = dlsym(ll, "LLVMContextCreate"); ctx_dispose = dlsym(ll, "LLVMContextDispose"); mod_dispose = dlsym(ll, "LLVMDisposeModule");
+            to_fd = dlsym(ll, "LLVMWriteBitcodeToFD"); gen = dlsym(gl, "oglCodeGenServiceGenerateIR");
+            rn_llvm_md.nmd_count = dlsym(ll, "LLVMGetNamedMetadataNumOperands"); rn_llvm_md.nmd_ops = dlsym(ll, "LLVMGetNamedMetadataOperands");
+            rn_llvm_md.md_count = dlsym(ll, "LLVMGetMDNodeNumOperands"); rn_llvm_md.md_ops = dlsym(ll, "LLVMGetMDNodeOperands");
+            rn_llvm_md.md_string = dlsym(ll, "LLVMGetMDString"); rn_llvm_md.is_int = dlsym(ll, "LLVMIsAConstantInt"); rn_llvm_md.int_value = dlsym(ll, "LLVMConstIntGetZExtValue");
+        }
+        cache = [NSMutableDictionary new];
+    });
+    if (![f respondsToSelector:@selector(bitcodeData)] || ![f respondsToSelector:@selector(bitcodeType)] ||
+        ((NSUInteger (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType)) != 1) { *why = [NSString stringWithFormat:@"the function is not from a RedNavi library (%s)", class_getName(object_getClass(f))]; return nil; }
+    if (!ctx_create || !ctx_dispose || !mod_dispose || !to_fd || !gen) { *why = @"OpenGL function: libGLVMPlugin or libLLVMContainer is not usable"; return nil; }
+    id bd = [f performSelector:@selector(bitcodeData)];
+    NSData *req = [bd isKindOfClass:[NSData class]] ? bd : nil;
+    if (!req && bd) { const void *p0; size_t len; dispatch_data_t m = dispatch_data_create_map((dispatch_data_t)bd, &p0, &len); req = [NSData dataWithBytes:p0 length:len]; (void)m; }
+    if (req.length < 4) { *why = @"OpenGL function without a request"; return nil; }
+    os_unfair_lock_lock(&lock);
+    NSArray *hit = cache[req];
+    os_unfair_lock_unlock(&lock);
+    NSData *bc = hit[0];
+    NSArray<NSDictionary *> *args = hit.count > 1 ? hit[1] : nil;
+    if (!bc) {
+        char path[PATH_MAX];
+        if (!confstr(_CS_DARWIN_USER_TEMP_DIR, path, sizeof(path))) strlcpy(path, "/tmp/", sizeof(path));
+        strlcat(path, "rn_gl_XXXXXX", sizeof(path));
+        const int fd = mkstemp(path);
+        if (fd < 0) { *why = @"OpenGL function: no temporary file"; return nil; }
+        unlink(path);
+        void *ctx = ctx_create();
+        void *mod = gen(ctx, req.bytes, (uint32_t)req.length);
+        const int werr = mod ? to_fd(mod, fd, 0, 0) : -1;
+        args = mod ? rn_gl_args(mod) : nil;
+        if (mod) mod_dispose(mod);
+        ctx_dispose(ctx);
+        const off_t n = lseek(fd, 0, SEEK_END);
+        NSMutableData *d = (!werr && n > 0) ? [NSMutableData dataWithLength:(NSUInteger)n] : nil;
+        if (d && pread(fd, d.mutableBytes, (size_t)n, 0) != n) d = nil;
+        close(fd);
+        if (!d) { *why = [NSString stringWithFormat:@"OpenGL function: the GL code generator failed (request kind %u, %lu bytes)", *(const uint32_t *)req.bytes, (unsigned long)req.length]; return nil; }
+        bc = d;
+        os_unfair_lock_lock(&lock);
+        cache[req] = args ? @[bc, args] : @[bc];
+        os_unfair_lock_unlock(&lock);
+        NSMutableString *al = [NSMutableString string];
+        for (NSDictionary *a in args) [al appendFormat:@" %c%@%@", "b?ts"[[a[@"type"] intValue] & 3], a[@"index"], [a[@"size"] unsignedLongLongValue] ? [NSString stringWithFormat:@"(%@)", a[@"size"]] : @""];
+        rn_log("OpenGL function: request kind %u, %lu bytes, AIR %lu bytes, arguments:%s", *(const uint32_t *)req.bytes, (unsigned long)req.length, (unsigned long)bc.length, args ? al.UTF8String : " (metadata not readable)");
+        const char *dump = rn_diag ? getenv("RN_DUMP_AIR") : NULL;
+        if (dump) {
+            static int seq; [bc writeToFile:[NSString stringWithFormat:@"%s/gl_%02d_kind%u.air", dump, seq, *(const uint32_t *)req.bytes] atomically:NO];
+            [req writeToFile:[NSString stringWithFormat:@"%s/gl_%02d_kind%u.req", dump, seq++, *(const uint32_t *)req.bytes] atomically:NO];
+            Ivar fdv = class_getInstanceVariable(object_getClass(f), "_functionData");
+            if (fdv) {                                       // MTLFunctionData: functionInputs at +112 and airScript at +152 (dispatch data)
+                const char *base = (const char *)(__bridge void *)f + ivar_getOffset(fdv);
+                const char *nm[2] = {"inputs", "airscript"}; const size_t off[2] = {112, 152};
+                for (int k = 0; k < 2; k++) {
+                    id o = (__bridge id)*(void * const *)(base + off[k]);
+                    if (!o) { rn_log("GL function %s: nil", nm[k]); continue; }
+                    const void *p0; size_t len; dispatch_data_t m = dispatch_data_create_map((dispatch_data_t)o, &p0, &len);
+                    [[NSData dataWithBytes:p0 length:len] writeToFile:[NSString stringWithFormat:@"%s/gl_%02d_%s.bin", dump, seq - 1, nm[k]] atomically:NO];
+                    rn_log("GL function %s: %lu bytes", nm[k], (unsigned long)len); (void)m;
+                }
+            }
+            for (Class c = object_getClass(f); c && c != [NSObject class]; c = class_getSuperclass(c)) {
+                unsigned ni = 0; Ivar *iv = class_copyIvarList(c, &ni);
+                for (unsigned i = 0; i < ni; i++) {
+                    const char *t = ivar_getTypeEncoding(iv[i]);
+                    NSString *v = @"";
+                    if (t && t[0] == '@') { id o = object_getIvar(f, iv[i]); v = o ? [[o description] substringToIndex:MIN((NSUInteger)300, [[o description] length])] : @"nil"; }
+                    else if (t && (t[0] == 'Q' || t[0] == 'q' || t[0] == 'I' || t[0] == 'i')) v = [NSString stringWithFormat:@"%lld", (long long)*(int64_t *)((char *)(__bridge void *)f + ivar_getOffset(iv[i])) & (t[0] == 'I' || t[0] == 'i' ? 0xffffffffLL : -1LL)];
+                    rn_log("GL function ivar %s.%s (%s): %s", class_getName(c), ivar_getName(iv[i]), t, v.UTF8String);
+                }
+                free(iv);
+            }
+        }
+    }
+    RedNaviMTLFunction *w = [RedNaviMTLFunction new];
+    w->name = @"#main";
+    w->type = [(id<MTLFunction>)f functionType];
+    w->bitcode = bc;
+    w->args = args;
+    w->dev = dev;
+    return w;
+}
 static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error) {
     if (error) *error = nil;
     NSString *why = nil;
     RedNaviMTLFunction *fn[2] = {(RedNaviMTLFunction *)desc.vertexFunction, (RedNaviMTLFunction *)desc.fragmentFunction};
     rn_vk *vk = rn_vk_shared();
     RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
-    rn_log("render pipeline asked: vertex %s, fragment %s", fn[0] ? [(NSString *)((RedNaviMTLFunction *)fn[0])->name UTF8String] : "-", fn[1] ? [(NSString *)((RedNaviMTLFunction *)fn[1])->name UTF8String] : "-");
+    rn_log("render pipeline asked: vertex %s, fragment %s", fn[0] ? [fn[0].name UTF8String] : "-", fn[1] ? [fn[1].name UTF8String] : "-");
     if (!vk) why = @"RADV is not available";
     else if (!fn[0] || !fn[1]) why = @"a render pipeline needs a vertex and a fragment function";
     else for (int s = 0; s < 2 && !why; s++) {
-        if (![fn[s] isKindOfClass:[RedNaviMTLFunction class]]) { why = @"the function is not from a RedNavi library"; break; }
+        if (![fn[s] isKindOfClass:[RedNaviMTLFunction class]] && !(fn[s] = rn_gl_function(fn[s], dev, &why))) break;
         if (fn[s]->type != (s ? MTLFunctionTypeFragment : MTLFunctionTypeVertex)) { why = @"the function has the wrong type for its stage"; break; }
         char err[300] = "";
         uint32_t *spv = NULL;
@@ -2837,12 +3187,26 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
         for (unsigned i = 0; i < n; i++) {
             const rn_air_binding *ab = &info.bindings[i];
             p->binds[s][i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind == RN_AIR_NULL_TEXTURE ? RN_VK_SAMPLED_IMAGE : ab->kind, NULL};
-            p->kind[s][i] = ab->kind == RN_AIR_NULL_TEXTURE ? (RN_AIR_NULL_TEXTURE | (ab->dim << 8)) : ab->kind;   // the dimension of a placeholder texture rides in the upper bits
+            p->kind[s][i] = (ab->kind == RN_AIR_NULL_TEXTURE ? RN_AIR_NULL_TEXTURE : ab->kind) | (ab->dim << 8);   // the dimension of a texture rides in the upper bits (a placeholder needs it)
             p->mi[s][i] = ab->metal_index;
             if (ab->kind == RN_AIR_STATIC_SAMPLER) {
                 p->sampl[s][i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
                 p->binds[s][i].sampler = &p->sampl[s][i];
             }
+        }
+        if (fn[s]->args) p->args[s] = fn[s]->args;
+        else {                                               // a function of a Metal library: the reflection from the translator's bindings (no buffer sizes)
+            static const MTLTextureType tt[8][2] = {{MTLTextureType1D, MTLTextureType1DArray}, {MTLTextureType2D, MTLTextureType2DArray}, {MTLTextureType3D, MTLTextureType3D},
+                                                    {MTLTextureTypeCube, MTLTextureTypeCubeArray}, {MTLTextureTypeTextureBuffer, MTLTextureTypeTextureBuffer}};
+            NSMutableArray<NSDictionary *> *a = [NSMutableArray array];
+            for (unsigned i = 0; i < n; i++) {
+                const rn_air_binding *ab = &info.bindings[i];
+                if (ab->kind == RN_AIR_BUFFER) [a addObject:@{@"type": @(MTLArgumentTypeBuffer), @"index": @(ab->metal_index), @"size": @0, @"writable": @(ab->writable)}];
+                else if (ab->kind == RN_AIR_SAMPLER) [a addObject:@{@"type": @(MTLArgumentTypeSampler), @"index": @(ab->metal_index)}];
+                else if (ab->kind == RN_AIR_TEXTURE || ab->kind == RN_AIR_STORAGE_IMAGE || ab->kind == RN_AIR_NULL_TEXTURE)
+                    [a addObject:@{@"type": @(MTLArgumentTypeTexture), @"index": @(ab->metal_index), @"textureType": @(tt[ab->dim & 7][(ab->dim >> 3) & 1]), @"dataType": @(MTLDataTypeFloat), @"writable": @(ab->kind == RN_AIR_STORAGE_IMAGE)}];
+            }
+            p->args[s] = a;
         }
     }
     if (!why) {
@@ -2867,10 +3231,12 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
         }
         // The vertex descriptor of [[stage_in]] vertex functions: layouts[i] is vertex buffer index i, attribute n is the shader's [[attribute(n)]].
         MTLVertexDescriptor *vd = desc.vertexDescriptor;
+        uint8_t intype[16] = {0};
+        if (vd) rn_spv_input_types(p->spv[0], intype);
         for (NSUInteger i = 0; vd && !why && i < 16; i++) {
             MTLVertexAttributeDescriptor *a = vd.attributes[i];
             if (a.format == MTLVertexFormatInvalid) continue;
-            const unsigned vf = rn_vk_vertex_format(a.format);
+            const unsigned vf = intype[i] ? rn_vk_vertex_format_int(rn_vk_vertex_format(a.format)) : rn_vk_vertex_format(a.format);
             if (!vf) { why = [NSString stringWithFormat:@"vertex attribute %lu: format %lu is not supported", (unsigned long)i, (unsigned long)a.format]; break; }
             if (a.bufferIndex >= 16) { why = @"a vertex buffer index is 16 or more"; break; }
             p->vattr[p->nvattr++] = (rn_vk_vattr){(unsigned)i, (unsigned)a.bufferIndex, vf, (unsigned)a.offset};
@@ -2880,10 +3246,12 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             BOOL used = NO;
             for (unsigned k = 0; k < p->nvattr; k++) if (p->vattr[k].binding == i) used = YES;
             if (!used) continue;
-            if (l.stepFunction != MTLVertexStepFunctionPerVertex && l.stepFunction != MTLVertexStepFunctionPerInstance) { why = @"this vertex step function is not supported"; break; }
+            // Constant: every vertex reads the first element (OpenGL's current value of an attribute array that is not enabled), which is a per-vertex binding with stride 0 in Vulkan.
+            const BOOL constant = l.stepFunction == MTLVertexStepFunctionConstant;
+            if (l.stepFunction != MTLVertexStepFunctionPerVertex && l.stepFunction != MTLVertexStepFunctionPerInstance && !constant) { why = @"this vertex step function is not supported"; break; }
             if (l.stepFunction == MTLVertexStepFunctionPerInstance && l.stepRate != 1) { why = @"a vertex step rate other than 1 is not supported"; break; }
-            if (l.stride == 0) { why = @"a vertex buffer layout with stride 0 is not supported"; break; }
-            p->vlayout[p->nvlayout++] = (rn_vk_vlayout){(unsigned)i, (unsigned)l.stride, l.stepFunction == MTLVertexStepFunctionPerInstance};
+            if (l.stride == 0 && !constant) { why = @"a vertex buffer layout with stride 0 is not supported"; break; }
+            p->vlayout[p->nvlayout++] = (rn_vk_vlayout){(unsigned)i, constant ? 0u : (unsigned)l.stride, l.stepFunction == MTLVertexStepFunctionPerInstance};
         }
         if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
         if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";
@@ -2895,6 +3263,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
         return nil;
     }
     p->dev = dev;
+    rn_log("render pipeline %p made: vertex %lu bytes of SPIR-V (%u bindings), fragment %lu (%u bindings), %u vertex attributes", p, (unsigned long)p->spv[0].length, p->n[0], (unsigned long)p->spv[1].length, p->n[1], p->nvattr);
     return p;
 }
 
@@ -2906,6 +3275,66 @@ id rn_test_library(NSData *blob, NSError **error) { return [[RedNaviMTLLibrary a
 typedef uintptr_t (*rn_imp_len_opt)(id, SEL, NSUInteger, NSUInteger);
 typedef uintptr_t (*imp_fn_err1)(id, SEL, id);
 typedef uintptr_t (*rn_imp_bytes)(id, SEL, const void *, NSUInteger, NSUInteger);
+
+// Heaps (newHeapWithDescriptor:): no sub-allocation yet. A resource made from a heap is a resource of the device, allocated on its own; the heap keeps the count of what it
+// was asked for so that size, usedSize and the refusal of an allocation that does not fit behave as a heap's do. heapOffset stays 0.
+@interface RedNaviMTLHeap : NSObject <MTLHeap> {
+@public
+    id<MTLDevice> dev_;
+    MTLHeapDescriptor *desc_;
+    NSUInteger used_;
+    NSString *label_;
+}
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc;
+@end
+@implementation RedNaviMTLHeap
++ (void)load { class_addProtocol(self, @protocol(MTLHeap)); }
+- (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc {
+    if (!(self = [super init])) return nil;
+    dev_ = d;
+    desc_ = [desc copy];
+    rn_log("heap: %lu bytes, storage %lu", (unsigned long)desc.size, (unsigned long)desc.storageMode);
+    return self;
+}
+- (id<MTLDevice>)device { return dev_; }
+- (NSString *)label { return label_; }
+- (void)setLabel:(NSString *)label { label_ = [label copy]; }
+- (MTLStorageMode)storageMode { return desc_.storageMode; }
+- (MTLCPUCacheMode)cpuCacheMode { return desc_.cpuCacheMode; }
+- (MTLHazardTrackingMode)hazardTrackingMode { return desc_.hazardTrackingMode; }
+- (MTLResourceOptions)resourceOptions { return desc_.resourceOptions; }
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
+- (MTLHeapType)type { return desc_.type; }
+- (NSUInteger)size { return desc_.size; }
+- (NSUInteger)usedSize { return used_; }
+- (NSUInteger)currentAllocatedSize { return used_; }
+- (NSUInteger)allocatedSize { return used_; }
+- (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment {
+    NSUInteger a = alignment > 1 ? alignment : 1;
+    NSUInteger start = (used_ + a - 1) / a * a;
+    return start < desc_.size ? desc_.size - start : 0;
+}
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
+    MTLSizeAndAlign sa = [dev_ heapBufferSizeAndAlignWithLength:length options:options];
+    NSUInteger need = sa.size ? sa.size : length;
+    if (used_ + need > desc_.size) return nil;
+    id<MTLBuffer> b = [dev_ newBufferWithLength:length options:options];
+    if (b) used_ += need;
+    return b;
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
+    // The size a texture takes is not asked of the device when the device does not answer it (its answer would be a zero struct): width x height x depth x 4 then.
+    NSUInteger need = (NSUInteger)desc.width * desc.height * desc.depth * 4;
+    if ([dev_ respondsToSelector:@selector(heapTextureSizeAndAlignWithDescriptor:)]) {
+        MTLSizeAndAlign sa = [dev_ heapTextureSizeAndAlignWithDescriptor:desc];
+        if (sa.size) need = sa.size;
+    }
+    if (used_ + need > desc_.size) return nil;
+    id<MTLTexture> t = [dev_ newTextureWithDescriptor:desc];
+    if (t) used_ += need;
+    return t;
+}
+@end
 
 void rn_compute_install(Class k, Class sup) {
     {
@@ -2993,6 +3422,15 @@ void rn_compute_install(Class k, Class sup) {
         if (!rn_gate()) return o7 ? o7(self, s7, desc) : 0;
         return (uintptr_t)CFBridgingRetain([[RedNaviMTLTexture alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc]);
     }), m7 ? method_getTypeEncoding(m7) : "@24@0:8@16");
+    // Heaps (see RedNaviMTLHeap)
+    SEL sh = sel_registerName("newHeapWithDescriptor:");
+    Method mh = class_getInstanceMethod(sup, sh);
+    typedef uintptr_t (*imp_heap)(id, SEL, id);
+    imp_heap oh = mh ? (imp_heap)method_getImplementation(mh) : NULL;
+    class_addMethod(k, sh, imp_implementationWithBlock(^uintptr_t(id self, MTLHeapDescriptor *desc) {
+        if (!rn_gate()) return oh ? oh(self, sh, desc) : 0;
+        return (uintptr_t)CFBridgingRetain([[RedNaviMTLHeap alloc] initWithDevice:(id<MTLDevice>)self descriptor:desc]);
+    }), mh ? method_getTypeEncoding(mh) : "@24@0:8@16");
     // Events (the first one of this process's plug-in creates a shared memory object per event)
     SEL se1 = sel_registerName("newSharedEvent"), se2 = sel_registerName("newEvent"), se3 = sel_registerName("newSharedEventWithHandle:");
     Method me1 = class_getInstanceMethod(sup, se1), me2 = class_getInstanceMethod(sup, se2), me3 = class_getInstanceMethod(sup, se3);
@@ -3069,7 +3507,10 @@ void rn_compute_install(Class k, Class sup) {
     imp_desc_opt_refl_err ro2 = rm2 ? (imp_desc_opt_refl_err)method_getImplementation(rm2) : NULL;
     class_addMethod(k, r2, imp_implementationWithBlock(^uintptr_t(id self, id desc, NSUInteger options, void *reflection, NSError **error) {
         if (!rn_gate()) return ro2 ? ro2(self, r2, desc, options, reflection, error) : 0;
-        return (uintptr_t)CFBridgingRetain(rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, error));
+        id p = rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, error);
+        if (reflection) *(id __autoreleasing *)reflection = p ? rn_render_reflection(p) : nil;
+        if (rn_diag && reflection) rn_log("render pipeline %p: reflection asked, options 0x%lx", (__bridge void *)p, (unsigned long)options);
+        return (uintptr_t)CFBridgingRetain(p);
     }), rm2 ? method_getTypeEncoding(rm2) : "@48@0:8@16Q24^@32^@40");
     SEL r3 = sel_registerName("newRenderPipelineStateWithDescriptor:completionHandler:");
     Method rm3 = class_getInstanceMethod(sup, r3);
@@ -3087,7 +3528,7 @@ void rn_compute_install(Class k, Class sup) {
         if (!rn_gate()) { if (ro4) ro4(self, r4, desc, options, (id)handler); return; }
         NSError *error = nil;
         id p = rn_render_pso_from_descriptor((id<MTLDevice>)self, desc, &error);
-        handler(p, nil, error);
+        handler(p, p ? rn_render_reflection(p) : nil, error);
     }), rm4 ? method_getTypeEncoding(rm4) : "v40@0:8@16Q24@?32");
     // The private shader entry
     class_addMethod(k, sel_registerName("rn_newComputePipelineWithSPIRV:bufferCount:pushBytes:"), imp_implementationWithBlock(^id(id self, NSData *spirv, NSUInteger nbuf, NSUInteger push) {
@@ -3183,6 +3624,7 @@ void rn_compute_install(Class k, Class sup) {
         static const struct { const char *name; BOOL value; } caps[] = {
             {"supportsBufferlessClientStorageTexture", YES}, {"isHeadless", NO},   /* WindowServer composes the display with Metal only if some device is not headless (WSSystemCanCompositeWithMetal asks isHeadless of every device); this one drives a display */ {"supportsExtendedXR10Formats", NO}, {"supportsMemorylessRenderTargets", NO}, {"supportsNativeHardwareFP16", NO},
             {"supportsRasterOrderGroups", NO}, {"supportsSIMDGroup", NO}, {"supportsSIMDReduction", NO}, {"supportsSIMDShuffleAndFill", NO}, {"supportsTileShaders", NO},
+            {"supportsUnalignedVertexFetch", YES},   /* Vulkan has no stride or offset alignment rule of 4 bytes for vertex buffers (RADV fetches 1-byte strides); with NO the OpenGL renderer repacks the attributes per vertex and splits instanced draws into one draw per instance with instance_id 0 (Kitty's cells, 2026-11-21) */
             {"isFramebufferReadSupported", YES}, {"supportsProgrammableBlending", YES}, {"supportsYCBCRFormats12", NO}, {"supportsYCBCRPackedFormats12", NO}, {"supportsExpectedWakeupBeforeCommitDeadline", NO},
             // what a real device answers and RADV on Navi 32 can do too (tools/mtl_limits.m lists them): QuartzCore chooses data formats and shader variants from these
             {"supports32BitFloatFiltering", YES}, {"supportsFloat16InfNanFiltering", YES}, {"supportsTextureSwizzle", YES}, {"supportsQueryTextureLOD", YES}, {"supportsInt64", YES},

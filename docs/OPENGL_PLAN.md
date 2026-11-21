@@ -52,6 +52,19 @@ Then `tools/gl_probe.m` gets renderer `0x01027f00`, accelerated, `GL_VENDOR AMD`
 
 This was run with the new plug-in loaded only into the test process (`DYLD_INSERT_LIBRARIES` with a small `dlopen` shim), not installed.
 
+## Kitty draws (2026-11-21, desktop, **V**)
+
+Kitty 0.47.4 now opens a 3.3 core context on the card and its window shows the shell and `fastfetch` output with the right glyphs and colours (checked on the render pass dumps of the cell pass, run with the plug-in preloaded into Kitty only, not installed). What it took after the first run:
+
+1. The renderer makes its functions with `newFunctionWithGLCoreIR:`: the GL compiler service (`oglCodeGenServiceGenerateIR`) produces AIR, which goes through the AIR to SPIR-V translator like any Metal library.
+2. The renderer binds only what the pipeline reflection lists, by name: `vs_`/`fs_` followed by `tex_N`, `smp_N`, `uniform_buffer` and `ubo_k` (AIR buffer 18 + k), as its `processReflection` builds them. The plug-in's reflection now uses those names; with other names the uniform buffers and textures were never bound.
+3. `supportsUnalignedVertexFetch` answers YES (Vulkan has no 4-byte rule for vertex strides or offsets). With NO the renderer repacks the attributes per vertex and splits an instanced draw into one draw per instance with `instance_id` 0: every Kitty cell landed on cell 0 and the cell pass drew nothing visible.
+4. Metal converts a vertex attribute to the type the shader declares, Vulkan takes it from the format. The plug-in reads the type of each input location from the SPIR-V and uses the `UINT`/`SINT` format for integer inputs (Kitty's colours and sprite indices are `uvec`); with the `USCALED` format the shader got the bits of floats.
+
+A pitfall on the way: a test bundle with a RADV library from before the attribute ring fix (BIG_PAGE, see `docs/M6_DISPLAY_ACCEL.md`) drew 8-row blocks of the cell grid with another cell's glyphs, different on every run. Kitty's 7399-instance cell draw spans many NGG workgroups, so it shows that bug at once; with the current RADV the frames are clean. The pass dump (`RN_DUMP_PASSES`) now waits for the batch before it reads the target, so a dump is never a half-copied image.
+
+Still unimplemented and logged by Kitty: `setProvokingVertexMode:` (Kitty's output looks right without it), `setPrimitiveRestartEnabled:index:` and `makeTextureViewRscIfNeeded`. Not checked: Kitty with the plug-in installed (it needs `kitty` in `/Users/Shared/rednavi-on`), typing and scrolling over time, other GL programs.
+
 ## If that fails: the options
 
 All of these are **S** (assessment from the sources and from how the projects are built; none was tried here).
@@ -66,5 +79,5 @@ Recommendation: do the experiment first (it costs nothing but a boot-arg), then 
 
 ## Not done
 
-- No run on the card. No test of `newGLContext`, of `IOVARendererID`, of an off-screen context from SSH, or of Kitty on the desktop.
+- No test of `newGLContext`, of `IOVARendererID` or of an off-screen context from SSH.
 - The OpenGL framework (dyld cache) was not inspected, so the renderer-selection logic is inferred from the Intel registry entry and from the strings of the renderer bundle.

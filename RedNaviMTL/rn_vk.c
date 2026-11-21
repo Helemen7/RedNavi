@@ -56,7 +56,10 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; };   // gpudirty: a render pass wrote the image and the host copy is older
+struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; int array; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; };   // gpudirty: a render pass wrote the image and the host copy is older
+// A 2D array keeps its layers in d like the depth of a 3D image (the host copy is the same: slice after slice), but Vulkan wants them as array layers.
+#define RN_IMG_LAYERS(im) ((im)->array ? (im)->d : 1u)
+#define RN_IMG_DEPTH(im) ((im)->array ? 1u : (im)->d)
 struct rn_vk_sampler { VkSampler s; };
 struct rn_vk_compute {
     VkShaderModule sm; VkDescriptorSetLayout dsl; VkPipelineLayout pl; VkDescriptorPool dp; VkDescriptorSet ds;
@@ -462,13 +465,13 @@ uint64_t rn_vk_imgstat[3];                                     // reused, made, 
 // Experiment switches, read once: /Users/Shared/rednavi-nopool (no image reuse) and /Users/Shared/rednavi-passsubmit (every render pass submitted and waited for on its own).
 static int rn_switch(int *v, const char *path) { if (*v < 0) *v = access(path, F_OK) == 0; return *v; }
 static int g_sw_nopool = -1, g_sw_passsubmit = -1;
-static rn_vk_image *image_pool_take(int format, uint32_t w, uint32_t h, uint32_t d) {
+static rn_vk_image *image_pool_take(int format, uint32_t w, uint32_t h, uint32_t d, int array) {
     rn_vk_image *hit = NULL;
     if (rn_switch(&g_sw_nopool, "/Users/Shared/rednavi-nopool")) return NULL;
     pthread_mutex_lock(&g_img_pool_lock);
     for (unsigned i = 0; i < g_img_pool_n; i++) {
         rn_vk_image *c = g_img_pool[i];
-        if (c->rnfmt == format && c->w == w && c->h == h && c->d == d) { hit = c; g_img_pool[i] = g_img_pool[--g_img_pool_n]; g_img_pool_bytes -= (unsigned long long)w * h * d * c->texel; break; }
+        if (c->rnfmt == format && c->w == w && c->h == h && c->d == d && c->array == array) { hit = c; g_img_pool[i] = g_img_pool[--g_img_pool_n]; g_img_pool_bytes -= (unsigned long long)w * h * d * c->texel; break; }
     }
     pthread_mutex_unlock(&g_img_pool_lock);
     if (hit) {
@@ -481,15 +484,17 @@ static rn_vk_image *image_pool_take(int format, uint32_t w, uint32_t h, uint32_t
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t w, uint32_t h) { return rn_vk_image_create3d(vk, format, w, h, 1); }
 static __thread const char *g_image_err = "";
 const char *rn_vk_image_last_error(void) { return g_image_err; }
-rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h, uint32_t d) {
+rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h, uint32_t d) { return rn_vk_image_create_layers(vk, format, w, h, d, 0); }
+rn_vk_image *rn_vk_image_create_layers(rn_vk *vk, int format, uint32_t w, uint32_t h, uint32_t d, int array) {
     const unsigned texel = rn_vk_format_texel_bytes(format);
     g_image_err = "bad size or format";
     if (!texel || !w || !h || !d) return NULL;
-    { rn_vk_image *re = image_pool_take(format, w, h, d); if (re) return re; }
+    array = array != 0;
+    { rn_vk_image *re = image_pool_take(format, w, h, d, array); if (re) return re; }
     __atomic_fetch_add(&rn_vk_imgstat[1], 1, __ATOMIC_RELAXED);
     rn_vk_image *im = calloc(1, sizeof(*im));
     if (!im) return NULL;
-    im->fmt = vk_format(format); im->rnfmt = format; im->w = w; im->h = h; im->d = d; im->texel = texel;
+    im->fmt = vk_format(format); im->rnfmt = format; im->w = w; im->h = h; im->d = d; im->array = array; im->texel = texel;
     VkFormatProperties fp;
     vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
     const VkFormatFeatureFlags f = fp.optimalTilingFeatures;
@@ -497,7 +502,7 @@ rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h,
     if ((f & need) != need) { g_image_err = "format features"; goto fail; }
     im->storage = (f & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     im->color = d == 1 && (f & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;   // a 3D texture is never a render target here
-    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = d > 1 ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, d}, .mipLevels = 1, .arrayLayers = 1,
+    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = d > 1 && !array ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = im->fmt, .extent = {w, h, RN_IMG_DEPTH(im)}, .mipLevels = 1, .arrayLayers = RN_IMG_LAYERS(im),
                              .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
                                 .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
                              .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | (im->storage ? VK_IMAGE_USAGE_STORAGE_BIT : 0) | (im->color ? VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT : 0)};
@@ -511,8 +516,8 @@ rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t w, uint32_t h,
     VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
     if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) { g_image_err = "vkAllocateMemory of the image (out of device memory?)"; goto fail; }
     if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) { g_image_err = "vkBindImageMemory"; goto fail; }
-    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
-                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS}};
     if (format == RN_VK_A8) {                   // Metal's A8Unorm samples as (0, 0, 0, a); Vulkan has no such format, so the R8 view puts the texel in alpha. Not a render target (an attachment view must not swizzle).
         vci.components = (VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};
         im->color = 0;
@@ -542,8 +547,8 @@ rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const un
     v->base = root; v->fmt = vf; v->view = VK_NULL_HANDLE; v->initialized = v->dirty = 0;
     v->storage = root->storage && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
     v->color = root->color && (fp.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = root->d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = vf,
-                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = root->array ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : root->d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = vf,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS}};
     if (swizzle) vci.components = (VkComponentMapping){swizzle[0], swizzle[1], swizzle[2], swizzle[3]};
     if (format == RN_VK_A8) {
         // An A8Unorm view samples as (0, 0, 0, a) like an A8 image (rn_vk_image_create): the R8 texel goes to alpha, and the view's own swizzle, if any, picks from (0, 0, 0, texel).
@@ -599,7 +604,7 @@ rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t w, uint32_t h
     if (vk->AllocateMemory(vk->dev, &mai, NULL, &im->mem) != VK_SUCCESS) { g_image_err = "vkAllocateMemory of the host pointer"; goto fail; }
     if (vk->BindImageMemory(vk->dev, im->img, im->mem, 0) != VK_SUCCESS) { g_image_err = "vkBindImageMemory (host)"; goto fail; }
     VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = im->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = im->fmt,
-                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                 .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS}};
     if (format == RN_VK_A8) { vci.components = (VkComponentMapping){VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R}; im->color = 0; }
     if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view) != VK_SUCCESS) { g_image_err = "vkCreateImageView (host)"; goto fail; }
     return im;
@@ -800,12 +805,12 @@ static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, uns
         if (!r->initialized) {
             VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = 0, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .oldLayout = r->hostmem ? VK_IMAGE_LAYOUT_PREINITIALIZED : VK_IMAGE_LAYOUT_UNDEFINED,
                                        .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = r->img,
-                                       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                       .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS}};
             vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
             r->initialized = 1;
         }
         if (r->dirty && !r->hostmem) {
-            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
+            VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, RN_IMG_LAYERS(r)}, .imageExtent = {r->w, r->h, RN_IMG_DEPTH(r)}};
             vk->CmdCopyBufferToImage(cb, r->stage->buf, r->img, VK_IMAGE_LAYOUT_GENERAL, 1, &bc);
             r->dirty = 0;
             copied = 1;
@@ -845,7 +850,7 @@ static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, un
         int seen = 0;
         for (unsigned j = 0; j < i; j++) seen |= (im[j]->base ? im[j]->base : im[j]) == r;
         if (seen || r->hostmem) continue;                            // an image over host memory is already where the host reads it
-        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {r->w, r->h, r->d}};
+        VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, RN_IMG_LAYERS(r)}, .imageExtent = {r->w, r->h, RN_IMG_DEPTH(r)}};
         vk->CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_GENERAL, r->stage->buf, 1, &bc);
         r->gpudirty = 0;
         done++;
@@ -900,7 +905,7 @@ int rn_vk_image_verify(rn_vk *vk, rn_vk_image *im, size_t *ndiff, size_t *first,
         VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
         if (tmp && vk->AllocateCommandBuffers(vk->dev, &cba, &cb) == VK_SUCCESS) {
             if (vk->BeginCommandBuffer(cb, &cbb) == VK_SUCCESS) {
-                VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {im->w, im->h, im->d}};
+                VkBufferImageCopy bc = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, RN_IMG_LAYERS(im)}, .imageExtent = {im->w, im->h, RN_IMG_DEPTH(im)}};
                 vk->CmdCopyImageToBuffer(cb, im->img, VK_IMAGE_LAYOUT_GENERAL, tmp->buf, 1, &bc);
                 VkMemoryBarrier hb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_HOST_READ_BIT};
                 vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
@@ -1185,7 +1190,7 @@ static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
         if (!targets[i].clear) continue;
         VkClearColorValue cc;
         clear_value(targets[i].image, targets[i].color, &cc);
-        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
         vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
         if (!targets[i].discard) out[cleared++] = targets[i].image;
     }
@@ -1354,7 +1359,7 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
             if (!targets[i].clear) continue;
             VkClearColorValue cc;
             clear_value(targets[i].image, targets[i].color, &cc);
-            VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageSubresourceRange rg = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS};
             vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
         }
     }
