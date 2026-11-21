@@ -39,6 +39,7 @@ These are Linux driver API responses from this capture; they are not claims abou
 ## Findings
 
 - ACCEL_WORKING returned 1. This is the Linux driver's status flag, not proof that a particular workload was submitted.
+- `AMDGPU_INFO_FW_TA` (`FW_VERSION` type `0x13`) returned nonzero metadata for indices 0, 1 and 2: version `0x13`, feature `0x1` in each response. The Linux UAPI identifies type `0x13` as PSP TA. This is positive runtime evidence that the PSP TA firmware was loaded for this boot; the ioctl does not reveal the source file path or payload hash.
 - The successful HW_IP_INFO responses report GFX 11.0, COMPUTE 11.0, DMA 6.0, and VCN decoder/encoder/JPEG 4.0. Their IP Discovery versions cross-check with the existing Navi 33 inventory: GC 11.0.2, SDMA 6.0.2 and VCN/UVD 4.0.4.
 - HW_IP_COUNT reports two DMA instances. This is distinct from the HW_IP_INFO instance argument; the public UAPI in the installed kernel headers sets AMDGPU_HW_IP_INSTANCE_MAX_COUNT to 1, so instance argument 1 is rejected.
 - VCN decoder reports no available ring bits in this snapshot, while VCN encoder and JPEG report ring 0. This is a Linux API observation only; it does not demonstrate that RedNavi can initialize or submit work to those engines.
