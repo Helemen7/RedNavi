@@ -15,6 +15,11 @@ chown root:wheel "$B/Contents/MacOS/RedNaviMTLDriver"
 chmod 755 "$B/Contents/MacOS/RedNaviMTLDriver"
 # A new RADV (zero-copy IOSurface textures need the bridge's RN_UC_BO_USERPTR import): staged next to the executable as /Users/Shared/rnstage/libvulkan_radeon.dylib, put in the bundle when it differs.
 VKLIB=${2:-/Users/Shared/rnstage/libvulkan_radeon.dylib}
+# A RADV straight from the Mesa build links MacPorts' libraries (/opt/local/lib/libz.1.dylib, ...), which the bundle does not carry: WindowServer then gets no Metal device and
+# CoreDisplay aborts at every start (2026-11-21). Relink it first as scripts/package_metal_test.sh does (libz to /usr/lib, the others to @loader_path).
+if [ -f "$VKLIB" ] && otool -L "$VKLIB" | tail -n +2 | grep -qE '/opt/local/|/Users/'; then
+  echo "$VKLIB links libraries outside the bundle:"; otool -L "$VKLIB" | grep -E '/opt/local/|/Users/'; exit 1
+fi
 if [ -f "$VKLIB" ] && ! cmp -s "$VKLIB" "$B/Contents/Resources/vk/libvulkan_radeon.dylib"; then
   cp "$VKLIB" "$B/Contents/Resources/vk/libvulkan_radeon.dylib"
   chown root:wheel "$B/Contents/Resources/vk/libvulkan_radeon.dylib"
