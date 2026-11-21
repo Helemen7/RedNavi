@@ -30,7 +30,14 @@
 // The log goes to the unified log (subsystem org.rednavi.metal, category plugin: `log stream --predicate 'subsystem == "org.rednavi.metal"'`), which every process can write, WindowServer
 // and the other system daemons included. The long lists of selectors and capability answers a device is asked for go in at debug level (not kept unless asked). A process that was started
 // for testing (RN_METAL_COMPUTE or RN_LOG_FILE in its environment) also appends to /tmp/rednavi-metal-<uid>.log, which the test tools read.
+// Diagnostics (the log, the commit statistics, the creation sites, the trace switches) cost time on every frame, so they are off unless /Users/Shared/rednavi-log exists when the
+// plug-in loads, or the process was started for testing (RN_METAL_COMPUTE, RN_LOG_FILE or RN_DIAG in its environment). Without them rn_log returns at once.
+int rn_diag;
+__attribute__((constructor)) static void rn_diag_init(void) {
+    rn_diag = access("/Users/Shared/rednavi-log", F_OK) == 0 || getenv("RN_METAL_COMPUTE") != NULL || getenv("RN_LOG_FILE") != NULL || getenv("RN_DIAG") != NULL;
+}
 void rn_log(const char *fmt, ...) {
+    if (!rn_diag) return;
     static char name[64];
     if (!name[0]) { extern const char *getprogname(void); strlcpy(name, getprogname(), sizeof(name)); }
     static os_log_t log;

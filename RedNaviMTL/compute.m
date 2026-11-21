@@ -34,6 +34,7 @@
 #include "metallib.h"
 
 extern void rn_log(const char *fmt, ...);
+extern int rn_diag;                      // diagnostics on (plugin.m): /Users/Shared/rednavi-log, or a test process
 
 // Which processes get the plug-in's queues, textures and the rest. Until now only the ones started with RN_METAL_COMPUTE in their environment, so WindowServer kept its software
 // compositor. The environment variable still works; for every process (WindowServer included) the files /Users/Shared/rednavi-on (switch it on) and /Users/Shared/rednavi-off (wins
@@ -69,7 +70,7 @@ static struct rn_site { uint64_t h; long live; long made; char kind; char where[
 static os_unfair_lock g_sites_lock = OS_UNFAIR_LOCK_INIT;
 static uint64_t rn_site_enter(char kind) {
     static int off = -1;
-    if (off < 0) { const char *e = getenv("RN_SITES"); off = e && e[0] == '0'; }
+    if (off < 0) { const char *e = getenv("RN_SITES"); off = !rn_diag || (e && e[0] == '0'); }
     if (off) return 0;
     void *bt[12];
     int n = backtrace(bt, 12);
@@ -160,7 +161,7 @@ BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
         if (!b) { rn_log("buffer of %lu bytes: allocation failed", (unsigned long)l); return nil; }
         dev = d; len = l; options = o; site_ = rn_site_enter('B');
         memset(rn_vk_buffer_contents(b), 0, l ? l : 1);
-        if (getenv("RN_LOG_BUFFERS")) rn_log("new buffer %p: %lu bytes, options 0x%lx, contents %p", self, (unsigned long)l, (unsigned long)o, rn_vk_buffer_contents(b));
+        if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("new buffer %p: %lu bytes, options 0x%lx, contents %p", self, (unsigned long)l, (unsigned long)o, rn_vk_buffer_contents(b));
     }
     return self;
 }
@@ -1272,19 +1273,19 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { pso = (RedNaviMTLRenderPipelineState *)state; }
-- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: set%sBuffer %p off %lu idx %lu", st ? "Fragment" : "Vertex", b, (unsigned long)o, (unsigned long)i); if (rn_slot_ok(i, "buffer")) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
+- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("trace: set%sBuffer %p off %lu idx %lu", st ? "Fragment" : "Vertex", b, (unsigned long)o, (unsigned long)i); if (rn_slot_ok(i, "buffer")) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
 - (void)bindBytes:(const void *)bytes length:(NSUInteger)len index:(NSUInteger)i stage:(int)st { if (rn_slot_ok(i, "buffer")) { bytesAt[st][i] = [NSData dataWithBytes:bytes length:len]; bufs[st][i] = nil; } }
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:0]; }
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:0];
 }
-- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setVertexBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[0][index] = offset; }
+- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("trace: setVertexBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[0][index] = offset; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:0]; }
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:1]; }
 - (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:1];
 }
-- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[1][index] = offset; }
+- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[1][index] = offset; }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:1]; }
 - (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[0][i] = (RedNaviMTLTexture *)t; }
 - (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[1][i] = (RedNaviMTLTexture *)t; }
@@ -1303,7 +1304,7 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)setViewports:(const MTLViewport [])v count:(NSUInteger)n { if (n) [self setViewport:v[0]]; if (n > 1) [self ignored:"viewports beyond the first"]; }
 - (void)setScissorRects:(const MTLScissorRect [])r count:(NSUInteger)n { if (n) [self setScissorRect:r[0]]; if (n > 1) [self ignored:"scissor rects beyond the first"]; }
 // state that is not implemented yet is logged once and ignored: there is no depth test
-- (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
+- (void)ignored:(const char *)what { if (!rn_diag) return; static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
 - (void)setDepthClipMode:(MTLDepthClipMode)m { if (m != MTLDepthClipModeClip) [self ignored:"depth clip mode (clamp)"]; }
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)m offset:(NSUInteger)o { if (m != MTLVisibilityResultModeDisabled) [self ignored:"visibility result mode (occlusion queries)"]; }
 - (void)textureBarrier { [self ignored:"textureBarrier"]; }
@@ -1324,7 +1325,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
     d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
     d->cull = cullMode; d->clockwise = !counterClockwise;
-    if (getenv("RN_LOG_BUFFERS")) {                                 // does anything rewrite the vertex data of the earlier draws while the rest is encoded?
+    if ((rn_diag && getenv("RN_LOG_BUFFERS"))) {                                 // does anything rewrite the vertex data of the earlier draws while the rest is encoded?
         static NSMutableArray *snaps; if (!snaps) snaps = [NSMutableArray new];
         static unsigned drawNo;
         for (NSMutableDictionary *sn in snaps) {
@@ -1342,7 +1343,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) { if (d->bufs[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=%p+%lu", st ? 'f' : 'v', i, d->bufs[st][i], (unsigned long)d->offs[st][i]); else if (d->bytesAt[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=bytes(%lu)", st ? 'f' : 'v', i, (unsigned long)d->bytesAt[st][i].length); }
         rn_log("  encode: draw #%u binds:%s", drawNo - 1, bl);
     }
-    if (getenv("RN_LOG_BUFFERS") && d->bufs[0][1]) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
+    if ((rn_diag && getenv("RN_LOG_BUFFERS")) && d->bufs[0][1]) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
         const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1];
         char hx[100] = ""; for (int j = 0; j < 32; j++) snprintf(hx + 2 * j, 4, "%02x", bp[j]);
         rn_log("  encode: draw %lu of the pass, v buffer 1 %p offset %lu: %s", (unsigned long)pass->draws.count, d->bufs[0][1], (unsigned long)d->offs[0][1], hx);
@@ -1398,6 +1399,7 @@ static void rn_frame_note(void *src) {
     if (gap > 12000000ull) atomic_fetch_add(&g_framelong, 1);
 }
 static void rn_commit_stats(uint64_t ticks) {
+    if (!rn_diag) return;                                // the statistics are diagnostics: only with /Users/Shared/rednavi-log
     static mach_timebase_info_data_t tb;
     static uint64_t sum, worst, count, since;
     static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
@@ -2090,7 +2092,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 - (id<MTLBlitCommandEncoder>)blitCommandEncoder { return (id)[[RedNaviMTLBlitCommandEncoder alloc] initWithCommandBuffer:self]; }
 - (id<MTLBlitCommandEncoder>)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)d { return [self blitCommandEncoder]; }
 - (id<MTLRenderCommandEncoder>)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)d {
-    if (getenv("RN_LOG_BUFFERS")) rn_log("render pass encoder on command buffer %p, thread %p", self, (void *)pthread_self());
+    if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("render pass encoder on command buffer %p, thread %p", self, (void *)pthread_self());
     RNRenderPass *rp = [RNRenderPass new];
     rp->draws = [NSMutableArray new];
     for (NSUInteger i = 0; i < 8; i++) {
@@ -2111,7 +2113,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 - (void)runRenderPass:(RNRenderPass *)rp {
     rn_vk *vk = rn_vk_shared();
     NSUInteger nd = rp->draws.count;
-    if (getenv("RN_MAX_DRAWS") && nd > (NSUInteger)atoi(getenv("RN_MAX_DRAWS"))) nd = (NSUInteger)atoi(getenv("RN_MAX_DRAWS"));   // debugging: only the first n draws of every pass
+    if (rn_diag && getenv("RN_MAX_DRAWS") && nd > (NSUInteger)atoi(getenv("RN_MAX_DRAWS"))) nd = (NSUInteger)atoi(getenv("RN_MAX_DRAWS"));   // debugging: only the first n draws of every pass
     rn_vk_target tg[8];
     BOOL direct = NO;
     for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}, !rp->store[i]};
@@ -2121,11 +2123,11 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             if (vr && rp->tex[i]->pf != rt->pf) { @synchronized ([RedNaviMTLTexture class]) { vr = rn_vram_as(vk, vr, rp->tex[i]->pf); } }
             if (vr) { tg[i].image = vr; direct = YES; }
         } }
-    if (getenv("RN_LOG_DRAWS"))
+    if ((rn_diag && getenv("RN_LOG_DRAWS")))
         for (unsigned i = 0; i < rp->nt; i++) rn_log("pass: target %u %lux%lu/%lu %s %s clear (%.2f %.2f %.2f %.2f), %lu draws", i, (unsigned long)rp->tex[i]->w, (unsigned long)rp->tex[i]->h, (unsigned long)rp->tex[i]->pf, rp->tex[i]->parent ? "view" : "texture", rp->clear[i] ? "with" : "no", rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3], (unsigned long)nd);
     {   // /Users/Shared/rednavi-probe-display: what the render passes into display-sized surfaces are (which one CoreDisplay's final pass is), the first few of each kind
         static unsigned said; struct stat pst;
-        if (said < 14 && rp->tex[0] && rp->tex[0]->surf && rp->tex[0]->w == 1920 && rp->tex[0]->h == 1080 && stat("/Users/Shared/rednavi-probe-display", &pst) == 0) {
+        if (said < 14 && rp->tex[0] && rp->tex[0]->surf && rp->tex[0]->w == 1920 && rp->tex[0]->h == 1080 && rn_diag && stat("/Users/Shared/rednavi-probe-display", &pst) == 0) {
             said++;
             CFDictionaryRef props = IOSurfaceCopyAllValues(rp->tex[0]->surf);
             NSString *pd = props ? [(__bridge NSDictionary *)props description] : @"-";
@@ -2136,7 +2138,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     }
     // /Users/Shared/rednavi-logdraws (looked at on every pass, so it can be made and removed while the client runs): the draws of the passes into display surfaces, with their buffers
     BOOL logPass = NO;
-    if (direct) { static _Atomic unsigned budget; struct stat lst; if (stat("/Users/Shared/rednavi-logdraws", &lst) == 0) { if (atomic_fetch_add(&budget, 1) < 400) { logPass = YES; rn_log("logdraws: pass into IOSurface %u, %lu draws, clear %d", rp->tex[0]->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->surf) : (rp->tex[0]->parent && rp->tex[0]->parent->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->parent->surf) : 0u), (unsigned long)nd, rp->clear[0]); } } else atomic_store(&budget, 0); }
+    if (direct) { static _Atomic unsigned budget; struct stat lst; if (rn_diag && stat("/Users/Shared/rednavi-logdraws", &lst) == 0) { if (atomic_fetch_add(&budget, 1) < 400) { logPass = YES; rn_log("logdraws: pass into IOSurface %u, %lu draws, clear %d", rp->tex[0]->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->surf) : (rp->tex[0]->parent && rp->tex[0]->parent->surf ? (unsigned)IOSurfaceGetID(rp->tex[0]->parent->surf) : 0u), (unsigned long)nd, rp->clear[0]); } } else atomic_store(&budget, 0); }
     const NSUInteger na = nd ? nd : 1;               // a pass without draws still runs: its clears are done
     rn_vk_draw *dr = calloc(na, sizeof(*dr));
     rn_vk_arg (*va)[RN_VK_MAX_BINDINGS] = calloc(na, sizeof(*va));
@@ -2147,7 +2149,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
-        if (logPass || getenv("RN_LOG_DRAWS")) {
+        if (logPass || (rn_diag && getenv("RN_LOG_DRAWS"))) {
             char tb[400] = ""; int o = 0;
             for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
             rn_log("draw %lu: %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
@@ -2159,7 +2161,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             for (unsigned j = 0; j < d->vertexCount && j < 12 && io < 180; j++) { unsigned v = isz == 4 ? ((const uint32_t *)ip)[j] : ((const uint16_t *)ip)[j]; io += snprintf(ix + io, sizeof(ix) - io, " %u", v); }
             rn_log("  indices (%s, offset %llu, buffer %lu bytes):%s", d->index32 ? "uint32" : "uint16", (unsigned long long)d->indexOffset, (unsigned long)d->indexBuf->len, ix);
         }
-        if (logPass || getenv("RN_LOG_BUFFERS")) {                       // debugging: what is bound at every buffer index, with the first bytes
+        if (logPass || (rn_diag && getenv("RN_LOG_BUFFERS"))) {                       // debugging: what is bound at every buffer index, with the first bytes
             for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                 const uint8_t *bp = NULL; NSUInteger len = 0;
                 if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
@@ -2228,7 +2230,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             directPasses++;
         }
     }
-    if (!bad && !rc && getenv("RN_DUMP_PASSES") && rp->nt && rp->tex[0]->texel == 4 && rp->store[0]) {   // debugging: every pass's first target as a PNG in the directory named by the variable
+    if (!bad && !rc && rn_diag && getenv("RN_DUMP_PASSES") && rp->nt && rp->tex[0]->texel == 4 && rp->store[0]) {   // debugging: every pass's first target as a PNG in the directory named by the variable
         static unsigned seq;
         RedNaviMTLTexture *t = rp->tex[0];
         const uint8_t *src = rn_vk_image_staging(t->img);
@@ -2329,7 +2331,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     }
 }
 - (void)commitBody {
-    if (getenv("RN_LOG_BUFFERS")) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
+    if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
     if (ran) return;
     ran = YES;
     {   static dispatch_once_t swonce;       // which experiment switches this process runs with, so that what is seen on the screen can be tied to a configuration
@@ -2357,7 +2359,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { [t syncFromSurface]; [t syncFromBuffer]; } rn_ph(3, ph3); }
     {   // /Users/Shared/rednavi-trace: what each command buffer draws (a client such as WindowServer has no environment to set)
         struct stat tst;
-        if (stat("/Users/Shared/rednavi-trace", &tst) == 0)
+        if (rn_diag && stat("/Users/Shared/rednavi-trace", &tst) == 0)
             for (id rec in records) {
                 if ([rec isKindOfClass:[RNRenderPass class]]) {
                     RNRenderPass *rp = rec;
@@ -2383,7 +2385,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
                 else if ([rec isKindOfClass:[RNDispatch class]]) rn_log("trace: compute dispatch");
             }
     }
-    if (getenv("RN_LOG_BUFFERS"))
+    if ((rn_diag && getenv("RN_LOG_BUFFERS")))
         for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
             for (RNDraw *dw in rp->draws) if (dw->bufs[0][1]) {
@@ -2442,7 +2444,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     [rn_batch_keep() removeAllObjects];
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
     {   struct stat tst2;
-        if (stat("/Users/Shared/rednavi-trace", &tst2) == 0)
+        if (rn_diag && stat("/Users/Shared/rednavi-trace", &tst2) == 0)
             for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
     }
     { const uint64_t ph4 = mach_absolute_time(); if (st != MTLCommandBufferStatusError) [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:NO]; rn_ph(4, ph4); }
