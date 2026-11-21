@@ -750,6 +750,20 @@ static void rnPublishCaps(IOService *a) {
 // The family's start() builds everything but does not register the service (the node stayed !registered and Metal saw no device), which the Intel subclass presumably does
 // after it; stage 3 and up do it here.
 bool RedNaviAccel2::start(IOService *provider) {
+    // The probe kext brings the card up inside its own start() (PSP, SMU, GC, the queues) and registers its service at the very end. On the RX 7600 (2026-11-21), with this kext
+    // installed, the probe's graphics ring was never executed (gfx-test ok 0, its scratch register never written, the MES graphics queue at step 4, so RADV saw no graphics queue);
+    // on the same machine without this kext the same boot gave ok 1 and the queue at step 7. The family's start runs on another thread while the probe is still working on the
+    // card. Waiting for the probe to finish (kext 0.0.3) did not change it: the next boot with the wait (the log shows it waited) gave ok 0 again, so this kext's start is not the cause.
+    // The wait stays, so that the family never starts on a card that is still being brought up. Boot-arg rednavi_accel2_wait=0 skips it.
+    uint32_t waitProbe = 1;
+    PE_parse_boot_argn("rednavi_accel2_wait", &waitProbe, sizeof(waitProbe));
+    if (waitProbe) {
+        OSDictionary *match = IOService::serviceMatching("RedNaviProbe");
+        IOService *probeSvc = match ? IOService::waitForMatchingService(match, 600ULL * 1000000000ULL) : nullptr;   // the 7800 XT bring-up takes minutes; bounded so a missing probe does not block for ever
+        if (match) match->release();
+        rnNote("waited for the probe: %s", probeSvc ? "registered" : "not found within 600 s");
+        if (probeSvc) probeSvc->release();
+    }
     bool ok = IOGraphicsAccelerator2::start(provider);
     rnNote("family start -> %s", ok ? "true" : "false");
     if (!ok || gStage < 3) return ok;
