@@ -64,6 +64,7 @@ static _Atomic long g_tex_live, g_tex_made; static _Atomic unsigned long g_tex_b
 // hashed), the log of the commit statistics lists the creation sites with the most objects still alive. Costs one backtrace per object; RN_SITES=0 in the environment turns it off.
 #include <execinfo.h>
 #define RN_NSITES 128
+#define RN_MTL_SLOTS 31                 // binding slots per stage an encoder keeps (rn_slot_ok)
 static struct rn_site { uint64_t h; long live; long made; char kind; char where[360]; } g_sites[RN_NSITES];
 static os_unfair_lock g_sites_lock = OS_UNFAIR_LOCK_INIT;
 static uint64_t rn_site_enter(char kind) {
@@ -614,6 +615,15 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
 - (BOOL)supportsIndirectCommandBuffers { return NO; }
 @end
 
+// Binding slots an encoder keeps per stage, for buffers, textures and samplers alike: 31 is the buffer limit the device reports (maxVertexBuffers, maxFragmentBuffers). The table had 16 and
+// dropped every binding above it without a word, so a shader that reads index 16 or more failed with "no buffer bound". Textures 31 to 127 (the device reports 128) are still dropped, now logged.
+static BOOL rn_slot_ok(NSUInteger index, const char *what) {
+    if (index < RN_MTL_SLOTS) return YES;
+    static unsigned said;
+    if (said++ < 8) rn_log("%s binding at index %lu dropped: the encoder keeps %d slots", what, (unsigned long)index, RN_MTL_SLOTS);
+    return NO;
+}
+
 // The resources a Metal encoder has bound, turned into the rn_vk arguments of a pipeline's bindings (compute, vertex and fragment stages all use it). Returns an error text or nil.
 // setBytes data becomes a small buffer that is kept in `temps` until the work is done.
 static NSMutableArray *rn_batch_keep(void) { static NSMutableArray *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [NSMutableArray new]; }); return k; }
@@ -623,8 +633,8 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
         const unsigned m = mi[i];
         switch (kind[i] & 0xff) {
         case RN_VK_BUFFER:
-            if (m < 16 && bufs[m]) { av[i].buffer = bufs[m]->b; av[i].offset = offs[m]; break; }
-            if (m < 16 && bytesAt[m]) {
+            if (m < RN_MTL_SLOTS && bufs[m]) { av[i].buffer = bufs[m]->b; av[i].offset = offs[m]; break; }
+            if (m < RN_MTL_SLOTS && bytesAt[m]) {
                 RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:bytesAt[m].length options:0];
                 if (!t) return @"no memory for constant data";
                 memcpy(rn_vk_buffer_contents(t->b), bytesAt[m].bytes, bytesAt[m].length);
@@ -645,10 +655,10 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
         }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
-            if (m < 16 && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
+            if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
             return [NSString stringWithFormat:@"no texture bound at index %u", m];
         case RN_VK_SAMPLER:
-            if (m < 16 && samps[m]) { av[i].sampler = samps[m]->s; break; }
+            if (m < RN_MTL_SLOTS && samps[m]) { av[i].sampler = samps[m]->s; break; }
             return [NSString stringWithFormat:@"no sampler state bound at index %u", m];
         default: break;
         }
@@ -660,11 +670,11 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
 @interface RNDispatch : NSObject {
 @public
     RedNaviMTLComputePipelineState *pso;
-    RedNaviMTLBuffer *bufs[16];
-    uint64_t offs[16];
-    NSData *bytesAt[16];
-    RedNaviMTLTexture *texs[16];
-    RedNaviMTLSamplerState *samps[16];
+    RedNaviMTLBuffer *bufs[RN_MTL_SLOTS];
+    uint64_t offs[RN_MTL_SLOTS];
+    NSData *bytesAt[RN_MTL_SLOTS];
+    RedNaviMTLTexture *texs[RN_MTL_SLOTS];
+    RedNaviMTLSamplerState *samps[RN_MTL_SLOTS];
     uint8_t push[128];
     uint32_t pushLen;
     MTLSize groups, threads, tpt;     // threads: the whole grid in threads
@@ -779,11 +789,11 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 @interface RNDraw : NSObject {
 @public
     RedNaviMTLRenderPipelineState *pso;
-    RedNaviMTLBuffer *bufs[2][16];
-    uint64_t offs[2][16];
-    NSData *bytesAt[2][16];
-    RedNaviMTLTexture *texs[2][16];
-    RedNaviMTLSamplerState *samps[2][16];
+    RedNaviMTLBuffer *bufs[2][RN_MTL_SLOTS];
+    uint64_t offs[2][RN_MTL_SLOTS];
+    NSData *bytesAt[2][RN_MTL_SLOTS];
+    RedNaviMTLTexture *texs[2][RN_MTL_SLOTS];
+    RedNaviMTLSamplerState *samps[2][RN_MTL_SLOTS];
     BOOL hasViewport, hasScissor, hasBlendColor;
     float blendColor[4];
     double viewport[6];
@@ -863,11 +873,11 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 @interface RedNaviMTLComputeCommandEncoder : NSObject {
     RedNaviMTLCommandBuffer *cb;
     RedNaviMTLComputePipelineState *pso;
-    RedNaviMTLBuffer *bufs[16];
-    uint64_t offs[16];
-    NSData *bytesAt[16];
-    RedNaviMTLTexture *texs[16];
-    RedNaviMTLSamplerState *samps[16];
+    RedNaviMTLBuffer *bufs[RN_MTL_SLOTS];
+    uint64_t offs[RN_MTL_SLOTS];
+    NSData *bytesAt[RN_MTL_SLOTS];
+    RedNaviMTLTexture *texs[RN_MTL_SLOTS];
+    RedNaviMTLSamplerState *samps[RN_MTL_SLOTS];
     uint8_t push[128];
     uint32_t pushLen;
     NSString *label_;
@@ -1001,7 +1011,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 - (MTLDispatchType)dispatchType { return MTLDispatchTypeSerial; }
 - (void)setComputePipelineState:(id<MTLComputePipelineState>)state { pso = (RedNaviMTLComputePipelineState *)state; }
 - (void)setBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index {
-    if (index >= 16) return;
+    if (!rn_slot_ok(index, "buffer")) return;
     bufs[index] = (RedNaviMTLBuffer *)buffer;
     offs[index] = offset;
     bytesAt[index] = nil;
@@ -1012,7 +1022,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 // Constant data. A hand-made SPIR-V pipeline has push constants at one index; for a translated kernel every [[buffer(n)]] is a storage buffer, also the one the app fills with
 // setBytes, so the bytes are kept and turned into a small buffer when the command buffer runs.
 - (void)setBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index {
-    if (index >= 16) return;
+    if (!rn_slot_ok(index, "buffer")) return;
     if (pso && index == pso->pushIndex) {
         if (length > sizeof(push)) length = sizeof(push);
         memcpy(push, bytes, length);
@@ -1023,14 +1033,14 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     bufs[index] = nil;
 }
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
-    if (index < 16) texs[index] = (RedNaviMTLTexture *)texture;
+    if (rn_slot_ok(index, "texture")) texs[index] = (RedNaviMTLTexture *)texture;
 }
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index { rn_log("setThreadgroupMemoryLength: not implemented, ignored (kernels with threadgroup memory arguments are refused by the translator)"); }
 - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])textures withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setTexture:textures[i] atIndex:range.location + i];
 }
 - (void)setSamplerState:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index {
-    if (index < 16) samps[index] = (RedNaviMTLSamplerState *)sampler;
+    if (rn_slot_ok(index, "sampler")) samps[index] = (RedNaviMTLSamplerState *)sampler;
 }
 - (void)setSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])samplers withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setSamplerState:samplers[i] atIndex:range.location + i];
@@ -1040,7 +1050,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
     d->pso = pso;
-    for (unsigned i = 0; i < 16; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; d->texs[i] = texs[i]; d->samps[i] = samps[i]; }
+    for (unsigned i = 0; i < RN_MTL_SLOTS; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; d->texs[i] = texs[i]; d->samps[i] = samps[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
     d->groups = groups;
@@ -1239,11 +1249,11 @@ static NSString *rn_run_blit(RNBlit *b) {
     RedNaviMTLCommandBuffer *cb;
     RNRenderPass *pass;
     RedNaviMTLRenderPipelineState *pso;
-    RedNaviMTLBuffer *bufs[2][16];
-    uint64_t offs[2][16];
-    NSData *bytesAt[2][16];
-    RedNaviMTLTexture *texs[2][16];
-    RedNaviMTLSamplerState *samps[2][16];
+    RedNaviMTLBuffer *bufs[2][RN_MTL_SLOTS];
+    uint64_t offs[2][RN_MTL_SLOTS];
+    NSData *bytesAt[2][RN_MTL_SLOTS];
+    RedNaviMTLTexture *texs[2][RN_MTL_SLOTS];
+    RedNaviMTLSamplerState *samps[2][RN_MTL_SLOTS];
     BOOL hasViewport, hasScissor, hasBlendColor;
     float blendColor[4];
     double viewport[6];
@@ -1262,26 +1272,26 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
 - (void)setRenderPipelineState:(id<MTLRenderPipelineState>)state { pso = (RedNaviMTLRenderPipelineState *)state; }
-- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: set%sBuffer %p off %lu idx %lu", st ? "Fragment" : "Vertex", b, (unsigned long)o, (unsigned long)i); if (i < 16) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
-- (void)bindBytes:(const void *)bytes length:(NSUInteger)len index:(NSUInteger)i stage:(int)st { if (i < 16) { bytesAt[st][i] = [NSData dataWithBytes:bytes length:len]; bufs[st][i] = nil; } }
+- (void)bindBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o index:(NSUInteger)i stage:(int)st { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: set%sBuffer %p off %lu idx %lu", st ? "Fragment" : "Vertex", b, (unsigned long)o, (unsigned long)i); if (rn_slot_ok(i, "buffer")) { bufs[st][i] = (RedNaviMTLBuffer *)b; offs[st][i] = o; bytesAt[st][i] = nil; } }
+- (void)bindBytes:(const void *)bytes length:(NSUInteger)len index:(NSUInteger)i stage:(int)st { if (rn_slot_ok(i, "buffer")) { bytesAt[st][i] = [NSData dataWithBytes:bytes length:len]; bufs[st][i] = nil; } }
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:0]; }
 - (void)setVertexBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:0];
 }
-- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setVertexBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < 16) offs[0][index] = offset; }
+- (void)setVertexBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setVertexBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[0][index] = offset; }
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:0]; }
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index { [self bindBuffer:buffer offset:offset index:index stage:1]; }
 - (void)setFragmentBuffers:(const id<MTLBuffer> __unsafe_unretained [])buffers offsets:(const NSUInteger [])offsets withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self bindBuffer:buffers[i] offset:offsets[i] index:range.location + i stage:1];
 }
-- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < 16) offs[1][index] = offset; }
+- (void)setFragmentBufferOffset:(NSUInteger)offset atIndex:(NSUInteger)index { if (getenv("RN_LOG_BUFFERS")) rn_log("trace: setFragmentBufferOffset off %lu idx %lu", (unsigned long)offset, (unsigned long)index); if (index < RN_MTL_SLOTS) offs[1][index] = offset; }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index { [self bindBytes:bytes length:length index:index stage:1]; }
-- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[0][i] = (RedNaviMTLTexture *)t; }
-- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (i < 16) texs[1][i] = (RedNaviMTLTexture *)t; }
+- (void)setVertexTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[0][i] = (RedNaviMTLTexture *)t; }
+- (void)setFragmentTexture:(id<MTLTexture>)t atIndex:(NSUInteger)i { if (rn_slot_ok(i, "texture")) texs[1][i] = (RedNaviMTLTexture *)t; }
 - (void)setVertexTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexTexture:t[i] atIndex:r.location + i]; }
 - (void)setFragmentTextures:(const id<MTLTexture> __unsafe_unretained [])t withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentTexture:t[i] atIndex:r.location + i]; }
-- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < 16) samps[0][i] = (RedNaviMTLSamplerState *)s; }
-- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (i < 16) samps[1][i] = (RedNaviMTLSamplerState *)s; }
+- (void)setVertexSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (rn_slot_ok(i, "sampler")) samps[0][i] = (RedNaviMTLSamplerState *)s; }
+- (void)setFragmentSamplerState:(id<MTLSamplerState>)s atIndex:(NSUInteger)i { if (rn_slot_ok(i, "sampler")) samps[1][i] = (RedNaviMTLSamplerState *)s; }
 - (void)setVertexSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setVertexSamplerState:s[i] atIndex:r.location + i]; }
 - (void)setFragmentSamplerStates:(const id<MTLSamplerState> __unsafe_unretained [])s withRange:(NSRange)r { for (NSUInteger i = 0; i < r.length; i++) [self setFragmentSamplerState:s[i] atIndex:r.location + i]; }
 - (void)setViewport:(MTLViewport)v {
@@ -1289,6 +1299,9 @@ static NSString *rn_run_blit(RNBlit *b) {
     viewport[0] = v.originX; viewport[1] = v.originY; viewport[2] = v.width; viewport[3] = v.height; viewport[4] = v.znear; viewport[5] = v.zfar;
 }
 - (void)setScissorRect:(MTLScissorRect)r { hasScissor = YES; scissor[0] = (uint32_t)r.x; scissor[1] = (uint32_t)r.y; scissor[2] = (uint32_t)r.width; scissor[3] = (uint32_t)r.height; }
+// The arrayed forms: one viewport and one scissor are kept (no viewport index in the shaders), so the first of each is used, as setViewport: / setScissorRect: would set it.
+- (void)setViewports:(const MTLViewport [])v count:(NSUInteger)n { if (n) [self setViewport:v[0]]; if (n > 1) [self ignored:"viewports beyond the first"]; }
+- (void)setScissorRects:(const MTLScissorRect [])r count:(NSUInteger)n { if (n) [self setScissorRect:r[0]]; if (n > 1) [self ignored:"scissor rects beyond the first"]; }
 // state that is not implemented yet is logged once and ignored: there is no depth test
 - (void)ignored:(const char *)what { static NSMutableSet *seen; if (!seen) seen = [NSMutableSet new]; NSString *k = @(what); if (![seen containsObject:k]) { [seen addObject:k]; rn_log("render encoder: %s is not implemented, ignored", what); } }
 - (void)setDepthClipMode:(MTLDepthClipMode)m { if (m != MTLDepthClipModeClip) [self ignored:"depth clip mode (clamp)"]; }
@@ -1305,7 +1318,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     if (!pso) { rn_log("draw without a render pipeline state"); return; }
     RNDraw *d = [RNDraw new];
     d->pso = pso;
-    for (int s = 0; s < 2; s++) for (int i = 0; i < 16; i++) { d->bufs[s][i] = bufs[s][i]; d->offs[s][i] = offs[s][i]; d->bytesAt[s][i] = bytesAt[s][i]; d->texs[s][i] = texs[s][i]; d->samps[s][i] = samps[s][i]; }
+    for (int s = 0; s < 2; s++) for (int i = 0; i < RN_MTL_SLOTS; i++) { d->bufs[s][i] = bufs[s][i]; d->offs[s][i] = offs[s][i]; d->bytesAt[s][i] = bytesAt[s][i]; d->texs[s][i] = texs[s][i]; d->samps[s][i] = samps[s][i]; }
     d->hasViewport = hasViewport; memcpy(d->viewport, viewport, sizeof(viewport));
     d->hasScissor = hasScissor; memcpy(d->scissor, scissor, sizeof(scissor));
     d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
@@ -1326,7 +1339,7 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (d->bufs[0][1]) [snaps addObject:[@{@"buf": d->bufs[0][1], @"off": @(d->offs[0][1]), @"n": @(drawNo), @"data": [NSData dataWithBytes:(const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1] length:96]} mutableCopy]];
         drawNo++;
         char bl[400] = ""; int o2 = 0;
-        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) { if (d->bufs[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=%p+%lu", st ? 'f' : 'v', i, d->bufs[st][i], (unsigned long)d->offs[st][i]); else if (d->bytesAt[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=bytes(%lu)", st ? 'f' : 'v', i, (unsigned long)d->bytesAt[st][i].length); }
+        for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) { if (d->bufs[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=%p+%lu", st ? 'f' : 'v', i, d->bufs[st][i], (unsigned long)d->offs[st][i]); else if (d->bytesAt[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=bytes(%lu)", st ? 'f' : 'v', i, (unsigned long)d->bytesAt[st][i].length); }
         rn_log("  encode: draw #%u binds:%s", drawNo - 1, bl);
     }
     if (getenv("RN_LOG_BUFFERS") && d->bufs[0][1]) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
@@ -1567,7 +1580,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                 if (d->hasScissor) { int a = (int)d->scissor[0], b = (int)d->scissor[1], c = a + (int)d->scissor[2], e = b + (int)d->scissor[3]; if (a > x0) x0 = a; if (b > y0) y0 = b; if (c < x1) x1 = c; if (e < y1) y1 = e; }
                 fprintf(df, "%3lu %s + %s [%s ; %s] rect (%d,%d)-(%d,%d) blend %d %u verts x %u inst:", (unsigned long)k, d->pso && d->pso->names[0] ? d->pso->names[0].UTF8String : "-", d->pso && d->pso->names[1] ? d->pso->names[1].UTF8String : "-", d->pso && d->pso->variant[0] ? d->pso->variant[0].UTF8String : "-", d->pso && d->pso->variant[1] ? d->pso->variant[1].UTF8String : "-",
                         x0, y0, x1, y1, d->pso ? d->pso->blend[0].enabled : 0, (unsigned)d->vertexCount, (unsigned)d->instanceCount);
-                for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                     RedNaviMTLTexture *tx = d->texs[st][i];
                     if (tx) fprintf(df, " %c%d=%lux%lu/pf%lu/surf%u%s", st ? 'f' : 'v', i, (unsigned long)tx->w, (unsigned long)tx->h, (unsigned long)tx->pf, tx->surf ? (unsigned)IOSurfaceGetID(tx->surf) : 0u, tx->img && rn_vk_image_is_host(tx->img) ? "H" : "");
                 }
@@ -1580,9 +1593,9 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                     FILE *bf = fopen(bpath, "w");
                     if (bf) {
                         uint32_t nb = 0, hdr[12] = {0x31444e52u, (uint32_t)d->vertexCount, (uint32_t)d->instanceCount, (uint32_t)(d->pso->blend[0].enabled), (uint32_t)x0, (uint32_t)y0, (uint32_t)x1, (uint32_t)y1, (uint32_t)t->w, (uint32_t)t->h, 0, 0};
-                        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->bufs[st][i] || d->bytesAt[st][i]) nb++;
+                        for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) if (d->bufs[st][i] || d->bytesAt[st][i]) nb++;
                         hdr[10] = nb; fwrite(hdr, 4, 12, bf);
-                        for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                        for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                             const uint8_t *bp = NULL; NSUInteger len = 0;
                             if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
                             else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
@@ -1619,7 +1632,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                     }
                     // the textures the draw binds, as raw bytes (at most 1 MB each): <n>_d<k>_t<stage><index>_<w>x<h>_pf<format>.raw is the host copy the card is given (w * h * texel bytes) and, for a texture over an
                     // IOSurface, ..._surf.raw is the surface's own bytes (rows are the surface's pitch apart: the pitch is in the name). Compare the two to see whether the upload changed anything.
-                    for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                    for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                         RedNaviMTLTexture *tx = d->texs[st][i];
                         if (!tx || !tx->img || tx->d > 1 || !shadowDraw) continue;   // the shadow draws only
                         const size_t nbt = (size_t)tx->w * tx->h * tx->texel;
@@ -1637,7 +1650,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                 }
                 if (k < 8 || d->vertexCount > 6) {      // what is bound at each buffer index of the first draws: setBytes data or a client buffer, the first 64 bytes as floats and the size
                     // the first six draws are dumped in full (the six vertices of a quad with their stride), the others as 16 floats
-                    for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+                    for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                         const uint8_t *bp = NULL; NSUInteger len = 0;
                         if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
                         else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
@@ -1657,7 +1670,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
         FILE *vf = fopen(vpath, "a");
         for (NSUInteger k = 0; k < nd && vf; k++) {
             RNDraw *d = rp->draws[k];
-            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+            for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                 RedNaviMTLTexture *tx = d->texs[st][i];
                 if (!tx || !tx->img || tx == t) continue;
                 BOOL dup = NO; for (unsigned q = 0; q < ns; q++) if (seen[q] == tx) dup = YES;
@@ -1867,7 +1880,7 @@ static void rn_locator_note(RNRenderPass *rp, RedNaviMTLTexture *rt) {
         r->x0 = 0; r->y0 = 0; r->x1 = (int)rt->w; r->y1 = (int)rt->h;
         if (d->hasViewport) { r->x0 = (int)d->viewport[0]; r->y0 = (int)d->viewport[1]; r->x1 = (int)(d->viewport[0] + d->viewport[2]); r->y1 = (int)(d->viewport[1] + d->viewport[3]); }
         if (d->hasScissor) { int sx0 = (int)d->scissor[0], sy0 = (int)d->scissor[1], sx1 = sx0 + (int)d->scissor[2], sy1 = sy0 + (int)d->scissor[3]; if (sx0 > r->x0) r->x0 = sx0; if (sy0 > r->y0) r->y0 = sy0; if (sx1 < r->x1) r->x1 = sx1; if (sy1 < r->y1) r->y1 = sy1; }
-        for (int i = 0; i < 16 && r->ntex < 3; i++) { RedNaviMTLTexture *t = d->texs[1][i]; if (!t) continue; r->tw[r->ntex] = (unsigned)t->w; r->th[r->ntex] = (unsigned)t->h; r->tpf[r->ntex] = (unsigned)t->pf; r->tsurf[r->ntex] = t->surf ? (unsigned)IOSurfaceGetID(t->surf) : 0; r->ntex++; }
+        for (int i = 0; i < RN_MTL_SLOTS && r->ntex < 3; i++) { RedNaviMTLTexture *t = d->texs[1][i]; if (!t) continue; r->tw[r->ntex] = (unsigned)t->w; r->th[r->ntex] = (unsigned)t->h; r->tpf[r->ntex] = (unsigned)t->pf; r->tsurf[r->ntex] = t->surf ? (unsigned)IOSurfaceGetID(t->surf) : 0; r->ntex++; }
         r->instances = d->instanceCount; r->vertices = d->vertexCount; r->blend = d->pso ? d->pso->blend[0].enabled : 0;
     }
 }
@@ -2136,7 +2149,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         RedNaviMTLRenderPipelineState *p = d->pso;
         if (logPass || getenv("RN_LOG_DRAWS")) {
             char tb[400] = ""; int o = 0;
-            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
+            for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) if (d->texs[st][i] && o < 380) o += snprintf(tb + o, sizeof(tb) - o, " %c%d=%lux%lu/%lu%s", st ? 'f' : 'v', i, (unsigned long)d->texs[st][i]->w, (unsigned long)d->texs[st][i]->h, (unsigned long)d->texs[st][i]->pf, d->texs[st][i] == rp->tex[0] || d->texs[st][i]->parent == rp->tex[0] || (rp->tex[0]->parent && d->texs[st][i] == rp->tex[0]->parent) ? "(=target)" : "");
             rn_log("draw %lu: %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
         }
         if (logPass && d->indexBuf) {                                    // the indices of the draw, as the card will read them
@@ -2147,7 +2160,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             rn_log("  indices (%s, offset %llu, buffer %lu bytes):%s", d->index32 ? "uint32" : "uint16", (unsigned long long)d->indexOffset, (unsigned long)d->indexBuf->len, ix);
         }
         if (logPass || getenv("RN_LOG_BUFFERS")) {                       // debugging: what is bound at every buffer index, with the first bytes
-            for (int st = 0; st < 2; st++) for (int i = 0; i < 16; i++) {
+            for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                 const uint8_t *bp = NULL; NSUInteger len = 0;
                 if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
                 else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
@@ -2302,7 +2315,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
             for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
-            for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) note(dw->texs[s2][i], NO);
+            for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < RN_MTL_SLOTS; i++) note(dw->texs[s2][i], NO);
         } else if ([rec isKindOfClass:[RNEventOp class]]) {
             // no textures
         } else if ([rec isKindOfClass:[RNBlit class]]) {
@@ -2311,7 +2324,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             note(bl->dt, YES);
         } else {
             RNDispatch *dp = rec;
-            for (int i = 0; i < 16; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
+            for (int i = 0; i < RN_MTL_SLOTS; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
         }
     }
 }
@@ -2357,7 +2370,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
                     if (said < 120) {   // what the draws sample: size, format, and how many of 4096 sampled texels of the host copy are not zero
                         said++;
                         for (RNDraw *dw in rp->draws) rn_log("trace:   draw %s / %s: %u vertices x %u instances", dw->pso && dw->pso->names[0] ? [dw->pso->names[0] UTF8String] : "-", dw->pso && dw->pso->names[1] ? [dw->pso->names[1] UTF8String] : "-", dw->vertexCount, dw->instanceCount);
-                        for (RNDraw *dw in rp->draws) for (int st = 0; st < 2; st++) for (int ti = 0; ti < 16; ti++) {
+                        for (RNDraw *dw in rp->draws) for (int st = 0; st < 2; st++) for (int ti = 0; ti < RN_MTL_SLOTS; ti++) {
                             RedNaviMTLTexture *t = dw->texs[st][ti];
                             if (!t) continue;
                             unsigned nz = 0; uint32_t v0 = 0;
@@ -2383,8 +2396,8 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     {   // the buffers made over caller memory that this command buffer touches
         void (^nb)(RedNaviMTLBuffer *) = ^(RedNaviMTLBuffer *bf) { if (bf && bf->userPtr) [noCopyUsed addObject:bf]; };
         for (id rec in records) {
-            if ([rec isKindOfClass:[RNRenderPass class]]) { for (RNDraw *dw in ((RNRenderPass *)rec)->draws) { for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < 16; i++) nb(dw->bufs[s2][i]); nb(dw->indexBuf); } }
-            else if ([rec isKindOfClass:[RNDispatch class]]) { for (int i = 0; i < 16; i++) nb(((RNDispatch *)rec)->bufs[i]); }
+            if ([rec isKindOfClass:[RNRenderPass class]]) { for (RNDraw *dw in ((RNRenderPass *)rec)->draws) { for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < RN_MTL_SLOTS; i++) nb(dw->bufs[s2][i]); nb(dw->indexBuf); } }
+            else if ([rec isKindOfClass:[RNDispatch class]]) { for (int i = 0; i < RN_MTL_SLOTS; i++) nb(((RNDispatch *)rec)->bufs[i]); }
             else if ([rec isKindOfClass:[RNBlit class]]) { nb(((RNBlit *)rec)->sb); nb(((RNBlit *)rec)->db); }
         }
     }

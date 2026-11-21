@@ -545,6 +545,17 @@ rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const un
     VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = root->img, .viewType = root->d > 1 ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D, .format = vf,
                                  .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     if (swizzle) vci.components = (VkComponentMapping){swizzle[0], swizzle[1], swizzle[2], swizzle[3]};
+    if (format == RN_VK_A8) {
+        // An A8Unorm view samples as (0, 0, 0, a) like an A8 image (rn_vk_image_create): the R8 texel goes to alpha, and the view's own swizzle, if any, picks from (0, 0, 0, texel).
+        // Without this a view made A8 sampled (texel, 0, 0, 1): opaque everywhere. No attachment: an attachment view must not swizzle.
+        static const VkComponentSwizzle a8[7] = {VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ONE,      // indexed by VkComponentSwizzle: IDENTITY (handled apart), ZERO, ONE
+                                                 VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_ZERO, VK_COMPONENT_SWIZZLE_R};   // R G B A
+        const VkComponentSwizzle in[4] = {vci.components.r, vci.components.g, vci.components.b, vci.components.a};
+        VkComponentSwizzle out[4];
+        for (int i = 0; i < 4; i++) out[i] = in[i] == VK_COMPONENT_SWIZZLE_IDENTITY ? (i == 3 ? VK_COMPONENT_SWIZZLE_R : VK_COMPONENT_SWIZZLE_ZERO) : (unsigned)in[i] < 7 ? a8[in[i]] : VK_COMPONENT_SWIZZLE_ZERO;
+        vci.components = (VkComponentMapping){out[0], out[1], out[2], out[3]};
+        v->color = 0; v->storage = 0;
+    }
     if (vk->CreateImageView(vk->dev, &vci, NULL, &v->view) != VK_SUCCESS) { free(v); return NULL; }
     return v;
 }
@@ -1394,9 +1405,9 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         if (dr->index_buffer) {
             if (dr->index_offset >= dr->index_buffer->size) { vk->CmdEndRenderPass(cb); rc = 4; goto done; }
             vk->CmdBindIndexBuffer(cb, dr->index_buffer->buf, dr->index_offset, dr->index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16);
-            vk->CmdDrawIndexed(cb, dr->vertex_count, dr->instance_count ? dr->instance_count : 1, 0, dr->base_vertex, dr->first_instance);
+            vk->CmdDrawIndexed(cb, dr->vertex_count, dr->instance_count, 0, dr->base_vertex, dr->first_instance);
         } else
-            vk->CmdDraw(cb, dr->vertex_count, dr->instance_count ? dr->instance_count : 1, dr->first_vertex, dr->first_instance);
+            vk->CmdDraw(cb, dr->vertex_count, dr->instance_count, dr->first_vertex, dr->first_instance);
         if (snapOn && d + 1 < nd && (d < 6 || d % 16 == 0 || rn_vk_snap_small)) {   // pass capture: the target after this draw (the pass restarts with LOAD, as around a feedback draw)
             vk->CmdEndRenderPass(cb);
             snap_record(vk, cb, targets[0].image, d);
