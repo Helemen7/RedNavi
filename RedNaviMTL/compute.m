@@ -424,6 +424,24 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     uint8_t *dst = rn_vk_image_staging(img);
     // Only what differs is written, and an image that did not change is not uploaded to the card again. The caller's memory is read through the kernel copy (it can vanish under us), a row at a time.
     BOOL changed = NO;
+    // One kernel call for the whole image when it fits the scratch (the row loop below cost one mach message per row: Launchpad's folder animation spent most of a frame in vm_read_overwrite, 2026-11-21).
+    // The scratch is shared and only used under the host lock taken above.
+    static uint8_t *scratch; static size_t scratchCap;
+    const size_t span = srcBpr * (h - 1) + w * texel;
+    if (h > 1 && span <= (8u << 20)) {
+        if (span > scratchCap) { free(scratch); scratchCap = span; scratch = malloc(scratchCap); }
+        if (scratch && rn_copy_from_caller(scratch, src, span)) {
+            for (NSUInteger y = 0; y < h; y++) {
+                const uint8_t *s = scratch + y * srcBpr;
+                uint8_t *d = dst + y * w * texel;
+                if (memcmp(d, s, w * texel)) { memcpy(d, s, w * texel); changed = YES; }
+            }
+            if (changed) rn_vk_image_host_wrote(img);
+            rn_vk_host_unlock();
+            return;
+        }
+        // not readable as a whole (the last row may end the mapping, or it vanished): the row loop below skips what cannot be read
+    }
     uint8_t rowbuf[16384];
     const BOOL small = w * texel <= sizeof(rowbuf);
     for (NSUInteger y = 0; y < h; y++) {
@@ -537,10 +555,11 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     rn_tex_wait_idle(self);
     rn_vk_host_lock();
     uint8_t *dst = rn_vk_image_staging(img);
+    const size_t pitch = rn_vk_image_row_bytes(img);      // a zero-copy IOSurface image has the surface's row pitch
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
-            memcpy(dst + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
+            memcpy(dst + ((region.origin.z + z) * h + region.origin.y + y) * pitch + region.origin.x * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
     rn_vk_host_unlock();
     if ((w == 161 || w == 249) && w == h) rn_log("shadow texture %lux%lu: replaceRegion (%lu,%lu %lux%lu) from %p", (unsigned long)w, (unsigned long)h, (unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width, (unsigned long)region.size.height, __builtin_return_address(0));
@@ -557,10 +576,11 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     [self syncFromSurface];
     rn_vk_image *card = rn_display_vram_peek((__bridge void *)self);      // a scanout surface's pixels are in the card's copy, not in the texture's own image
     const uint8_t *src = rn_vk_image_staging(card ? card : img);
+    const size_t pitch = rn_vk_image_row_bytes(card ? card : img);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
-            memcpy((uint8_t *)out + z * bpi + y * bpr, src + (((region.origin.z + z) * h + region.origin.y + y) * w + region.origin.x) * texel, region.size.width * texel);
+            memcpy((uint8_t *)out + z * bpi + y * bpr, src + ((region.origin.z + z) * h + region.origin.y + y) * pitch + region.origin.x * texel, region.size.width * texel);
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
     [self getBytes:out bytesPerRow:bpr bytesPerImage:0 fromRegion:region mipmapLevel:level slice:0];
@@ -1209,8 +1229,9 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
         rn_vk_image *card = b->kind == 1 ? rn_display_vram_peek((__bridge void *)t) : NULL;      // reading a scanout surface: its pixels are in the card's copy
         uint8_t *tex = rn_vk_image_staging(card ? card : t->img), *buf = (uint8_t *)rn_vk_buffer_contents(bf->b) + off;
+        const size_t tpitch = rn_vk_image_row_bytes(card ? card : t->img);
         for (NSUInteger y = 0; y < b->sz.height; y++) {
-            uint8_t *tp = tex + ((o.y + y) * t->w + o.x) * t->texel, *bp = buf + y * bpr;
+            uint8_t *tp = tex + (o.y + y) * tpitch + o.x * t->texel, *bp = buf + y * bpr;
             if (b->kind == 0) memcpy(tp, bp, b->sz.width * t->texel); else memcpy(bp, tp, b->sz.width * t->texel);
         }
         if (b->kind == 0) { rn_vk_image_host_wrote(t->img); rn_display_host_write_note((__bridge void *)t, "a blit from a buffer"); }
@@ -1241,7 +1262,8 @@ static NSString *rn_run_blit(RNBlit *b) {
         rn_vk_image *scard = rn_display_vram_peek((__bridge void *)s2);
         const uint8_t *sp = rn_vk_image_staging(scard ? scard : s2->img);
         uint8_t *dp = rn_vk_image_staging(d2->img);
-        for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + ((b->dorg.y + y) * d2->w + b->dorg.x) * d2->texel, sp + ((b->so.y + y) * s2->w + b->so.x) * s2->texel, b->sz.width * s2->texel);
+        const size_t spitch = rn_vk_image_row_bytes(scard ? scard : s2->img), dpitch = rn_vk_image_row_bytes(d2->img);     // a zero-copy IOSurface image has the surface's row pitch
+        for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + (b->dorg.y + y) * dpitch + b->dorg.x * d2->texel, sp + (b->so.y + y) * spitch + b->so.x * s2->texel, b->sz.width * s2->texel);
         rn_vk_image_host_wrote(d2->img);
         rn_display_host_write_note((__bridge void *)d2, "a blit on the host");
         return nil;

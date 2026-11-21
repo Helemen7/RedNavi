@@ -3901,6 +3901,16 @@ bool RedNaviProbe::start(IOService *provider) {
         registerService();
         return true;
     }
+    // System Information reads the GPU name and VRAM size from these properties of the PCI node. Published for every known board, before the read-only and
+    // RX 7600 ladder paths return: on the RX 7600 they were never set and System Information showed the 7 MB of the firmware framebuffer and no chipset.
+    {
+        uint32_t vramMb = board->vram_mb;
+        OSData *m = OSData::withBytes(board->model, static_cast<unsigned int>(strlen(board->model) + 1));
+        OSData *v = OSData::withBytes(&vramMb, sizeof(vramMb));
+        if (m) { pci->setProperty("model", m); m->release(); }
+        if (v) { pci->setProperty("VRAM,totalMB", v); v->release(); }
+    }
+
     if (strcmp(asic->name, RN_FW_ASIC) != 0) {      // the firmware headers compiled into this build are those of another die
         IOLog("RedNavi: this build carries the firmware of %s, the card is a %s: no write stages\n", RN_FW_ASIC, asic->name);
         setProperty("fw-die-mismatch", asic->name);
@@ -3919,15 +3929,6 @@ bool RedNaviProbe::start(IOService *provider) {
         dumpVbios();
         registerService();
         return true;
-    }
-
-    // System Information reads the GPU name and VRAM size from these properties of the PCI node.
-    {
-        uint32_t vramMb = board->vram_mb;
-        OSData *m = OSData::withBytes(board->model, static_cast<unsigned int>(strlen(board->model) + 1));
-        OSData *v = OSData::withBytes(&vramMb, sizeof(vramMb));
-        if (m) { pci->setProperty("model", m); m->release(); }
-        if (v) { pci->setProperty("VRAM,totalMB", v); v->release(); }
     }
 
     dumpVbios();

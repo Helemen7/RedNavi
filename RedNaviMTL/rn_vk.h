@@ -42,7 +42,8 @@ rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_
 rn_vk_image *rn_vk_image_create_layers(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth, int array);   // array: depth is the layer count of a 2D array (sampled only), staged like a 3D image
 rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t width, uint32_t height, void *ptr, size_t pitch, size_t bytes);   // linear image over page-aligned host memory (an IOSurface's), zero copy; NULL: keep copying
 int rn_vk_image_is_host(rn_vk_image *img);                          // 1: made by rn_vk_image_from_host, no host copy exists, rn_vk_image_staging is the memory itself
-void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows packed (width * texel bytes)
+void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows rn_vk_image_row_bytes apart
+size_t rn_vk_image_row_bytes(rn_vk_image *img);                     // width * texel bytes, except for a zero-copy image over an IOSurface: the surface's row pitch
 void rn_vk_image_host_wrote(rn_vk_image *img);
 // A view with another format of the same texel size (RN_VK_* as in rn_vk_image_create), components swizzled by VkComponentSwizzle values (NULL: as they are). It shares the image, its
 // memory and its host copy with `base`, which must outlive it; destroy it with rn_vk_image_destroy. NULL: sizes differ or the card cannot sample that format.

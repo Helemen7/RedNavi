@@ -60,6 +60,12 @@ for f in "$V"/*.dylib; do [ -L "$f" ] || codesign -f -s - "$f" >/dev/null 2>&1; 
 # The Metal test program (tools/mtl_init_harness.m, built by hand: clang -fobjc-arc -framework Foundation -framework Metal -framework IOKit -framework IOSurface); given with HARNESS=.
 if [ -n "$HARNESS" ]; then
   cp "$HARNESS" "$OUT/mtl_init_harness"; codesign -f -s - "$OUT/mtl_init_harness" >/dev/null 2>&1
+  # Every test of the program (run_all_tests.sh) with the .metallib files of mesa-bridge/test, built here with Xcode's Metal toolchain.
+  cp "$ROOT/scripts/run_all_metal_tests.sh" "$OUT/run_all_tests.sh"
+  for m in tri quad fc texcopy dispatch; do
+    xcrun metal -c "$ROOT/mesa-bridge/test/vk_$m.metal" -o "$OUT/vk_$m.air" && xcrun metallib "$OUT/vk_$m.air" -o "$OUT/vk_$m.metallib" || echo "vk_$m.metallib not built (no Metal toolchain?)"
+    rm -f "$OUT/vk_$m.air"
+  done
   cat > "$OUT/run_metal_test.sh" <<'EOT'
 #!/bin/sh
 # Runs a small compute test through the official Metal API, on the plug-in installed by install.sh. Needs the boot-args of README.txt and a boot that got through. Run as: sudo sh run_metal_test.sh
@@ -113,6 +119,7 @@ Needs: the RedNavi kext loaded with the stages of its rung 4c plus rednavi_gfx_q
      ioreg -rc IOPCIDevice -n GFX0 -l | grep rednavi-accel2-log
    (if the card is not GFX0 in your ioreg, the node with the vendor id 1002 and the rednavi-accel2-log property)
 4. Only if step 3 shows the accelerator registered and the machine is fine: sudo sh run_metal_test.sh   and send me the whole output (it makes a Metal device from the card and runs a compute kernel).
+5. All Metal tests: sh run_all_tests.sh 2>&1 | tee tests.txt   and send me tests.txt (each test has a 60 s limit; the .metallib files must stay in this folder).
 To remove: sudo rm -rf /Library/Extensions/RedNaviAccel2.kext /Library/GPUBundles/RedNaviMTLDriver.bundle, remove the two boot-args, reboot.
 EOF
 echo "package in $OUT"

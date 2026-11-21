@@ -56,7 +56,7 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; };
-struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; int array; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; };   // gpudirty: a render pass wrote the image and the host copy is older
+struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; int array; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; size_t hostpitch; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; };   // gpudirty: a render pass wrote the image and the host copy is older
 // A 2D array keeps its layers in d like the depth of a 3D image (the host copy is the same: slice after slice), but Vulkan wants them as array layers.
 #define RN_IMG_LAYERS(im) ((im)->array ? (im)->d : 1u)
 #define RN_IMG_DEPTH(im) ((im)->array ? 1u : (im)->d)
@@ -574,7 +574,7 @@ rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t w, uint32_t h
     if (!texel || !w || !h || !ptr || ((uintptr_t)ptr & 4095) || !bytes) return NULL;
     rn_vk_image *im = calloc(1, sizeof(*im));
     if (!im) return NULL;
-    im->fmt = vk_format(format); im->w = w; im->h = h; im->d = 1; im->texel = texel; im->hostmem = 1; im->hostptr = ptr;
+    im->fmt = vk_format(format); im->w = w; im->h = h; im->d = 1; im->texel = texel; im->hostmem = 1; im->hostptr = ptr; im->hostpitch = pitch;
     VkFormatProperties fp;
     vk->GetPhysicalDeviceFormatProperties(vk->pd, im->fmt, &fp);
     const VkFormatFeatureFlags f = fp.linearTilingFeatures;
@@ -613,6 +613,7 @@ fail:
     return NULL;
 }
 int rn_vk_image_is_host(rn_vk_image *im) { return (im->base ? im->base : im)->hostmem; }
+size_t rn_vk_image_row_bytes(rn_vk_image *im) { rn_vk_image *r = im->base ? im->base : im; return r->hostmem ? r->hostpitch : (size_t)im->w * im->texel; }
 static rn_vk *g_readback_vk;                                    // the device of the last render pass, for the lazy readback below
 static void image_readback_now(rn_vk *vk, rn_vk_image *r);
 static void bsync(rn_vk *vk);
