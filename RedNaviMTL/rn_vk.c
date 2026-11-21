@@ -1019,6 +1019,7 @@ struct rn_vk_render {
     unsigned n[2], kinds[2][RN_VK_MAX_BINDINGS], binds[2][RN_VK_MAX_BINDINGS];
     VkSampler statics[2][RN_VK_MAX_BINDINGS];
     unsigned nt;
+    int blended;                               // some colour target blends
     VkFormat fmts[8];
     unsigned nvl, vlbind[16];                  // the vertex buffer bindings the pipeline reads
 };
@@ -1085,14 +1086,20 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
                                            .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL};
         ref[i] = (VkAttachmentReference){i, VK_IMAGE_LAYOUT_GENERAL};
         const rn_vk_blend *bl = &d->blend[i];
+        r->blended |= bl->enabled != 0;
         cba[i] = (VkPipelineColorBlendAttachmentState){.blendEnable = bl->enabled ? VK_TRUE : VK_FALSE, .srcColorBlendFactor = bl->src_rgb, .dstColorBlendFactor = bl->dst_rgb, .colorBlendOp = bl->op_rgb,
                                                        .srcAlphaBlendFactor = bl->src_a, .dstAlphaBlendFactor = bl->dst_a, .alphaBlendOp = bl->op_a, .colorWriteMask = bl->write_mask};
     }
     // every colour attachment is also an input attachment (framebuffer fetch), with a self dependency so a draw sees what the earlier draws of the pass wrote at the same pixel
     VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = r->nt, .pInputAttachments = ref, .colorAttachmentCount = r->nt, .pColorAttachments = ref};
-    VkSubpassDependency selfdep = {.srcSubpass = 0, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                   .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT};
-    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 1, .pDependencies = &selfdep};
+    // The second self dependency allows the colour barrier before a blended draw (see the draw loop). Every pass declares both, whatever its
+    // pipeline blends, because render passes with different dependencies are not compatible and one pass mixes the draws of several pipelines.
+    VkSubpassDependency selfdep[2] = {
+        {.srcSubpass = 0, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT},
+        {.srcSubpass = 0, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+         .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT}};
+    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = selfdep};
     if (vk->CreateRenderPass(vk->dev, &rpi, NULL, &r->rp) != VK_SUCCESS) goto fail;
     static const VkPrimitiveTopology topo[5] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
@@ -1378,6 +1385,18 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
             // draw of every pass) and the cost are not measured. RN_VK_DRAWSYNC=0 turns it off.
             static int ds = -1; if (ds < 0) ds = getenv("RN_VK_DRAWSYNC") ? atoi(getenv("RN_VK_DRAWSYNC")) : 1;
             if (d && ds) vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, 0, 0, NULL, 0, NULL, 0, NULL);
+        }
+        {   // A colour barrier before a blended draw that follows other draws of the pass. Vulkan's rasterization order should already order
+            // overlapping blends; on Navi 33 with the Darwin RADV bridge they came out with rectangular corruption without it, and the barrier
+            // removed it (darrenintr/RedNavi_navi33 89fe991, offscreen CoreAnimation test, 23 of 1200 frames bad before, 0 after). Here on every
+            // card, because the 7800 XT shows rectangular grey bars in the tab strip of Brave too: UNVERIFIED that it is the same defect.
+            // The root cause in the driver is not known. RN_VK_BLENDSYNC=0 turns it off.
+            static int bs = -1; if (bs < 0) bs = getenv("RN_VK_BLENDSYNC") ? atoi(getenv("RN_VK_BLENDSYNC")) : 1;
+            if (d && bs && dr->pipe->blended && !(feedback || prevFeedback)) {
+                VkMemoryBarrier mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                                      .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
+                vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_DEPENDENCY_BY_REGION_BIT, 1, &mb, 0, NULL, 0, NULL);
+            }
         }
         vk->CmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pipe);
         vk->CmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, dr->pipe->pl, 0, 2, &sets[3 * d], 0, NULL);
