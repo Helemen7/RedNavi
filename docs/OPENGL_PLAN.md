@@ -1,6 +1,6 @@
 # OpenGL on the RX 7800 XT
 
-Goal: OpenGL programs that need a 3.3 core context, Kitty first, run on the card. Status 2026-11-17: **research and an experiment prepared; nothing has run on the card yet** (the test desktop was down while this was written). Marks: **V** = verified (on the laptop used for the research, an Intel UHD 617 Mac on macOS 15.7, or in a shipped file), **S** = read from sources or from strings, not run on our hardware, **U** = unknown.
+Goal: OpenGL programs that need a 3.3 core context, Kitty first, run on the card. Status 2026-11-21: **a hardware OpenGL 4.1 context runs on the card; clears work, draws do not yet** (section "First run"). Status 2026-11-17 was research only. Marks: **V** = verified (on the laptop used for the research, an Intel UHD 617 Mac on macOS 15.7, or in a shipped file), **S** = read from sources or from strings, not run on our hardware, **U** = unknown.
 
 ## What macOS gives us
 
@@ -38,6 +38,19 @@ What each outcome means and what to do:
 | A hardware context, shader compile or link fails | The AIR translator or the plug-in lacks something the GL compiler emits | Read the failure with the translator's log (`docs/M6_AIR_TRANSLATOR_LICENCE.md`, `docs/M6_METAL_ON_RADV.md`); fix in the plug-in/translator; this is the "gaps the GL path needs" list |
 | Context and shaders work, pixels wrong | A plug-in draw-state bug (blending, instancing, vertex descriptor) | Bisect with the probe; the plug-in's selftest (`RedNaviMTL/rn_vk_selftest.c`) is the place for a regression test |
 | `gl_probe` passes | GL-on-Metal-on-RADV works for the basics | Try Kitty; the open items become texture arrays, buffer textures and performance |
+
+## First run (2026-11-21, desktop, **V**)
+
+With `rednavi_accel2_exp=127` (bit 6 set), `IOGLBundleName = AppleMetalOpenGLRenderer` is on the accelerator and CGL loads the renderer, which loads our plug-in. What stood in the way, in order:
+
+1. `/Users/Shared/rednavi-on` lists only `WindowServer`, so any other process gets no Metal device and CGL offers only the software renderer (`0x01020400`, no 3.2 core pixel format: Kitty's `NSGL: Failed to find a suitable pixel format`). A GL client must be let in (its name in `rednavi-on`, or `RN_METAL_COMPUTE=1`).
+2. The renderer asks `respondsToSelector:@selector(originalObject)` and uses the answer instead of the device; the plug-in's catch-all resolver answered nil and the renderer crashed in `strdup` (`GLDDeviceRec::initWithDisplayMask`). The resolver now refuses `originalObject` (`RedNaviMTL/plugin.m`).
+3. The renderer accepts only a device whose name contains AMD/ATI, NVIDIA or Intel ("Unknown GPU!!" and an assertion otherwise); the base class answers "Apple". The plug-in now answers the RADV device name and vendor "AMD", in every process but WindowServer (`RedNaviMTL/compute.m`).
+4. `maxThreadsPerThreadgroup` returns a struct, which the catch-all stub cannot answer (crash); it, `supportsSampleCount:` (1 only) and `gpuCoreCount` are implemented.
+
+Then `tools/gl_probe.m` gets renderer `0x01027f00`, accelerated, `GL_VENDOR AMD`, `GL_RENDERER AMD Radeon RX 7800 XT (RADV NAVI32)`, `GL_VERSION 4.1 Metal - 89.4`, GLSL 4.10. The clear colour is right; the two blended quads are not drawn. The renderer logs `Fallback to SW vertex processing because buildPipelineState failed` and the plug-in logs `render pipeline asked: vertex (null), fragment (null)` / `the function is not from a RedNavi library`: the GL renderer's shader functions do not come through the plug-in's `newLibraryWithData:`-style paths. Next: find how the renderer makes its `MTLFunction`s (the `gldMetalLibFromPluginReturnData` / compiler path) and give the plug-in that entry. Also logged and unimplemented: `-[MTLTexture swizzleKey]`, texture views with a different swizzle, `setColorStoreAction:atIndex:`, sampler states with LOD clamps.
+
+This was run with the new plug-in loaded only into the test process (`DYLD_INSERT_LIBRARIES` with a small `dlopen` shim), not installed.
 
 ## If that fails: the options
 

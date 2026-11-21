@@ -121,7 +121,7 @@ static rn_vk *rn_vk_shared(void) {
         if (vk) {
             rn_log("RADV opened: %s", rn_vk_device_name(vk));
             if (getenv("RN_LATENCY_PROBE") || access("/Users/Shared/rednavi-latency", F_OK) == 0) { double mn, av, mx; rn_vk_latency_probe(vk, 200, &mn, &av, &mx); rn_log("empty submit and wait, 200 round trips: min %.0f us, average %.0f us, max %.0f us", mn, av, mx); 
-            { double up, down; const int f = rn_vk_format_of(MTLPixelFormatBGRA8Unorm); rn_vk_bandwidth_probe(vk, f, 30, &up, &down); rn_log("1920x1080 BGRA copy, 30 each: host to card %.2f ms, card to host %.2f ms", up, down); } }
+            if (rn_diag) { double up, down; const int f = rn_vk_format_of(MTLPixelFormatBGRA8Unorm); rn_vk_bandwidth_probe(vk, f, 30, &up, &down); rn_log("1920x1080 BGRA copy, 30 each: host to card %.2f ms, card to host %.2f ms", up, down); } }
         }
         else rn_log("RADV not available: %s", err);
     });
@@ -656,7 +656,7 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
         }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
-            if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
+            if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (rn_diag && getenv("RN_EXP_NULL_F0") && m == 0 && kind[i] == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
             return [NSString stringWithFormat:@"no texture bound at index %u", m];
         case RN_VK_SAMPLER:
             if (m < RN_MTL_SLOTS && samps[m]) { av[i].sampler = samps[m]->s; break; }
@@ -851,7 +851,7 @@ static BOOL rn_resolve_default(id self, SEL _cmd, SEL sel) {
     while (*r == 'r' || *r == 'n' || *r == 'N' || *r == 'o' || *r == 'O' || *r == 'R' || *r == 'V') r++;
     IMP imp = (r[0] == 'f') ? (IMP)rn_stub_float : (r[0] == 'd') ? (IMP)rn_stub_double : (IMP)rn_stub_int;
     class_addMethod((Class)self, sel, imp, types ? types : "Q16@0:8");
-    rn_log("unimplemented -[%s %s]: answering zero%s", class_getName((Class)self), sel_getName(sel), types ? "" : " (no protocol declares it)");
+    rn_log("no implementation of -[%s %s]: answering zero%s",class_getName((Class)self), sel_getName(sel), types ? "" : " (no protocol declares it)");
     return YES;
 }
 static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c), @selector(resolveInstanceMethod:), (IMP)rn_resolve_default, "c@::"); }
@@ -1492,6 +1492,7 @@ static int g_pd_small = 400;        // passes of small targets that may still be
 static BOOL rn_passdump_on(void) {
     // /Users/Shared/rednavi-passdump-live: while the file exists the budgets are refilled whenever they run out, so a long gesture (dragging a window, 60 frames a second) is captured whole.
     // The captures are large (a few MB a frame): create the file, do the gesture for a few seconds, remove it.
+    if (!rn_diag) return NO;                // a stat every 20 ms of passes otherwise
     static struct timespec lastLive; struct timespec nowt; clock_gettime(CLOCK_MONOTONIC, &nowt);
     if (g_pd_left <= 0 && (nowt.tv_sec - lastLive.tv_sec) * 1000 + (nowt.tv_nsec - lastLive.tv_nsec) / 1000000 >= 20) {
         lastLive = nowt;
@@ -2929,6 +2930,29 @@ void rn_compute_install(Class k, Class sup) {
             if (class_addMethod(k, sel, imp, enc)) rn_log("installed -%s (%s) of %s", sel_getName(sel), enc ? enc : "?", class_getName(c));
         }
         free(list);
+    }
+    // The device's name. The base class answers "Apple" (for name and vendorName), and AppleMetalOpenGLRenderer (GLDDeviceRec::initWithDisplayMask) only accepts a device whose
+    // name contains AMD or ATI, NVIDIA or Intel: anything else is "Unknown GPU!!" and an assertion, so no OpenGL context (2026-11-21). The RADV device name contains AMD.
+    // WindowServer keeps the base class's answers for now: whether QuartzCore picks vendor-specific paths by name is not known, and the compositor works as it is.
+    {
+        extern const char *getprogname(void);
+        if (strcmp(getprogname(), "WindowServer") != 0) {
+            SEL sn = sel_registerName("name"), sv = sel_registerName("vendorName");
+            Method mn = class_getInstanceMethod(sup, sn), mv = class_getInstanceMethod(sup, sv);
+            IMP on = mn ? method_getImplementation(mn) : NULL, ov = mv ? method_getImplementation(mv) : NULL;
+            class_addMethod(k, sn, imp_implementationWithBlock(^id(id self) {
+                rn_vk *vk = rn_gate() ? rn_vk_shared() : NULL;
+                return vk ? [NSString stringWithUTF8String:rn_vk_device_name(vk)] : (on ? ((id(*)(id, SEL))on)(self, sn) : nil);
+            }), "@16@0:8");
+            class_addMethod(k, sv, imp_implementationWithBlock(^id(id self) {
+                return rn_gate() && rn_vk_shared() ? @"AMD" : (ov ? ((id(*)(id, SEL))ov)(self, sv) : nil);
+            }), "@16@0:8");
+            // Queries the GL renderer makes while it creates its device. The generic stub of plugin.m cannot answer a struct (MTLSize comes back through a hidden pointer, which the
+            // stub took for self and crashed on). One sample per pixel only: the render encoder has no multisampling.
+            class_addMethod(k, sel_registerName("maxThreadsPerThreadgroup"), imp_implementationWithBlock(^MTLSize(id self) { return MTLSizeMake(1024, 1024, 1024); }), "{?=QQQ}16@0:8");
+            class_addMethod(k, sel_registerName("supportsSampleCount:"), imp_implementationWithBlock(^BOOL(id self, NSUInteger n) { return n == 1; }), "c24@0:8Q16");
+            class_addMethod(k, sel_registerName("gpuCoreCount"), imp_implementationWithBlock(^NSUInteger(id self) { return 60; }), "Q16@0:8");   // compute units of the RX 7800 XT
+        }
     }
     // Buffers
     SEL s1 = sel_registerName("newBufferWithLength:options:");

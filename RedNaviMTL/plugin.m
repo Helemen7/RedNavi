@@ -201,6 +201,9 @@ static id rn_generic(id self, SEL _cmd, ...) {
 }
 
 static BOOL rn_resolve_instance(id self, SEL _cmd, SEL sel) {
+    // -originalObject belongs to Metal's tool and capture wrappers, which answer the device they wrap. Callers ask respondsToSelector: first and then use the answer instead
+    // of the device: AppleMetalOpenGLRenderer (GLDDeviceRec::initWithDisplayMask) got nil from the generic stub and crashed in strdup of its name (2026-11-21, every CGL client).
+    if (sel == sel_registerName("originalObject")) return NO;
     class_addMethod((Class)self, sel, (IMP)rn_generic, "@@:");
     rn_log("resolveInstanceMethod: -%s", sel_getName(sel));
     return YES;
