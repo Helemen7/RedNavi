@@ -1,12 +1,12 @@
-# Navi 33 ASIC Profile — Draft for RedNavi Issue #7
+# Navi 33 ASIC Profile — RX 7600 (read-only; write stages disabled)
 
-**Status:** evidence-backed draft; not an enabled ASIC row
+**Status:** implemented ASIC profile and probe match; read-only (write_ok = 0)
 **Contributor:** Frame121
 **Candidate GPU:** AMD Radeon RX 7600 (Navi 33)
 **PCI identity:** vendor/device `1002:7480`, subsystem `148c:2421`, revision `0xcf`, BDF `0000:03:00.0`
 **Host:** CachyOS Linux x86_64, kernel `7.3.1-1-cachyos`
 
-> Safety / integration boundary: this document does not add RX 7600 to `RedNavi/asic.cpp`, either Info.plist match list, or any accelerator match list. The RX 7600 must remain on the existing read-only fallback until the maintainer has reviewed the profile and all write-stage dependencies are selected by ASIC. Do not use this draft to enable hardware writes.
+> **Safety / integration boundary:** RX 7600 (1002:7480) is now registered in `RedNavi/asic.cpp` and included in the probe's `IOPCIPrimaryMatch`. It is **not** enabled in the accelerator match list. Its board row deliberately keeps `write_ok = 0` and `replay = nullptr`; `kern_probe.cpp` publishes the matched profile, dumps VBIOS, registers the service, and returns before the write stages. This is identification/read-only support only—not macOS display bring-up, PSP/TMR validation, or Metal acceleration. Do not change the write gate based on profile matching or host tests alone.
 
 ## 1. Five-key ASIC lookup candidate
 
@@ -20,14 +20,14 @@ RedNavi's current lookup key uses five IP Discovery versions: GC, DMU (published
 | `mp1` | 1 | **13.0.7** | RX 7600 IP Discovery, 39-record inventory |
 | `sdma` (SDMA0) | 42 | **6.0.2** | RX 7600 IP Discovery, 39-record inventory |
 
-These values are observed on the contributor's RX 7600 capture. They are a candidate match key, not permission to enable the ASIC.
+These values are observed on the contributor's RX 7600 capture and are the five-key match used by the registered Navi 33 profile. They identify the ASIC; they do not validate any write-stage dependency.
 
 ## 2. Board identity candidate
 
 | Field | Observed value | Integration status |
 |---|---|---|
 | Model | AMD Radeon RX 7600 | Observed |
-| PCI device ID | `0x7480` | Observed; do not add to match list yet |
+| PCI device ID | `0x7480` | Observed; present in the probe match list and Navi 33 board row (read-only) |
 | Vendor ID | `0x1002` | Observed |
 | Subsystem ID | `0x148c:0x2421` | Observed |
 | PCI revision | `0xcf` | Observed |
@@ -94,8 +94,8 @@ Do not copy or relabel the current Navi 32 generated register headers. Follow th
 2. Identify exact firmware filenames and source provenance for the observed IP versions; do not infer filenames from version numbers.
 3. Identify the correct GC / SDMA / DCN / NBIO / MMHUB / OSSSYS register headers from the matching Linux source.
 4. Obtain a safe and independently verified DCN pipe / PHY / VBIOS connector mapping for the live DP-1 path; current connector + EDID evidence is not enough to define a display replay. No Navi 32 replay constants may be reused by assumption.
-5. Refactor all write stages to select their firmware, register headers, memory layout, and display data from the ASIC profile before adding a Navi 33 row to the live table.
-6. Add host tests proving the RX 7600 candidate remains unmatched / read-only until the complete profile and write-stage selection are implemented.
+5. Refactor all write stages to select their firmware, register headers, memory layout, and display data from the ASIC profile before considering any change to the Navi 33 row's write_ok flag.
+6. Keep host tests asserting that the real RX 7600 capture resolves to the Navi 33 / RX 7600 row while `write_ok == 0` and `replay == nullptr`; add coverage for the probe's early read-only return before considering any write-stage work.
 
 ## 8. Evidence provenance
 

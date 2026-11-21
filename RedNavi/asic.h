@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Helemen7 and RedNavi contributors
 
-// The table of ASICs the probe may write to, keyed by the versions in the card's IP discovery table.
+// ASIC profiles known to the probe, keyed by the versions in the card's IP discovery table. A matched board may still be read-only (`write_ok = 0`).
 // A card that matches no row stays read-only (IP discovery and VBIOS dumps only).
 // How to add a row: docs/ADDING_A_GPU.md.
 #ifndef REDNAVI_ASIC_H
@@ -71,7 +71,7 @@ struct rn_asic_board {
 struct rn_asic {
     const char *name;                         // name of the die
     struct rn_ip_version gc, dcn, mp0, mp1, sdma;   // what the IP discovery table must say (GC, DMU, MP0, MP1, SDMA0)
-    const struct rn_asic_board *boards;       // boards verified on hardware
+    const struct rn_asic_board *boards;       // known boards; write_ok distinguishes hardware-validated write support
     const struct rn_drm_info *drm_info;       // answers of the DRM_AMDGPU_INFO queries
     // What the code paths of this ASIC were built from. Names only: the firmware and the register headers are compiled in
     // and not selected through the row yet. Published in the "asic" property so a report shows which ones a build used.
