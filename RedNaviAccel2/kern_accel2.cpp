@@ -46,6 +46,9 @@ static IOService *gProv;
 class RedNaviAccel2;
 static class RedNaviDisplayMachine *gMachine;   // the display machine the family was given, for the power-on notification
 static IOFramebuffer *gFb;    // the framebuffer createDisplayPipe was given, retained, for found_framebuffer
+static IOLock *gUpLock;
+static bool gStarted, gUpDone, gRegistered;   // start() finished / the bring-up was scheduled
+static void rnMaybeBringUp();
 static IOService *gSelf;     // the accelerator, retained, for the delayed registerService()       // the PCI device, set in probe(); it outlives every object of this kext
 
 // Alignment with the reference driver, switchable without reinstalling: boot-arg rednavi_accel2_exp=<bit mask>. Bit 0: the first megabyte of every GPU address space is reserved (the
@@ -64,7 +67,12 @@ static void rnNote(const char *fmt, ...) {
     char line[220];
     va_list ap;
     va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
+    int n = 0;
+    uint64_t now, ns;
+    clock_get_uptime(&now);
+    absolutetime_to_nanoseconds(now, &ns);
+    n = snprintf(line, sizeof(line), "[%llu.%03llu] ", ns / 1000000000ULL, (ns / 1000000ULL) % 1000);   // seconds since boot, to order the log against WindowServer's start
+    vsnprintf(line + n, sizeof(line) - n, fmt, ap);
     va_end(ap);
     IOLog("RedNaviAccel2: %s\n", line);
     if (!gLog || !gLogLock || !gProv) return;
@@ -633,6 +641,9 @@ long RedNaviDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *tx) 
     return 0;
 }
 
+// Client type that opens the probe's compute connection through this accelerator; the plug-in's bridge (mesa-bridge/src/ac_apple_iokit.c) uses the same number.
+static const UInt32 kRNComputeClientType = 0x524e4301;
+
 class RedNaviAccel2 : public IOGraphicsAccelerator2 {
     OSDeclareDefaultStructors(RedNaviAccel2)
     void *allocByName(const char *hook, const char *cls);
@@ -711,6 +722,7 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
     gStage = arg;
     if (!gLogLock) gLogLock = IOLockAlloc();
     if (!gXferLock) gXferLock = IOLockAlloc();
+    if (!gUpLock) gUpLock = IOLockAlloc();
     if (!gLog) gLog = OSArray::withCapacity(256);
     gProv = provider;
     rnNote("probe on %s, stage %u", provider ? provider->getName() : "?", gStage);
@@ -747,44 +759,11 @@ static void rnPublishCaps(IOService *a) {
     }
 }
 
-// The family's start() builds everything but does not register the service (the node stayed !registered and Metal saw no device), which the Intel subclass presumably does
-// after it; stage 3 and up do it here.
-bool RedNaviAccel2::start(IOService *provider) {
-    // The probe kext brings the card up inside its own start() (PSP, SMU, GC, the queues) and registers its service at the very end. On the RX 7600 (2026-11-21), with this kext
-    // installed, the probe's graphics ring was never executed (gfx-test ok 0, its scratch register never written, the MES graphics queue at step 4, so RADV saw no graphics queue);
-    // on the same machine without this kext the same boot gave ok 1 and the queue at step 7. The family's start runs on another thread while the probe is still working on the
-    // card. Waiting for the probe to finish (kext 0.0.3) did not change it: the next boot with the wait (the log shows it waited) gave ok 0 again, so this kext's start is not the cause.
-    // The wait stays, so that the family never starts on a card that is still being brought up. Boot-arg rednavi_accel2_wait=0 skips it.
-    uint32_t waitProbe = 1;
-    PE_parse_boot_argn("rednavi_accel2_wait", &waitProbe, sizeof(waitProbe));
-    if (waitProbe) {
-        OSDictionary *match = IOService::serviceMatching("RedNaviProbe");
-        IOService *probeSvc = match ? IOService::waitForMatchingService(match, 600ULL * 1000000000ULL) : nullptr;   // the 7800 XT bring-up takes minutes; bounded so a missing probe does not block for ever
-        if (match) match->release();
-        rnNote("waited for the probe: %s", probeSvc ? "registered" : "not found within 600 s");
-        if (probeSvc) probeSvc->release();
-    }
-    bool ok = IOGraphicsAccelerator2::start(provider);
-    rnNote("family start -> %s", ok ? "true" : "false");
-    if (!ok || gStage < 3) return ok;
-    // What the Intel accelerator publishes and the family leaves to the subclass (docs/M6_ACCELERATOR_STUDY.md, section 3): WindowServer looks for the display pipe of each
-    // framebuffer through these ("Unable to find display pipe for IOFB service" otherwise, and the display has no Metal composite destination). Boot-arg rednavi_accel2_pipe=0 leaves them out.
-    uint32_t pipe = 1;
-    PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
-    if (pipe && !(accelExp() & 32)) rnPublishCaps(this);
-    // Boot-arg rednavi_accel2_delay=<seconds>: register later, so that a panic after the registration comes when SSH is up and tools/accel2_watch.sh can follow the log
-    // (a panic loses the property; registration at once crashed 17 s into the boot, before SSH answers).
-    uint32_t delay = 0;
-    PE_parse_boot_argn("rednavi_accel2_delay", &delay, sizeof(delay));
-    if (!delay) { registerService(); rnNote("registerService called"); return ok; }
-    static thread_call_t call;
-    gSelf = this;
-    retain();
-    call = thread_call_allocate([](thread_call_param_t, thread_call_param_t) {
-        rnNote("registerService after the delay");
+// The display bring-up, in a thread: not in start() or createDisplayPipe, which hold the family's locks while they run.
+static void rnBringUp(thread_call_param_t, thread_call_param_t) {
+        rnNote("display bring-up");
         attachGraphicsControl();
-        gSelf->registerService();
-        rnNote("registerService returned");
+        if (!gRegistered) { gSelf->registerService(); gRegistered = true; rnNote("registerService returned"); }
         // The family made the display pipe when the framebuffer appeared (createDisplayPipe in the log) but the pipe is inactive ("isFramebufferActive" false) while the framebuffer
         // has not told the display machine it is powered on, and WindowServer's request for the pipe (client type 4) is refused until it is. RedNaviFB stays at power state 0
         // (no MaxPowerState in its IOPowerManagement: it never registers a power driver), so the notification is made here (rednavi_accel2_pipe=0 skips it).
@@ -841,16 +820,115 @@ bool RedNaviAccel2::start(IOService *provider) {
             }
         }
         if (accelExp() & 32) rnPublishCaps(gSelf);
-    }, nullptr);
+}
+
+static bool rnHeadless() {
+    uint32_t fbArg = 0;
+    PE_parse_boot_argn("rednavi_fb", &fbArg, sizeof(fbArg));
+    return fbArg != 1;
+}
+
+// Starts the bring-up once, when the accelerator has started and the framebuffer has a display pipe (or there is no framebuffer to wait for).
+static void rnMaybeBringUp() {
+    if (!gUpLock) return;
+    IOLockLock(gUpLock);
+    bool go = gStarted && !gUpDone && (gFb || rnHeadless());
+    if (go) gUpDone = true;
+    IOLockUnlock(gUpLock);
+    if (!go) return;
+    uint32_t delay = 0;
+    PE_parse_boot_argn("rednavi_accel2_delay", &delay, sizeof(delay));
+    thread_call_t call = thread_call_allocate(rnBringUp, nullptr);
+    if (!call) { rnNote("no thread call for the bring-up"); return; }
+    // 1 ms when no delay is asked: only to leave createDisplayPipe, which is still returning to the family when it calls this.
     uint64_t deadline;
-    clock_interval_to_deadline(delay, NSEC_PER_SEC, &deadline);
+    if (delay) clock_interval_to_deadline(delay, NSEC_PER_SEC, &deadline);
+    else clock_interval_to_deadline(1, NSEC_PER_MSEC, &deadline);
     thread_call_enter_delayed(call, deadline);
-    rnNote("registerService in %u s", delay);
+    rnNote("bring-up in %u ms", delay ? delay * 1000 : 1);
+}
+
+// The family's start() builds everything but does not register the service (the node stayed !registered and Metal saw no device), which the Intel subclass presumably does
+// after it; stage 3 and up do it here.
+bool RedNaviAccel2::start(IOService *provider) {
+    // The probe kext brings the card up inside its own start() (PSP, SMU, GC, the queues) and registers its service at the very end. On the RX 7600 (2026-11-21), with this kext
+    // installed, the probe's graphics ring was never executed (gfx-test ok 0, its scratch register never written, the MES graphics queue at step 4, so RADV saw no graphics queue);
+    // on the same machine without this kext the same boot gave ok 1 and the queue at step 7. The family's start runs on another thread while the probe is still working on the
+    // card. Waiting for the probe to finish (kext 0.0.3) did not change it: the next boot with the wait (the log shows it waited) gave ok 0 again, so this kext's start is not the cause.
+    // So the wait is off by default: the accelerator starts and registers at once, and WindowServer (which starts a few seconds into the boot and decides once whether Metal can composite)
+    // finds it. The compute connection waits for the probe instead (newUserClient). Boot-arg rednavi_accel2_wait=1 brings the old wait back.
+    uint32_t waitProbe = 0;
+    PE_parse_boot_argn("rednavi_accel2_wait", &waitProbe, sizeof(waitProbe));
+    if (waitProbe) {
+        OSDictionary *match = IOService::serviceMatching("RedNaviProbe");
+        IOService *probeSvc = match ? IOService::waitForMatchingService(match, 600ULL * 1000000000ULL) : nullptr;   // the 7800 XT bring-up takes minutes; bounded so a missing probe does not block for ever
+        if (match) match->release();
+        rnNote("waited for the probe: %s", probeSvc ? "registered" : "not found within 600 s");
+        if (probeSvc) probeSvc->release();
+    }
+    bool ok = IOGraphicsAccelerator2::start(provider);
+    rnNote("family start -> %s", ok ? "true" : "false");
+    if (!ok || gStage < 3) return ok;
+    // What the Intel accelerator publishes and the family leaves to the subclass (docs/M6_ACCELERATOR_STUDY.md, section 3): WindowServer looks for the display pipe of each
+    // framebuffer through these ("Unable to find display pipe for IOFB service" otherwise, and the display has no Metal composite destination). Boot-arg rednavi_accel2_pipe=0 leaves them out.
+    uint32_t pipe = 1;
+    PE_parse_boot_argn("rednavi_accel2_pipe", &pipe, sizeof(pipe));
+    if (pipe && !(accelExp() & 32)) rnPublishCaps(this);
+    // The display bring-up (registerService and the display machine's notifications) runs as soon as both halves exist: this start() and the framebuffer's display pipe
+    // (createDisplayPipe), so the accelerator is registered the moment the card and its display are ready and WindowServer, which decides once whether Metal can composite, finds it.
+    // A card with no display here (no rednavi_fb=1) has no framebuffer to wait for. Boot-arg rednavi_accel2_delay=<seconds> still adds a fixed wait (debugging: a panic after the
+    // registration then comes when SSH is up).
+    gSelf = this;
+    retain();
+    // Registered now, not after the display bring-up: the Metal plug-in and WindowServer need the accelerator to exist from the first seconds of the boot. Nothing it serves needs the
+    // display machine until a framebuffer appears, and the compute connection waits for the probe.
+    uint32_t delayArg = 0;
+    PE_parse_boot_argn("rednavi_accel2_delay", &delayArg, sizeof(delayArg));
+    if (!delayArg) { registerService(); gRegistered = true; rnNote("registerService called"); }
+    gStarted = true;
+    rnNote("started");
+    rnMaybeBringUp();
     return ok;
 }
 
 IOReturn RedNaviAccel2::newUserClient(task_t owningTask, void *securityID, UInt32 type, OSDictionary *properties, IOUserClient **handler) {
     IOReturn r;
+    if (type == kRNComputeClientType && handler) {
+        // The compute connection of the Metal plug-in and RADV, made by the probe. The probe's own class (IOAccelRedNaviClient) is not one a sandboxed process may open: the system
+        // graphics sandbox profile allows iokit-open-user-client for IOAccelerator services (iokit-connection "IOAccelerator"), and this service is one. So the plug-in opens this
+        // service with this type and the probe hands back its client. The probe still decides who may have one (administrator, or rednavi_uc_anyone=1).
+        // The probe is another client of the same PCI device. Found by walking the device's clients: only calls that the probe kext already links are used here (an unresolved
+        // symbol in this kext freezes the boot), so no serviceMatching or copyMatchingService.
+        // The accelerator registers before the probe has finished the card, and WindowServer opens this at the start of the boot: wait for the probe (bounded).
+        if (OSDictionary *match = IOService::serviceMatching("RedNaviProbe")) {
+            IOService *ready = IOService::waitForMatchingService(match, 120ULL * 1000000000ULL);
+            match->release();
+            if (ready) ready->release();
+        }
+        IOService *probe = nullptr;
+        OSIterator *it = gProv ? gProv->getClientIterator() : nullptr;
+        if (it) {
+            while (OSObject *o = it->getNextObject()) {
+                IOService *c = OSDynamicCast(IOService, o);
+                if (c && !strcmp(c->getMetaClass()->getClassName(), "RedNaviProbe")) { probe = c; probe->retain(); break; }
+            }
+            it->release();
+        }
+        r = kIOReturnNotReady;
+        if (probe) {
+            r = probe->newUserClient(owningTask, securityID, 0, handler);
+            // The sandbox decides on the client object: iokit-connection "IOAccelerator" matches a user client whose provider is an IOAccelerator, and the probe is not one (the denial was
+            // "iokit-open-user-client IOAccelRedNaviClient" even with the connection opened on this service). Attached to this accelerator as well it was still denied (the provider is
+            // the first parent), so the client moves here: this accelerator becomes its only provider. The client keeps its own pointer to the probe (gpuOwner), set in its start().
+            if (r == kIOReturnSuccess && *handler) {
+                (*handler)->attach(this);
+                (*handler)->detach(probe);
+            }
+            probe->release();
+        }
+        rnNote("compute client for task %p -> 0x%x", (void *)owningTask, (unsigned)r);
+        return r;
+    }
     if (type == 4 && gStage >= 3 && handler) {
         // Client type 4 is the display pipe. The family's newUserClient has no case for it (the dtrace of 2026-11-06: it counts the process's clients and answers kIOReturnUnsupported), so the
         // accelerator's own subclass makes it, as the Intel and AMD ones do: an IOAccelDisplayPipeUserClient2, init, attach, start. WindowServer then selects the pipe with its
@@ -936,6 +1014,7 @@ void *RedNaviAccel2::createDisplayPipe(IOFramebuffer *fb, unsigned int index) {
     if (fb && !gFb) { fb->retain(); gFb = fb; }
     void *r = IOGraphicsAccelerator2::createDisplayPipe(fb, index);
     rnNote("createDisplayPipe -> %p", r);
+    if (r) rnMaybeBringUp();
     // Measurement: where, in the pipe object (792 bytes for IOAccelDisplayPipe, 896 for the legacy one), the family keeps the framebuffer, the display machine and the accelerator.
     if (r) {
         const uint64_t *w = static_cast<const uint64_t *>(r);
