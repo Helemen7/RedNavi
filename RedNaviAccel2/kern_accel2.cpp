@@ -720,6 +720,35 @@ IOService *RedNaviAccel2::probe(IOService *provider, SInt32 *score) {
     uint32_t arg = 0;
     if (!PE_parse_boot_argn("rednavi_accel2", &arg, sizeof(arg)) || arg == 0) return nullptr;
     gStage = arg;
+    // A card with no display here (no rednavi_fb=1) is attached only after the probe has brought it up and registered. On the RX 7600 (2026-11-22) this kext being attached
+    // during the bring-up was enough to break the probe's graphics ring (gfx-test ok 0, MES graphics queue at step 4); the same boot with this kext loaded but its probe
+    // refused gave ok 1 and step 7, and the wait in start() did not help. Until the probe is registered this refuses, and a thread call re-runs the matching of the PCI device
+    // once it is. A card that drives the display keeps the early attach: WindowServer decides in its first seconds whether Metal can composite.
+    uint32_t fb = 0;
+    PE_parse_boot_argn("rednavi_fb", &fb, sizeof(fb));
+    if (!fb && provider) {
+        OSDictionary *match = IOService::serviceMatching("RedNaviProbe");
+        IOService *probeSvc = match ? IOService::copyMatchingService(match) : nullptr;
+        if (match) match->release();
+        if (!probeSvc) {
+            static thread_call_t rematch;
+            if (!rematch) {
+                provider->retain();
+                rematch = thread_call_allocate([](thread_call_param_t p, thread_call_param_t) {
+                    IOService *pci = static_cast<IOService *>(p);
+                    OSDictionary *m = IOService::serviceMatching("RedNaviProbe");
+                    IOService *svc = m ? IOService::waitForMatchingService(m, 900ULL * 1000000000ULL) : nullptr;
+                    if (m) m->release();
+                    if (svc) { svc->release(); pci->registerService(); }      // matching runs again on the PCI device, and this probe() now accepts
+                    pci->release();
+                }, provider);
+                if (rematch) thread_call_enter(rematch);
+                else provider->release();
+            }
+            return nullptr;
+        }
+        probeSvc->release();
+    }
     if (!gLogLock) gLogLock = IOLockAlloc();
     if (!gXferLock) gXferLock = IOLockAlloc();
     if (!gUpLock) gUpLock = IOLockAlloc();
