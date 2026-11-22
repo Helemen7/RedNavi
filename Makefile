@@ -187,6 +187,8 @@ test:
 	./build/mode_regs_test
 	clang++ -std=c++17 -Wall tests/host/asic_test.cpp RedNavi/asic.cpp RedNavi/asic_navi32.cpp RedNavi/asic_navi33.cpp -o build/asic_test
 	./build/asic_test
+	clang++ -std=c++17 -Wall -IRedNavi tests/host/navi33_profile_test.cpp -o build/navi33_profile_test
+	./build/navi33_profile_test
 	python3 -I tests/host/compare_discovery_test.py
 	python3 -I tests/host/decode_discovery_test.py
 
