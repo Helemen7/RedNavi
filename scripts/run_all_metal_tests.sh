@@ -16,6 +16,7 @@ run COMPUTE   RN_COMPUTE_TEST=1 RN_VK_SELFTEST=1
 run AIR       RN_AIR_TEST=$D/vk_dispatch.metallib RN_AIR_FUNC=dispatch_add
 run TRI       RN_TRI_TEST=$D/vk_tri.metallib
 run QUAD      RN_QUAD_TEST=$D/vk_quad.metallib
+run DEPTH     RN_DEPTH_TEST=$D/vk_tri.metallib
 run BLIT      RN_BLIT_TEST=1
 run RASTER    RN_RASTER_TEST=$D/vk_quad.metallib
 run LOADSTORE RN_LOADSTORE_TEST=$D/vk_quad.metallib

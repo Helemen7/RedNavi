@@ -117,6 +117,82 @@ int main(int argc, char **argv) {
                 printf("stitched libraries through Metal on RADV: %s\n", bad ? "FAILED" : "all checks passed");
                 return bad;
             }
+            if (getenv("RN_DEPTH_TEST")) {
+                // Depth test through the official API, on vk_tri.metallib: a 40 x 24 RGBA8 target and a Depth32Float_Stencil8 texture. Triangle A (z 0.3, vertex colours) is drawn first, then triangle B
+                // (same corners, z 0.7, farther, tint black). With a Less depth state B must be rejected, the corners of A stay red, green and blue. With Always B overwrites A and the pixel is black.
+                // A third pass draws B nearer (z 0.1) after A with Less: B wins. A stencil pass: Equal 1 with a cleared stencil of 0 rejects everything.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_DEPTH_TEST"))];
+                dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library\n"); return 50; }
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
+                pd.fragmentFunction = [lib newFunctionWithName:@"tri_fragment"];
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+                pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+                id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                printf("render pipeline %p with depth, error: %s\n", (__bridge void *)rps, e ? e.localizedDescription.UTF8String : "none");
+                if (!rps) return 51;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:40 height:24 mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                id<MTLTexture> target = [d newTextureWithDescriptor:td];
+                MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:40 height:24 mipmapped:NO];
+                zd.usage = MTLTextureUsageRenderTarget; zd.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> ztex = [d newTextureWithDescriptor:zd];
+                printf("depth texture %p\n", (__bridge void *)ztex);
+                if (!target || !ztex) return 52;
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                int fails = 0;
+                // case: A's z, B's z, B's compare function, stencil compare (Always: none), expected the pixel near the red corner is red (YES) or black (NO) or grey (stencil reject)
+                struct { float za, zb; MTLCompareFunction cmp; MTLCompareFunction scmp; int expect; const char *name; } cases[] = {
+                    {0.3f, 0.7f, MTLCompareFunctionLess, MTLCompareFunctionAlways, 1, "farther triangle rejected (Less)"},
+                    {0.3f, 0.7f, MTLCompareFunctionAlways, MTLCompareFunctionAlways, 2, "Always: the later triangle overwrites"},
+                    {0.7f, 0.3f, MTLCompareFunctionLess, MTLCompareFunctionAlways, 2, "nearer triangle drawn later wins (Less)"},
+                    {0.3f, 0.7f, MTLCompareFunctionLess, MTLCompareFunctionEqual, 3, "stencil Equal 1 against a cleared 0 rejects everything"},
+                };
+                for (unsigned t = 0; t < sizeof(cases) / sizeof(cases[0]); t++) {
+                    MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rpd.colorAttachments[0].texture = target; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1.0);
+                    rpd.depthAttachment.texture = ztex; rpd.depthAttachment.loadAction = MTLLoadActionClear; rpd.depthAttachment.storeAction = MTLStoreActionDontCare; rpd.depthAttachment.clearDepth = 1.0;
+                    rpd.stencilAttachment.texture = ztex; rpd.stencilAttachment.loadAction = MTLLoadActionClear; rpd.stencilAttachment.storeAction = MTLStoreActionDontCare; rpd.stencilAttachment.clearStencil = 0;
+                    MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];
+                    dsd.depthCompareFunction = cases[t].cmp; dsd.depthWriteEnabled = YES;
+                    MTLStencilDescriptor *sd = [MTLStencilDescriptor new]; sd.stencilCompareFunction = cases[t].scmp;
+                    dsd.frontFaceStencil = sd; dsd.backFaceStencil = sd;
+                    id<MTLDepthStencilState> st = [d newDepthStencilStateWithDescriptor:dsd];
+                    id<MTLCommandBuffer> cb = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
+                    if (!enc) { printf("no render encoder\n"); return 53; }
+                    [enc setRenderPipelineState:rps];
+                    [enc setDepthStencilState:st];
+                    [enc setStencilReferenceValue:1];
+                    const float col[3][4] = {{1, 0, 0, 1}, {0, 1, 0, 1}, {0, 0, 1, 1}};
+                    for (int tri = 0; tri < 2; tri++) {
+                        const float z = tri ? cases[t].zb : cases[t].za;
+                        const float pos[3][4] = {{-1, 1, z, 1}, {0, 1, z, 1}, {-1, 0, z, 1}};
+                        const float tint[4] = {tri ? 0.f : 1.f, tri ? 0.f : 1.f, tri ? 0.f : 1.f, 1};
+                        [enc setVertexBytes:pos length:sizeof(pos) atIndex:0];
+                        [enc setVertexBytes:col length:sizeof(col) atIndex:1];
+                        [enc setFragmentBytes:tint length:sizeof(tint) atIndex:0];
+                        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                    }
+                    [enc endEncoding];
+                    [cb commit]; [cb waitUntilCompleted];
+                    uint8_t px[40 * 24 * 4];
+                    [target getBytes:px bytesPerRow:40 * 4 fromRegion:MTLRegionMake2D(0, 0, 40, 24) mipmapLevel:0];
+                    const uint8_t *a = px + (1 * 40 + 2) * 4;
+                    const int red = a[0] > 180 && a[1] < 70 && a[2] < 70, black = a[0] < 20 && a[1] < 20 && a[2] < 20, grey = a[0] == 51 && a[1] == 51 && a[2] == 51;
+                    const int ok = cases[t].expect == 1 ? red : cases[t].expect == 2 ? black : grey;
+                    printf("  %s: pixel (2,1) = %u %u %u, status %ld: %s\n", cases[t].name, a[0], a[1], a[2], (long)cb.status, ok ? "ok" : "FAIL");
+                    if (!ok) fails++;
+                }
+                printf("depth and stencil through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails;
+            }
             if (getenv("RN_TRI_TEST")) {
                 // A render pipeline from a .metallib (mesa-bridge/test/vk_tri.metal) through the official API: a 40 x 24 RGBA8 target cleared to grey, one triangle in the top-left
                 // quadrant of Metal's clip space (x from -1 to 0, y from 0 to 1: pixels x < 20, y < 12, a different colour at each corner). The asserts catch a flipped image (the bottom-left

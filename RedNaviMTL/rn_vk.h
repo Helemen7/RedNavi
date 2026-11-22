@@ -35,7 +35,7 @@ void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b);
 // This is the first version of Metal textures (docs/M6_METAL_ON_RADV.md): an IOSurface or any host memory cannot be imported by RADV yet (the kext has no userptr).
 typedef struct rn_vk_image rn_vk_image;
 typedef struct rn_vk_sampler rn_vk_sampler;
-enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA16F, RN_VK_R32F, RN_VK_RG32F, RN_VK_RGBA32F, RN_VK_R32U, RN_VK_R32I, RN_VK_RGBA8U, RN_VK_RGBA8_SRGB, RN_VK_BGRA8_SRGB, RN_VK_RGB10A2, RN_VK_BGR10A2, RN_VK_RG16F, RN_VK_R16, RN_VK_RG16, RN_VK_RGBA16, RN_VK_A8 };
+enum { RN_VK_RGBA8 = 1, RN_VK_BGRA8, RN_VK_R8, RN_VK_RG8, RN_VK_R16F, RN_VK_RGBA16F, RN_VK_R32F, RN_VK_RG32F, RN_VK_RGBA32F, RN_VK_R32U, RN_VK_R32I, RN_VK_RGBA8U, RN_VK_RGBA8_SRGB, RN_VK_BGRA8_SRGB, RN_VK_RGB10A2, RN_VK_BGR10A2, RN_VK_RG16F, RN_VK_R16, RN_VK_RG16, RN_VK_RGBA16, RN_VK_A8, RN_VK_D16, RN_VK_D32, RN_VK_D32S8 };   // the last three are depth formats: rn_vk_depth only, never an rn_vk_image
 unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknown format
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
 rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth);   // depth > 1: a 3D image (sampled only); staging is depth slices of width * height texels
@@ -107,10 +107,21 @@ typedef struct {
     rn_vk_blend blend[8];                              // per colour attachment; write_mask is Vulkan's (R 1, G 2, B 4, A 8): 15 writes all
     unsigned nvattr; const rn_vk_vattr *vattrs;        // vertex input of [[stage_in]] functions, locations as the shader declares them
     unsigned nvlayout; const rn_vk_vlayout *vlayouts;
+    int depth_format;                                  // RN_VK_D16, D32 or D32S8 when the pass has a depth (and stencil) attachment, else 0; needs VK_EXT_extended_dynamic_state (else ignored)
 } rn_vk_render_desc;
 rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d);   // NULL: RADV refused it
 void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
 
+// The depth (and stencil) attachment of a pass: an image of the card only, with no host copy. Its contents are never read back; a texture of a depth format cannot be sampled or filled by the host.
+typedef struct rn_vk_depth rn_vk_depth;
+rn_vk_depth *rn_vk_depth_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: the card has no such depth format or no memory
+void rn_vk_depth_destroy(rn_vk *vk, rn_vk_depth *d);                                       // waits for the work that uses it
+int rn_vk_depth_format_has_stencil(int format);
+typedef struct { rn_vk_depth *depth; int clear_depth; float depth_value; int clear_stencil; uint32_t stencil_value; } rn_vk_depth_target;
+// Depth and stencil state of a draw, in Vulkan's numbers (VkCompareOp, VkStencilOp: Metal's MTLCompareFunction and MTLStencilOperation have the same values). All zero: no depth test, no depth
+// write, no stencil test (what Metal does when no depth stencil state is set).
+typedef struct { unsigned fail, pass, depth_fail, cmp; uint32_t read_mask, write_mask, ref; } rn_vk_stencil_face;
+typedef struct { int depth_test, depth_write; unsigned depth_cmp; int stencil_test; rn_vk_stencil_face front, back; } rn_vk_ds;
 typedef struct { rn_vk_image *image; int clear; float color[4]; int discard; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded; discard: the host copy is not updated afterwards (store action don't care)
 typedef struct {
     rn_vk_render *pipe;
@@ -120,6 +131,7 @@ typedef struct {
     uint32_t first_vertex, vertex_count, instance_count, first_instance;
     const rn_vk_vbuf *vbufs;                           // 16 entries, by vertex buffer binding (used for the bindings the pipeline declares)
     int has_blend_color; float blend_color[4];
+    rn_vk_ds ds;                                       // used when the pipeline and the pass have a depth attachment
     rn_vk_buffer *index_buffer; uint64_t index_offset; int index32; int32_t base_vertex;   // indexed draw: vertex_count is the index count
 } rn_vk_draw;
 // One render pass over the targets with the draws in order (no draws: only the clears are done), submitted and waited for (0 on success; 5 pipeline not usable with these targets, 6 a resource is missing, 4 a buffer
@@ -142,6 +154,7 @@ int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // rn_vk_
 int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // whole image to an image of the same size and format on the card, waited for
 int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);   // a rectangle between two images of the same format on the card
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_draw *draws, unsigned ndraws);
+int rn_vk_render_pass_ds(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_depth_target *depth, const rn_vk_draw *draws, unsigned ndraws);   // depth: NULL for none
 
 // The test of tools/mtl_init_harness: the compute shader of mesa-bridge/test/vk_dispatch.comp (v[i] = i * 3 + 7, 64 invocations per group). Prints to stderr, returns 0 when every value is right.
 int rn_vk_selftest(const char *dir);

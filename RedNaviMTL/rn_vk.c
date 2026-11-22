@@ -25,7 +25,9 @@
     X(CmdPushConstants) X(CmdDispatch) X(CmdPipelineBarrier) X(CreateFence) X(DestroyFence) X(WaitForFences) X(QueueSubmit) X(ResetDescriptorPool) X(ResetFences) X(ResetCommandBuffer) \
     X(GetImageSubresourceLayout) X(GetMemoryHostPointerPropertiesEXT) X(CreateImage) X(DestroyImage) X(GetImageMemoryRequirements) X(BindImageMemory) X(CreateImageView) X(DestroyImageView) X(CreateSampler) X(DestroySampler) \
     X(CmdCopyBufferToImage) X(CmdCopyImage) X(CmdCopyImageToBuffer) X(CmdClearColorImage) X(CreateRenderPass) X(DestroyRenderPass) X(CreateFramebuffer) X(DestroyFramebuffer) \
-    X(CreateGraphicsPipelines) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdSetViewport) X(CmdSetScissor) X(CmdDraw) X(CmdBindVertexBuffers) X(CmdSetBlendConstants) X(CmdBindIndexBuffer) X(CmdDrawIndexed)
+    X(CreateGraphicsPipelines) X(CmdBeginRenderPass) X(CmdEndRenderPass) X(CmdSetViewport) X(CmdSetScissor) X(CmdDraw) X(CmdBindVertexBuffers) X(CmdSetBlendConstants) X(CmdBindIndexBuffer) X(CmdDrawIndexed) \
+    X(CmdClearDepthStencilImage) X(CmdSetStencilCompareMask) X(CmdSetStencilWriteMask) X(CmdSetStencilReference) \
+    X(CmdSetDepthTestEnableEXT) X(CmdSetDepthWriteEnableEXT) X(CmdSetDepthCompareOpEXT) X(CmdSetStencilTestEnableEXT) X(CmdSetStencilOpEXT)
 
 struct rn_vk {
     void *lib;
@@ -42,6 +44,7 @@ struct rn_vk {
     VkDescriptorPool rpool; uint32_t rpoolSets, rpoolCnt[5];   // the render pass's descriptor pool, kept and reset (a pool owns a buffer object: creating one per pass cost kernel calls each time)
     VkCommandBuffer rcb; VkFence rfence;                      // and its command buffer and fence
     VkPipelineCache pcache; unsigned pcnew; uint64_t pcsaved; // the pipeline cache, kept on disk between runs (RADV compiles a shader the first time an effect shows up: hundreds of ms)
+    int eds;                                   // VK_EXT_extended_dynamic_state is enabled: the depth and stencil state of a draw is set with commands
     int brec, brc;                             // render passes are being recorded into rcb (one submit for all of a command buffer's passes); the failure a nested flush had
     VkFramebuffer *bfb; unsigned nbfb, capbfb; // framebuffers of the recorded passes, destroyed after the submit
     struct rn_vk_image **bimg; unsigned nbimg, capbimg;   // images the recorded work uses (pending until the submit has finished)
@@ -193,8 +196,13 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics;
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &want};
     static const char *const hostExt[] = {"VK_EXT_external_memory_host"};
-    dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = hostExt;
+    // The depth and stencil state of a draw (Metal sets it on the encoder) is dynamic state of the pipeline: first try with VK_EXT_extended_dynamic_state, then without it (no depth then).
+    static const char *const bothExt[] = {"VK_EXT_external_memory_host", "VK_EXT_extended_dynamic_state"};
+    VkPhysicalDeviceExtendedDynamicStateFeaturesEXT edsf = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT, .extendedDynamicState = VK_TRUE};
+    dci.enabledExtensionCount = 2; dci.ppEnabledExtensionNames = bothExt; dci.pNext = &edsf;
     r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev);
+    vk->eds = r == VK_SUCCESS;
+    if (r != VK_SUCCESS) { dci.pNext = NULL; dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = hostExt; r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev); }
     vk->hostimport = r == VK_SUCCESS;
     if (r != VK_SUCCESS) { dci.enabledExtensionCount = 0; dci.ppEnabledExtensionNames = NULL; r = vk->CreateDevice(vk->pd, &dci, NULL, &vk->dev); }   // without the extension everything is copied as before
     if (r != VK_SUCCESS) { seterr(err, errlen, "vkCreateDevice", r); goto fail; }
@@ -1026,6 +1034,7 @@ struct rn_vk_render {
     VkSampler statics[2][RN_VK_MAX_BINDINGS];
     unsigned nt;
     int blended;                               // some colour target blends
+    int depth, stencil;                        // the pass has a depth attachment (index nt), with a stencil aspect
     VkFormat fmts[8];
     unsigned nvl, vlbind[16];                  // the vertex buffer bindings the pipeline reads
 };
@@ -1081,7 +1090,7 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
     VkPipelineLayoutCreateInfo plci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 4, .pSetLayouts = all};
     if (vk->CreatePipelineLayout(vk->dev, &plci, NULL, &r->pl) != VK_SUCCESS) goto fail;
     // The pass the pipeline is made for: every attachment is loaded and stored and stays in GENERAL (clears are done by the caller before the pass).
-    VkAttachmentDescription att[8];
+    VkAttachmentDescription att[9];
     VkAttachmentReference ref[8];
     VkPipelineColorBlendAttachmentState cba[8];
     for (unsigned i = 0; i < r->nt; i++) {
@@ -1098,6 +1107,14 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
     }
     // every colour attachment is also an input attachment (framebuffer fetch), with a self dependency so a draw sees what the earlier draws of the pass wrote at the same pixel
     VkSubpassDescription sub = {.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS, .inputAttachmentCount = r->nt, .pInputAttachments = ref, .colorAttachmentCount = r->nt, .pColorAttachments = ref};
+    VkAttachmentReference dref = {r->nt, VK_IMAGE_LAYOUT_GENERAL};
+    if (d->depth_format && vk->eds) {            // depth (and stencil) attachment after the colour ones, loaded and stored, in GENERAL like the others
+        const VkFormat df = d->depth_format == RN_VK_D16 ? VK_FORMAT_D16_UNORM : d->depth_format == RN_VK_D32 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+        r->depth = 1; r->stencil = d->depth_format == RN_VK_D32S8;
+        att[r->nt] = (VkAttachmentDescription){.format = df, .samples = VK_SAMPLE_COUNT_1_BIT, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+                                               .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE, .initialLayout = VK_IMAGE_LAYOUT_GENERAL, .finalLayout = VK_IMAGE_LAYOUT_GENERAL};
+        sub.pDepthStencilAttachment = &dref;
+    }
     // The second self dependency allows the colour barrier before a blended draw (see the draw loop). Every pass declares both, whatever its
     // pipeline blends, because render passes with different dependencies are not compatible and one pass mixes the draws of several pipelines.
     VkSubpassDependency selfdep[2] = {
@@ -1105,7 +1122,7 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
          .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_INPUT_ATTACHMENT_READ_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT},
         {.srcSubpass = 0, .dstSubpass = 0, .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, .dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
          .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, .dependencyFlags = VK_DEPENDENCY_BY_REGION_BIT}};
-    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = selfdep};
+    VkRenderPassCreateInfo rpi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO, .attachmentCount = r->nt + (r->depth ? 1 : 0), .pAttachments = att, .subpassCount = 1, .pSubpasses = &sub, .dependencyCount = 2, .pDependencies = selfdep};
     if (vk->CreateRenderPass(vk->dev, &rpi, NULL, &r->rp) != VK_SUCCESS) goto fail;
     static const VkPrimitiveTopology topo[5] = {VK_PRIMITIVE_TOPOLOGY_POINT_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_LIST, VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
                                                 VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP};
@@ -1129,10 +1146,18 @@ rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d) {
                                                  .frontFace = d->front_clockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE, .lineWidth = 1.0f};
     VkPipelineMultisampleStateCreateInfo ms = {.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
     VkPipelineColorBlendStateCreateInfo cb = {.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = r->nt, .pAttachments = cba};
-    const VkDynamicState dyn[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
-    VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = 3, .pDynamicStates = dyn};
+    VkDynamicState dyn[12] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    unsigned ndyn = 3;
+    VkPipelineDepthStencilStateCreateInfo dss = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO, .depthCompareOp = VK_COMPARE_OP_ALWAYS,
+                                                 .front = {.compareOp = VK_COMPARE_OP_ALWAYS}, .back = {.compareOp = VK_COMPARE_OP_ALWAYS}};
+    if (r->depth) {                              // all of it is set per draw (rn_vk_ds)
+        dyn[ndyn++] = VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_DEPTH_COMPARE_OP_EXT;
+        dyn[ndyn++] = VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE_EXT; dyn[ndyn++] = VK_DYNAMIC_STATE_STENCIL_OP_EXT;
+        dyn[ndyn++] = VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK; dyn[ndyn++] = VK_DYNAMIC_STATE_STENCIL_WRITE_MASK; dyn[ndyn++] = VK_DYNAMIC_STATE_STENCIL_REFERENCE;
+    }
+    VkPipelineDynamicStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = ndyn, .pDynamicStates = dyn};
     VkGraphicsPipelineCreateInfo gp = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .stageCount = 2, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia,
-                                       .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = r->pl,
+                                       .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = r->depth ? &dss : NULL, .pColorBlendState = &cb, .pDynamicState = &ds, .layout = r->pl,
                                        .renderPass = r->rp, .subpass = 0};
     if (vk->CreateGraphicsPipelines(vk->dev, vk->pcache, 1, &gp, NULL, &r->pipe) != VK_SUCCESS) goto fail;
     pipecache_note(vk);
@@ -1167,8 +1192,67 @@ static void clear_value(const rn_vk_image *im, const float c[4], VkClearColorVal
     if (vb != rb) { out->float32[0] = c[2]; out->float32[2] = c[0]; }
 }
 
+// ------------------------------------------------------------------------------------------------------------------------------------ depth images
+// The depth (and stencil) attachment of a pass lives on the card only: no host copy, never read back. It stays in GENERAL; the first use takes it out of UNDEFINED and clears it.
+struct rn_vk_depth { VkImage img; VkImageView view; VkDeviceMemory mem; VkFormat fmt; uint32_t w, h; int stencil, init; };
+int rn_vk_depth_format_has_stencil(int format) { return format == RN_VK_D32S8; }
+rn_vk_depth *rn_vk_depth_create(rn_vk *vk, int format, uint32_t w, uint32_t h) {
+    if (!vk || !vk->eds || !w || !h || (format != RN_VK_D16 && format != RN_VK_D32 && format != RN_VK_D32S8)) return NULL;
+    rn_vk_depth *d = calloc(1, sizeof(*d));
+    if (!d) return NULL;
+    d->fmt = format == RN_VK_D16 ? VK_FORMAT_D16_UNORM : format == RN_VK_D32 ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D32_SFLOAT_S8_UINT;
+    d->w = w; d->h = h; d->stencil = format == RN_VK_D32S8;
+    VkFormatProperties fp;
+    vk->GetPhysicalDeviceFormatProperties(vk->pd, d->fmt, &fp);
+    if (!(fp.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT)) goto fail;
+    VkImageCreateInfo ici = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = d->fmt, .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1,
+                             .samples = VK_SAMPLE_COUNT_1_BIT, .tiling = VK_IMAGE_TILING_OPTIMAL, .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED, .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                             .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
+    if (vk->CreateImage(vk->dev, &ici, NULL, &d->img) != VK_SUCCESS) goto fail;
+    VkMemoryRequirements mr;
+    vk->GetImageMemoryRequirements(vk->dev, d->img, &mr);
+    int mt = -1;
+    for (uint32_t i = 0; i < vk->mp.memoryTypeCount; i++)
+        if ((mr.memoryTypeBits & (1u << i)) && (vk->mp.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) { mt = (int)i; break; }
+    if (mt < 0) goto fail;
+    VkMemoryAllocateInfo mai = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = mr.size, .memoryTypeIndex = (uint32_t)mt};
+    if (vk->AllocateMemory(vk->dev, &mai, NULL, &d->mem) != VK_SUCCESS || vk->BindImageMemory(vk->dev, d->img, d->mem, 0) != VK_SUCCESS) goto fail;
+    VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = d->img, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = d->fmt,
+                                 .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT | (d->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0), 0, 1, 0, 1}};
+    if (vk->CreateImageView(vk->dev, &vci, NULL, &d->view) != VK_SUCCESS) goto fail;
+    return d;
+fail:
+    rn_vk_depth_destroy(vk, d);
+    return NULL;
+}
+void rn_vk_depth_destroy(rn_vk *vk, rn_vk_depth *d) {
+    if (!d) return;
+    bsync(vk);                                   // a recorded pass may still use it
+    if (d->view) vk->DestroyImageView(vk->dev, d->view, NULL);
+    if (d->img) vk->DestroyImage(vk->dev, d->img, NULL);
+    if (d->mem) vk->FreeMemory(vk->dev, d->mem, NULL);
+    free(d);
+}
+// Commands that take the depth image out of UNDEFINED on its first use and clear what the pass asked to clear (everything on the first use); the stencil aspect only when it exists.
+static void depth_prepare(rn_vk *vk, VkCommandBuffer cb, const rn_vk_depth_target *dt) {
+    rn_vk_depth *d = dt->depth;
+    const VkImageAspectFlags all = VK_IMAGE_ASPECT_DEPTH_BIT | (d->stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+    const int first = !d->init;
+    const int cd = dt->clear_depth || first, cs = d->stencil && (dt->clear_stencil || first);
+    VkImageMemoryBarrier ib = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                               .oldLayout = first ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                               .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .image = d->img, .subresourceRange = {all, 0, 1, 0, 1}};
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &ib);
+    if (cd || cs) {
+        VkClearDepthStencilValue cv = {.depth = first && !dt->clear_depth ? 0.0f : dt->depth_value, .stencil = first && !dt->clear_stencil ? 0 : dt->stencil_value};
+        VkImageSubresourceRange rg = {(cd ? VK_IMAGE_ASPECT_DEPTH_BIT : 0) | (cs ? VK_IMAGE_ASPECT_STENCIL_BIT : 0), 0, 1, 0, 1};
+        vk->CmdClearDepthStencilImage(cb, d->img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &rg);
+    }
+    d->init = 1;
+}
+
 // A pass without draws: only its clears. They are done outside a render pass (vkCmdClearColorImage) and the images' host copies are brought up to date.
-static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
+static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_depth_target *dt) {
     bsync(vk);
     rn_vk_image *im[8];
     for (unsigned i = 0; i < nt; i++) {
@@ -1197,6 +1281,7 @@ static int clear_targets(rn_vk *vk, const rn_vk_target *targets, unsigned nt) {
     }
     VkMemoryBarrier fromClear = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fromClear, 0, NULL, 0, NULL);
+    if (dt && dt->depth && (dt->clear_depth || dt->clear_stencil || !dt->depth->init)) depth_prepare(vk, cb, dt);
     images_mark_gpu(out, cleared);
     if (vk->EndCommandBuffer(cb) != VK_SUCCESS) goto done;
     VkFenceCreateInfo fci = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
@@ -1237,17 +1322,19 @@ static void snap_record(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *img, unsigne
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 1, &hb, 0, NULL, 0, NULL);
     vk->snap[vk->nsnap].b = b; vk->snap[vk->nsnap].seq = rn_vk_snap_seq; vk->snap[vk->nsnap].draw = draw; vk->snap[vk->nsnap].w = img->w; vk->snap[vk->nsnap].h = img->h; vk->nsnap++;
 }
-int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_draw *draws, unsigned nd) {
+int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_draw *draws, unsigned nd) { return rn_vk_render_pass_ds(vk, targets, nt, NULL, draws, nd); }
+int rn_vk_render_pass_ds(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const rn_vk_depth_target *dt, const rn_vk_draw *draws, unsigned nd) {
     if (!nt || nt > 8) return 6;
     g_readback_vk = vk;
-    if (!nd) return clear_targets(vk, targets, nt);
+    if (dt && (!dt->depth || !vk->eds)) dt = NULL;                       // no depth image, or a card that cannot test depth here: the pass runs without it (its pipelines have none either)
+    if (!nd) return clear_targets(vk, targets, nt, dt);
     rn_vk_render *p0 = draws[0].pipe;
     for (unsigned i = 0; i < nt; i++) {
         if (!targets[i].image || !targets[i].image->color || targets[i].image->w != targets[0].image->w || targets[i].image->h != targets[0].image->h) return 6;
     }
     for (unsigned d = 0; d < nd; d++) {
         const rn_vk_render *p = draws[d].pipe;
-        if (!p || p->nt != nt) return 5;
+        if (!p || p->nt != nt || p->depth != (dt != NULL) || (dt && p->stencil != dt->depth->stencil)) return 5;
         for (unsigned i = 0; i < nt; i++) if (p->fmts[i] != targets[i].image->fmt) return 5;
     }
     const uint32_t W = targets[0].image->w, H = targets[0].image->h;
@@ -1322,9 +1409,11 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         }
     }
     if (nw) vk->UpdateDescriptorSets(vk->dev, nw, w, 0, NULL);
-    VkImageView views[8];
+    VkImageView views[9];
     for (unsigned i = 0; i < nt; i++) views[i] = targets[i].image->view;
-    VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = p0->rp, .attachmentCount = nt, .pAttachments = views, .width = W, .height = H, .layers = 1};
+    if (dt) views[nt] = dt->depth->view;
+    if (dt && (dt->depth->w < W || dt->depth->h < H)) goto done;                // the depth image must cover the colour targets
+    VkFramebufferCreateInfo fbi = {.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO, .renderPass = p0->rp, .attachmentCount = nt + (dt ? 1 : 0), .pAttachments = views, .width = W, .height = H, .layers = 1};
     if (vk->CreateFramebuffer(vk->dev, &fbi, NULL, &fb) != VK_SUCCESS) goto done;
     if (vk->nbfb == vk->capbfb) { vk->capbfb = vk->capbfb ? vk->capbfb * 2 : 32; vk->bfb = realloc(vk->bfb, vk->capbfb * sizeof(*vk->bfb)); }
     vk->bfb[vk->nbfb++] = fb;                            // destroyed once the batch has run (the pass keeps using it until then)
@@ -1364,9 +1453,10 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
             vk->CmdClearColorImage(cb, targets[i].image->img, VK_IMAGE_LAYOUT_GENERAL, &cc, 1, &rg);
         }
     }
+    if (dt) depth_prepare(vk, cb, dt);
     VkMemoryBarrier toGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT,
-                             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT};   // the vertex and index data the host wrote are read by the vertex fetch, not by a shader load: without these the card's vertex cache can hold older data
-    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT};   // the vertex and index data the host wrote are read by the vertex fetch, not by a shader load: without these the card's vertex cache can hold older data
+    vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                            0, 1, &toGfx, 0, NULL, 0, NULL);
     VkRenderPassBeginInfo rbi = {.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO, .renderPass = p0->rp, .framebuffer = fbh, .renderArea = {{0, 0}, {W, H}}};
     vk->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
@@ -1377,9 +1467,9 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         const int feedback = samples_target(dr, targets, nt);
         if (d && (feedback || prevFeedback)) {          // the render pass is restarted (LOAD) around a draw that reads the target, with the writes made visible
             vk->CmdEndRenderPass(cb);
-            VkMemoryBarrier fb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
-                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
-            vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            VkMemoryBarrier fb2 = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                   .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+            vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
                                    0, 1, &fb2, 0, NULL, 0, NULL);
             vk->CmdBeginRenderPass(cb, &rbi, VK_SUBPASS_CONTENTS_INLINE);
         }
@@ -1420,6 +1510,24 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
         vk->CmdSetViewport(cb, 0, 1, &vp);
         vk->CmdSetScissor(cb, 0, 1, &sc);
         vk->CmdSetBlendConstants(cb, dr->has_blend_color ? dr->blend_color : (const float[4]){0, 0, 0, 0});
+        if (dr->pipe->depth) {                          // Metal's depth stencil state (compare functions and stencil operations have Vulkan's numbers)
+            const rn_vk_ds *z = &dr->ds;
+            vk->CmdSetDepthTestEnableEXT(cb, z->depth_test ? VK_TRUE : VK_FALSE);
+            vk->CmdSetDepthWriteEnableEXT(cb, z->depth_write ? VK_TRUE : VK_FALSE);
+            vk->CmdSetDepthCompareOpEXT(cb, (VkCompareOp)z->depth_cmp);
+            const int st = dr->pipe->stencil && z->stencil_test;
+            vk->CmdSetStencilTestEnableEXT(cb, st ? VK_TRUE : VK_FALSE);
+            if (st) {
+                const rn_vk_stencil_face *fc[2] = {&z->front, &z->back};
+                static const VkStencilFaceFlags face[2] = {VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
+                for (int f = 0; f < 2; f++) {
+                    vk->CmdSetStencilOpEXT(cb, face[f], (VkStencilOp)fc[f]->fail, (VkStencilOp)fc[f]->pass, (VkStencilOp)fc[f]->depth_fail, (VkCompareOp)fc[f]->cmp);
+                    vk->CmdSetStencilCompareMask(cb, face[f], fc[f]->read_mask);
+                    vk->CmdSetStencilWriteMask(cb, face[f], fc[f]->write_mask);
+                    vk->CmdSetStencilReference(cb, face[f], fc[f]->ref);
+                }
+            }
+        }
         for (unsigned i = 0; i < dr->pipe->nvl; i++) {
             const rn_vk_vbuf *vbf = dr->vbufs ? &dr->vbufs[dr->pipe->vlbind[i]] : NULL;
             if (!vbf || !vbf->buffer || vbf->offset >= vbf->buffer->size) { vk->CmdEndRenderPass(cb); rc = 6; goto done; }
@@ -1441,7 +1549,7 @@ int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned nt, const
     }
     vk->CmdEndRenderPass(cb);
     if (snapOn) snap_record(vk, cb, targets[0].image, nd - 1);
-    VkMemoryBarrier fromGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+    VkMemoryBarrier fromGfx = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER, .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
                                .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};   // the next pass of the batch reads or blends over what this one drew   // host read: a target over an IOSurface's own memory is read by the CPU and by other processes
     vk->CmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &fromGfx, 0, NULL, 0, NULL);
     images_mark_gpu(out, nout);

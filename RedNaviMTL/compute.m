@@ -48,7 +48,9 @@ static BOOL rn_gate(void) {
         if (getenv("RN_METAL_COMPUTE") != NULL) { on = YES; return; }
         // rednavi-on empty: every process; with lines in it: only the processes with these names (one per line), so a test can start with WindowServer alone
         FILE *f = fopen("/Users/Shared/rednavi-on", "r");
-        if (!f) return;
+        // A sandboxed process (Maps, the icon services) cannot read /Users/Shared: the profile refuses it with EPERM. It cannot see the files, so it takes the default of the project: on.
+        // A file that does not exist (ENOENT) is the old default, off.
+        if (!f) { if (errno == EPERM || errno == EACCES) on = YES; return; }
         char line[128], name[64]; extern const char *getprogname(void);
         strlcpy(name, getprogname(), sizeof(name));
         BOOL listed = NO, any = NO;
@@ -237,6 +239,16 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     }
 }
 
+// Depth and stencil formats are images of the card only (rn_vk_depth). Depth24Unorm_Stencil8 and Stencil8 are kept in a 32 bit float depth with stencil, which holds more.
+static int rn_depth_format_of(MTLPixelFormat pf) {
+    switch (pf) {
+    case MTLPixelFormatDepth16Unorm: return RN_VK_D16;
+    case MTLPixelFormatDepth32Float: return RN_VK_D32;
+    case MTLPixelFormatDepth32Float_Stencil8: case MTLPixelFormatDepth24Unorm_Stencil8: case MTLPixelFormatStencil8: return RN_VK_D32S8;
+    default: return 0;
+    }
+}
+
 @class RedNaviMTLBuffer;
 @interface RedNaviMTLTexture : NSObject {
 @public
@@ -245,6 +257,7 @@ static int rn_vk_format_of(MTLPixelFormat pf) {
     uint8_t *srcRaw;                                 // or client memory (newTiledTextureWithBytesNoCopy:...): the first texel's address, read the same way
     void *srcBase; NSUInteger srcLen; void (^srcDealloc)(void *, NSUInteger);
     rn_vk_image *img;
+    rn_vk_depth *dep;                                // a depth or stencil texture: no image, no host copy
     id<MTLDevice> dev;
     MTLPixelFormat pf;
     NSUInteger w, h, d;                              // d: depth of a 3D texture, else 1
@@ -291,10 +304,12 @@ static void rn_tex_wait_idle(RedNaviMTLTexture *t) {
     else if (n < 8 || n % 1000 == 0) rn_log("texture %lux%lu: host access waited for a committed command buffer (%u such waits so far)", (unsigned long)r->w, (unsigned long)r->h, n + 1);
 }
 // The rows of a texture's host copy: a 2D array keeps its slices one after the other, so a blit to slice s is one to rows s * h and on.
-static NSUInteger rn_tex_rows(RedNaviMTLTexture *t) { return t->ttype == MTLTextureType2DArray ? t->h * t->d : t->h; }
+// A cube texture is kept as a 2D array of six faces, so that it can be made, filled face by face and read back (Maps' ground textures are cubes). Sampling it as a cube in a shader is not done yet.
+#define RN_LAYERED(tt) ((tt) == MTLTextureType2DArray || (tt) == MTLTextureTypeCube)
+static NSUInteger rn_tex_rows(RedNaviMTLTexture *t) { return RN_LAYERED(t->ttype) ? t->h * t->d : t->h; }
 static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) {
     if (!t) return NO;
-    if (t->ttype == MTLTextureType2DArray && slice < t->d) { o->y += slice * t->h; return YES; }
+    if (RN_LAYERED(t->ttype) && slice < t->d) { o->y += slice * t->h; return YES; }
     if (t->alen > 1 && slice < t->alen) { o->y += slice; return YES; }
     return NO;
 }
@@ -303,7 +318,7 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
     if (!(self = [super init])) return nil;
     const BOOL is3d = desc.textureType == MTLTextureType3D;
-    const BOOL is2da = desc.textureType == MTLTextureType2DArray;   // OpenGL's GL_TEXTURE_2D_ARRAY (kitty's glyph atlas): the slices are kept like the depth of a 3D texture
+    const BOOL is2da = RN_LAYERED(desc.textureType);   // OpenGL's GL_TEXTURE_2D_ARRAY (kitty's glyph atlas): the slices are kept like the depth of a 3D texture
     const BOOL is1d = desc.textureType == MTLTextureType1D || desc.textureType == MTLTextureType1DArray;
     ttype = desc.textureType; alen = desc.textureType == MTLTextureType1DArray ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
     if ((desc.textureType != MTLTextureType2D && !is3d && !is1d && !is2da) || (desc.arrayLength > 1 && desc.textureType != MTLTextureType1DArray && !is2da) || desc.sampleCount > 1 || (!is3d && desc.depth > 1)) {
@@ -311,10 +326,18 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
         return nil;
     }
     if (desc.mipmapLevelCount > 1) rn_log("texture: %lu mipmap levels asked, only level 0 exists", (unsigned long)desc.mipmapLevelCount);
+    if (rn_depth_format_of(desc.pixelFormat)) {
+        rn_vk *dvk = rn_vk_shared();
+        dep = dvk && desc.textureType == MTLTextureType2D ? rn_vk_depth_create(dvk, rn_depth_format_of(desc.pixelFormat), (uint32_t)desc.width, (uint32_t)desc.height) : NULL;
+        if (!dep) { rn_log("depth texture %lux%lu pixel format %lu: not supported (type %ld, %s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, (long)desc.textureType, dvk ? "no depth image on the card" : "RADV is not available"); return nil; }
+        dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; self->d = 1; usage_ = desc.usage; texel = 4;
+        site_ = rn_site_enter('T');
+        return self;
+    }
     const int f = rn_vk_format_of(desc.pixelFormat);
     rn_vk *vk = f ? rn_vk_shared() : NULL;
     const NSUInteger rows = is1d ? alen : desc.height;
-    const NSUInteger slices = is3d ? desc.depth : is2da ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
+    const NSUInteger slices = is3d ? desc.depth : desc.textureType == MTLTextureTypeCube ? 6 : is2da ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
     img = vk ? rn_vk_image_create_layers(vk, f, (uint32_t)desc.width, (uint32_t)rows, (uint32_t)slices, is2da) : NULL;
     if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported (%s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, f ? (vk ? rn_vk_image_last_error() : "RADV is not available") : "no Vulkan format for it"); return nil; }
     dev = d; pf = desc.pixelFormat; w = desc.width; h = rows; self->d = slices; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
@@ -322,7 +345,7 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     counted_ = YES; atomic_fetch_add(&g_tex_live, 1); atomic_fetch_add(&g_tex_made, 1); atomic_fetch_add(&g_tex_bytes, (unsigned long)w * h * self->d * texel);
     return self;
 }
-- (void)dealloc { rn_site_leave(site_); if (srcDealloc) srcDealloc(srcBase, srcLen); if (counted_) { atomic_fetch_sub(&g_tex_live, 1); atomic_fetch_sub(&g_tex_bytes, (unsigned long)w * h * self->d * texel); } if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (surf) CFRelease(surf); }
+- (void)dealloc { rn_site_leave(site_); if (srcDealloc) srcDealloc(srcBase, srcLen); if (counted_) { atomic_fetch_sub(&g_tex_live, 1); atomic_fetch_sub(&g_tex_bytes, (unsigned long)w * h * self->d * texel); } if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (dep) rn_vk_depth_destroy(rn_vk_shared(), dep); if (surf) CFRelease(surf); }
 // IOSurface-backed textures (no host memory import in the kext, so a copy): the surface's rows are copied into the host copy of the image before the command buffer runs and, for
 // what the command buffer wrote, back afterwards. The surface's row pitch is its own; the host copy is packed.
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane {
@@ -508,7 +531,7 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
 // A view must cover the whole texture: all its slices, one level, the same type (a 2D array of one slice may also be viewed as 2D).
 static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange levels, NSRange slices) {
     const MTLTextureType own = t.textureType;
-    const NSUInteger n = own == MTLTextureType2DArray ? t.arrayLength : 1;
+    const NSUInteger n = own == MTLTextureType2DArray ? t.arrayLength : own == MTLTextureTypeCube ? 6 : 1;
     if ((type == own || (type == MTLTextureType2D && own == MTLTextureType2DArray && n == 1)) && levels.location == 0 && levels.length == 1 && slices.location == 0 && slices.length == n) return YES;
     rn_log("texture view: only the whole of a texture of one level can be viewed (type %ld of %ld, slices %lu+%lu)", (long)type, (long)own, (unsigned long)slices.location, (unsigned long)slices.length);
     return NO;
@@ -531,11 +554,11 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device { rn_log("newRemoteTextureViewForDevice: not supported"); return nil; }
 - (MTLSharedTextureHandle *)newSharedTextureHandle { rn_log("newSharedTextureHandle: not supported (an IOSurface-backed texture is shared through its IOSurface)"); return nil; }
 - (id<MTLTexture>)remoteStorageTexture { return nil; }
-- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) || ttype == MTLTextureType2DArray ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
+- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) || RN_LAYERED(ttype) ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
 - (MTLPixelFormat)pixelFormat { return pf; }
 - (NSUInteger)width { return w; }
 - (NSUInteger)height { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) ? 1 : h; }
-- (NSUInteger)depth { return ttype == MTLTextureType2DArray ? 1 : d; }
+- (NSUInteger)depth { return RN_LAYERED(ttype) ? 1 : d; }
 - (NSUInteger)mipmapLevelCount { return 1; }
 - (NSUInteger)sampleCount { return 1; }
 - (NSUInteger)arrayLength { return ttype == MTLTextureType2DArray ? d : alen ? alen : 1; }
@@ -550,7 +573,7 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z + r.size.depth <= d;
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
-    if (ttype == MTLTextureType2DArray && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }   // a slice of a 2D array is stored like a depth slice
+    if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }   // a slice of a 2D array is stored like a depth slice
     if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     rn_tex_wait_idle(self);
     rn_vk_host_lock();
@@ -570,7 +593,7 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
-    if (ttype == MTLTextureType2DArray && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }
+    if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }
     if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
     rn_tex_wait_idle(self);
     [self syncFromSurface];
@@ -853,6 +876,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     rn_vk_sampler_desc sampl[2][RN_VK_MAX_BINDINGS];
     unsigned nt;
     int tfmt[8];
+    int dfmt;                                        // RN_VK_D16, D32 or D32S8 when the pipeline has a depth or stencil attachment
     rn_vk_blend blend[8];
     NSString *names[2];                              // vertex and fragment function names (for logs)
     NSString *variant[2];                            // per stage: the function constants it was specialised with and the kinds of its bindings (pass dumps)
@@ -889,7 +913,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     memset(&d, 0, sizeof(d));
     d.vs = spv[0].bytes; d.vs_bytes = spv[0].length; d.fs = spv[1].bytes; d.fs_bytes = spv[1].length;
     d.nvbind = n[0]; d.vbinds = binds[0]; d.nfbind = n[1]; d.fbinds = binds[1];
-    d.ntargets = nt; d.topology = prim; d.cull_mode = cull; d.front_clockwise = cw;
+    d.depth_format = dfmt; d.ntargets = nt; d.topology = prim; d.cull_mode = cull; d.front_clockwise = cw;
     for (unsigned i = 0; i < nt; i++) { d.target_formats[i] = tfmt[i]; d.blend[i] = blend[i]; }
     d.nvattr = nvattr; d.vattrs = vattr; d.nvlayout = nvlayout; d.vlayouts = vlayout;
     byKey[key] = rn_vk_render_create(vk, &d);
@@ -913,6 +937,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     unsigned prim, vertexStart, vertexCount, instanceCount, baseInstance;
     unsigned cull;                                   // MTLCullMode
     BOOL clockwise;
+    rn_vk_ds ds;                                     // depth stencil state at the time of the draw
     RedNaviMTLBuffer *indexBuf;                      // indexed draws: vertexCount is the index count
     uint64_t indexOffset;
     BOOL index32;
@@ -922,9 +947,10 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
 @implementation RNDraw
 @end
 
-// Depth/stencil states exist so that apps get an object back; the render encoder does not test depth or stencil yet (setDepthStencilState: logs and ignores it).
+// A depth stencil state: the compare functions and stencil operations in Vulkan's numbers (they are Metal's). The stencil reference values are the encoder's, put in when a draw is recorded.
 @interface RedNaviMTLDepthStencilState : NSObject {
 @public
+    rn_vk_ds ds;
     id<MTLDevice> dev;
     NSString *label_;
 }
@@ -945,7 +971,7 @@ static double rn_stub_double(id self, SEL _cmd) { return 0; }
 static const char *rn_selector_types(SEL sel) {
     static const char *const protos[] = {"MTLTexture", "MTLTextureSPI", "MTLResource", "MTLResourceSPI", "MTLBuffer", "MTLBufferSPI", "MTLCommandQueue", "MTLCommandQueueSPI", "MTLCommandBuffer",
         "MTLCommandBufferSPI", "MTLCommandEncoder", "MTLRenderCommandEncoder", "MTLRenderCommandEncoderSPI", "MTLComputeCommandEncoder", "MTLBlitCommandEncoder", "MTLLibrary", "MTLFunction",
-        "MTLRenderPipelineState", "MTLComputePipelineState", "MTLSamplerState", "MTLDepthStencilState", "MTLSharedEvent", "MTLEvent", "MTLDrawable"};
+        "MTLRenderPipelineState", "MTLComputePipelineState", "MTLSamplerState", "MTLDepthStencilState", "MTLSharedEvent", "MTLEvent", "MTLDrawable", "MTLHeap", "MTLHeapSPI"};
     for (unsigned i = 0; i < sizeof(protos) / sizeof(protos[0]); i++) {
         Protocol *p = objc_getProtocol(protos[i]);
         if (!p) continue;
@@ -977,6 +1003,10 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     BOOL clear[8], store[8];
     float clearColor[8][4];
     unsigned nt;
+    RedNaviMTLTexture *depthTex;                     // depth and stencil attachment, if any
+    BOOL clearDepth, clearStencil;
+    float depthValue;
+    uint32_t stencilValue;
     NSMutableArray<RNDraw *> *draws;
 }
 @end
@@ -1376,6 +1406,8 @@ static NSString *rn_run_blit(RNBlit *b) {
     float blendColor[4];
     double viewport[6];
     uint32_t scissor[4];
+    RedNaviMTLDepthStencilState *dss;                // the depth stencil state set, if any
+    uint32_t stencilRef[2];                          // front and back reference values
     unsigned cullMode;                               // MTLCullMode, default none
     BOOL counterClockwise;                           // MTLWinding, default clockwise
     NSString *label_;
@@ -1431,10 +1463,11 @@ static NSString *rn_run_blit(RNBlit *b) {
 - (void)setCullMode:(MTLCullMode)m { cullMode = (unsigned)m; }
 - (void)setFrontFacingWinding:(MTLWinding)w { counterClockwise = w == MTLWindingCounterClockwise; }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)m { if (m != MTLTriangleFillModeFill) [self ignored:"triangle fill mode"]; }
-- (void)setDepthStencilState:(id<MTLDepthStencilState>)s { [self ignored:"depth stencil state"]; }
+- (void)setDepthStencilState:(id<MTLDepthStencilState>)s { dss = (RedNaviMTLDepthStencilState *)s; }
 - (void)setDepthBias:(float)d slopeScale:(float)s clamp:(float)c {}
 - (void)setBlendColorRed:(float)r green:(float)g blue:(float)b alpha:(float)a { hasBlendColor = YES; blendColor[0] = r; blendColor[1] = g; blendColor[2] = b; blendColor[3] = a; }
-- (void)setStencilReferenceValue:(uint32_t)v {}
+- (void)setStencilReferenceValue:(uint32_t)v { stencilRef[0] = stencilRef[1] = v; }
+- (void)setStencilFrontReferenceValue:(uint32_t)f backReferenceValue:(uint32_t)b { stencilRef[0] = f; stencilRef[1] = b; }
 - (void)drawPrimitives:(MTLPrimitiveType)type vertexStart:(NSUInteger)start vertexCount:(NSUInteger)count instanceCount:(NSUInteger)instances baseInstance:(NSUInteger)base {
     if (!pso) { rn_log("draw without a render pipeline state"); return; }
     RNDraw *d = [RNDraw new];
@@ -1445,6 +1478,7 @@ static NSString *rn_run_blit(RNBlit *b) {
     d->hasBlendColor = hasBlendColor; memcpy(d->blendColor, blendColor, sizeof(blendColor));
     d->prim = (unsigned)type; d->vertexStart = (unsigned)start; d->vertexCount = (unsigned)count; d->instanceCount = (unsigned)instances; d->baseInstance = (unsigned)base;
     d->cull = cullMode; d->clockwise = !counterClockwise;
+    if (dss) { d->ds = dss->ds; d->ds.front.ref = stencilRef[0]; d->ds.back.ref = stencilRef[1]; }
     if ((rn_diag && getenv("RN_LOG_BUFFERS"))) {                                 // does anything rewrite the vertex data of the earlier draws while the rest is encoded?
         static NSMutableArray *snaps; if (!snaps) snaps = [NSMutableArray new];
         static unsigned drawNo;
@@ -2227,8 +2261,35 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         rp->clearColor[i][0] = (float)ca.clearColor.red; rp->clearColor[i][1] = (float)ca.clearColor.green; rp->clearColor[i][2] = (float)ca.clearColor.blue; rp->clearColor[i][3] = (float)ca.clearColor.alpha;
         rp->nt = (unsigned)i + 1;
     }
-    if (!rp->nt) { rn_log("renderCommandEncoder: no colour attachment (depth-only passes are not implemented)"); return nil; }
-    if (d.depthAttachment.texture || d.stencilAttachment.texture) rn_log("renderCommandEncoder: depth and stencil attachments are not implemented, ignored");
+    id<MTLTexture> dtex = d.depthAttachment.texture ?: d.stencilAttachment.texture;
+    if (dtex) {
+        RedNaviMTLTexture *dt = (RedNaviMTLTexture *)dtex;
+        if (![dtex isKindOfClass:[RedNaviMTLTexture class]] || !dt->dep) rn_log("renderCommandEncoder: the depth attachment is not a RedNavi depth texture, ignored");
+        else {
+            rp->depthTex = dt;
+            rp->clearDepth = d.depthAttachment.texture && d.depthAttachment.loadAction == MTLLoadActionClear;
+            rp->clearStencil = d.stencilAttachment.texture && d.stencilAttachment.loadAction == MTLLoadActionClear;
+            rp->depthValue = (float)d.depthAttachment.clearDepth; rp->stencilValue = d.stencilAttachment.clearStencil;
+        }
+    }
+    if (!rp->nt && rp->depthTex) {                    // depth only: the pipelines write no colour, into a scratch target of the depth's size (kept per size)
+        static NSMutableDictionary<NSNumber *, RedNaviMTLTexture *> *scratch;
+        static dispatch_once_t once; dispatch_once(&once, ^{ scratch = [NSMutableDictionary new]; });
+        NSNumber *key = @((uint64_t)rp->depthTex->w << 32 | rp->depthTex->h);
+        RedNaviMTLTexture *sc;
+        @synchronized (scratch) {
+            sc = scratch[key];
+            if (!sc) {
+                MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:rp->depthTex->w height:rp->depthTex->h mipmapped:NO];
+                sd.usage = MTLTextureUsageRenderTarget;
+                sc = [[RedNaviMTLTexture alloc] initWithDevice:dev descriptor:sd];
+                if (sc) scratch[key] = sc;
+            }
+        }
+        if (!sc) { rn_log("renderCommandEncoder: no scratch target for a depth-only pass %lux%lu", (unsigned long)rp->depthTex->w, (unsigned long)rp->depthTex->h); return nil; }
+        rp->tex[0] = sc; rp->nt = 1;
+    }
+    if (!rp->nt) { rn_log("renderCommandEncoder: no colour or depth attachment"); return nil; }
     return (id)[[RedNaviMTLRenderCommandEncoder alloc] initWithCommandBuffer:self pass:rp];
 }
 - (void)runRenderPass:(RNRenderPass *)rp {
@@ -2328,6 +2389,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         dr[k] = (rn_vk_draw){.pipe = r, .vbufs = vbs[k], .has_blend_color = d->hasBlendColor, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
                              .instance_count = d->instanceCount, .first_instance = d->baseInstance};
         if (d->indexBuf) { dr[k].index_buffer = d->indexBuf->b; dr[k].index_offset = d->indexOffset; dr[k].index32 = d->index32; dr[k].base_vertex = d->baseVertex; }
+        dr[k].ds = d->ds;
         memcpy(dr[k].blend_color, d->blendColor, sizeof(dr[k].blend_color));
         memcpy(dr[k].viewport, d->viewport, sizeof(dr[k].viewport));
         memcpy(dr[k].scissor, d->scissor, sizeof(dr[k].scissor));
@@ -2335,7 +2397,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     const uint64_t phv = mach_absolute_time();
     rn_vk_snap_small = g_pd_dir[0] && nd < 16 && tg[0].image && rp->tex[0] && rp->tex[0]->w == rp->tex[0]->h && (rp->tex[0]->w == 93 || rp->tex[0]->w == 137 || rp->tex[0]->w == 161 || rp->tex[0]->w == 174 || rp->tex[0]->w == 249 || rp->tex[0]->w == 256);
     rn_vk_snap_on = (g_pd_left > 0 && nd >= 16) || rn_vk_snap_small; rn_vk_snap_seq = g_pd_seq;   // pass capture running: snapshots of the target after some draws (rn_snap_write)
-    int rc = bad ? -1 : rn_vk_render_pass(vk, tg, rp->nt, dr, (unsigned)nd);
+    rn_vk_depth_target dtv = {0};
+    if (rp->depthTex) dtv = (rn_vk_depth_target){rp->depthTex->dep, rp->clearDepth, rp->depthValue, rp->clearStencil, rp->stencilValue};
+    int rc = bad ? -1 : rn_vk_render_pass_ds(vk, tg, rp->nt, rp->depthTex ? &dtv : NULL, dr, (unsigned)nd);
     rn_vk_snap_on = 0; rn_vk_snap_small = 0;
     rn_ph(1, phv);
     if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
@@ -2869,7 +2933,8 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
                 const rn_air_binding *ab = &info.bindings[i];
                 binds[i] = (rn_vk_binding){ab->binding, ab->writable, ab->kind, NULL};
                 if (ab->kind == RN_AIR_STATIC_SAMPLER) {
-                    sds[i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
+                    // a pixel-coordinate constexpr sampler: the translator divides the coordinate by the texture size or fetches the texels itself, so the VkSampler is a normalized one
+                    sds[i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, 0, ab->border, ab->lod_min, ab->lod_max};
                     binds[i].sampler = &sds[i];
                 }
             }
@@ -3212,7 +3277,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             p->kind[s][i] = (ab->kind == RN_AIR_NULL_TEXTURE ? RN_AIR_NULL_TEXTURE : ab->kind) | (ab->dim << 8);   // the dimension of a texture rides in the upper bits (a placeholder needs it)
             p->mi[s][i] = ab->metal_index;
             if (ab->kind == RN_AIR_STATIC_SAMPLER) {
-                p->sampl[s][i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, ab->pixel_coords, ab->border, ab->lod_min, ab->lod_max};
+                p->sampl[s][i] = (rn_vk_sampler_desc){ab->min_filter, ab->mag_filter, ab->mip_filter, {ab->address[0], ab->address[1], ab->address[2]}, 0, ab->border, ab->lod_min, ab->lod_max};
                 p->binds[s][i].sampler = &p->sampl[s][i];
             }
         }
@@ -3275,6 +3340,10 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             if (l.stride == 0 && !constant) { why = @"a vertex buffer layout with stride 0 is not supported"; break; }
             p->vlayout[p->nvlayout++] = (rn_vk_vlayout){(unsigned)i, constant ? 0u : (unsigned)l.stride, l.stepFunction == MTLVertexStepFunctionPerInstance};
         }
+        p->dfmt = rn_depth_format_of(desc.depthAttachmentPixelFormat) ?: rn_depth_format_of(desc.stencilAttachmentPixelFormat);
+        if (!p->nt && p->dfmt) {                                   // a pass with only depth: one colour target that nothing is written to (the pass supplies a scratch image of the depth's size)
+            p->tfmt[0] = RN_VK_RGBA8; p->blend[0] = (rn_vk_blend){.src_rgb = 1, .src_a = 1, .write_mask = 0}; p->nt = 1;
+        }
         if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
         if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";
         if (!why && ![p renderForPrimitive:3 cull:0 clockwise:YES]) why = @"RADV refused the pipeline";
@@ -3298,25 +3367,57 @@ typedef uintptr_t (*rn_imp_len_opt)(id, SEL, NSUInteger, NSUInteger);
 typedef uintptr_t (*imp_fn_err1)(id, SEL, id);
 typedef uintptr_t (*rn_imp_bytes)(id, SEL, const void *, NSUInteger, NSUInteger);
 
-// Heaps (newHeapWithDescriptor:): no sub-allocation yet. A resource made from a heap is a resource of the device, allocated on its own; the heap keeps the count of what it
-// was asked for so that size, usedSize and the refusal of an allocation that does not fit behave as a heap's do. heapOffset stays 0.
+// The bytes a texture takes in a heap (heapTextureSizeAndAlignWithDescriptor: of the device and the heap's own count): texel size x texels of every level and slice, a third more
+// for the mip chain, rounded up to 4 KB. The base class would answer from the tables of a vendor driver, which this device does not have.
+static MTLSizeAndAlign rn_heap_texture_size(MTLTextureDescriptor *desc) {
+    unsigned texel = rn_vk_format_texel_bytes(rn_vk_format_of(desc.pixelFormat));
+    if (!texel) texel = 16;
+    NSUInteger slices = MAX(desc.arrayLength, 1) * (desc.textureType == MTLTextureTypeCube || desc.textureType == MTLTextureTypeCubeArray ? 6 : 1);
+    NSUInteger bytes = (NSUInteger)texel * MAX(desc.width, 1) * MAX(desc.height, 1) * MAX(desc.depth, 1) * slices;
+    if (desc.mipmapLevelCount > 1) bytes += bytes / 3;
+    return (MTLSizeAndAlign){(bytes + 4095) & ~(NSUInteger)4095, 4096};
+}
+
+// Heaps (newHeapWithDescriptor:): no sub-allocation yet. A resource made from a heap is a resource of the device, allocated on its own; the heap counts the bytes of the resources
+// made from it that are still alive (a lease object rides on each resource and gives its bytes back when the resource goes away), so that size, usedSize and the refusal of an
+// allocation that does not fit behave as a heap's do. heapOffset stays 0, and placement heaps (resources at an offset the app chooses) are not supported.
+@class RedNaviMTLHeap;
+@interface RNHeapLease : NSObject { @public RedNaviMTLHeap *__weak heap; NSUInteger bytes; }
+@end
 @interface RedNaviMTLHeap : NSObject <MTLHeap> {
 @public
     id<MTLDevice> dev_;
     MTLHeapDescriptor *desc_;
-    NSUInteger used_;
+    _Atomic NSUInteger used_;
     NSString *label_;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc;
 @end
+@implementation RNHeapLease
+- (void)dealloc { RedNaviMTLHeap *h = heap; if (h) atomic_fetch_sub(&h->used_, bytes); }
+@end
+static char rn_heap_lease_key;
 @implementation RedNaviMTLHeap
 + (void)load { class_addProtocol(self, @protocol(MTLHeap)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc {
     if (!(self = [super init])) return nil;
     dev_ = d;
     desc_ = [desc copy];
-    rn_log("heap: %lu bytes, storage %lu", (unsigned long)desc.size, (unsigned long)desc.storageMode);
+    rn_log("heap: %lu bytes, storage %lu, type %ld%s", (unsigned long)desc.size, (unsigned long)desc.storageMode, (long)desc.type,
+           desc.type == MTLHeapTypePlacement ? " (placement: resources at an offset are not supported)" : "");
     return self;
+}
+// Takes the bytes from the heap if they fit; NO when they do not.
+- (BOOL)reserve:(NSUInteger)need {
+    NSUInteger cur = atomic_load(&used_);
+    do { if (cur + need > desc_.size) return NO; } while (!atomic_compare_exchange_weak(&used_, &cur, cur + need));
+    return YES;
+}
+- (void)lease:(id)resource bytes:(NSUInteger)need {
+    if (!resource) { atomic_fetch_sub(&used_, need); return; }
+    RNHeapLease *l = [RNHeapLease new];
+    l->heap = self; l->bytes = need;
+    objc_setAssociatedObject(resource, &rn_heap_lease_key, l, OBJC_ASSOCIATION_RETAIN);
 }
 - (id<MTLDevice>)device { return dev_; }
 - (NSString *)label { return label_; }
@@ -3328,33 +3429,35 @@ typedef uintptr_t (*rn_imp_bytes)(id, SEL, const void *, NSUInteger, NSUInteger)
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 - (MTLHeapType)type { return desc_.type; }
 - (NSUInteger)size { return desc_.size; }
-- (NSUInteger)usedSize { return used_; }
-- (NSUInteger)currentAllocatedSize { return used_; }
-- (NSUInteger)allocatedSize { return used_; }
+- (NSUInteger)usedSize { return atomic_load(&used_); }
+- (NSUInteger)currentAllocatedSize { return desc_.size; }
+- (NSUInteger)allocatedSize { return desc_.size; }
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment {
     NSUInteger a = alignment > 1 ? alignment : 1;
-    NSUInteger start = (used_ + a - 1) / a * a;
+    NSUInteger start = (atomic_load(&used_) + a - 1) / a * a;
     return start < desc_.size ? desc_.size - start : 0;
 }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
-    MTLSizeAndAlign sa = [dev_ heapBufferSizeAndAlignWithLength:length options:options];
-    NSUInteger need = sa.size ? sa.size : length;
-    if (used_ + need > desc_.size) return nil;
+    NSUInteger need = (length + 255) & ~(NSUInteger)255;
+    if (![self reserve:need]) return nil;
     id<MTLBuffer> b = [dev_ newBufferWithLength:length options:options];
-    if (b) used_ += need;
+    [self lease:b bytes:need];
     return b;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
-    // The size a texture takes is not asked of the device when the device does not answer it (its answer would be a zero struct): width x height x depth x 4 then.
-    NSUInteger need = (NSUInteger)desc.width * desc.height * desc.depth * 4;
-    if ([dev_ respondsToSelector:@selector(heapTextureSizeAndAlignWithDescriptor:)]) {
-        MTLSizeAndAlign sa = [dev_ heapTextureSizeAndAlignWithDescriptor:desc];
-        if (sa.size) need = sa.size;
-    }
-    if (used_ + need > desc_.size) return nil;
+    NSUInteger need = rn_heap_texture_size(desc).size;
+    if (![self reserve:need]) return nil;
     id<MTLTexture> t = [dev_ newTextureWithDescriptor:desc];
-    if (t) used_ += need;
+    [self lease:t bytes:need];
     return t;
+}
+- (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
+    rn_log("heap: a buffer at offset %lu of a placement heap is not supported", (unsigned long)offset);
+    return nil;
+}
+- (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc offset:(NSUInteger)offset {
+    rn_log("heap: a texture at offset %lu of a placement heap is not supported", (unsigned long)offset);
+    return nil;
 }
 @end
 
@@ -3362,7 +3465,7 @@ void rn_compute_install(Class k, Class sup) {
     {
         const char *classes[] = {"RedNaviMTLBuffer", "RedNaviMTLTexture", "RedNaviMTLSamplerState", "RedNaviMTLComputePipelineState", "RedNaviMTLRenderPipelineState", "RedNaviMTLComputeCommandEncoder",
                                  "RedNaviMTLRenderCommandEncoder", "RedNaviMTLBlitCommandEncoder", "RedNaviMTLCommandBuffer", "RedNaviMTLCommandQueue", "RedNaviMTLFunction", "RedNaviMTLLibrary",
-                                 "RedNaviMTLDepthStencilState", "RedNaviMTLSharedEvent"};
+                                 "RedNaviMTLDepthStencilState", "RedNaviMTLSharedEvent", "RedNaviMTLHeap"};
         for (unsigned i = 0; i < sizeof(classes) / sizeof(classes[0]); i++) { Class c = objc_getClass(classes[i]); if (c) rn_add_default_resolver(c); }
     }
     // Command queues: every newCommandQueue* method of the superclass chain (the base class would call them in a loop, see M6_ACCELERATOR_STUDY.md section 10).
@@ -3593,6 +3696,18 @@ void rn_compute_install(Class k, Class sup) {
             if (!rn_gate()) return ods ? ods(self, sds, desc) : 0;
             RedNaviMTLDepthStencilState *st = [RedNaviMTLDepthStencilState new];
             st->dev = (id<MTLDevice>)self;
+            MTLDepthStencilDescriptor *dd = (MTLDepthStencilDescriptor *)desc;
+            if (dd) {
+                st->ds.depth_test = 1;                                 // Metal always tests; Always passes
+                st->ds.depth_write = dd.depthWriteEnabled; st->ds.depth_cmp = (unsigned)dd.depthCompareFunction;
+                MTLStencilDescriptor *sf[2] = {dd.frontFaceStencil, dd.backFaceStencil};
+                rn_vk_stencil_face *df[2] = {&st->ds.front, &st->ds.back};
+                for (int f = 0; f < 2; f++) {
+                    if (!sf[f]) { *df[f] = (rn_vk_stencil_face){0, 0, 0, 7, 0xffffffffu, 0xffffffffu, 0}; continue; }
+                    *df[f] = (rn_vk_stencil_face){(unsigned)sf[f].stencilFailureOperation, (unsigned)sf[f].depthStencilPassOperation, (unsigned)sf[f].depthFailureOperation, (unsigned)sf[f].stencilCompareFunction, sf[f].readMask, sf[f].writeMask, 0};
+                    if (sf[f].stencilCompareFunction != MTLCompareFunctionAlways || sf[f].stencilFailureOperation != MTLStencilOperationKeep || sf[f].depthFailureOperation != MTLStencilOperationKeep || sf[f].depthStencilPassOperation != MTLStencilOperationKeep) st->ds.stencil_test = 1;
+                }
+            }
             return (uintptr_t)CFBridgingRetain(st);
         }), mds ? method_getTypeEncoding(mds) : "@24@0:8@16");
     }
@@ -3714,6 +3829,14 @@ void rn_compute_install(Class k, Class sup) {
             if (!rn_gate() && ohb) return ohb(self, shb, len, opt);
             return (MTLSizeAndAlign){len, 32};                      // as a real device answers
         }), mhb ? method_getTypeEncoding(mhb) : "{?=QQ}32@0:8Q16Q24");
+        SEL sht = sel_registerName("heapTextureSizeAndAlignWithDescriptor:");
+        Method mht = class_getInstanceMethod(sup, sht);
+        typedef MTLSizeAndAlign (*imp_ht)(id, SEL, id);
+        imp_ht oht = mht ? (imp_ht)method_getImplementation(mht) : NULL;
+        class_addMethod(k, sht, imp_implementationWithBlock(^MTLSizeAndAlign(id self, MTLTextureDescriptor *desc) {
+            if (!rn_gate() && oht) return oht(self, sht, desc);
+            return rn_heap_texture_size(desc);
+        }), mht ? method_getTypeEncoding(mht) : "{?=QQ}24@0:8@16");
         SEL smin = sel_registerName("minimumLinearTextureAlignmentForPixelFormat:");
         Method mmin = class_getInstanceMethod(sup, smin);
         typedef NSUInteger (*imp_align)(id, SEL, NSUInteger);
