@@ -4,6 +4,7 @@
 
 # Replaces the executable of the installed Metal plug-in (/Library/GPUBundles/RedNaviMTLDriver.bundle) with a new build staged on the desktop and seals the bundle again (ad hoc). The RADV and
 # translator libraries inside the bundle stay as they are. WindowServer must be restarted afterwards to load it (sudo killall -9 WindowServer).
+# A new translator staged as /Users/Shared/rnstage/librn_air2spirv.dylib is put in the bundle's vk folder when it differs.
 # usage (on the desktop): sudo sh /Users/Shared/rn_install_plugin.sh [/Users/Shared/rnstage/RedNaviMTLDriver.bin [/Users/Shared/rnstage/libvulkan_radeon.dylib]]
 set -e
 NEW=${1:-/Users/Shared/rnstage/RedNaviMTLDriver.bin}
@@ -27,6 +28,15 @@ if [ -f "$VKLIB" ] && ! cmp -s "$VKLIB" "$B/Contents/Resources/vk/libvulkan_rade
   xattr -c "$B/Contents/Resources/vk/libvulkan_radeon.dylib"
   codesign -f -s - "$B/Contents/Resources/vk/libvulkan_radeon.dylib"
   echo "libvulkan_radeon.dylib replaced"
+fi
+TRLIB=/Users/Shared/rnstage/librn_air2spirv.dylib
+if [ -f "$TRLIB" ] && ! cmp -s "$TRLIB" "$B/Contents/Resources/vk/librn_air2spirv.dylib"; then
+  cp "$TRLIB" "$B/Contents/Resources/vk/librn_air2spirv.dylib"
+  chown root:wheel "$B/Contents/Resources/vk/librn_air2spirv.dylib"
+  chmod 755 "$B/Contents/Resources/vk/librn_air2spirv.dylib"
+  xattr -c "$B/Contents/Resources/vk/librn_air2spirv.dylib"
+  codesign -f -s - "$B/Contents/Resources/vk/librn_air2spirv.dylib"
+  echo "librn_air2spirv.dylib replaced"
 fi
 xattr -cr "$B"
 codesign -f -s - "$B"

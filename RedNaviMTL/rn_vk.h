@@ -26,7 +26,20 @@ const char *rn_vk_device_name(const rn_vk *vk);
 
 // Host-visible, host-coherent storage buffer, mapped for good.
 rn_vk_buffer *rn_vk_buffer_create(rn_vk *vk, size_t bytes);
+int rn_vk_buffer_is_vram(const rn_vk_buffer *b);   // made by rn_vk_buffer_create_vram (a heap's range: its parent's placement is not known here)
+rn_vk_buffer *rn_vk_buffer_create_vram(rn_vk *vk, size_t bytes);   // CPU-visible VRAM within a small per-process budget; NULL when it does not fit (take rn_vk_buffer_create)
+rn_vk_buffer *rn_vk_buffer_create_in(rn_vk *vk, rn_vk_buffer *parent, size_t offset, size_t bytes);   // bytes of parent's memory (a heap's buffer); NULL if offset is misaligned
 void *rn_vk_buffer_contents(rn_vk_buffer *b);
+// A buffer in VRAM the CPU cannot map (Metal Private): contents is NULL, the memory starts zeroed. NULL when VRAM refuses it (the caller then takes host memory).
+rn_vk_buffer *rn_vk_buffer_create_device(rn_vk *vk, size_t bytes);
+int rn_vk_buffer_is_device(const rn_vk_buffer *b);
+uint64_t rn_vk_device_bytes(void);                   // device-local bytes this process holds
+uint64_t rn_vk_vram_size(rn_vk *vk);                  // the device-local heap's size (0 if not known)
+uint64_t rn_vk_max_storage_range(rn_vk *vk);          // maxStorageBufferRange
+void rn_vk_memory_describe(rn_vk *vk, char *out, size_t n);   // the memory heaps and types, for the log
+// On the card, in order with the work recorded before (inside an open batch), else submitted and waited for; 0 on success. fill: offset and size multiples of 4 (else 4).
+int rn_vk_buffer_copy(rn_vk *vk, rn_vk_buffer *src, uint64_t soff, rn_vk_buffer *dst, uint64_t doff, uint64_t size);
+int rn_vk_buffer_fill(rn_vk *vk, rn_vk_buffer *dst, uint64_t off, uint64_t size, uint32_t value);
 size_t rn_vk_buffer_length(const rn_vk_buffer *b);
 void rn_vk_buffer_destroy(rn_vk *vk, rn_vk_buffer *b);
 
@@ -40,6 +53,10 @@ unsigned rn_vk_format_texel_bytes(int format);                      // 0: unknow
 rn_vk_image *rn_vk_image_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: format not supported by the card or no memory
 rn_vk_image *rn_vk_image_create3d(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth);   // depth > 1: a 3D image (sampled only); staging is depth slices of width * height texels
 rn_vk_image *rn_vk_image_create_layers(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth, int array);   // array: depth is the layer count of a 2D array (sampled only), staged like a 3D image
+rn_vk_image *rn_vk_image_create_mips(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t depth, int array, uint32_t levels);   // levels is clamped to the full chain (1 when the format cannot be blitted); the host copy holds level after level
+uint32_t rn_vk_image_levels(rn_vk_image *img);
+size_t rn_vk_image_level_offset(rn_vk_image *img, uint32_t level);    // where a level starts in the host copy (rn_vk_image_staging); its rows are width >> level texels
+int rn_vk_image_gen_mips(rn_vk *vk, rn_vk_image *img);               // generateMipmaps: every level from level 0, on the card (0 on success)
 rn_vk_image *rn_vk_image_from_host(rn_vk *vk, int format, uint32_t width, uint32_t height, void *ptr, size_t pitch, size_t bytes);   // linear image over page-aligned host memory (an IOSurface's), zero copy; NULL: keep copying
 int rn_vk_image_is_host(rn_vk_image *img);                          // 1: made by rn_vk_image_from_host, no host copy exists, rn_vk_image_staging is the memory itself
 void *rn_vk_image_staging(rn_vk_image *img);                        // width * height texels, rows rn_vk_image_row_bytes apart
@@ -48,7 +65,13 @@ void rn_vk_image_host_wrote(rn_vk_image *img);
 // A view with another format of the same texel size (RN_VK_* as in rn_vk_image_create), components swizzled by VkComponentSwizzle values (NULL: as they are). It shares the image, its
 // memory and its host copy with `base`, which must outlive it; destroy it with rn_vk_image_destroy. NULL: sizes differ or the card cannot sample that format.
 rn_vk_image *rn_vk_image_view(rn_vk *vk, rn_vk_image *base, int format, const unsigned swizzle[4]);
+rn_vk_image *rn_vk_image_view_levels(rn_vk *vk, rn_vk_image *base, int format, const unsigned swizzle[4], uint32_t first, uint32_t count);   // levels first .. first + count - 1; NULL outside the image
 void rn_vk_image_destroy(rn_vk *vk, rn_vk_image *img);
+// Multisampling. rn_vk_sample_counts: the sample counts (VkSampleCountFlags: 1, 2, 4, 8 ...) a multisample image can have here (rendered into with colour and depth, and sampled).
+// A multisample image is a 2D render target and sampled texture (texture2d_ms) that the host never reads or writes: it starts at zero and reaches a plain image only through a resolve (rn_vk_target).
+uint32_t rn_vk_sample_counts(const rn_vk *vk);
+rn_vk_image *rn_vk_image_create_ms(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t samples);   // NULL: count or format not supported (rn_vk_image_last_error)
+uint32_t rn_vk_image_samples(rn_vk_image *img);                    // 1 for a plain image
 
 // Sampler state as the translator reports it for a sampler written in the shader (RedNaviMTL/rn_air.h) and as MTLSamplerDescriptor has it.
 typedef struct {
@@ -108,6 +131,7 @@ typedef struct {
     unsigned nvattr; const rn_vk_vattr *vattrs;        // vertex input of [[stage_in]] functions, locations as the shader declares them
     unsigned nvlayout; const rn_vk_vlayout *vlayouts;
     int depth_format;                                  // RN_VK_D16, D32 or D32S8 when the pass has a depth (and stencil) attachment, else 0; needs VK_EXT_extended_dynamic_state (else ignored)
+    unsigned samples;                                  // samples of the pass's attachments (Metal's rasterSampleCount); 0 or 1: plain images. A multisample pipeline cannot use framebuffer fetch
 } rn_vk_render_desc;
 rn_vk_render *rn_vk_render_create(rn_vk *vk, const rn_vk_render_desc *d);   // NULL: RADV refused it
 void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
@@ -115,6 +139,7 @@ void rn_vk_render_destroy(rn_vk *vk, rn_vk_render *r);
 // The depth (and stencil) attachment of a pass: an image of the card only, with no host copy. Its contents are never read back; a texture of a depth format cannot be sampled or filled by the host.
 typedef struct rn_vk_depth rn_vk_depth;
 rn_vk_depth *rn_vk_depth_create(rn_vk *vk, int format, uint32_t width, uint32_t height);   // NULL: the card has no such depth format or no memory
+rn_vk_depth *rn_vk_depth_create_ms(rn_vk *vk, int format, uint32_t width, uint32_t height, uint32_t samples);   // the depth attachment of a multisample pass (samples as its colour targets)
 void rn_vk_depth_destroy(rn_vk *vk, rn_vk_depth *d);                                       // waits for the work that uses it
 int rn_vk_depth_format_has_stencil(int format);
 typedef struct { rn_vk_depth *depth; int clear_depth; float depth_value; int clear_stencil; uint32_t stencil_value; } rn_vk_depth_target;
@@ -122,7 +147,7 @@ typedef struct { rn_vk_depth *depth; int clear_depth; float depth_value; int cle
 // write, no stencil test (what Metal does when no depth stencil state is set).
 typedef struct { unsigned fail, pass, depth_fail, cmp; uint32_t read_mask, write_mask, ref; } rn_vk_stencil_face;
 typedef struct { int depth_test, depth_write; unsigned depth_cmp; int stencil_test; rn_vk_stencil_face front, back; } rn_vk_ds;
-typedef struct { rn_vk_image *image; int clear; float color[4]; int discard; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded; discard: the host copy is not updated afterwards (store action don't care)
+typedef struct { rn_vk_image *image; int clear; float color[4]; int discard; rn_vk_image *resolve; } rn_vk_target;   // clear: 1 clears to color first, else the contents are loaded; discard: the host copy is not updated afterwards (store action don't care); resolve: a plain image the multisample image is resolved into after the pass (NULL: none)
 typedef struct {
     rn_vk_render *pipe;
     const rn_vk_arg *vargs, *fargs;                    // one per binding of the vertex and fragment module

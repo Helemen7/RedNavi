@@ -31,13 +31,14 @@ typedef struct {
     uint32_t binding;          // the descriptor binding in set 0
     uint32_t writable;         // 0: the kernel only reads it
     uint32_t kind;             // RN_AIR_BUFFER, RN_AIR_TEXTURE (sampled), RN_AIR_STORAGE_IMAGE or RN_AIR_SAMPLER; metal_index is [[texture(n)]] or [[sampler(n)]] for the last three
-    uint32_t dim;              // textures: 0 1D, 1 2D, 2 3D, 3 cube, 4 buffer; +8 when arrayed
+    uint32_t dim;              // textures: 0 1D, 1 2D, 2 3D, 3 cube, 4 buffer; +8 when arrayed; +16 (RN_AIR_DIM_MS) when multisampled (texture2d_ms, depth2d_ms)
     // RN_AIR_STATIC_SAMPLER only (a constexpr sampler of the shader; the app does not set it): filters 0 nearest, 1 linear; mip filter 0 none, 1 nearest, 2 linear;
     // address modes 0 clamp to zero, 1 clamp to edge, 2 repeat, 3 mirrored repeat, 4 clamp to border; pixel_coords 1: unnormalized coordinates; border 0 transparent black,
     // 1 opaque black, 2 opaque white.
     uint32_t min_filter, mag_filter, mip_filter, address[3], pixel_coords, border;
     float lod_min, lod_max;
 } rn_air_binding;
+#define RN_AIR_DIM_MS 16
 enum { RN_AIR_BUFFER = 0, RN_AIR_TEXTURE = 1, RN_AIR_STORAGE_IMAGE = 2, RN_AIR_SAMPLER = 3, RN_AIR_STATIC_SAMPLER = 4, RN_AIR_NULL_TEXTURE = 5, RN_AIR_COLOR_INPUT = 6 };   // 5: a texture the translator adds where the real one is absent in this variant: the plug-in binds a 1 x 1 texture; 6: a [[color(n)]] framebuffer-fetch input (metal_index n): an input attachment of the fragment stage, descriptor set 3, the plug-in binds render target n
 
 typedef struct {
@@ -66,7 +67,32 @@ typedef struct { int32_t index; const char *name; uint32_t size; const void *dat
 // rn_air_translate_stage for a function specialized with constants: the module is specialized before it is translated, so what a constant switches off is not in the bindings. A
 // translator library without rn_air_translate_stage_fc fails here when nconsts is not 0.
 int rn_air_translate_stage_fc(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
+// The byte length the app set for threadgroup buffer `index` (-setThreadgroupMemoryLength:atIndex:). A threadgroup buffer the translator is not told about gets its default of
+// 2048 bytes; each listed one is built into the module at its length, so a different length is a different module (rn_air_translate_stage_tg).
+typedef struct { uint32_t index; uint32_t bytes; } rn_air_tg_length;
+int rn_air_translate_stage_tg(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, const rn_air_tg_length *tgs, unsigned ntgs, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen);
 void rn_air_free(uint32_t *spirv, size_t bytes);
+
+// Function stitching (newLibraryWithStitchedDescriptor:, which CoreImage compiles its filter graphs with). One graph of calls to stitchable functions becomes the LLVM text of one compute kernel
+// named `kernel`; pass that text (it is not bitcode) to rn_air_translate_stage_fc in place of bitcode, with the kernel's name as the entry. fns are the stitchable functions with their LLVM
+// bitcode (the functions of the metallib that hold them). Arguments: kind 0 the result of node a; 1 buffer address: buffer a plus byte offset b, c != 0 passes the value stored there instead
+// of the address; 2 buffer a; 3 texture a; 4 sampler a; 5 thread_position_in_grid; 6 thread_position_in_threadgroup (7 threadgroup, 8 imageblock and 9 graph arguments are refused).
+// A node with no name is an early return: the kernel returns when node `condition` is true. `deps` are nodes that run first. Returns 0 and a text released with rn_air_stitch_free(), or a
+// reason in err. A translator library without rn_air_stitch fails here.
+typedef struct { const char *name; const void *bitcode; size_t bytes; } rn_air_stitch_fn;
+typedef struct { uint32_t kind; uint32_t a; uint64_t b; uint32_t c; } rn_air_stitch_arg;
+typedef struct { const char *name; uint32_t condition; const rn_air_stitch_arg *args; uint32_t nargs; const uint32_t *deps; uint32_t ndeps; } rn_air_stitch_node;
+int rn_air_stitch(const char *dir, const char *kernel, const rn_air_stitch_fn *fns, unsigned nfns, const rn_air_stitch_node *nodes, unsigned nnodes, char **text, size_t *text_bytes, char *err, size_t errlen);
+void rn_air_stitch_free(char *text);
+
+// DAG functions (newLibraryWithDAG:functions:error:, MetalPerformanceShaders). One graph becomes the LLVM text of one visible function named `function`: nodes as for rn_air_stitch, with
+// argument kind 9 for the function's argument a; a node's name is the name of one of fns (as the DAG calls it), whose symbol in its bitcode is `symbol` and whose function constants are
+// built in first. `output` is the node whose value the function returns, or negative for none. Text released with rn_air_stitch_free().
+typedef struct { const char *name; const char *symbol; const void *bitcode; size_t bytes; const rn_air_const *consts; uint32_t nconsts; } rn_air_dag_fn;
+int rn_air_stitch_function(const char *dir, const char *function, const rn_air_dag_fn *fns, unsigned nfns, const rn_air_stitch_node *nodes, unsigned nnodes, int output, char **text, size_t *text_bytes, char *err, size_t errlen);
+// The kernel (bitcode or text) with the visible functions fns (name, LLVM text) linked in where it calls them; a function it calls that is not given returns zero. Pass the text to
+// rn_air_translate_stage_fc in place of the kernel's bitcode. Text released with rn_air_stitch_free().
+int rn_air_link_visible(const char *dir, const void *kernel, size_t bytes, const rn_air_stitch_fn *fns, unsigned nfns, char **text, size_t *text_bytes, char *err, size_t errlen);
 
 #ifdef __cplusplus
 }

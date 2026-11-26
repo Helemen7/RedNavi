@@ -947,6 +947,22 @@ void rn_compute_ring_test(struct rn_device *adev, u64 vaBase, u64 ringOff, u32 r
 #define RN_PACKET3_RELEASE_MEM 0x49u
 #define RN_CACHE_FLUSH_AND_INV_TS_EVENT 0x14u
 
+// gfx_v11_0_emit_mem_sync, which amdgpu_ib_schedule sends before every job: ACQUIRE_MEM over the whole address range with GCR_CNTL GL2 invalidate and write back, GLM
+// invalidate and write back, and GL1, GLV, GLK, GLI invalidate (nvd.h bit positions: GLI_INV 0, GLM_WB 4, GLM_INV 5, GLK_INV 7, GLV_INV 8, GL1_INV 9, GL2_INV 14, GL2_WB 15).
+// Without it the caches keep lines from before the job: harmless while all system memory was mapped MTYPE_UC, required with MTYPE_NC, where the GL2 holds lines of host memory.
+#define RN_PACKET3_ACQUIRE_MEM 0x58u
+static u32 emitMemSync(u32 *pk, u32 n) {
+    pk[n++] = RN_PACKET3(RN_PACKET3_ACQUIRE_MEM, 6);
+    pk[n++] = 0;                     // CP_COHER_CNTL
+    pk[n++] = 0xffffffffu;           // CP_COHER_SIZE
+    pk[n++] = 0xffffffu;             // CP_COHER_SIZE_HI
+    pk[n++] = 0;                     // CP_COHER_BASE
+    pk[n++] = 0;                     // CP_COHER_BASE_HI
+    pk[n++] = 0x0000000Au;           // POLL_INTERVAL
+    pk[n++] = 0xC3B1u;               // GCR_CNTL
+    return n;
+}
+
 // Compute state registers (gc_11_0_x_offset.h, all in GC segment 0): the SET_SH_REG offset is the register's absolute dword minus 0x2c00.
 #define RN_COMPUTE_START_X 0x1ba4u
 #define RN_COMPUTE_NUM_THREAD_X 0x1ba7u
@@ -1227,8 +1243,8 @@ static int computeSubmitLocked(struct rn_device *adev, u64 vaBase, u64 ringOff, 
     (void)vaBase;
     const u32 mask = ringBytes / 4 - 1;
     const u64 wptrOff = ringOff + 0x1008;
-    u32 pk[24];
-    u32 n = 0;
+    u32 pk[40];
+    u32 n = emitMemSync(pk, 0);
     // gfx_v11_0_ring_emit_ib_compute: INDIRECT_BUFFER, address (dword aligned), upper 16 bits, size | VALID | VMID << 24
     pk[n++] = RN_PACKET3(0x3Fu, 2);
     pk[n++] = lower_32_bits(ibVa) & 0xfffffffcu;
@@ -2349,7 +2365,7 @@ void rn_gfx_ring_pointers(struct rn_device *adev, u32 *rptr, u32 *wptr) {
 
 int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
     if (!gGfxBlk) return -EINVAL;
-    u32 pk[24];
+    u32 pk[40];
     u32 n = 0;
     // What amdgpu_ib_schedule sends for a job on the graphics ring: FRAME_CONTROL start, CONTEXT_CONTROL (load enable, plus the load flags when the context changed since the
     // last job: gfx_v11_0_ring_emit_cntxcntl), the INDIRECT_BUFFER (no INDIRECT_BUFFER_VALID bit on the graphics ring: gfx_v11_0_ring_emit_ib_gfx), the fence, FRAME_CONTROL end.
@@ -2357,6 +2373,7 @@ int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa
     gGfxLastVmid = vmid;
     pk[n++] = RN_PACKET3(0x90u, 0); pk[n++] = 0;                              // PACKET3_FRAME_CONTROL, FRAME_CMD(0) = start
     pk[n++] = RN_PACKET3(0x28u, 1); pk[n++] = 0x80000000u | (ctxSwitch ? (0x8001u | 0x01000000u | 0x10002u) : 0u); pk[n++] = 0;
+    n = emitMemSync(pk, n);
     pk[n++] = RN_PACKET3(0x3Fu, 2);                                          // INDIRECT_BUFFER
     pk[n++] = lower_32_bits(ibVa) & 0xfffffffcu;
     pk[n++] = upper_32_bits(ibVa) & 0xFFFFu;

@@ -339,16 +339,26 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
 {
    (void)fd;
    (void)is_virtio;
-   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviProbe"));
-   if (!svc)
-      return -ENODEV;
    struct ac_drm_device *dev = calloc(1, sizeof(*dev));
-   if (!dev) {
-      IOObjectRelease(svc);
+   if (!dev)
       return -ENOMEM;
+   /* First through the accelerator: it is an IOAccelerator, which the sandbox profile of system graphics lets a sandboxed process open; the probe's own client class is not. The
+    * type is the one RedNaviAccel2 forwards to the probe (kRNComputeClientType in RedNaviAccel2/kern_accel2.cpp). A kext without it answers an error and the probe is opened directly. */
+   kern_return_t kr = KERN_FAILURE;
+   io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviAccel2"));
+   if (svc) {
+      kr = IOServiceOpen(svc, mach_task_self(), 0x524e4301, &dev->conn);
+      IOObjectRelease(svc);
    }
-   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &dev->conn);
-   IOObjectRelease(svc);
+   if (kr != KERN_SUCCESS) {
+      svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("RedNaviProbe"));
+      if (!svc) {
+         free(dev);
+         return -ENODEV;
+      }
+      kr = IOServiceOpen(svc, mach_task_self(), 0, &dev->conn);
+      IOObjectRelease(svc);
+   }
    if (kr != KERN_SUCCESS) {
       free(dev);
       return errno_of(kr);
@@ -422,6 +432,7 @@ const char *ac_drm_get_marketing_name(ac_drm_device *device)
    }
 }
 
+int ac_apple_pci_bus_info(ac_drm_device *dev, uint16_t *domain, uint8_t *bus, uint8_t *device, uint8_t *function);   /* inside Mesa the header is the patch's, without it */
 int ac_apple_pci_bus_info(ac_drm_device *dev, uint16_t *domain, uint8_t *bus, uint8_t *device, uint8_t *function)
 {
    (void)dev;
@@ -590,6 +601,12 @@ int ac_drm_query_sw_info(ac_drm_device *dev, enum amdgpu_sw_info info, void *val
 
 /* ---------------------------------------------------------------------------------------------------------------------------------------------- buffers */
 
+/* The Metal plug-in's hint (rn_vk_buffer_create_vram): the next allocations on this thread are buffers that should be in CPU-visible VRAM although they may also live in host
+ * memory (VRAM|GTT, which otherwise goes to host memory, see below). They are small buffers that shader atomics work on; an atomic on host memory crosses PCIe. */
+static __thread int t_prefer_vram;
+__attribute__((visibility("default"))) void rn_bridge_prefer_vram(int on);
+__attribute__((visibility("default"))) void rn_bridge_prefer_vram(int on) { t_prefer_vram = on; }
+
 int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_drm_bo *bo)
 {
    /* GDS, GWS and OA do not exist. VRAM requests come from the kext's VRAM allocator: a request that says NO_CPU_ACCESS gets the device-local pool the CPU cannot touch, any other the small
@@ -601,7 +618,7 @@ int ac_drm_bo_alloc(ac_drm_device *dev, struct amdgpu_bo_alloc_request *req, ac_
     * to read. The device-local pool is for NO_CPU_ACCESS buffers, the visible part for what asks for VRAM alone. */
    const int cpu_may_map = !(req->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) || (req->flags & AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED);
    const int want_vram = (req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) && !getenv("RN_BRIDGE_NO_VRAM") &&
-                         !(cpu_may_map && (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) && !getenv("RN_BRIDGE_VRAM_FIRST"));
+                         !(cpu_may_map && (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) && !t_prefer_vram && !getenv("RN_BRIDGE_VRAM_FIRST"));
    const int allow_gtt = (req->preferred_heap & AMDGPU_GEM_DOMAIN_GTT) || !(req->preferred_heap & AMDGPU_GEM_DOMAIN_VRAM) || !want_vram;
    struct rn_uc_bo_info out;
    int r = -ENOMEM;

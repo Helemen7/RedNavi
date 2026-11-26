@@ -15,14 +15,18 @@ echo "rednavi_gfx_queue=1 in boot-args: $(sysctl -n kern.bootargs | tr " " "\n" 
 run COMPUTE   RN_COMPUTE_TEST=1 RN_VK_SELFTEST=1
 run AIR       RN_AIR_TEST=$D/vk_dispatch.metallib RN_AIR_FUNC=dispatch_add
 run TRI       RN_TRI_TEST=$D/vk_tri.metallib
+run TRISRC    RN_METAL_SRCLIB=1 RN_TRI_TEST=$D/vk_tri.metallib RN_TRI_SOURCE=$D/vk_tri.metal
+run MSAA      RN_TRI_TEST=$D/vk_tri.metallib RN_TRI_MSAA=1
 run QUAD      RN_QUAD_TEST=$D/vk_quad.metallib
 run DEPTH     RN_DEPTH_TEST=$D/vk_tri.metallib
 run BLIT      RN_BLIT_TEST=1
+run MIP       RN_MIP_TEST=1
 run RASTER    RN_RASTER_TEST=$D/vk_quad.metallib
 run LOADSTORE RN_LOADSTORE_TEST=$D/vk_quad.metallib
 run FORMAT    RN_FORMAT_TEST=1
 run VIEW      RN_VIEW_TEST=$D/vk_texcopy.metallib
 run FC        RN_FC_TEST=$D/vk_fc.metallib
+run FCSRC     RN_METAL_SRCLIB=1 RN_FC_TEST=$D/vk_fc.metallib RN_FC_SOURCE=$D/vk_fc.metal
 run TEX       RN_TEX_TEST=$D/vk_texcopy.metallib
 run IOSURFACE RN_IOSURFACE_TEST=$D/vk_quad.metallib
 run EVENT     RN_EVENT_TEST=1

@@ -201,12 +201,17 @@ int main(int argc, char **argv) {
                 NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_TRI_TEST"))];
                 dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
                 NSError *e = nil;
-                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
-                if (!lib) { printf("no library\n"); return 50; }
+                // RN_TRI_SOURCE=<vk_tri.metal>: the same shaders compiled from source by the base class (newLibraryWithSource:, what Chromium's Dawn does), not from the .metallib
+                NSString *src = getenv("RN_TRI_SOURCE") ? [NSString stringWithContentsOfFile:@(getenv("RN_TRI_SOURCE")) encoding:NSUTF8StringEncoding error:nil] : nil;
+                id<MTLLibrary> lib = src ? [d newLibraryWithSource:src options:nil error:&e] : [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library: %s\n", e ? e.localizedDescription.UTF8String : "-"); return 50; }
+                if (src) printf("library from source: %s\n", object_getClassName(lib));
                 MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
                 pd.vertexFunction = [lib newFunctionWithName:@"tri_vertex"];
                 pd.fragmentFunction = [lib newFunctionWithName:@"tri_fragment"];
                 pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                const BOOL msaa = getenv("RN_TRI_MSAA") != NULL;    // RN_TRI_MSAA=1: drawn into a 4-sample texture with a 4-sample pipeline and resolved into the target (Chromium's Graphite does this)
+                if (msaa) pd.rasterSampleCount = 4;
                 id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
                 printf("render pipeline %p, error: %s\n", (__bridge void *)rps, e ? e.localizedDescription.UTF8String : "none");
                 if (!rps) return 51;
@@ -222,6 +227,18 @@ int main(int argc, char **argv) {
                 rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
                 rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
                 rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1.0);
+                id<MTLTexture> msTex = nil;
+                if (msaa) {
+                    MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:40 height:24 mipmapped:NO];
+                    md.textureType = MTLTextureType2DMultisample; md.sampleCount = 4; md.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; md.storageMode = MTLStorageModePrivate;
+                    id<MTLTexture> ms = [d newTextureWithDescriptor:md];
+                    msTex = ms;
+                    if (!ms) { printf("no multisample texture\n"); return 54; }
+                    printf("multisample texture: type %ld, %lu samples\n", (long)ms.textureType, (unsigned long)ms.sampleCount);
+                    rpd.colorAttachments[0].texture = ms;
+                    rpd.colorAttachments[0].resolveTexture = target;
+                    rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+                }
                 id<MTLCommandQueue> q = [d newCommandQueue];
                 id<MTLCommandBuffer> cb = [q commandBuffer];
                 id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rpd];
@@ -254,6 +271,42 @@ int main(int argc, char **argv) {
                 if (!(far[0] == 51 && far[1] == 51 && far[2] == 51)) { printf("  FAIL: the bottom-right is not the clear colour\n"); fails++; }
                 if (!(bl[0] == 51 && bl[1] == 51 && bl[2] == 51)) { printf("  FAIL: the bottom-left is not the clear colour (image flipped?)\n"); fails++; }
                 if (inTri < 100 || inTri > 140) { printf("  FAIL: the triangle covers %d pixels, not about 120\n", inTri); fails++; }
+                // Edge pixels. Inside the triangle r + g + b is about 255 (the corner colours are blended by barycentrics); the clear colour gives 153. A pixel the edge only partly covers
+                // resolves to something in between: with 4 samples the hypotenuse must have some, with one sample there must be none.
+                int partial = 0;
+                for (int y = 0; y < 24; y++) for (int x = 0; x < 40; x++) {
+                    const uint8_t *p = PX(x, y); const int s = p[0] + p[1] + p[2];
+                    if (s > 163 && s < 245) partial++;
+                }
+                printf("%d pixels partly covered (edge antialiasing)\n", partial);
+                if (msaa && partial < 5) { printf("  FAIL: 4-sample rendering left no partly covered pixels on the edges (not multisampled?)\n"); fails++; }
+                if (!msaa && partial) { printf("  FAIL: %d partly covered pixels without multisampling\n", partial); fails++; }
+                if (msaa && msTex && !fails && getenv("RN_METAL_SRCLIB")) {
+                    // The 4-sample texture read back in a compute kernel compiled from source (only with RN_METAL_SRCLIB=1): get_num_samples() and the mean of the samples, which must match the resolved pixel.
+                    NSString *ks = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                        "kernel void ms_read(texture2d_ms<float> t [[texture(0)]], device float4 *o [[buffer(0)]], uint2 g [[thread_position_in_grid]]) {\n"
+                        "  float4 s = 0; uint n = t.get_num_samples(); for (uint i = 0; i < n; i++) s += t.read(g, i);\n"
+                        "  o[g.y * 40 + g.x] = float4(s.xyz / float(n), float(n)); }\n";
+                    id<MTLLibrary> kl = [d newLibraryWithSource:ks options:nil error:&e];
+                    id<MTLFunction> kf = kl ? [kl newFunctionWithName:@"ms_read"] : nil;
+                    id<MTLComputePipelineState> cps = kf ? [d newComputePipelineStateWithFunction:kf error:&e] : nil;
+                    if (!cps) { printf("  FAIL: texture2d_ms kernel: %s\n", e ? e.localizedDescription.UTF8String : "-"); fails++; }
+                    else {
+                        id<MTLBuffer> ob = [d newBufferWithLength:40 * 24 * 16 options:MTLResourceStorageModeShared];
+                        id<MTLCommandBuffer> cb2 = [q commandBuffer];
+                        id<MTLComputeCommandEncoder> ce = [cb2 computeCommandEncoder];
+                        [ce setComputePipelineState:cps]; [ce setTexture:msTex atIndex:0]; [ce setBuffer:ob offset:0 atIndex:0];
+                        [ce dispatchThreads:MTLSizeMake(40, 24, 1) threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+                        [ce endEncoding]; [cb2 commit]; [cb2 waitUntilCompleted];
+                        const float *o = (const float *)ob.contents; int off = 0, worst = 0;
+                        for (int i = 0; i < 40 * 24; i++) for (int c = 0; c < 3; c++) {
+                            const int dlt = abs((int)lroundf(o[i * 4 + c] * 255.0f) - (int)px[i * 4 + c]);
+                            if (dlt > 2) off++; if (dlt > worst) worst = dlt;
+                        }
+                        printf("texture2d_ms read: status %ld, %.0f samples, %d values differ from the resolve by more than 2 (worst %d)\n", (long)cb2.status, o[3], off, worst);
+                        if (cb2.status != MTLCommandBufferStatusCompleted || o[3] != 4.0f || off) { printf("  FAIL: texture2d_ms read\n"); fails++; }
+                    }
+                }
                 printf("render encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 if (!fails && getenv("RN_PRESENT_SECONDS")) {
                     // To the screen: the same triangle, at the display's size, in a Metal texture; the pixels go to display surface 1 (rn_bridge_scanout, XRGB8888 = B G R X
@@ -468,6 +521,71 @@ int main(int argc, char **argv) {
                 IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
                 printf("texture -> IOSurface texture: %d bytes wrong\n", bad); fails += bad != 0;
                 printf("blit encoder through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails ? 1 : 0;
+            }
+            if (getenv("RN_MIP_TEST")) {
+                // Mipmap levels: replaceRegion/getBytes of a level, a blit buffer -> level -> buffer, generateMipmaps on the card (level 0 has red 0 and 100 in alternate
+                // columns, so every smaller level is 50 within one step of rounding), and a view of level 1 cleared as a render target (level 0 must stay as it was).
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:32 height:16 mipmapped:YES];
+                td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView;
+                id<MTLTexture> A = [d newTextureWithDescriptor:td], B = [d newTextureWithDescriptor:td];
+                if (!A || !B) { printf("no textures\n"); return 80; }
+                int fails = 0;
+                printf("levels: %lu (want 6)\n", (unsigned long)A.mipmapLevelCount); fails += A.mipmapLevelCount != 6;
+                static uint8_t l0[32 * 16 * 4], l2[8 * 4 * 4], back[32 * 16 * 4];
+                for (int y = 0; y < 16; y++) for (int x = 0; x < 32; x++) { uint8_t *p = l0 + (y * 32 + x) * 4; p[0] = (x & 1) ? 100 : 0; p[1] = 10; p[2] = 0; p[3] = 255; }
+                memset(l2, 0x33, sizeof(l2));
+                [A replaceRegion:MTLRegionMake2D(0, 0, 32, 16) mipmapLevel:0 withBytes:l0 bytesPerRow:128];
+                [B replaceRegion:MTLRegionMake2D(0, 0, 32, 16) mipmapLevel:0 withBytes:l0 bytesPerRow:128];
+                [B replaceRegion:MTLRegionMake2D(0, 0, 8, 4) mipmapLevel:2 withBytes:l2 bytesPerRow:32];
+                memset(back, 0, sizeof(back)); [B getBytes:back bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 4) mipmapLevel:2];
+                int bad = memcmp(back, l2, sizeof(l2)) != 0;
+                memset(back, 0, sizeof(back)); [B getBytes:back bytesPerRow:128 fromRegion:MTLRegionMake2D(0, 0, 32, 16) mipmapLevel:0];
+                bad += memcmp(back, l0, sizeof(l0)) != 0;
+                printf("replaceRegion/getBytes of level 2 (level 0 untouched): %s\n", bad ? "WRONG" : "ok"); fails += bad;
+                id<MTLBuffer> in3 = [d newBufferWithLength:4 * 2 * 4 options:MTLResourceStorageModeShared], out3 = [d newBufferWithLength:4 * 2 * 4 options:MTLResourceStorageModeShared];
+                for (int i = 0; i < 32; i++) ((uint8_t *)in3.contents)[i] = (uint8_t)(i * 9 + 1);
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+                [be copyFromBuffer:in3 sourceOffset:0 sourceBytesPerRow:16 sourceBytesPerImage:32 sourceSize:MTLSizeMake(4, 2, 1) toTexture:B destinationSlice:0 destinationLevel:3 destinationOrigin:MTLOriginMake(0, 0, 0)];
+                [be copyFromTexture:B sourceSlice:0 sourceLevel:3 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(4, 2, 1) toBuffer:out3 destinationOffset:0 destinationBytesPerRow:16 destinationBytesPerImage:32];
+                [be generateMipmapsForTexture:A];
+                [be endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                printf("blit status %ld, error %s\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none"); fails += cb.status != MTLCommandBufferStatusCompleted;
+                bad = memcmp(in3.contents, out3.contents, 32) != 0;
+                printf("blit buffer -> level 3 -> buffer: %s\n", bad ? "WRONG" : "ok"); fails += bad;
+                bad = 0;
+                for (NSUInteger l = 1; l < 6; l++) {
+                    const NSUInteger lw = 32 >> l ? 32 >> l : 1, lh = 16 >> l ? 16 >> l : 1;
+                    memset(back, 0, sizeof(back)); [A getBytes:back bytesPerRow:lw * 4 fromRegion:MTLRegionMake2D(0, 0, lw, lh) mipmapLevel:l];
+                    int lb = 0;
+                    for (NSUInteger i = 0; i < lw * lh; i++) if (abs((int)back[i * 4] - 50) > 1 || abs((int)back[i * 4 + 1] - 10) > 1 || back[i * 4 + 3] != 255) lb++;
+                    printf("generateMipmaps level %lu (%lux%lu): first texel %u %u %u %u, %d wrong\n", (unsigned long)l, (unsigned long)lw, (unsigned long)lh, back[0], back[1], back[2], back[3], lb);
+                    bad += lb != 0;
+                }
+                fails += bad != 0;
+                id<MTLTexture> V = [A newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm textureType:MTLTextureType2D levels:NSMakeRange(1, 1) slices:NSMakeRange(0, 1)];
+                printf("view of level 1: %s, %lux%lu, %lu levels\n", V ? "made" : "REFUSED", (unsigned long)V.width, (unsigned long)V.height, (unsigned long)V.mipmapLevelCount);
+                if (!V || V.width != 16 || V.height != 8) fails++;
+                else {
+                    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rp.colorAttachments[0].texture = V; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 1, 1);
+                    id<MTLCommandBuffer> cb2 = [q commandBuffer];
+                    id<MTLRenderCommandEncoder> re = [cb2 renderCommandEncoderWithDescriptor:rp];
+                    [re endEncoding];
+                    [cb2 commit]; [cb2 waitUntilCompleted];
+                    memset(back, 0, sizeof(back)); [A getBytes:back bytesPerRow:64 fromRegion:MTLRegionMake2D(0, 0, 16, 8) mipmapLevel:1];
+                    int lb = 0; for (int i = 0; i < 16 * 8; i++) if (back[i * 4] || back[i * 4 + 2] != 255) lb++;
+                    memset(back, 0, sizeof(back)); [A getBytes:back bytesPerRow:128 fromRegion:MTLRegionMake2D(0, 0, 32, 16) mipmapLevel:0];
+                    const int l0bad = memcmp(back, l0, sizeof(l0)) != 0;
+                    printf("clear of the level-1 view: status %ld, %d texels wrong in level 1, level 0 %s\n", (long)cb2.status, lb, l0bad ? "CHANGED" : "unchanged");
+                    fails += lb != 0 || l0bad || cb2.status != MTLCommandBufferStatusCompleted;
+                }
+                printf("mipmaps through Metal on RADV: %s\n", fails ? "FAILED" : "all checks passed");
                 return fails ? 1 : 0;
             }
             if (getenv("RN_RASTER_TEST")) {
@@ -730,8 +848,12 @@ int main(int argc, char **argv) {
                 NSData *blob = [NSData dataWithContentsOfFile:@(getenv("RN_FC_TEST"))];
                 dispatch_data_t dd = dispatch_data_create(blob.bytes, blob.length, NULL, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
                 NSError *e = nil;
-                id<MTLLibrary> lib = [d newLibraryWithData:dd error:&e];
-                if (!lib) { printf("no library\n"); return 100; }
+                // RN_FC_SOURCE=<vk_fc.metal>: the same kernel compiled from source by the base class (newLibraryWithSource:, what ANGLE and Dawn do), so that the constants go through
+                // the base class's newFunctionWithName:constantValues: (needs RN_METAL_SRCLIB=1)
+                NSString *fsrc = getenv("RN_FC_SOURCE") ? [NSString stringWithContentsOfFile:@(getenv("RN_FC_SOURCE")) encoding:NSUTF8StringEncoding error:NULL] : nil;
+                id<MTLLibrary> lib = fsrc ? [d newLibraryWithSource:fsrc options:nil error:&e] : [d newLibraryWithData:dd error:&e];
+                if (!lib) { printf("no library: %s\n", e.localizedDescription.UTF8String); return 100; }
+                printf("library %s\n", class_getName(object_getClass(lib)));
                 id<MTLCommandQueue> q = [d newCommandQueue];
                 MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
                 id<MTLTexture> tex = [d newTextureWithDescriptor:td];
@@ -754,6 +876,7 @@ int main(int argc, char **argv) {
                     }
                     e = nil;
                     id<MTLFunction> fn = [lib newFunctionWithName:@"fc_kernel" constantValues:cv error:&e];
+                    if (fn) printf("case %d: function class %s\n", c, class_getName(object_getClass(fn)));
                     id<MTLComputePipelineState> pso = fn ? [d newComputePipelineStateWithFunction:fn error:&e] : nil;
                     printf("case %d: function %p, pipeline %p, error: %s\n", c, (__bridge void *)fn, (__bridge void *)pso, e ? e.localizedDescription.UTF8String : "none");
                     if (!pso) { fails++; continue; }

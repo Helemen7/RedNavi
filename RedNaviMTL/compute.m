@@ -13,6 +13,7 @@
 // id<MTLComputePipelineState> built from raw SPIR-V (entry point "main"). Buffers are bound at indices 0..bufferCount-1 with -setBuffer:offset:atIndex: (offset must be 0),
 // -setBytes:length:atIndex: with an index >= bufferCount fills the push constants.
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 #include <os/lock.h>
 #include <dlfcn.h>
 #import <Foundation/Foundation.h>
@@ -122,6 +123,7 @@ static rn_vk *rn_vk_shared(void) {
         vk = rn_vk_open(NULL, err, sizeof(err));
         if (vk) {
             rn_log("RADV opened: %s", rn_vk_device_name(vk));
+            { char md[1024]; rn_vk_memory_describe(vk, md, sizeof(md)); rn_log("memory: %s", md); }
             if (getenv("RN_LATENCY_PROBE") || access("/Users/Shared/rednavi-latency", F_OK) == 0) { double mn, av, mx; rn_vk_latency_probe(vk, 200, &mn, &av, &mx); rn_log("empty submit and wait, 200 round trips: min %.0f us, average %.0f us, max %.0f us", mn, av, mx); 
             if (rn_diag) { double up, down; const int f = rn_vk_format_of(MTLPixelFormatBGRA8Unorm); rn_vk_bandwidth_probe(vk, f, 30, &up, &down); rn_log("1920x1080 BGRA copy, 30 each: host to card %.2f ms, card to host %.2f ms", up, down); } }
         }
@@ -137,10 +139,54 @@ BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
 #pragma clang diagnostic ignored "-Wincomplete-implementation"
 
 @class RedNaviMTLComputePipelineState;
+#define RN_TG_SLOTS 8
+// The pipeline of `p` for the threadgroup lengths the app set (tgLen, by index): p itself when they are the ones it was built with, else a variant built once (rn_pso_build)
+static void rn_probe_write_fcs(FILE *mf, id fn);     // RN_PROBE_DUMP: "fc <index or name> <hex bytes>" lines (defined after RedNaviMTLFunction)
+@class RedNaviMTLBuffer;
+static void rn_probe_write_buf(rn_vk *vk, RedNaviMTLBuffer *x, const char *fn);     // RN_PROBE_DUMP: a whole buffer to a file, staged through host memory when the CPU cannot map it
+static RedNaviMTLComputePipelineState *rn_pso_for_tg(RedNaviMTLComputePipelineState *p, const uint32_t *tgLen);
+
+// The memory of a heap: one allocation of the heap's size, which the heap's buffers are ranges of (rn_vk_buffer_create_in). Each of them holds it, so it lives as long as the
+// heap or any of its buffers.
+@interface RNBacking : NSObject { @public rn_vk_buffer *b; BOOL host; }   // host: host memory counted in rn_buf_budget_take
+@end
+// The host buffer memory of one process. The kext wires at most 2 GB of host memory for the buffers of all processes (rednavi_bo_budget_mb), and WindowServer aborts when it
+// cannot get a texture: an app that used it all up (Geekbench's Background Blur, with MetalPerformanceShaders retrying without end) took the desktop down with it. Every process
+// but WindowServer stops at RN_BUFFER_BUDGET_MB (default 1280) of host buffers. Private buffers and the memory of Private heaps go to VRAM (rn_vk_buffer_create_device) and do
+// not count here: raising this cap to fit Geekbench's 574 MB Private buffer in host memory instead (2026-11-24) left WindowServer short and the desktop glitched.
+static _Atomic long g_proc_buf_bytes;
+// WindowServer keeps the memory behaviour of before (Private buffers and heaps in host memory or visible VRAM, Shared as the storage mode, the old size answers) until the
+// VRAM placement has been proven with apps: it is the process whose crash takes the desktop down.
+static BOOL rn_is_ws(void) { static int v = -1; if (v < 0) v = !strcmp(getprogname(), "WindowServer"); return v; }
+static __thread BOOL rn_force_host_;                 // newBufferWithBytes: a Private buffer is made where the CPU can write it (the bytes go in with the CPU) and still answers Private
+static BOOL rn_buf_budget_take(size_t bytes) {
+    static long cap = -1;
+    if (cap < 0) {
+        const char *e = getenv("RN_BUFFER_BUDGET_MB");
+        long mb = e ? atol(e) : 1280;
+        cap = !strcmp(getprogname(), "WindowServer") || mb <= 0 ? LONG_MAX : mb << 20;
+    }
+    if (atomic_fetch_add(&g_proc_buf_bytes, (long)bytes) + (long)bytes > cap) { atomic_fetch_sub(&g_proc_buf_bytes, (long)bytes); return NO; }
+    return YES;
+}
+static void rn_buf_budget_give(size_t bytes) { atomic_fetch_sub(&g_proc_buf_bytes, (long)bytes); }
+// Where the CPU sees byte `off` of a buffer; NULL for a Private buffer in VRAM the CPU cannot map (the debugging dumps skip those).
+static inline const uint8_t *rn_bufp(rn_vk_buffer *b, NSUInteger off) { const uint8_t *c = b ? (const uint8_t *)rn_vk_buffer_contents(b) : NULL; return c ? c + off : NULL; }
+// Heap statistics for the 5-second report: heap memory alive (count, bytes), buffers made aliasable, buffers placed in a heap, buffers a heap could not place.
+static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
+@implementation RNBacking
+- (void)dealloc { if (b) { atomic_fetch_sub(&g_hb_live, 1); atomic_fetch_sub(&g_hb_bytes, (long)rn_vk_buffer_length(b)); if (host) rn_buf_budget_give(rn_vk_buffer_length(b)); rn_vk_buffer_destroy(rn_vk_shared(), b); } }
+@end
+@interface NSObject (RNHeapAlias)
+- (void)rn_aliased:(id)buffer;
+@end
 
 @interface RedNaviMTLBuffer : NSObject {
 @public
     rn_vk_buffer *b;
+    RNBacking *backing;                              // a heap's buffer: the heap's memory, which b is a range of
+    id heap_;                                        // the RedNaviMTLHeap it was made from
+    BOOL aliasable_;
     id<MTLDevice> dev;
     NSUInteger len;
     NSUInteger options;
@@ -148,8 +194,14 @@ BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
     void *userPtr;                                   // newBufferWithBytesNoCopy: the caller's memory, copied in before and out after each command buffer
     uint64_t site_;
     void (^userDealloc)(void *, NSUInteger);
+    BOOL hostBudget_;                                // its memory is host memory counted in rn_buf_budget_take
+    NSUInteger heapOffset_;                          // a heap's buffer: its offset in the heap's memory
+    BOOL managedDev_;                                // a Managed buffer in VRAM the CPU cannot map (the host budget refused it): the CPU works on shadow_
+    BOOL shadowStale_;                               // the card wrote it since shadow_ was filled (synchronizeResource): read back on the next contents
+    void *shadow_;                                   // managedDev_: the CPU's copy, made on the first contents
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o;
+- (instancetype)initWithDevice:(id<MTLDevice>)d backing:(RNBacking *)k buffer:(rn_vk_buffer *)sub length:(NSUInteger)l options:(NSUInteger)o heap:(id)h;
 @end
 
 @implementation RedNaviMTLBuffer
@@ -159,18 +211,56 @@ BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o {
     if ((self = [super init])) {
         rn_vk *vk = rn_vk_shared();
-        b = vk ? rn_vk_buffer_create(vk, l ? l : 1) : NULL;
-        if (!b) { rn_log("buffer of %lu bytes: allocation failed", (unsigned long)l); return nil; }
+        const size_t want = l ? l : 1;
+        const NSUInteger sm = o & MTLResourceStorageModeMask;
+        BOOL host = NO;                              // in host memory, counted in the per-process budget
+        if (vk) {
+            // A small Private or Managed buffer (counters, histograms, accumulators: what shader atomics work on) goes to CPU-visible VRAM, where atomics stay on the card
+            // (rn_vk_buffer_create_vram); the CPU still reaches it through the BAR. Geekbench's Hough accumulator is a Managed buffer of 1.1 MB.
+            if ((sm == MTLResourceStorageModePrivate || sm == MTLResourceStorageModeManaged) && want <= (2u << 20)) b = rn_vk_buffer_create_vram(vk, want);
+            // A larger Private buffer goes to VRAM the CPU cannot map (contents is NULL, as Metal defines it for Private). Shared and Managed buffers stay in host memory.
+            if (!b && sm == MTLResourceStorageModePrivate && !rn_force_host_ && !rn_is_ws()) {
+                b = rn_vk_buffer_create_device(vk, want);
+                if (!b) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Private buffer of %lu bytes: VRAM refused it, host memory", (unsigned long)l); }
+            }
+            if (!b && rn_buf_budget_take(want)) {
+                b = rn_vk_buffer_create(vk, want);
+                if (b) host = YES; else rn_buf_budget_give(want);
+            }
+            // A Managed buffer the host budget refused goes to VRAM, as Managed memory is on a discrete card: the CPU gets its own copy (contents), sent to the card by
+            // didModifyRange and read back after synchronizeResource. Geekbench's Feature Matching has a Managed buffer of 574 MB the GPU fills and reads.
+            if (!b && sm == MTLResourceStorageModeManaged && !rn_is_ws() && (b = rn_vk_buffer_create_device(vk, want))) {
+                managedDev_ = YES;
+                static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer of %lu bytes: over the host budget, in VRAM with a CPU copy", (unsigned long)l);
+            }
+        }
+        if (!b) {                                    // rate-limited: MetalPerformanceShaders retries a failed allocation without end
+            static _Atomic unsigned long fails;
+            const unsigned long n = atomic_fetch_add(&fails, 1) + 1;
+            if (n <= 20 || n % 100000 == 0) rn_log("buffer of %lu bytes, storage %lu: allocation failed, nil (%lu so far; host buffers of this process %ld MB)", (unsigned long)l, (unsigned long)(sm >> MTLResourceStorageModeShift), n, atomic_load(&g_proc_buf_bytes) >> 20);
+            return nil;
+        }
+        hostBudget_ = host;
         dev = d; len = l; options = o; site_ = rn_site_enter('B');
-        memset(rn_vk_buffer_contents(b), 0, l ? l : 1);
+        if (rn_vk_buffer_contents(b)) memset(rn_vk_buffer_contents(b), 0, l ? l : 1);    // a device-local buffer was zeroed on the card
         if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("new buffer %p: %lu bytes, options 0x%lx, contents %p", self, (unsigned long)l, (unsigned long)o, rn_vk_buffer_contents(b));
+    }
+    return self;
+}
+// A heap's buffer, sub a range of the heap's memory k. Its memory is not cleared (a heap's resources start with whatever the memory holds, an aliased one with what the one
+// before left).
+- (instancetype)initWithDevice:(id<MTLDevice>)d backing:(RNBacking *)k buffer:(rn_vk_buffer *)sub length:(NSUInteger)l options:(NSUInteger)o heap:(id)h {
+    if ((self = [super init])) {
+        backing = k; heap_ = h; b = sub;
+        dev = d; len = l; options = o; site_ = rn_site_enter('B');
     }
     return self;
 }
 - (void)dealloc {
     rn_site_leave(site_);
     if (userPtr) { @synchronized([RedNaviMTLBuffer class]) { [[RedNaviMTLBuffer noCopyBuffers] removeObject:self]; } if (userDealloc) userDealloc(userPtr, len); }
-    if (b) rn_vk_buffer_destroy(rn_vk_shared(), b);
+    if (shadow_) munmap(shadow_, len ? len : 1);
+    if (b) { if (!backing && hostBudget_) rn_buf_budget_give(len ? len : 1); rn_vk_buffer_destroy(rn_vk_shared(), b); }   // a heap's buffer: only its range (the heap's memory is the backing's)
 }
 + (NSHashTable *)noCopyBuffers { static NSHashTable *t; static dispatch_once_t o; dispatch_once(&o, ^{ t = [NSHashTable weakObjectsHashTable]; }); return t; }
 // The buffers made over the caller's memory: what the caller wrote goes into the RADV buffer before a command buffer runs, what the GPU wrote comes back after it.
@@ -192,21 +282,58 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
         if (!ok && said++ < 20) rn_log("buffer over caller memory %p (%lu bytes): the memory cannot be %s, skipped", x->userPtr, (unsigned long)x->len, in ? "read" : "written");
     }
 }
-- (void *)contents { return userPtr ? userPtr : rn_vk_buffer_contents(b); }
+// managedDev_: a range between the card's buffer and shadow_, through a host buffer of at most 32 MB at a time. toCard: shadow_ to the card, else the card to shadow_.
+- (BOOL)rn_shadowSync:(NSUInteger)off length:(NSUInteger)n toCard:(BOOL)toCard {
+    rn_vk *vk = rn_vk_shared(); if (!vk || !b || !shadow_) return NO;
+    if (off >= len) return YES;
+    if (n > len - off) n = len - off;
+    const size_t chunk = n < (32u << 20) ? n : (32u << 20);
+    rn_vk_buffer *t = rn_vk_buffer_create(vk, chunk ? chunk : 1); if (!t) return NO;
+    BOOL ok = YES;
+    for (NSUInteger at = 0; at < n && ok; at += chunk) {
+        const size_t m = n - at < chunk ? n - at : chunk;
+        if (toCard) { memcpy(rn_vk_buffer_contents(t), (uint8_t *)shadow_ + off + at, m); ok = rn_vk_buffer_copy(vk, t, 0, b, off + at, m) == 0; }
+        else if ((ok = rn_vk_buffer_copy(vk, b, off + at, t, 0, m) == 0)) memcpy((uint8_t *)shadow_ + off + at, rn_vk_buffer_contents(t), m);
+    }
+    rn_vk_buffer_destroy(vk, t);
+    if (!ok) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer %p in VRAM: copy %s the card failed", self, toCard ? "to" : "from"); }
+    return ok;
+}
+- (void *)contents {
+    if (userPtr) return userPtr;
+    if (managedDev_) {
+        @synchronized (self) {
+            if (!shadow_) {
+                void *p = mmap(NULL, len ? len : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                if (p == MAP_FAILED) return NULL;
+                shadow_ = p; shadowStale_ = YES;
+            }
+            if (shadowStale_) { [self rn_shadowSync:0 length:len toCard:NO]; shadowStale_ = NO; }
+        }
+        return shadow_;
+    }
+    return rn_vk_buffer_contents(b);
+}
 - (NSUInteger)length { return len; }
 - (id<MTLDevice>)device { return dev; }
 - (MTLResourceOptions)resourceOptions { return options; }
-- (MTLStorageMode)storageMode { return MTLStorageModeShared; }
-- (MTLCPUCacheMode)cpuCacheMode { return MTLCPUCacheModeDefaultCache; }
+- (MTLStorageMode)storageMode { return rn_is_ws() ? MTLStorageModeShared : (MTLStorageMode)((options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift); }   // as asked for (MPS picks blits by it)
+- (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)((options & MTLResourceCPUCacheModeMask) >> MTLResourceCPUCacheModeShift); }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeUntracked; }
 - (NSUInteger)allocatedSize { return len; }
-- (void)didModifyRange:(NSRange)range {}
+- (void)didModifyRange:(NSRange)range { if (managedDev_ && shadow_) @synchronized (self) { [self rn_shadowSync:range.location length:range.length toCard:YES]; } }
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
-- (id<MTLHeap>)heap { return nil; }
-- (NSUInteger)heapOffset { return 0; }
-- (BOOL)isAliasable { return NO; }
-- (void)makeAliasable {}
+- (id<MTLHeap>)heap { return heap_; }
+- (NSUInteger)heapOffset { return heapOffset_; }
+- (BOOL)isAliasable { return aliasable_; }
+// MetalPerformanceShaders keeps the buffers of its temporary tensors and makes them aliasable when it is done with them, so that the heap's memory serves the next ones. Without
+// that every temporary buffer kept its own memory and Geekbench's Background Blur used up what the kext may wire (2 GB).
+- (void)makeAliasable {
+    if (!heap_ || aliasable_) return;
+    aliasable_ = YES;
+    [heap_ rn_aliased:self];
+}
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
 @end
 
@@ -263,6 +390,8 @@ static int rn_depth_format_of(MTLPixelFormat pf) {
     NSUInteger w, h, d;                              // d: depth of a 3D texture, else 1
     MTLTextureType ttype;                            // the type asked for; a 1D texture is a one-row image, a 1D array one row per slice (CoreDisplay's gamma tables are R32Float 1D arrays)
     NSUInteger alen;                                 // array length reported (1D arrays only)
+    NSUInteger levels_;                              // mipmap levels of the image (1 when the type or format has none here)
+    NSUInteger samples_;                             // sample count: more than 1 for a 2D multisample texture (a multisample Vulkan image)
     unsigned texel;
     MTLTextureUsage usage_;
     NSString *label_;
@@ -281,8 +410,11 @@ static int rn_depth_format_of(MTLPixelFormat pf) {
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane;
 - (void)syncFromSurface;
 - (void)syncFromBuffer;
+- (void)rn_bufferToImage:(BOOL)inBatch;
+- (void)rn_imageToBuffer:(BOOL)inBatch;
 - (void)syncToSurface;
 - (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)pf swizzle:(const MTLTextureSwizzleChannels *)sw;
+- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)pf swizzle:(const MTLTextureSwizzleChannels *)sw levels:(NSRange)lv;
 @end
 // A commit returns before its command buffer has run (the bodies run on one serial queue). Metal's rule is that a committed command buffer sees the textures as they were when it was
 // committed, so a host access to a texture (replaceRegion, getBytes) waits until the command buffers that use it have run. Without the wait a client that draws with a texture, commits
@@ -313,6 +445,24 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     if (t->alen > 1 && slice < t->alen) { o->y += slice; return YES; }
     return NO;
 }
+// Mipmap levels (2026-11-22): the image has them, the host copy keeps them level after level (rn_vk_image_level_offset). Level l is width >> l by height >> l (at least 1), with every slice of
+// an array and depth >> l slices of a 3D texture; its rows are packed (a zero-copy IOSurface texture has one level).
+static NSUInteger rn_lvl(NSUInteger v, NSUInteger l) { v >>= l; return v ? v : 1; }
+static NSUInteger rn_lvl_depth(RedNaviMTLTexture *t, NSUInteger l) { return RN_LAYERED(t->ttype) ? t->d : rn_lvl(t->d, l); }
+static uint8_t *rn_level_host(RedNaviMTLTexture *t, rn_vk_image *im, NSUInteger level, size_t *pitch) {
+    uint8_t *p = rn_vk_image_staging(im);
+    *pitch = level ? rn_lvl(t->w, level) * t->texel : rn_vk_image_row_bytes(im);   // a view's level 0 is its own first level, as wide as the view
+    return p + rn_vk_image_level_offset(im, (uint32_t)level);
+}
+static BOOL rn_slice_rows_l(RedNaviMTLTexture *t, NSUInteger slice, NSUInteger level, MTLOrigin *o) {
+    if (!level) return rn_slice_rows(t, slice, o);
+    if (t && RN_LAYERED(t->ttype) && slice < t->d) { o->y += slice * rn_lvl(t->h, level); return YES; }
+    return NO;
+}
+// Multisampling (Chromium's Graphite and Dawn ask for it on every page): a 2D multisample texture is a Vulkan image with that many samples (rn_vk_image_create_ms), pipelines with
+// rasterSampleCount > 1 rasterize with that many samples, and the multisample resolve store action resolves on the card after the pass. The sample counts offered are the ones RADV
+// renders and samples (supportsTextureSampleCount:). Shaders read the samples with texture2d_ms (the translator's dim flag RN_AIR_DIM_MS).
+static BOOL rn_sample_count_ok(NSUInteger n) { if (n == 1) return YES; rn_vk *vk = rn_vk_shared(); return vk && n <= 64 && !(n & (n - 1)) && (rn_vk_sample_counts(vk) & n); }
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
@@ -320,15 +470,16 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     const BOOL is3d = desc.textureType == MTLTextureType3D;
     const BOOL is2da = RN_LAYERED(desc.textureType);   // OpenGL's GL_TEXTURE_2D_ARRAY (kitty's glyph atlas): the slices are kept like the depth of a 3D texture
     const BOOL is1d = desc.textureType == MTLTextureType1D || desc.textureType == MTLTextureType1DArray;
-    ttype = desc.textureType; alen = desc.textureType == MTLTextureType1DArray ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
-    if ((desc.textureType != MTLTextureType2D && !is3d && !is1d && !is2da) || (desc.arrayLength > 1 && desc.textureType != MTLTextureType1DArray && !is2da) || desc.sampleCount > 1 || (!is3d && desc.depth > 1)) {
+    const BOOL isms = desc.textureType == MTLTextureType2DMultisample;
+    ttype = desc.textureType; samples_ = isms && desc.sampleCount > 1 ? desc.sampleCount : 1; alen = desc.textureType == MTLTextureType1DArray ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
+    if ((desc.textureType != MTLTextureType2D && !isms && !is3d && !is1d && !is2da) || (desc.arrayLength > 1 && desc.textureType != MTLTextureType1DArray && !is2da) || (desc.sampleCount > 1 && !isms) || (!is3d && desc.depth > 1)) {
         rn_log("texture: only plain 2D textures are supported (type %ld, array %lu, samples %lu)", (long)desc.textureType, (unsigned long)desc.arrayLength, (unsigned long)desc.sampleCount);
         return nil;
     }
-    if (desc.mipmapLevelCount > 1) rn_log("texture: %lu mipmap levels asked, only level 0 exists", (unsigned long)desc.mipmapLevelCount);
+    levels_ = 1;
     if (rn_depth_format_of(desc.pixelFormat)) {
         rn_vk *dvk = rn_vk_shared();
-        dep = dvk && desc.textureType == MTLTextureType2D ? rn_vk_depth_create(dvk, rn_depth_format_of(desc.pixelFormat), (uint32_t)desc.width, (uint32_t)desc.height) : NULL;
+        dep = dvk && (desc.textureType == MTLTextureType2D || isms) ? rn_vk_depth_create_ms(dvk, rn_depth_format_of(desc.pixelFormat), (uint32_t)desc.width, (uint32_t)desc.height, (uint32_t)samples_) : NULL;
         if (!dep) { rn_log("depth texture %lux%lu pixel format %lu: not supported (type %ld, %s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, (long)desc.textureType, dvk ? "no depth image on the card" : "RADV is not available"); return nil; }
         dev = d; pf = desc.pixelFormat; w = desc.width; h = desc.height; self->d = 1; usage_ = desc.usage; texel = 4;
         site_ = rn_site_enter('T');
@@ -338,7 +489,10 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     rn_vk *vk = f ? rn_vk_shared() : NULL;
     const NSUInteger rows = is1d ? alen : desc.height;
     const NSUInteger slices = is3d ? desc.depth : desc.textureType == MTLTextureTypeCube ? 6 : is2da ? (desc.arrayLength ? desc.arrayLength : 1) : 1;
-    img = vk ? rn_vk_image_create_layers(vk, f, (uint32_t)desc.width, (uint32_t)rows, (uint32_t)slices, is2da) : NULL;
+    const NSUInteger askLevels = desc.mipmapLevelCount > 1 && !is1d && !isms ? desc.mipmapLevelCount : 1;
+    img = !vk ? NULL : samples_ > 1 ? rn_vk_image_create_ms(vk, f, (uint32_t)desc.width, (uint32_t)desc.height, (uint32_t)samples_) : rn_vk_image_create_mips(vk, f, (uint32_t)desc.width, (uint32_t)rows, (uint32_t)slices, is2da, (uint32_t)askLevels);
+    if (img) levels_ = rn_vk_image_levels(img);
+    if (desc.mipmapLevelCount > levels_) { static unsigned said; if (said++ < 8) rn_log("texture %lux%lu type %ld: %lu mipmap levels asked, %lu made", (unsigned long)desc.width, (unsigned long)desc.height, (long)desc.textureType, (unsigned long)desc.mipmapLevelCount, (unsigned long)levels_); }
     if (!img) { rn_log("texture %lux%lu pixel format %lu: not supported (%s)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, f ? (vk ? rn_vk_image_last_error() : "RADV is not available") : "no Vulkan format for it"); return nil; }
     dev = d; pf = desc.pixelFormat; w = desc.width; h = rows; self->d = slices; usage_ = desc.usage; texel = rn_vk_format_texel_bytes(f);
     site_ = rn_site_enter('T');
@@ -440,8 +594,60 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
     IOSurfaceUnlock(surf, 0, NULL);
     surfSeed = IOSurfaceGetSeed(surf);
 }
+// A texture over one of our buffers shares the buffer's bytes in Metal: what a kernel writes into the buffer is what the texture reads, and the other way round. Here the texture is an
+// image with a host copy of its own, so the rows are copied from the buffer's memory (staged through host memory when the buffer is in VRAM) before each dispatch that uses the texture,
+// and back into the buffer after a dispatch that wrote it (rn_imageToBuffer). Geekbench's RAW workload blurs with MPS between two of its kernels over textures made inside its
+// buffers; with the rows copied only when the command buffer was committed the blur read the buffer from before the kernels ran and its result never reached the buffer.
+// inBatch: called inside an open batch (rn_vk_batch_begin), which a copy on the card has to leave so that it runs now.
+static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSUInteger off, size_t span, BOOL inBatch, rn_vk_buffer **stage) {
+    *stage = NULL;
+    uint8_t *c = rn_vk_buffer_contents(bf->b);
+    if (c) return c + off;
+    if (!(*stage = rn_vk_buffer_create(vk, span))) return NULL;
+    if (inBatch) rn_vk_batch_end(vk);
+    const int rc = rn_vk_buffer_copy(vk, bf->b, off, *stage, 0, span);
+    if (inBatch) rn_vk_batch_begin(vk);
+    if (rc) { rn_vk_buffer_destroy(vk, *stage); *stage = NULL; return NULL; }
+    return rn_vk_buffer_contents(*stage);
+}
+- (void)rn_bufferToImage:(BOOL)inBatch {
+    rn_vk *vk = rn_vk_shared();
+    if (!srcBuf || !img || !vk || !w || !h) return;
+    const size_t row = w * texel, span = srcBpr * (h - 1) + row;
+    rn_vk_buffer *stage;
+    const uint8_t *src = rn_buf_bytes_for_host(vk, srcBuf, srcOff, span, inBatch, &stage);
+    if (!src) { static int said; if (said++ < 20) rn_log("texture over a buffer: the buffer's rows cannot be read"); return; }
+    rn_vk_host_lock();
+    uint8_t *dst = rn_vk_image_staging(img); const size_t pitch = rn_vk_image_row_bytes(img);
+    BOOL changed = NO;
+    for (NSUInteger y = 0; y < h; y++) if (memcmp(dst + y * pitch, src + y * srcBpr, row)) { memcpy(dst + y * pitch, src + y * srcBpr, row); changed = YES; }
+    if (changed) rn_vk_image_host_wrote(img);
+    rn_vk_host_unlock();
+    if (stage) rn_vk_buffer_destroy(vk, stage);
+}
+- (void)rn_imageToBuffer:(BOOL)inBatch {
+    rn_vk *vk = rn_vk_shared();
+    if (!srcBuf || !img || !vk || !w || !h) return;
+    const size_t row = w * texel, span = srcBpr * (h - 1) + row;
+    const uint8_t *src = rn_vk_image_staging(img); const size_t pitch = rn_vk_image_row_bytes(img);
+    uint8_t *c = rn_vk_buffer_contents(srcBuf->b);
+    if (c) { for (NSUInteger y = 0; y < h; y++) memcpy(c + srcOff + y * srcBpr, src + y * pitch, row); }
+    else {
+        rn_vk_buffer *stage = NULL;
+        uint8_t *dst = srcBpr == row ? ((stage = rn_vk_buffer_create(vk, span)) ? rn_vk_buffer_contents(stage) : NULL) : (uint8_t *)rn_buf_bytes_for_host(vk, srcBuf, srcOff, span, inBatch, &stage);   // rows with gaps: the gaps are kept
+        if (!dst || !stage) { if (stage) rn_vk_buffer_destroy(vk, stage); static int said; if (said++ < 20) rn_log("texture over a buffer: the rows cannot be written back to the buffer"); return; }
+        for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * srcBpr, src + y * pitch, row);
+        if (inBatch) rn_vk_batch_end(vk);
+        const int rc = rn_vk_buffer_copy(vk, stage, 0, srcBuf->b, srcOff, span);
+        if (inBatch) rn_vk_batch_begin(vk);
+        rn_vk_buffer_destroy(vk, stage);
+        if (rc) { static int said; if (said++ < 20) rn_log("texture over a buffer: copying the rows into the buffer on the card failed"); return; }
+        if (srcBuf->managedDev_) srcBuf->shadowStale_ = YES;
+    }
+}
 - (void)syncFromBuffer {
     if (!srcBuf && !srcRaw) return;
+    if (srcBuf) { [self rn_bufferToImage:NO]; return; }
     rn_vk_host_lock();
     const uint8_t *src = srcBuf ? (const uint8_t *)[(id<MTLBuffer>)srcBuf contents] + srcOff : srcRaw;
     uint8_t *dst = rn_vk_image_staging(img);
@@ -505,7 +711,9 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
 - (IOSurfaceRef)iosurface { return surf; }
 - (NSUInteger)iosurfacePlane { return surfPlane; }
 // Texture views: another pixel format of the same texel size and/or swizzled components over the same storage. Only the whole of a 2D, one-level texture can be viewed.
-- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)newPf swizzle:(const MTLTextureSwizzleChannels *)sw {
+- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)newPf swizzle:(const MTLTextureSwizzleChannels *)sw { return [self viewWithPixelFormat:newPf swizzle:sw levels:NSMakeRange(0, levels_ ? levels_ : 1)]; }
+// A view of some of the levels (a level of a blur chain as a render target): its size is that of its first level, its level l is the texture's level lv.location + l.
+- (RedNaviMTLTexture *)viewWithPixelFormat:(MTLPixelFormat)newPf swizzle:(const MTLTextureSwizzleChannels *)sw levels:(NSRange)lv {
     const int f = rn_vk_format_of(newPf);
     rn_vk *vk = f ? rn_vk_shared() : NULL;
     if (!vk) { rn_log("texture view: pixel format %lu is not supported", (unsigned long)newPf); return nil; }
@@ -516,10 +724,11 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
         for (int i = 0; i < 4; i++) comp[i] = in[i] < 6 ? map[in[i]] : 0;
         cp = comp;
     }
-    rn_vk_image *v = rn_vk_image_view(vk, parent ? parent->img : img, f, cp);
-    if (!v) { rn_log("texture view: pixel format %lu does not fit the texture (texel size) or cannot be sampled", (unsigned long)newPf); return nil; }
+    rn_vk_image *v = rn_vk_image_view_levels(vk, img, f, cp, (uint32_t)lv.location, (uint32_t)lv.length);
+    if (!v) { rn_log("texture view: pixel format %lu does not fit the texture (texel size), cannot be sampled, or levels %lu+%lu are outside it", (unsigned long)newPf, (unsigned long)lv.location, (unsigned long)lv.length); return nil; }
     RedNaviMTLTexture *t = [[RedNaviMTLTexture alloc] init];
-    t->img = v; t->dev = dev; t->pf = newPf; t->w = w; t->h = h; t->d = d; t->ttype = ttype; t->alen = alen; t->texel = texel; t->usage_ = usage_;
+    t->img = v; t->dev = dev; t->pf = newPf; t->w = rn_lvl(w, lv.location); t->h = alen > 1 ? h : rn_lvl(h, lv.location); t->d = RN_LAYERED(ttype) ? d : rn_lvl(d, lv.location); t->ttype = ttype; t->alen = alen; t->texel = texel; t->usage_ = usage_;
+    t->levels_ = lv.length; t->samples_ = samples_;
     t->parent = parent ? parent : self;
     t->zeroCopy = t->parent->zeroCopy;
     t->displayScan = t->parent->displayScan;
@@ -532,17 +741,17 @@ static BOOL rn_slice_rows(RedNaviMTLTexture *t, NSUInteger slice, MTLOrigin *o) 
 static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange levels, NSRange slices) {
     const MTLTextureType own = t.textureType;
     const NSUInteger n = own == MTLTextureType2DArray ? t.arrayLength : own == MTLTextureTypeCube ? 6 : 1;
-    if ((type == own || (type == MTLTextureType2D && own == MTLTextureType2DArray && n == 1)) && levels.location == 0 && levels.length == 1 && slices.location == 0 && slices.length == n) return YES;
-    rn_log("texture view: only the whole of a texture of one level can be viewed (type %ld of %ld, slices %lu+%lu)", (long)type, (long)own, (unsigned long)slices.location, (unsigned long)slices.length);
+    if ((type == own || (type == MTLTextureType2D && own == MTLTextureType2DArray && n == 1)) && levels.length && levels.location + levels.length <= t.mipmapLevelCount && slices.location == 0 && slices.length == n) return YES;
+    rn_log("texture view: only all the slices of a texture can be viewed (type %ld of %ld, slices %lu+%lu, levels %lu+%lu of %lu)", (long)type, (long)own, (unsigned long)slices.location, (unsigned long)slices.length, (unsigned long)levels.location, (unsigned long)levels.length, (unsigned long)t.mipmapLevelCount);
     return NO;
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices {
     if (!rn_whole_view(self, type, levels, slices)) return nil;
-    return [self newTextureViewWithPixelFormat:newPf];
+    return (id)[self viewWithPixelFormat:newPf swizzle:NULL levels:levels];
 }
 - (id<MTLTexture>)newTextureViewWithPixelFormat:(MTLPixelFormat)newPf textureType:(MTLTextureType)type levels:(NSRange)levels slices:(NSRange)slices swizzle:(MTLTextureSwizzleChannels)swizzle {
     if (!rn_whole_view(self, type, levels, slices)) return nil;
-    return (id)[self viewWithPixelFormat:newPf swizzle:&swizzle];
+    return (id)[self viewWithPixelFormat:newPf swizzle:&swizzle levels:levels];
 }
 - (MTLTextureSwizzleChannels)swizzle { return swz.red == swz.green && swz.green == swz.blue && swz.blue == swz.alpha && swz.red == 0 && !parent ? (MTLTextureSwizzleChannels){MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha} : swz; }
 // Private: the swizzle packed one channel per byte, red in the low byte (identity 0x05040302). AppleMetalOpenGLRenderer compares it with the swizzle a GL texture wants before it
@@ -554,13 +763,13 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
 - (id<MTLTexture>)newRemoteTextureViewForDevice:(id<MTLDevice>)device { rn_log("newRemoteTextureViewForDevice: not supported"); return nil; }
 - (MTLSharedTextureHandle *)newSharedTextureHandle { rn_log("newSharedTextureHandle: not supported (an IOSurface-backed texture is shared through its IOSurface)"); return nil; }
 - (id<MTLTexture>)remoteStorageTexture { return nil; }
-- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) || RN_LAYERED(ttype) ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
+- (MTLTextureType)textureType { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) || RN_LAYERED(ttype) || ttype == MTLTextureType2DMultisample ? ttype : (d > 1 ? MTLTextureType3D : MTLTextureType2D); }
 - (MTLPixelFormat)pixelFormat { return pf; }
 - (NSUInteger)width { return w; }
 - (NSUInteger)height { return (alen && (ttype == MTLTextureType1D || ttype == MTLTextureType1DArray)) ? 1 : h; }
 - (NSUInteger)depth { return RN_LAYERED(ttype) ? 1 : d; }
-- (NSUInteger)mipmapLevelCount { return 1; }
-- (NSUInteger)sampleCount { return 1; }
+- (NSUInteger)mipmapLevelCount { return levels_ ? levels_ : 1; }
+- (NSUInteger)sampleCount { return samples_ ? samples_ : 1; }
 - (NSUInteger)arrayLength { return ttype == MTLTextureType2DArray ? d : alen ? alen : 1; }
 - (MTLTextureUsage)usage { return usage_; }
 - (BOOL)isShareable { return NO; }
@@ -569,24 +778,29 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
 - (BOOL)isSparse { return NO; }
 - (NSUInteger)firstMipmapInTail { return 0; }
 - (NSUInteger)tailSizeInBytes { return 0; }
-- (BOOL)clampRegion:(MTLRegion)r {
-    return r.origin.x + r.size.width <= w && r.origin.y + r.size.height <= h && r.origin.z + r.size.depth <= d;
+- (BOOL)clampRegion:(MTLRegion)r level:(NSUInteger)l {
+    return l < (levels_ ? levels_ : 1) && r.origin.x + r.size.width <= rn_lvl(w, l) && r.origin.y + r.size.height <= rn_lvl(h, l) && r.origin.z + r.size.depth <= rn_lvl_depth(self, l);
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
     if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }   // a slice of a 2D array is stored like a depth slice
-    if (level || slice || ![self clampRegion:region]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    if (alen > 1 && slice && slice < alen && !region.origin.y && region.size.height == 1) { region.origin.y = slice; slice = 0; }   // a slice of a 1D array is one row
+    if (slice || ![self clampRegion:region level:level]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored (type %ld, %lux%lux%lu, array %lu)", (unsigned long)level, (unsigned long)slice, (long)ttype, (unsigned long)w, (unsigned long)h, (unsigned long)d, (unsigned long)alen); return; }
     rn_tex_wait_idle(self);
     rn_vk_host_lock();
-    uint8_t *dst = rn_vk_image_staging(img);
-    const size_t pitch = rn_vk_image_row_bytes(img);      // a zero-copy IOSurface image has the surface's row pitch
+    size_t pitch;                                         // a zero-copy IOSurface image has the surface's row pitch
+    uint8_t *dst = rn_level_host(self, img, level, &pitch);
+    const NSUInteger lh = rn_lvl(h, level);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
-            memcpy(dst + ((region.origin.z + z) * h + region.origin.y + y) * pitch + region.origin.x * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
+            memcpy(dst + ((region.origin.z + z) * lh + region.origin.y + y) * pitch + region.origin.x * texel, (const uint8_t *)bytes + z * bpi + y * bpr, region.size.width * texel);
     rn_vk_image_host_wrote(img);
     rn_vk_host_unlock();
     if ((w == 161 || w == 249) && w == h) rn_log("shadow texture %lux%lu: replaceRegion (%lu,%lu %lux%lu) from %p", (unsigned long)w, (unsigned long)h, (unsigned long)region.origin.x, (unsigned long)region.origin.y, (unsigned long)region.size.width, (unsigned long)region.size.height, __builtin_return_address(0));
     rn_display_host_write_note((__bridge void *)self, "replaceRegion");
+    // a texture made inside a buffer: the buffer holds the texels (Geekbench 505 fills its sky texture this way), so the rows go into it too, or the next sync from the buffer would undo the write
+    RedNaviMTLTexture *root = parent ? parent : self;
+    if (root->srcBuf && !level) [root rn_imageToBuffer:NO];
     [self syncToSurface];
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr {
@@ -594,16 +808,19 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
     if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }
-    if (level || slice || ![self clampRegion:region]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored", (unsigned long)level, (unsigned long)slice); return; }
+    if (alen > 1 && slice && slice < alen && !region.origin.y && region.size.height == 1) { region.origin.y = slice; slice = 0; }
+    if (slice || ![self clampRegion:region level:level]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored (type %ld, %lux%lux%lu, array %lu)", (unsigned long)level, (unsigned long)slice, (long)ttype, (unsigned long)w, (unsigned long)h, (unsigned long)d, (unsigned long)alen); return; }
     rn_tex_wait_idle(self);
     [self syncFromSurface];
-    rn_vk_image *card = rn_display_vram_peek((__bridge void *)self);      // a scanout surface's pixels are in the card's copy, not in the texture's own image
-    const uint8_t *src = rn_vk_image_staging(card ? card : img);
-    const size_t pitch = rn_vk_image_row_bytes(card ? card : img);
+    { RedNaviMTLTexture *root = parent ? parent : self; if (root->srcBuf && !level) [root rn_bufferToImage:NO]; }   // a texture made inside a buffer: the buffer holds the current texels
+    rn_vk_image *card = level ? NULL : rn_display_vram_peek((__bridge void *)self);      // a scanout surface's pixels are in the card's copy, not in the texture's own image
+    size_t pitch;
+    const uint8_t *src = rn_level_host(self, card ? card : img, level, &pitch);
+    const NSUInteger lh = rn_lvl(h, level);
     if (!bpi) bpi = bpr * region.size.height;
     for (NSUInteger z = 0; z < region.size.depth; z++)
         for (NSUInteger y = 0; y < region.size.height; y++)
-            memcpy((uint8_t *)out + z * bpi + y * bpr, src + ((region.origin.z + z) * h + region.origin.y + y) * pitch + region.origin.x * texel, region.size.width * texel);
+            memcpy((uint8_t *)out + z * bpi + y * bpr, src + ((region.origin.z + z) * lh + region.origin.y + y) * pitch + region.origin.x * texel, region.size.width * texel);
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level {
     [self getBytes:out bytesPerRow:bpr bytesPerImage:0 fromRegion:region mipmapLevel:level slice:0];
@@ -667,6 +884,11 @@ static id rn_new_sampler_state(id<MTLDevice> dev, MTLSamplerDescriptor *d) {
     unsigned localSize[3];
     id<MTLDevice> dev;
     NSString *label_;
+    NSString *fname;                 // the kernel's name (logs); set for translated kernels
+    id src;                          // the RedNaviMTLFunction it was translated from (translated kernels): variants for other threadgroup lengths are built from it
+    unsigned ntg;                    // threadgroup buffers ([[threadgroup(n)]]) the translator reported (logs)
+    uint32_t tgBuilt[RN_TG_SLOTS];   // the length of threadgroup buffer n this module was built with (0: the translator's default)
+    NSMutableDictionary *variants;   // lengths (NSData of uint32_t[RN_TG_SLOTS]) -> the pipeline built with them
 }
 @end
 @implementation RedNaviMTLComputePipelineState
@@ -697,11 +919,15 @@ static NSMutableArray *rn_batch_keep(void) { static NSMutableArray *k; static di
 // A texture of zeros for a texture argument with nothing behind it, by the translator's dimension (rn_air_binding.dim): 3D 1 x 1 x 2, a 2D array of one slice, otherwise 2D 1 x 1.
 // Made once each; they are never written.
 static rn_vk_image *rn_null_image(unsigned dim) {
-    static rn_vk_image *img[3];
+    static rn_vk_image *img[4];
     static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
-    const int k = dim == 2 ? 1 : dim == 9 ? 2 : 0;
+    const int k = (dim & RN_AIR_DIM_MS) ? 3 : dim == 2 ? 1 : dim == 9 ? 2 : 0;   // 3: a texture2d_ms, 1 x 1 with the lowest sample count above one that the card has
     os_unfair_lock_lock(&lock);
-    if (!img[k]) { rn_vk *vk = rn_vk_shared(); img[k] = vk ? rn_vk_image_create_layers(vk, RN_VK_RGBA8, 1, 1, k == 1 ? 2 : 1, k == 2) : NULL; }
+    if (!img[k]) {
+        rn_vk *vk = rn_vk_shared();
+        if (vk && k == 3) { uint32_t n = 2; while (n <= 64 && !(rn_vk_sample_counts(vk) & n)) n <<= 1; img[k] = n <= 64 ? rn_vk_image_create_ms(vk, RN_VK_RGBA8, 1, 1, n) : NULL; }
+        else img[k] = vk ? rn_vk_image_create_layers(vk, RN_VK_RGBA8, 1, 1, k == 1 ? 2 : 1, k == 2) : NULL;
+    }
     os_unfair_lock_unlock(&lock);
     return img[k];
 }
@@ -739,6 +965,10 @@ static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kin
         }
         case RN_VK_SAMPLED_IMAGE:
         case RN_VK_STORAGE_IMAGE:
+            // A texture2d_ms argument takes a multisample texture and any other texture argument a plain one: Vulkan's image type must match the shader's, and a mismatch is not
+            // checked by the card (undefined results). The draw is refused instead.
+            if (m < RN_MTL_SLOTS && texs[m] && texs[m]->img && (((kind[i] >> 8) & RN_AIR_DIM_MS) != 0) != (rn_vk_image_samples(texs[m]->img) > 1))
+                return [NSString stringWithFormat:@"texture at index %u has %u samples, the shader declares a %s texture", m, rn_vk_image_samples(texs[m]->img), ((kind[i] >> 8) & RN_AIR_DIM_MS) ? "multisample" : "single-sample"];
             if (m < RN_MTL_SLOTS && texs[m]) { rn_vk_image *dv = rn_display_vram_peek((__bridge void *)texs[m]); av[i].image = dv ? dv : texs[m]->img; if (rn_diag && getenv("RN_EXP_NULL_F0") && m == 0 && (kind[i] & 0xff) == RN_VK_SAMPLED_IMAGE && texs[m]->w == 256) { static rn_vk_image *z; if (!z) z = rn_vk_image_create(rn_vk_shared(), RN_VK_BGRA8, 256, 256); av[i].image = z; } break; }
             // Nothing bound: AppleMetalOpenGLRenderer leaves a texture unit of its fixed-function shaders unbound when no GL texture is there (2026-11-21); Metal does not check it.
             // A sampled image gets a texture of zeros of the shader's dimension.
@@ -877,8 +1107,10 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     unsigned nt;
     int tfmt[8];
     int dfmt;                                        // RN_VK_D16, D32 or D32S8 when the pipeline has a depth or stencil attachment
+    unsigned samples;                                // rasterSampleCount (1: plain targets)
     rn_vk_blend blend[8];
     NSString *names[2];                              // vertex and fragment function names (for logs)
+    uint32_t spvHash[2];                             // FNV-1a of each stage's SPIR-V: names a module in logs (the files of RN_DUMP_SPV, the report of a failed batch)
     NSString *variant[2];                            // per stage: the function constants it was specialised with and the kinds of its bindings (pass dumps)
     unsigned nvattr, nvlayout;
     rn_vk_vattr vattr[16];
@@ -913,7 +1145,7 @@ static unsigned rn_vk_write_mask(MTLColorWriteMask m) {
     memset(&d, 0, sizeof(d));
     d.vs = spv[0].bytes; d.vs_bytes = spv[0].length; d.fs = spv[1].bytes; d.fs_bytes = spv[1].length;
     d.nvbind = n[0]; d.vbinds = binds[0]; d.nfbind = n[1]; d.fbinds = binds[1];
-    d.depth_format = dfmt; d.ntargets = nt; d.topology = prim; d.cull_mode = cull; d.front_clockwise = cw;
+    d.depth_format = dfmt; d.samples = samples; d.ntargets = nt; d.topology = prim; d.cull_mode = cull; d.front_clockwise = cw;
     for (unsigned i = 0; i < nt; i++) { d.target_formats[i] = tfmt[i]; d.blend[i] = blend[i]; }
     d.nvattr = nvattr; d.vattrs = vattr; d.nvlayout = nvlayout; d.vlayouts = vlayout;
     byKey[key] = rn_vk_render_create(vk, &d);
@@ -1000,6 +1232,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 @interface RNRenderPass : NSObject {
 @public
     RedNaviMTLTexture *tex[8];
+    RedNaviMTLTexture *resolve[8];                   // multisample resolve target of each colour attachment (resolved into on the card after the pass)
     BOOL clear[8], store[8];
     float clearColor[8][4];
     unsigned nt;
@@ -1018,6 +1251,7 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 @interface RedNaviMTLComputeCommandEncoder : NSObject {
     RedNaviMTLCommandBuffer *cb;
     RedNaviMTLComputePipelineState *pso;
+    uint32_t tgLen[RN_TG_SLOTS];                // -setThreadgroupMemoryLength:atIndex:
     RedNaviMTLBuffer *bufs[RN_MTL_SLOTS];
     uint64_t offs[RN_MTL_SLOTS];
     NSData *bytesAt[RN_MTL_SLOTS];
@@ -1131,6 +1365,8 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     size_t scanW, scanH;                        // size of the surface scanSrc belongs to
     rn_vk_image *scanSrc;                       // the card's copy of the surface the last such pass finished: copied into the scanout when the command buffer ends
     BOOL ran;                                   // the body has started
+    uint32_t scanId, scanSlot;                  // the IOSurface the frame belongs to, and the display surface leased for it (staged frames)
+    BOOL scanStaged;                            // scanSlot holds a lease
     BOOL scanCopied;                            // the scanout copy was recorded in the batch
     BOOL handlersRun;                           // the completed handlers have been called
     BOOL useCounted;                            // rednavi-usecount: the surfaces of queuedTex had their use count raised at the commit
@@ -1180,7 +1416,11 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 - (void)setTexture:(id<MTLTexture>)texture atIndex:(NSUInteger)index {
     if (rn_slot_ok(index, "texture")) texs[index] = (RedNaviMTLTexture *)texture;
 }
-- (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index { rn_log("setThreadgroupMemoryLength: not implemented, ignored (kernels with threadgroup memory arguments are refused by the translator)"); }
+- (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index {
+    // the module holds each threadgroup buffer at a fixed length (the translator's default is 2048 bytes): the dispatch picks a pipeline built with the lengths set here (rn_pso_for_tg)
+    if (index < RN_TG_SLOTS) tgLen[index] = (uint32_t)length;
+    else rn_log("setThreadgroupMemoryLength: index %lu is past the %d slots kept", (unsigned long)index, RN_TG_SLOTS);
+}
 - (void)setTextures:(const id<MTLTexture> __unsafe_unretained [])textures withRange:(NSRange)range {
     for (NSUInteger i = 0; i < range.length; i++) [self setTexture:textures[i] atIndex:range.location + i];
 }
@@ -1194,7 +1434,26 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 - (void)record:(MTLSize)groups grid:(MTLSize)threads threads:(MTLSize)tpt {
     if (!pso) { rn_log("dispatch without a pipeline state"); return; }
     RNDispatch *d = [RNDispatch new];
-    d->pso = pso;
+    d->pso = pso->src && pso->ntg ? rn_pso_for_tg(pso, tgLen) : pso;   // the length set stays for later pipelines of the encoder, which need not use it
+    {   // once per kernel: where its buffers live (an atomic on host memory crosses PCIe), and threadgroup lengths a pipeline without variants cannot honour
+        static NSMutableSet *seen; static dispatch_once_t once; dispatch_once(&once, ^{ seen = [NSMutableSet set]; });
+        NSString *nm = pso->fname ? pso->fname : @"?";
+        BOOL first; @synchronized (seen) { first = ![seen containsObject:nm]; if (first) [seen addObject:nm]; }
+        if (first) {
+            NSMutableString *m = [NSMutableString string];
+            for (unsigned i = 0; i < RN_MTL_SLOTS; i++) {
+                RedNaviMTLBuffer *x = bufs[i];
+                if (!x) continue;
+                const BOOL inHeap = x->backing != nil;
+                const BOOL vram = inHeap ? rn_vk_buffer_is_vram(x->backing->b) : rn_vk_buffer_is_vram(x->b);
+                const BOOL devl = rn_vk_buffer_is_device(inHeap ? x->backing->b : x->b);
+                [m appendFormat:@" [%u] %lu bytes storage %lu%s %s", i, (unsigned long)x->len, (unsigned long)((x->options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift),
+                                inHeap ? " heap" : "", devl ? "device" : vram ? "vram" : x->userPtr ? "nocopy" : "host"];
+            }
+            for (unsigned i = 0; i < RN_TG_SLOTS; i++) if (tgLen[i]) [m appendFormat:@" threadgroup[%u] %u bytes%s (%u reported)", i, tgLen[i], !pso->ntg || d->pso->tgBuilt[i] == tgLen[i] ? "" : " NOT honoured", pso->ntg];
+            rn_log("kernel %s buffers:%s", nm.UTF8String, m.UTF8String);
+        }
+    }
     for (unsigned i = 0; i < RN_MTL_SLOTS; i++) { d->bufs[i] = bufs[i]; d->offs[i] = offs[i]; d->bytesAt[i] = bytesAt[i]; d->texs[i] = texs[i]; d->samps[i] = samps[i]; }
     memcpy(d->push, push, sizeof(push));
     d->pushLen = pushLen;
@@ -1226,7 +1485,8 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 // before its next use on the GPU). Textures are 2D with one level, so slices and levels other than 0 are errors.
 @interface RNBlit : NSObject {
 @public
-    int kind;                                        // 0 buffer to texture, 1 texture to buffer, 2 texture to texture, 3 buffer to buffer, 4 fill
+    int kind;                                        // 0 buffer to texture, 1 texture to buffer, 2 texture to texture, 3 buffer to buffer, 4 fill, 5 generate mipmaps (dt)
+    NSUInteger slevel, dlevel;                       // mipmap levels of the source and destination textures
     RedNaviMTLBuffer *sb, *db;
     RedNaviMTLTexture *st, *dt;
     NSUInteger soff, doff, sbpr, dbpr, size;
@@ -1247,22 +1507,40 @@ static NSString *rn_run_blit(RNBlit *b) {
         RedNaviMTLTexture *t = b->kind == 0 ? b->dt : b->st;
         RedNaviMTLBuffer *bf = b->kind == 0 ? b->sb : b->db;
         const MTLOrigin o = b->kind == 0 ? b->dorg : b->so;
-        const NSUInteger bpr = b->kind == 0 ? b->sbpr : b->dbpr, off = b->kind == 0 ? b->soff : b->doff;
+        const NSUInteger bpr = b->kind == 0 ? b->sbpr : b->dbpr, off = b->kind == 0 ? b->soff : b->doff, lv = b->kind == 0 ? b->dlevel : b->slevel;
         if (!t || !bf) {
             static int said; if (said < 40) { said++; rn_log("blit kind %d failed: texture %p (alen %lu, %lux%lu fmt %lu type %ld), buffer %p, region %lux%lu at (%lu,%lu), bpr %lu", b->kind, (__bridge void *)t, t ? (unsigned long)t->alen : 0ul, t ? (unsigned long)t->w : 0ul, t ? (unsigned long)t->h : 0ul, t ? (unsigned long)t->pf : 0ul, t ? (long)t->ttype : -1l, (__bridge void *)bf, (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)o.x, (unsigned long)o.y, (unsigned long)bpr); }
             return @"blit: a texture or buffer is missing";
         }
-        if (rn_diag && getenv("RN_LOG_ARRAYS") && t->ttype == MTLTextureType2DArray) rn_log("blit kind %d: 2D array %lux%lux%lu, region %lux%lux%lu at (%lu,%lu,%lu), buffer %p offset %lu bpr %lu, first bytes %08x", b->kind, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)t->d, (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)b->sz.depth, (unsigned long)o.x, (unsigned long)o.y, (unsigned long)o.z, (__bridge void *)bf, (unsigned long)off, (unsigned long)bpr, *(const uint32_t *)((const uint8_t *)rn_vk_buffer_contents(bf->b) + off + 6 * bpr + 8));
-        if (o.z || b->sz.depth > 1 || o.x + b->sz.width > t->w || o.y + b->sz.height > rn_tex_rows(t)) return @"blit: the region is outside the texture";
+        if (rn_diag && getenv("RN_LOG_ARRAYS") && t->ttype == MTLTextureType2DArray && rn_bufp(bf->b, 0)) rn_log("blit kind %d: 2D array %lux%lux%lu, region %lux%lux%lu at (%lu,%lu,%lu), buffer %p offset %lu bpr %lu, first bytes %08x", b->kind, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)t->d, (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)b->sz.depth, (unsigned long)o.x, (unsigned long)o.y, (unsigned long)o.z, (__bridge void *)bf, (unsigned long)off, (unsigned long)bpr, *(const uint32_t *)((const uint8_t *)rn_vk_buffer_contents(bf->b) + off + 6 * bpr + 8));
+        if (lv >= (t->levels_ ? t->levels_ : 1)) return @"blit: the mipmap level is not in the texture";
+        if (o.z || b->sz.depth > 1 || o.x + b->sz.width > rn_lvl(t->w, lv) || o.y + b->sz.height > (lv ? rn_lvl(t->h, lv) * (RN_LAYERED(t->ttype) ? t->d : 1) : rn_tex_rows(t))) return @"blit: the region is outside the texture";
         if (!b->sz.width || !b->sz.height) return nil;
         if (bpr < b->sz.width * t->texel) return @"blit: bytesPerRow is smaller than a row of the region";
         if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
-        rn_vk_image *card = b->kind == 1 ? rn_display_vram_peek((__bridge void *)t) : NULL;      // reading a scanout surface: its pixels are in the card's copy
-        uint8_t *tex = rn_vk_image_staging(card ? card : t->img), *buf = (uint8_t *)rn_vk_buffer_contents(bf->b) + off;
-        const size_t tpitch = rn_vk_image_row_bytes(card ? card : t->img);
+        rn_vk_image *card = b->kind == 1 && !lv ? rn_display_vram_peek((__bridge void *)t) : NULL;      // reading a scanout surface: its pixels are in the card's copy
+        size_t tpitch;
+        // A buffer in VRAM the CPU cannot map (Private): the rows go through a host buffer, copied from it on the card before (to a texture) or into it after (from a texture).
+        const size_t span = (b->sz.height - 1) * bpr + b->sz.width * t->texel;
+        rn_vk_buffer *stage = NULL;
+        uint8_t *buf = (uint8_t *)rn_vk_buffer_contents(bf->b);
+        if (buf) buf += off;
+        else {
+            rn_vk *svk = rn_vk_shared();
+            if (!svk || !(stage = rn_vk_buffer_create(svk, span))) return @"blit: no host memory to stage a copy with a Private buffer";
+            if (b->kind == 0 && rn_vk_buffer_copy(svk, bf->b, off, stage, 0, span)) { rn_vk_buffer_destroy(svk, stage); return @"blit: reading the Private buffer on the card failed"; }
+            buf = (uint8_t *)rn_vk_buffer_contents(stage);
+        }
+        uint8_t *tex = rn_level_host(t, card ? card : t->img, lv, &tpitch);
         for (NSUInteger y = 0; y < b->sz.height; y++) {
             uint8_t *tp = tex + (o.y + y) * tpitch + o.x * t->texel, *bp = buf + y * bpr;
             if (b->kind == 0) memcpy(tp, bp, b->sz.width * t->texel); else memcpy(bp, tp, b->sz.width * t->texel);
+        }
+        if (stage) {
+            rn_vk *svk = rn_vk_shared();
+            const int rc = b->kind == 1 ? rn_vk_buffer_copy(svk, stage, 0, bf->b, off, span) : 0;
+            rn_vk_buffer_destroy(svk, stage);
+            if (rc) return @"blit: writing the Private buffer on the card failed";
         }
         if (b->kind == 0) { rn_vk_image_host_wrote(t->img); rn_display_host_write_note((__bridge void *)t, "a blit from a buffer"); }
         return nil;
@@ -1271,6 +1549,18 @@ static NSString *rn_run_blit(RNBlit *b) {
         RedNaviMTLTexture *s2 = b->st, *d2 = b->dt;
         if (!s2 || !d2) return @"blit: a texture is missing";
         if (s2->texel != d2->texel) return @"blit: the textures have different texel sizes";
+        if (b->slevel || b->dlevel) {        // between mipmap levels: on the host copies
+            if (b->slevel >= (s2->levels_ ? s2->levels_ : 1) || b->dlevel >= (d2->levels_ ? d2->levels_ : 1)) return @"blit: a mipmap level is not in the texture";
+            const NSUInteger srows = rn_lvl(s2->h, b->slevel) * (RN_LAYERED(s2->ttype) ? s2->d : 1), drows = rn_lvl(d2->h, b->dlevel) * (RN_LAYERED(d2->ttype) ? d2->d : 1);
+            if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > rn_lvl(s2->w, b->slevel) || b->so.y + b->sz.height > srows || b->dorg.x + b->sz.width > rn_lvl(d2->w, b->dlevel) || b->dorg.y + b->sz.height > drows)
+                return @"blit: the region is outside a texture level";
+            size_t spitch, dpitch;
+            const uint8_t *sp = rn_level_host(s2, s2->img, b->slevel, &spitch);
+            uint8_t *dp = rn_level_host(d2, d2->img, b->dlevel, &dpitch);
+            for (NSUInteger y = 0; y < b->sz.height; y++) memmove(dp + (b->dorg.y + y) * dpitch + b->dorg.x * d2->texel, sp + (b->so.y + y) * spitch + b->so.x * s2->texel, b->sz.width * s2->texel);
+            rn_vk_image_host_wrote(d2->img);
+            return nil;
+        }
         if (b->so.z || b->dorg.z || b->sz.depth > 1 || b->so.x + b->sz.width > s2->w || b->so.y + b->sz.height > rn_tex_rows(s2) || b->dorg.x + b->sz.width > d2->w || b->dorg.y + b->sz.height > rn_tex_rows(d2))
             return @"blit: the region is outside a texture";
         {   // A CoreDisplay scanout surface lives on the card (direct scanout renders into its VRAM copy): a copy into it, or out of it into a surface the CPU reads, is done there. A memmove on the
@@ -1298,14 +1588,44 @@ static NSString *rn_run_blit(RNBlit *b) {
         rn_display_host_write_note((__bridge void *)d2, "a blit on the host");
         return nil;
     }
+    case 5: {
+        rn_vk *gvk = rn_vk_shared();
+        if (!b->dt || !b->dt->img || !gvk) return @"generateMipmaps: not a texture with an image";
+        return rn_vk_image_gen_mips(gvk, b->dt->img) ? @"generateMipmaps failed on the card" : nil;
+    }
     case 3:
         if (!b->sb || !b->db || b->soff + b->size > b->sb->len || b->doff + b->size > b->db->len) return @"blit: a buffer range is outside its buffer";
-        memmove((uint8_t *)rn_vk_buffer_contents(b->db->b) + b->doff, (uint8_t *)rn_vk_buffer_contents(b->sb->b) + b->soff, b->size);
-        return nil;
+        {
+            uint8_t *dp = (uint8_t *)rn_vk_buffer_contents(b->db->b), *sp = (uint8_t *)rn_vk_buffer_contents(b->sb->b);
+            if (dp && sp) { memmove(dp + b->doff, sp + b->soff, b->size); return nil; }
+            // a Private buffer on either side: the copy is made on the card (overlapping ranges of one buffer through a host buffer, vkCmdCopyBuffer does not allow them)
+            rn_vk *cvk = rn_vk_shared();
+            if (!cvk) return @"blit: no device";
+            if (b->sb->b == b->db->b && b->soff < b->doff + b->size && b->doff < b->soff + b->size) {
+                rn_vk_buffer *t = rn_vk_buffer_create(cvk, b->size);
+                if (!t) return @"blit: no host memory to stage an overlapping copy";
+                const int rc = rn_vk_buffer_copy(cvk, b->sb->b, b->soff, t, 0, b->size) || rn_vk_buffer_copy(cvk, t, 0, b->db->b, b->doff, b->size);
+                rn_vk_buffer_destroy(cvk, t);
+                return rc ? @"blit: the copy on the card failed" : nil;
+            }
+            return rn_vk_buffer_copy(cvk, b->sb->b, b->soff, b->db->b, b->doff, b->size) ? @"blit: the copy on the card failed" : nil;
+        }
     case 4:
         if (!b->db || b->doff + b->size > b->db->len) return @"fillBuffer: the range is outside the buffer";
-        memset((uint8_t *)rn_vk_buffer_contents(b->db->b) + b->doff, b->value, b->size);
-        return nil;
+        {
+            uint8_t *dp = (uint8_t *)rn_vk_buffer_contents(b->db->b);
+            if (dp) { memset(dp + b->doff, b->value, b->size); return nil; }
+            rn_vk *fvk = rn_vk_shared();
+            if (!fvk) return @"fillBuffer: no device";
+            const uint32_t pat = (uint32_t)(uint8_t)b->value * 0x01010101u;
+            if (!((b->doff | b->size) & 3)) return rn_vk_buffer_fill(fvk, b->db->b, b->doff, b->size, pat) ? @"fillBuffer: the fill on the card failed" : nil;
+            rn_vk_buffer *t = rn_vk_buffer_create(fvk, b->size);         // a range that is not a multiple of 4 bytes: filled in host memory and copied
+            if (!t) return @"fillBuffer: no host memory to stage the fill";
+            memset(rn_vk_buffer_contents(t), b->value, b->size);
+            const int rc = rn_vk_buffer_copy(fvk, t, 0, b->db->b, b->doff, b->size);
+            rn_vk_buffer_destroy(fvk, t);
+            return rc ? @"fillBuffer: the copy on the card failed" : nil;
+        }
     }
     return @"blit: unknown operation";
 }
@@ -1333,8 +1653,8 @@ static NSString *rn_run_blit(RNBlit *b) {
       destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin {
     RNBlit *b = [self add:0];
     b->sb = (RedNaviMTLBuffer *)buf; b->soff = so; b->sbpr = bpr; b->dt = (RedNaviMTLTexture *)tex; b->dorg = origin; b->sz = size;
-    if (level) { b->dt = nil; rn_log("blit buffer->texture: level %lu asked, slice %lu", (unsigned long)level, (unsigned long)slice); }                           // reported as an error at commit
-    else if (slice) { if (!rn_slice_rows(b->dt, slice, &b->dorg)) b->dt = nil; }   // a slice of a 1D array is a row of the image, one of a 2D array h rows
+    b->dlevel = level;
+    if (slice) { if (!rn_slice_rows_l(b->dt, slice, level, &b->dorg)) b->dt = nil; }   // a slice of a 1D array is a row of the image, one of a 2D array h rows (of the level)
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)buf sourceOffset:(NSUInteger)so sourceBytesPerRow:(NSUInteger)bpr sourceBytesPerImage:(NSUInteger)bpi sourceSize:(MTLSize)size toTexture:(id<MTLTexture>)tex
       destinationSlice:(NSUInteger)slice destinationLevel:(NSUInteger)level destinationOrigin:(MTLOrigin)origin options:(MTLBlitOption)options {
@@ -1344,8 +1664,8 @@ static NSString *rn_run_blit(RNBlit *b) {
       destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi {
     RNBlit *b = [self add:1];
     b->st = (RedNaviMTLTexture *)tex; b->so = origin; b->sz = size; b->db = (RedNaviMTLBuffer *)buf; b->doff = doff; b->dbpr = bpr;
-    if (level) b->st = nil;
-    else if (slice) { if (!rn_slice_rows(b->st, slice, &b->so)) b->st = nil; }
+    b->slevel = level;
+    if (slice) { if (!rn_slice_rows_l(b->st, slice, level, &b->so)) b->st = nil; }
 }
 - (void)copyFromTexture:(id<MTLTexture>)tex sourceSlice:(NSUInteger)slice sourceLevel:(NSUInteger)level sourceOrigin:(MTLOrigin)origin sourceSize:(MTLSize)size toBuffer:(id<MTLBuffer>)buf
       destinationOffset:(NSUInteger)doff destinationBytesPerRow:(NSUInteger)bpr destinationBytesPerImage:(NSUInteger)bpi options:(MTLBlitOption)options {
@@ -1355,18 +1675,20 @@ static NSString *rn_run_blit(RNBlit *b) {
        destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl destinationOrigin:(MTLOrigin)dorg {
     RNBlit *b = [self add:2];
     b->st = (RedNaviMTLTexture *)src; b->so = so; b->sz = size; b->dt = (RedNaviMTLTexture *)dst; b->dorg = dorg;
-    if (sl || dl) b->dt = nil;
-    else {
-        if (ss && !rn_slice_rows(b->st, ss, &b->so)) b->dt = nil;
-        if (ds && !rn_slice_rows(b->dt, ds, &b->dorg)) b->dt = nil;
-    }
+    b->slevel = sl; b->dlevel = dl;
+    if (ss && !rn_slice_rows_l(b->st, ss, sl, &b->so)) b->dt = nil;
+    if (ds && !rn_slice_rows_l(b->dt, ds, dl, &b->dorg)) b->dt = nil;
 }
 - (void)copyFromTexture:(id<MTLTexture>)src toTexture:(id<MTLTexture>)dst {
     [self copyFromTexture:src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(src.width, src.height, 1) toTexture:dst destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
 }
 - (void)copyFromTexture:(id<MTLTexture>)src sourceSlice:(NSUInteger)ss sourceLevel:(NSUInteger)sl toTexture:(id<MTLTexture>)dst destinationSlice:(NSUInteger)ds destinationLevel:(NSUInteger)dl sliceCount:(NSUInteger)n levelCount:(NSUInteger)lc {
-    if (ss || sl || ds || dl || n != 1 || lc != 1) { RNBlit *b = [self add:2]; b->st = nil; return; }
-    [self copyFromTexture:src toTexture:dst];
+    if (!n || !lc) return;
+    for (NSUInteger l = 0; l < lc; l++)
+        for (NSUInteger i = 0; i < n; i++) {
+            const NSUInteger lw = rn_lvl(src.width, sl + l), lh = rn_lvl(src.height, sl + l);
+            [self copyFromTexture:src sourceSlice:ss + i sourceLevel:sl + l sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(lw, lh, 1) toTexture:dst destinationSlice:ds + i destinationLevel:dl + l destinationOrigin:MTLOriginMake(0, 0, 0)];
+        }
 }
 - (void)copyFromBuffer:(id<MTLBuffer>)src sourceOffset:(NSUInteger)so toBuffer:(id<MTLBuffer>)dst destinationOffset:(NSUInteger)doff size:(NSUInteger)size {
     RNBlit *b = [self add:3];
@@ -1376,9 +1698,15 @@ static NSString *rn_run_blit(RNBlit *b) {
     RNBlit *b = [self add:4];
     b->db = (RedNaviMTLBuffer *)buf; b->doff = range.location; b->size = range.length; b->value = value;
 }
-// nothing to do: there are no mipmap levels, and host and device copies are kept in step by the command buffer
-- (void)generateMipmapsForTexture:(id<MTLTexture>)texture {}
-- (void)synchronizeResource:(id<MTLResource>)resource {}
+// on the card, in order with the passes of the command buffer (rn_vk_image_gen_mips); a texture with one level has nothing to do
+- (void)generateMipmapsForTexture:(id<MTLTexture>)texture {
+    if (![texture isKindOfClass:[RedNaviMTLTexture class]] || texture.mipmapLevelCount < 2) return;
+    RNBlit *b = [self add:5];
+    b->dt = (RedNaviMTLTexture *)texture;
+}
+- (void)synchronizeResource:(id<MTLResource>)resource {      // a Managed buffer in VRAM: its CPU copy is read back on the next contents (after the command buffer, when the caller looks)
+    if ([(id)resource isKindOfClass:[RedNaviMTLBuffer class]]) { RedNaviMTLBuffer *x = (RedNaviMTLBuffer *)resource; if (x->managedDev_) x->shadowStale_ = YES; }
+}
 - (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture {}
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
@@ -1485,19 +1813,19 @@ static NSString *rn_run_blit(RNBlit *b) {
         for (NSMutableDictionary *sn in snaps) {
             RedNaviMTLBuffer *sb = sn[@"buf"];
             if (!sb || !sb->b) continue;
-            NSData *old = sn[@"data"]; const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(sb->b) + [sn[@"off"] unsignedLongValue];
-            if (memcmp(bp, old.bytes, old.length)) {
+            NSData *old = sn[@"data"]; const uint8_t *bp = rn_bufp(sb->b, [sn[@"off"] unsignedLongValue]);
+            if (bp && memcmp(bp, old.bytes, old.length)) {
                 rn_log("  REWRITTEN: draw #%u's vertex data (buffer %p offset %lu) changed before draw #%u was encoded", [sn[@"n"] unsignedIntValue], sb, [sn[@"off"] unsignedLongValue], drawNo);
                 sn[@"data"] = [NSData dataWithBytes:bp length:old.length];
             }
         }
-        if (d->bufs[0][1]) [snaps addObject:[@{@"buf": d->bufs[0][1], @"off": @(d->offs[0][1]), @"n": @(drawNo), @"data": [NSData dataWithBytes:(const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1] length:96]} mutableCopy]];
+        if (d->bufs[0][1] && rn_bufp(d->bufs[0][1]->b, 0)) [snaps addObject:[@{@"buf": d->bufs[0][1], @"off": @(d->offs[0][1]), @"n": @(drawNo), @"data": [NSData dataWithBytes:(const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1] length:96]} mutableCopy]];
         drawNo++;
         char bl[400] = ""; int o2 = 0;
         for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) { if (d->bufs[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=%p+%lu", st ? 'f' : 'v', i, d->bufs[st][i], (unsigned long)d->offs[st][i]); else if (d->bytesAt[st][i] && o2 < 360) o2 += snprintf(bl + o2, sizeof(bl) - o2, " %c%d=bytes(%lu)", st ? 'f' : 'v', i, (unsigned long)d->bytesAt[st][i].length); }
         rn_log("  encode: draw #%u binds:%s", drawNo - 1, bl);
     }
-    if ((rn_diag && getenv("RN_LOG_BUFFERS")) && d->bufs[0][1]) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
+    if ((rn_diag && getenv("RN_LOG_BUFFERS")) && d->bufs[0][1] && rn_bufp(d->bufs[0][1]->b, 0)) {                // the same bytes as at run time, to tell whether the arena is rewritten in between
         const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(d->bufs[0][1]->b) + d->offs[0][1];
         char hx[100] = ""; for (int j = 0; j < 32; j++) snprintf(hx + 2 * j, 4, "%02x", bp[j]);
         rn_log("  encode: draw %lu of the pass, v buffer 1 %p offset %lu: %s", (unsigned long)pass->draws.count, d->bufs[0][1], (unsigned long)d->offs[0][1], hx);
@@ -1570,6 +1898,8 @@ static void rn_commit_stats(uint64_t ticks) {
         { uint64_t is[3]; for (int i = 0; i < 3; i++) is[i] = __atomic_exchange_n(&rn_vk_imgstat[i], 0, __ATOMIC_RELAXED);
           rn_log("images: %llu reused from the pool, %llu made, %llu kept on free", is[0], is[1], is[2]); }
         rn_log("frames: %llu reached the scanout in 5 s, longest gap %.1f ms, %llu gaps over 12 ms, %llu render passes, %llu from the same surface as the frame before (%llu of them within 4 ms)", (unsigned long long)atomic_exchange(&g_frames, 0), (double)atomic_exchange(&g_framegapmax, 0) / 1e6, (unsigned long long)atomic_exchange(&g_framelong, 0), (unsigned long long)atomic_exchange(&g_passes, 0), (unsigned long long)atomic_exchange(&g_framesame, 0), (unsigned long long)atomic_exchange(&g_framesamefast, 0));
+        rn_log("heaps: %ld with memory alive (%ld MB), buffers %ld MB in all; in 5 s %ld buffers placed, %ld made aliasable, %ld that did not fit", (long)g_hb_live, (long)g_hb_bytes >> 20,
+               (long)g_proc_buf_bytes >> 20, (long)atomic_exchange(&g_hb_new, 0), (long)atomic_exchange(&g_hb_alias, 0), (long)atomic_exchange(&g_hb_reuse, 0));
         rn_log("commit: %llu command buffers in 5 s, %.2f ms each on average, %.2f ms at worst; textures alive %ld (%lu MB), made so far %ld", count, (double)sum * tb.numer / tb.denom / 1e6 / count, (double)worst * tb.numer / tb.denom / 1e6, (long)g_tex_live, (unsigned long)g_tex_bytes >> 20, (long)g_tex_made);
         sum = worst = count = 0; since = now;
         rn_sites_report();
@@ -1754,7 +2084,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                         hdr[10] = nb; fwrite(hdr, 4, 12, bf);
                         for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                             const uint8_t *bp = NULL; NSUInteger len = 0;
-                            if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                            if (d->bufs[st][i]) { bp = rn_bufp(d->bufs[st][i]->b, d->offs[st][i]); len = d->bufs[st][i]->len - d->offs[st][i]; }
                             else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
                             if (!bp) continue;
                             if (len > 32768) len = 32768;
@@ -1779,7 +2109,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                             if (d->indexBuf && d->indexOffset + ilen > d->indexBuf->len) ilen = d->indexBuf->len > d->indexOffset ? d->indexBuf->len - d->indexOffset : 0;
                             if (ilen > 65536) ilen = 65536;
                             ix[4] = (uint32_t)ilen; fwrite(ix, 4, 5, bf);
-                            if (ilen) fwrite(rn_vk_buffer_contents(d->indexBuf->b) + d->indexOffset, 1, ilen, bf);
+                            if (ilen && rn_bufp(d->indexBuf->b, 0)) fwrite(rn_bufp(d->indexBuf->b, d->indexOffset), 1, ilen, bf);
                         }
                         fclose(bf); chmod(bpath, 0644);
                     }
@@ -1809,7 +2139,7 @@ static void rn_passdump(RNRenderPass *rp, rn_vk_image *img, NSUInteger nd) {
                     // the first six draws are dumped in full (the six vertices of a quad with their stride), the others as 16 floats
                     for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                         const uint8_t *bp = NULL; NSUInteger len = 0;
-                        if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                        if (d->bufs[st][i]) { bp = rn_bufp(d->bufs[st][i]->b, d->offs[st][i]); len = d->bufs[st][i]->len - d->offs[st][i]; }
                         else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
                         if (!bp) continue;
                         fprintf(df, "      %c%d %s %lu bytes:", st ? 'f' : 'v', i, d->bufs[st][i] ? "buffer" : "bytes", (unsigned long)len);
@@ -2107,6 +2437,8 @@ static rn_vk_image *rn_vram_as(rn_vk *vk, rn_vk_image *base, MTLPixelFormat pf) 
     g_vviews[g_vviewn++] = (RNVramView){base, v, pf};
     return v;
 }
+// The card copy of the frame the display shows now (staged frames: display surface 0 is not kept up to date, the display scans the leased surfaces). A new ring surface starts from it.
+static rn_vk_image *g_last_shown;
 static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL create) {
     static NSMutableDictionary<NSNumber *, NSValue *> *cache; static NSMutableArray<NSNumber *> *order;
     if (!rt->surf) return NULL;
@@ -2121,10 +2453,10 @@ static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL c
         if (!create) return NULL;
         rn_vk_image *img = rn_vk_image_create(vk, rn_vk_format_of(rt->pf), (uint32_t)rt->w, (uint32_t)rt->h);
         if (!img) return NULL;
-        if (order.count >= 16) { rn_vram_views_drop(vk, (rn_vk_image *)cache[order[0]].pointerValue); rn_vk_image_destroy(vk, (rn_vk_image *)cache[order[0]].pointerValue); [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
+        if (order.count >= 16) { if ((rn_vk_image *)cache[order[0]].pointerValue == g_last_shown) g_last_shown = NULL; rn_vram_views_drop(vk, (rn_vk_image *)cache[order[0]].pointerValue); rn_vk_image_destroy(vk, (rn_vk_image *)cache[order[0]].pointerValue); [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
         cache[key] = [NSValue valueWithPointer:img]; [order addObject:key];
         // A new ring surface starts with whatever the card's memory held, and CoreDisplay draws only what changed into it: the picture on the screen is its best starting point.
-        rn_vk_image *shown = rn_scanout_image(vk, rt->w, rt->h);
+        rn_vk_image *shown = g_last_shown ? g_last_shown : rn_scanout_image(vk, rt->w, rt->h);
         if (shown && rn_vk_image_copy(vk, shown, img) != 0) rn_log("direct scanout: the card copy for IOSurface %u could not be filled from the scanout", (unsigned)IOSurfaceGetID(rt->surf));
         {   // Experiment switch /Users/Shared/rednavi-magenta: a new ring surface starts as bright magenta instead of the picture on the screen, so that tiles CoreDisplay never draws show up.
             static int mag = -1;
@@ -2157,10 +2489,41 @@ static void rn_display_host_write_note(void *tp, const char *how) {
     if (n < 20 || n % 1000 == 0) rn_log("direct scanout: %s writes the host image of scanout IOSurface %u, the card copy does not get it (%u such writes so far)", how, rt->surf ? (unsigned)IOSurfaceGetID(rt->surf) : 0u, n + 1);
 }
 static void rn_frame_done(void);
+// Staged frames (rn_uapi.h RN_PRESENT_LEASE): the finished frame goes into a display surface the display is not scanning (leased from the kext for that IOSurface) and the kext flips
+// to it when WindowServer shows the IOSurface, so a frame that CoreDisplay builds from several command buffers is never on the screen half done, and a surface being written is
+// never scanned. Used when the display has three surfaces; /Users/Shared/rednavi-nostage copies into surface 0 as before.
+static int (*g_present)(uint32_t, int); static pthread_mutex_t g_stage_mu = PTHREAD_MUTEX_INITIALIZER;
+static void rn_stage_id(uint32_t id) { static uint32_t last = ~0u; if (id != last) { g_present(0xFFFD0000u | (id & 0xFFFF), 0); g_present(0xFFFC0000u | (id >> 16), 0); last = id; } }
+static int rn_stage_commit(uint32_t id, uint32_t slot) { pthread_mutex_lock(&g_stage_mu); rn_stage_id(id); int r = g_present(0xFFFF0100u | slot, 0); pthread_mutex_unlock(&g_stage_mu); return r; }
+static rn_vk_image *rn_stage_lease(rn_vk *vk, uint32_t id, size_t w, size_t h, uint32_t *slot) {
+    static rn_vk_image *img[3]; static dispatch_once_t once; static int ok; static size_t sw, sh;
+    dispatch_once(&once, ^{
+        if (access("/Users/Shared/rednavi-nostage", F_OK) == 0) { rn_log("direct scanout: staged frames turned off by /Users/Shared/rednavi-nostage"); return; }
+        g_present = rn_vk_symbol(vk, "rn_bridge_present");
+        int (*scan)(uint32_t, uint32_t *, uint32_t *, uint32_t *, void **, size_t *) = rn_vk_symbol(vk, "rn_bridge_scanout");
+        const int fmt = rn_vk_format_of(MTLPixelFormatBGRA8Unorm);
+        if (!g_present || !scan || !fmt) { rn_log("direct scanout: staged frames not available (no rn_bridge_present)"); return; }
+        for (int i = 0; i < 3; i++) {
+            uint32_t bw = 0, bh = 0, bp = 0; void *cpu = NULL; size_t len = 0;
+            if (scan(i, &bw, &bh, &bp, &cpu, &len) || !cpu || bp != bw * 4) { rn_log("direct scanout: display surface %d not available for staging", i); return; }
+            img[i] = rn_vk_image_from_host(vk, fmt, bw, bh, cpu, bp, len);
+            if (!img[i]) { rn_log("direct scanout: display surface %d cannot be used as an image", i); return; }
+            sw = bw; sh = bh;
+        }
+        ok = 1; rn_log("direct scanout: staged frames over 3 display surfaces (%zux%zu)", sw, sh);
+    });
+    if (!ok || w != sw || h != sh || !id) return NULL;
+    pthread_mutex_lock(&g_stage_mu); rn_stage_id(id);
+    int sf = g_present(0xFFFF0200u, 0);        // the status of the answer is the display surface leased (negative: an error)
+    pthread_mutex_unlock(&g_stage_mu);
+    if (sf < 0 || sf > 2) return NULL;
+    *slot = (uint32_t)sf;
+    return img[sf];
+}
 static void rn_scan_dump(rn_vk_image *src, size_t w, size_t h);
 // A frame of the compositor can be spread over more than one command buffer into the same ring surface (measured: 40% of the copies came from the surface of the copy before, all
 // within 4 ms), and a copy after the first of them shows an unfinished picture. The copy into the scanout therefore waits: it is made when a command buffer draws into another
-// surface, or when nothing more was drawn into this one for 3 ms. /Users/Shared/rednavi-nodefer keeps the copy at the end of every command buffer.
+// surface, or when nothing more was drawn into this one for RN_DEFER_MS (12 ms). /Users/Shared/rednavi-nodefer keeps the copy at the end of every command buffer.
 static int rn_defer_on(void) { static int v = -1; if (v < 0) v = access("/Users/Shared/rednavi-nodefer", F_OK) != 0; return v; }
 static os_unfair_lock g_defer_lock = OS_UNFAIR_LOCK_INIT;
 static rn_vk_image *g_defer_src; static size_t g_defer_w, g_defer_h; static uint64_t g_defer_gen;
@@ -2169,6 +2532,12 @@ static void rn_defer_copy(rn_vk_image *src, size_t w, size_t h) {
     rn_vk_image *scan = rn_scanout_image(vk, w, h);
     if (scan && rn_vk_image_copy(vk, src, scan) == 0) { rn_frame_note(src); rn_scan_dump(src, w, h); }
 }
+// How long a frame may rest before it is copied although nothing else was drawn: the Launchpad folder animation has command buffers 3 to 18 ms apart inside one frame, and a copy after 3 ms
+// showed half frames (flicker between the two pictures and a black top, 2026-11-22; the same animation was clean with direct scanout off). Not verified that 12 ms is enough.
+// While frames are changing surface (an animation) the wait is longer: a big folder has frames whose command buffers are further apart than 12 ms, and the next frame arriving on another
+// surface is what finishes this one anyway. After 100 ms without a change of surface a single frame waits only RN_DEFER_MS.
+#define RN_DEFER_MS 12
+#define RN_DEFER_ANIM_MS 60
 static void rn_defer_frame(rn_vk_image *src, size_t w, size_t h) {
     static dispatch_queue_t q; static dispatch_once_t once;
     dispatch_once(&once, ^{ q = dispatch_queue_create("rednavi.scanout", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)); });
@@ -2176,9 +2545,14 @@ static void rn_defer_frame(rn_vk_image *src, size_t w, size_t h) {
     rn_vk_image *old = g_defer_src != src ? g_defer_src : NULL; const size_t ow = g_defer_w, oh = g_defer_h;
     g_defer_src = src; g_defer_w = w; g_defer_h = h;
     const uint64_t gen = ++g_defer_gen;
+    static uint64_t lastSwitch; static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    const uint64_t nowAbs = mach_absolute_time();
+    const uint64_t sinceMs = lastSwitch ? (nowAbs - lastSwitch) * tb.numer / tb.denom / 1000000ull : ~0ull;
+    if (old) lastSwitch = nowAbs;
+    const uint64_t waitMs = sinceMs < 100 ? RN_DEFER_ANIM_MS : RN_DEFER_MS;
     os_unfair_lock_unlock(&g_defer_lock);
     if (old) rn_defer_copy(old, ow, oh);         // the surface before this one is finished
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_MSEC), q, ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)waitMs * NSEC_PER_MSEC), q, ^{
         os_unfair_lock_lock(&g_defer_lock);
         rn_vk_image *mine = g_defer_gen == gen ? g_defer_src : NULL; const size_t mw = g_defer_w, mh = g_defer_h;
         if (mine) g_defer_src = NULL;
@@ -2190,6 +2564,74 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     static int (*present)(uint32_t, int); static dispatch_once_t once;
     dispatch_once(&once, ^{ present = rn_vk_symbol(rn_vk_shared(), "rn_bridge_present"); });
     if (present) present(0xFFFF0001u, 0);
+}
+
+// Names of the functions that came from source libraries (rn_source_function). While there are any, each command buffer that uses one of them logs which before it
+// goes to the card and logs again when the card is done: after a hang of the GPU queue, the last command buffer without its "done" line names the shaders it ran.
+static NSMutableSet<NSString *> *g_srcnames;
+static NSString *rn_srclib_used(NSArray *records) {
+    NSMutableOrderedSet<NSString *> *used = nil;
+    @synchronized ([RNRenderPass class]) {
+        if (!g_srcnames.count) return nil;
+        for (id rec in records) {
+            if ([rec isKindOfClass:[RNRenderPass class]]) {
+                for (RNDraw *d in ((RNRenderPass *)rec)->draws) for (int k = 0; k < 2; k++) {
+                    NSString *n = d->pso ? d->pso->names[k] : nil;
+                    if (n && [g_srcnames containsObject:n]) { if (!used) used = [NSMutableOrderedSet new]; [used addObject:n]; }
+                }
+            } else if ([rec isKindOfClass:[RNDispatch class]]) {
+                NSString *n = ((RNDispatch *)rec)->pso ? ((RNDispatch *)rec)->pso->fname : nil;
+                if (n && [g_srcnames containsObject:n]) { if (!used) used = [NSMutableOrderedSet new]; [used addObject:n]; }
+            }
+        }
+    }
+    return used ? [used.array componentsJoinedByString:@" "] : nil;
+}
+
+// Debugging (RN_CB_TRACE): every record of a command buffer in order, kernels by name with their grid, blits by kind and size, render passes by draw count.
+static NSString *rn_records_desc(NSArray *records) {
+    NSMutableString *m = [NSMutableString string];
+    for (id rec in records) {
+        if ([rec isKindOfClass:[RNRenderPass class]]) [m appendFormat:@" pass(%lu draws)", (unsigned long)((RNRenderPass *)rec)->draws.count];
+        else if ([rec isKindOfClass:[RNDispatch class]]) { RNDispatch *d = rec; [m appendFormat:@" %@", d->pso && d->pso->fname ? d->pso->fname : @"?"]; }
+        else if ([rec isKindOfClass:[RNBlit class]]) {
+            RNBlit *b = rec;
+            static const char *kn[] = {"buf>tex", "tex>buf", "tex>tex", "buf>buf", "fill", "mips"};
+            [m appendFormat:@" blit:%s", b->kind >= 0 && b->kind < 6 ? kn[b->kind] : "?"];
+            if (b->kind == 3 || b->kind == 4) [m appendFormat:@"(%lu)", (unsigned long)b->size];
+            else if (b->st || b->dt) { RedNaviMTLTexture *t = b->dt ? b->dt : b->st; [m appendFormat:@"(%lux%lu fmt %lu)", (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)t.pixelFormat]; }
+        } else [m appendFormat:@" %s", class_getName([rec class])];
+    }
+    return m;
+}
+
+// After a batch failed (the card did not finish it in time: a hung shader, most likely), what was in it: one line per record, with the SPIR-V hash of each pipeline stage
+// (RN_DUMP_SPV logs the same hashes when the modules are made and writes the modules out), the targets and the draw counts. The card cannot be asked which draw hung.
+static void rn_log_failed_records(NSArray *records) {
+    unsigned i = 0;
+    for (id rec in records) {
+        if ([rec isKindOfClass:[RNRenderPass class]]) {
+            RNRenderPass *rp = rec;
+            NSMutableString *t = [NSMutableString string];
+            for (unsigned k = 0; k < rp->nt; k++) { RedNaviMTLTexture *x = rp->tex[k]; if (x) [t appendFormat:@" %lux%lu pf %lu x%lu%s%s", (unsigned long)x->w, (unsigned long)x->h, (unsigned long)x->pf, (unsigned long)x->samples_, rp->resolve[k] ? " resolve" : "", x->surf ? " iosurface" : ""]; }
+            if (rp->depthTex) [t appendFormat:@" depth %lux%lu pf %lu", (unsigned long)rp->depthTex->w, (unsigned long)rp->depthTex->h, (unsigned long)rp->depthTex->pf];
+            rn_log("failed batch: record %u: render pass, %lu draws, targets%s", i, (unsigned long)rp->draws.count, t.UTF8String);
+            unsigned j = 0;
+            for (RNDraw *d in rp->draws) {
+                if (j < 40) rn_log("failed batch:   draw %u: pipeline %p spv %08x/%08x, prim %u, %u %s from %u, %u instances", j, (__bridge void *)d->pso, d->pso ? d->pso->spvHash[0] : 0, d->pso ? d->pso->spvHash[1] : 0,
+                                   d->prim, d->vertexCount, d->indexBuf ? "indices" : "vertices", d->vertexStart, d->instanceCount);
+                j++;
+            }
+        } else if ([rec isKindOfClass:[RNDispatch class]]) {
+            RNDispatch *d = rec;
+            rn_log("failed batch: record %u: dispatch %s (pipeline %p), grid %lux%lux%lu, threadgroup %lux%lux%lu", i, d->pso && d->pso->fname ? d->pso->fname.UTF8String : "?", (__bridge void *)d->pso,
+                   (unsigned long)d->threads.width, (unsigned long)d->threads.height, (unsigned long)d->threads.depth, (unsigned long)d->tpt.width, (unsigned long)d->tpt.height, (unsigned long)d->tpt.depth);
+        } else if ([rec isKindOfClass:[RNBlit class]]) {
+            RNBlit *b = rec;
+            rn_log("failed batch: record %u: blit kind %d, size %lu, region %lux%lu", i, b->kind, (unsigned long)b->size, (unsigned long)b->sz.width, (unsigned long)b->sz.height);
+        } else rn_log("failed batch: record %u: %s", i, object_getClassName(rec));
+        i++;
+    }
 }
 
 @implementation RedNaviMTLCommandBuffer
@@ -2225,6 +2667,10 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (now) block((id)self);
 }
 - (void)waitUntilScheduled {}
+// Private MTLCommandBuffer selectors that MetalPerformanceShaders sends (Geekbench, 2026-11-22). The root of a buffer that wraps no other is the buffer itself; with nil, MPSAutoCache
+// crashed on a recursive os_unfair_lock in the next call.
+- (id)rootCommandBuffer { return self; }
+- (uint64_t)globalTraceObjectID { return (uint64_t)(uintptr_t)self; }
 // Private variants of commit that SkyLight and CoreAnimation use (SkyLight's MetalContext::Flush sends commitAndWaitUntilSubmitted, found with tools/ws_flush.sh): the commit here is synchronous,
 // so the buffer is submitted and completed when it returns. Without them the message is unimplemented and WindowServer's composition never reaches the GPU.
 - (void)commitAndWaitUntilSubmitted { [self commitAsync:YES]; }
@@ -2257,7 +2703,10 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         rp->tex[i] = (RedNaviMTLTexture *)ca.texture;
         rp->clear[i] = ca.loadAction == MTLLoadActionClear;
         rp->store[i] = ca.storeAction != MTLStoreActionDontCare;
-        if (ca.storeAction == MTLStoreActionMultisampleResolve || ca.storeAction == MTLStoreActionStoreAndMultisampleResolve || ca.resolveTexture) rn_log("renderCommandEncoder: multisample resolve is not implemented, ignored");
+        if ((ca.storeAction == MTLStoreActionMultisampleResolve || ca.storeAction == MTLStoreActionStoreAndMultisampleResolve) && ca.resolveTexture) {
+            if (![ca.resolveTexture isKindOfClass:[RedNaviMTLTexture class]] || ca.resolveLevel || ca.resolveSlice || ca.resolveDepthPlane) rn_log("renderCommandEncoder: resolve target of attachment %lu is not a level 0 slice 0 RedNavi texture, ignored", (unsigned long)i);
+            else { rp->resolve[i] = (RedNaviMTLTexture *)ca.resolveTexture; rp->store[i] = YES; }
+        }
         rp->clearColor[i][0] = (float)ca.clearColor.red; rp->clearColor[i][1] = (float)ca.clearColor.green; rp->clearColor[i][2] = (float)ca.clearColor.blue; rp->clearColor[i][3] = (float)ca.clearColor.alpha;
         rp->nt = (unsigned)i + 1;
     }
@@ -2275,13 +2724,15 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if (!rp->nt && rp->depthTex) {                    // depth only: the pipelines write no colour, into a scratch target of the depth's size (kept per size)
         static NSMutableDictionary<NSNumber *, RedNaviMTLTexture *> *scratch;
         static dispatch_once_t once; dispatch_once(&once, ^{ scratch = [NSMutableDictionary new]; });
-        NSNumber *key = @((uint64_t)rp->depthTex->w << 32 | rp->depthTex->h);
+        const NSUInteger dsamples = rp->depthTex->samples_ > 1 ? rp->depthTex->samples_ : 1;   // the scratch target has the depth's sample count
+        NSNumber *key = @((uint64_t)rp->depthTex->w << 32 | (uint64_t)rp->depthTex->h << 8 | dsamples);
         RedNaviMTLTexture *sc;
         @synchronized (scratch) {
             sc = scratch[key];
             if (!sc) {
                 MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:rp->depthTex->w height:rp->depthTex->h mipmapped:NO];
                 sd.usage = MTLTextureUsageRenderTarget;
+                if (dsamples > 1) { sd.textureType = MTLTextureType2DMultisample; sd.sampleCount = dsamples; }
                 sc = [[RedNaviMTLTexture alloc] initWithDevice:dev descriptor:sd];
                 if (sc) scratch[key] = sc;
             }
@@ -2299,6 +2750,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     rn_vk_target tg[8];
     BOOL direct = NO;
     for (unsigned i = 0; i < rp->nt; i++) { tg[i] = (rn_vk_target){rp->tex[i]->img, rp->clear[i], {rp->clearColor[i][0], rp->clearColor[i][1], rp->clearColor[i][2], rp->clearColor[i][3]}, !rp->store[i]};
+        if (rp->resolve[i] && rp->resolve[i]->img && rp->tex[i]->img && rn_vk_image_samples(rp->tex[i]->img) > 1) tg[i].resolve = rp->resolve[i]->img;   // resolved on the card after the pass
         RedNaviMTLTexture *rt = rp->tex[i]->parent ? rp->tex[i]->parent : rp->tex[i];
         if (rt->displayScan && rp->tex[i]->texel == rt->texel && rn_scanout_image(vk, rt->w, rt->h)) {
             rn_vk_image *vr = rn_display_vram(vk, rt);
@@ -2345,7 +2797,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             }
             rn_log("draw %lu: pso %p %s + %s, prim %u, %u vertices from %u x %u instances%s, blend %d, viewport %d (%g %g %g %g) scissor %d (%u %u %u %u) cull %d, textures:%s", (unsigned long)k, p, p->names[0].UTF8String, p->names[1].UTF8String, d->prim, d->vertexCount, d->vertexStart, d->instanceCount, d->indexBuf ? " (indexed)" : "", p->blend[0].enabled, d->hasViewport, d->viewport[0], d->viewport[1], d->viewport[2], d->viewport[3], d->hasScissor, (unsigned)d->scissor[0], (unsigned)d->scissor[1], (unsigned)d->scissor[2], (unsigned)d->scissor[3], (int)d->cull, tb);
         }
-        if (logPass && d->indexBuf) {                                    // the indices of the draw, as the card will read them
+        if (logPass && d->indexBuf && rn_bufp(d->indexBuf->b, 0)) {                                    // the indices of the draw, as the card will read them
             const uint8_t *ip = rn_vk_buffer_contents(d->indexBuf->b) + d->indexOffset;
             const unsigned isz = d->index32 ? 4 : 2;
             char ix[200] = ""; int io = 0;
@@ -2355,7 +2807,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         if (logPass || (rn_diag && getenv("RN_LOG_BUFFERS"))) {                       // debugging: what is bound at every buffer index, with the first bytes
             for (int st = 0; st < 2; st++) for (int i = 0; i < RN_MTL_SLOTS; i++) {
                 const uint8_t *bp = NULL; NSUInteger len = 0;
-                if (d->bufs[st][i]) { bp = rn_vk_buffer_contents(d->bufs[st][i]->b) + d->offs[st][i]; len = d->bufs[st][i]->len - d->offs[st][i]; }
+                if (d->bufs[st][i]) { bp = rn_bufp(d->bufs[st][i]->b, d->offs[st][i]); len = d->bufs[st][i]->len - d->offs[st][i]; }
                 else if (d->bytesAt[st][i]) { bp = d->bytesAt[st][i].bytes; len = d->bytesAt[st][i].length; }
                 if (!bp) continue;
                 char hx[400] = ""; for (NSUInteger j = 0; j < len && j < 96; j++) snprintf(hx + 2 * j + j / 4, 4, "%02x ", bp[j]);
@@ -2403,6 +2855,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     rn_vk_snap_on = 0; rn_vk_snap_small = 0;
     rn_ph(1, phv);
     if (!rc) rn_locator_note(rp, rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0]);
+    if (!bad && !rc) for (unsigned i = 0; i < rp->nt; i++)
+        if (rp->resolve[i] && rp->resolve[i]->img && rp->tex[i]->img && !tg[i].resolve && rn_vk_batch_copy(vk, rp->tex[i]->img, rp->resolve[i]->img) != 0)   // a resolve from a texture of one sample is a copy
+            rn_log("pass: resolve of attachment %u into %lux%lu format %lu failed (size or format differs from %lux%lu format %lu)", i, (unsigned long)rp->resolve[i]->w, (unsigned long)rp->resolve[i]->h, (unsigned long)rp->resolve[i]->pf, (unsigned long)rp->tex[i]->w, (unsigned long)rp->tex[i]->h, (unsigned long)rp->tex[i]->pf);
     if (!bad && !rc && rp->nt) {
         BOOL dump = rn_passdump_on();
         const BOOL smallPass = rp->tex[0] && (size_t)rp->tex[0]->w * rp->tex[0]->h < 40000;      // icon, glyph and menu passes (64x64, 160x64, 352x64 ...) have a budget of their own: they used up the main one before a window was drawn, but a tab or hover layer can be one of them
@@ -2420,7 +2875,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         for (NSUInteger k = 0; k < nd && onlyFills; k++) { RNDraw *dk = rp->draws[k]; onlyFills = dk->pso && dk->pso->names[1] && [dk->pso->names[1] hasPrefix:@"ColorFill"]; }
         if (!onlyFills) {
             RedNaviMTLTexture *rt = rp->tex[0]->parent ? rp->tex[0]->parent : rp->tex[0];
-            scanSrc = rn_display_vram(vk, rt); scanW = rt->w; scanH = rt->h;      // the frame is complete when the command buffer is: one copy into the scanout at its end
+            scanSrc = rn_display_vram(vk, rt); scanW = rt->w; scanH = rt->h; scanId = rt->surf ? IOSurfaceGetID(rt->surf) : 0;      // the frame is complete when the command buffer is: one copy into the scanout at its end
             directPasses++;
         }
     }
@@ -2463,6 +2918,15 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
 // One commit at a time: the Vulkan queue and command pool are the process's single ones and are not thread safe, and the textures and buffers a commit copies are shared with the others.
 // Recursive: a completion handler may commit another command buffer.
 - (void)commit { [self commitAsync:NO]; }
+// Private (MPSGraph sends it to the command buffer under its MPSCommandBuffer): what was encoded so far is committed now, and the command buffer stays open for more work. The records
+// go to a command buffer of their own, committed on the same serial queue, so they run before whatever this one commits later; the handlers stay with this one.
+- (void)commitAndContinue {
+    if (st >= MTLCommandBufferStatusCommitted || !records.count) return;
+    RedNaviMTLCommandBuffer *part = [[RedNaviMTLCommandBuffer alloc] initWithQueue:queue device:dev];
+    part->records = records; part->label_ = label_;
+    records = [NSMutableArray new];
+    [part commit];
+}
 // Private: AppleMetalOpenGLRenderer commits with it (it also keeps the buffer for the renderer's own bookkeeping, which needs nothing here).
 - (void)commitAndHold { [self commitAsync:NO]; }
 // Commit order is kept by one serial queue; the caller goes on while the card works. The completion handlers, the presents and the semaphore run at the end of the body, on the queue.
@@ -2513,7 +2977,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     for (id rec in records) {
         if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
-            for (unsigned i = 0; i < rp->nt; i++) note(rp->tex[i], rp->store[i]);
+            for (unsigned i = 0; i < rp->nt; i++) { note(rp->tex[i], rp->store[i]); if (rp->resolve[i]) note(rp->resolve[i], YES); }
             for (RNDraw *dw in rp->draws) for (int s2 = 0; s2 < 2; s2++) for (int i = 0; i < RN_MTL_SLOTS; i++) note(dw->texs[s2][i], NO);
         } else if ([rec isKindOfClass:[RNEventOp class]]) {
             // no textures
@@ -2549,6 +3013,9 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     void (^note)(RedNaviMTLTexture *, BOOL) = ^(RedNaviMTLTexture *t, BOOL written) {
         if (t && t->parent) t = t->parent;       // a view shares its root's storage and host copy: the root is what is synchronised (a view has none of the buffer fields and not the plane)
         if (!t || (!t->surf && !t->srcBuf && !t->srcRaw)) return;
+        // A CoreDisplay scanout surface lives on the card with direct scanout (its pixels are the card copy, never the IOSurface's memory): copying it in and out of the IOSurface at every command
+        // buffer moves 8 MB each way for nothing. Its host copy goes stale, as it does in the display's own path.
+        if (t->displayScan && rn_scanout_image(rn_vk_shared(), t->w, t->h)) return;
         [surfUsed addObject:t];
         if (written) [surfWritten addObject:t];
     };
@@ -2585,7 +3052,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
     if ((rn_diag && getenv("RN_LOG_BUFFERS")))
         for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
-            for (RNDraw *dw in rp->draws) if (dw->bufs[0][1]) {
+            for (RNDraw *dw in rp->draws) if (dw->bufs[0][1] && rn_bufp(dw->bufs[0][1]->b, 0)) {
                 const uint8_t *bp = (const uint8_t *)rn_vk_buffer_contents(dw->bufs[0][1]->b) + dw->offs[0][1];
                 char hx[100] = ""; for (int j = 0; j < 32; j++) snprintf(hx + 2 * j, 4, "%02x", bp[j]);
                 rn_log("  commit start: buffer %p offset %lu: %s", dw->bufs[0][1], (unsigned long)dw->offs[0][1], hx);
@@ -2601,6 +3068,10 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         }
     }
     { const uint64_t ph4i = mach_absolute_time(); [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:YES]; rn_ph(4, ph4i); }
+    static atomic_ullong srcSeq; unsigned long long srcId = 0;
+    NSString *srcUsed = rn_srclib_used(records);
+    if (srcUsed) { srcId = atomic_fetch_add(&srcSeq, 1) + 1; rn_log("srclib: command buffer %llu submits: %s", srcId, srcUsed.UTF8String); }
+    { static int tr = -1; if (tr < 0) tr = getenv("RN_CB_TRACE") != NULL; if (tr && records.count) rn_log("cb %p:%s", self, rn_records_desc(records).UTF8String); }
     if (vk) rn_vk_batch_begin(vk);
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
@@ -2610,7 +3081,7 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             RNEventOp *o = rec;
             if (![o->event isKindOfClass:[RedNaviMTLSharedEvent class]]) { [self fail:@"an event that is not from RedNavi"]; break; }
             // the batch ends first: a signal must not run ahead of the work before it, and a wait must not hold the card lock
-            { const int br = vk ? rn_vk_batch_end(vk) : 0; if (br) [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; [rn_batch_keep() removeAllObjects]; }
+            { const int br = vk ? rn_vk_batch_end(vk) : 0; if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } [rn_batch_keep() removeAllObjects]; }
             BOOL got = YES;
             if (!o->wait) { if (o->event.signaledValue < o->value) o->event.signaledValue = o->value; }
             else got = [o->event waitFor:o->value timeoutMS:10000];
@@ -2628,16 +3099,97 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
         const uint32_t groups[3] = {(uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth};
         const uint32_t local[3] = {(uint32_t)d->tpt.width, (uint32_t)d->tpt.height, (uint32_t)d->tpt.depth};
         const uint32_t grid[3] = {(uint32_t)d->threads.width, (uint32_t)d->threads.height, (uint32_t)d->threads.depth};
+        // RN_PROBE_DUMP=a,b: the first two dispatches of those kernels run in a submit of their own, with every buffer written to /tmp/rnprobe/<kernel>-<n>/ before (pre_i) and after (post_i)
+        static const char *pd; static dispatch_once_t pdo; dispatch_once(&pdo, ^{ pd = getenv("RN_PROBE_DUMP"); });
+        char pdir[256] = "";
+        if (pd && p->fname && strstr(pd, p->fname.UTF8String)) {
+            static NSMutableDictionary *cnt; static dispatch_once_t co; dispatch_once(&co, ^{ cnt = [NSMutableDictionary dictionary]; });
+            int k; @synchronized (cnt) { k = [cnt[p->fname] intValue]; cnt[p->fname] = @(k + 1); }
+            if (k < 2) {
+                snprintf(pdir, sizeof(pdir), "/tmp/rnprobe/%s-%d", p->fname.UTF8String, k);
+                mkdir("/tmp/rnprobe", 0755); mkdir(pdir, 0755);
+                rn_vk_batch_end(vk);
+                char fn[320]; FILE *mf; snprintf(fn, sizeof(fn), "%s/meta.txt", pdir);
+                if ((mf = fopen(fn, "w"))) {
+                    fprintf(mf, "groups %u %u %u\nlocal %u %u %u\ngrid %u %u %u\ndyn %d\n", groups[0], groups[1], groups[2], local[0], local[1], local[2], grid[0], grid[1], grid[2], (int)p->dyn);
+                    for (unsigned i = 0; i < RN_TG_SLOTS; i++) if (p->tgBuilt[i]) fprintf(mf, "tg %u %u\n", i, p->tgBuilt[i]);
+                    rn_probe_write_fcs(mf, p->src);                     // the function constants the kernel was specialized with
+                    for (unsigned i = 0; i < RN_MTL_SLOTS; i++) {
+                        if (d->bufs[i]) fprintf(mf, "buf %u %lu %lu %p\n", i, (unsigned long)d->offs[i], (unsigned long)d->bufs[i]->len, (__bridge void *)d->bufs[i]);
+                        if (d->bytesAt[i]) { fprintf(mf, "bytes %u %lu\n", i, (unsigned long)d->bytesAt[i].length); snprintf(fn, sizeof(fn), "%s/bytes_%u.bin", pdir, i); [d->bytesAt[i] writeToFile:@(fn) atomically:NO]; }
+                        if (d->texs[i]) {                               // a texture: its description and the host copy of level 0 (tex_i.bin)
+                            RedNaviMTLTexture *t = d->texs[i]->parent ? d->texs[i]->parent : d->texs[i];
+                            fprintf(mf, "tex %u %lux%lux%lu pf %lu levels %lu usage %lu texel %u srcbuf %d img %d\n", i, (unsigned long)t->w, (unsigned long)t->h, (unsigned long)t->d,
+                                    (unsigned long)d->texs[i]->pf, (unsigned long)t->levels_, (unsigned long)t->usage_, t->texel, t->srcBuf != nil, t->img != NULL);
+                            if (t->img && rn_vk_image_staging(t->img)) {
+                                snprintf(fn, sizeof(fn), "%s/tex_%u.bin", pdir, i);
+                                FILE *tf = fopen(fn, "wb");
+                                if (tf) { fwrite(rn_vk_image_staging(t->img), 1, (size_t)rn_vk_image_row_bytes(t->img) * t->h, tf); fclose(tf); }
+                            }
+                        }
+                    }
+                    fclose(mf);
+                }
+                for (unsigned i = 0; i < RN_MTL_SLOTS; i++) if (d->bufs[i]) { snprintf(fn, sizeof(fn), "%s/pre_%u.bin", pdir, i); rn_probe_write_buf(vk, d->bufs[i], fn); }
+                rn_vk_batch_begin(vk);
+            } else pdir[0] = 0;
+        }
+        // textures made inside buffers: the buffer's rows in before, the rows a kernel wrote back into the buffer after (rn_bufferToImage)
+        RedNaviMTLTexture *overBuf[RN_MTL_SLOTS]; BOOL overW[RN_MTL_SLOTS]; unsigned nOver = 0;
+        for (unsigned i = 0; i < p->nbind; i++) {
+            const int kd = p->kind[i] & 0xff; const unsigned m = p->metalIndex[i];
+            if ((kd != RN_VK_SAMPLED_IMAGE && kd != RN_VK_STORAGE_IMAGE) || m >= RN_MTL_SLOTS || !d->texs[m]) continue;
+            RedNaviMTLTexture *t = d->texs[m]->parent ? d->texs[m]->parent : d->texs[m];
+            if (!t->srcBuf) continue;
+            unsigned j = 0; while (j < nOver && overBuf[j] != t) j++;
+            if (j == nOver) { overBuf[nOver] = t; overW[nOver] = NO; nOver++; }
+            if (kd == RN_VK_STORAGE_IMAGE) overW[j] = YES;
+        }
+        for (unsigned j = 0; j < nOver; j++) [overBuf[j] rn_bufferToImage:YES];
         int rc = p->dyn ? rn_vk_dispatch_threads(vk, p->c, av, grid, local) : rn_vk_dispatch(vk, p->c, av, d->pushLen ? d->push : NULL, groups, local);
+        if (!rc) for (unsigned j = 0; j < nOver; j++) if (overW[j]) [overBuf[j] rn_imageToBuffer:YES];
+        if (pdir[0]) {
+            const int br = rn_vk_batch_end(vk);
+            char fn[320];
+            for (unsigned i = 0; i < RN_MTL_SLOTS; i++) if (d->bufs[i]) { snprintf(fn, sizeof(fn), "%s/post_%u.bin", pdir, i); rn_probe_write_buf(vk, d->bufs[i], fn); }
+            rn_log("probe dump %s (rc %d, submit %d)", pdir, rc, br);
+            rn_vk_batch_begin(vk);
+        }
         if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
         else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
         else if (rc) [self fail:[NSString stringWithFormat:@"dispatch failed (%d)", rc]];
     }
-    if (vk && scanSrc && st != MTLCommandBufferStatusError && !rn_defer_on()) {       // the scanout copy rides in the same submit as the passes
+    if (vk && scanSrc && st != MTLCommandBufferStatusError && scanId) {       // staged frame: the copy into a leased display surface rides in the same submit
+        uint32_t sl = 0; rn_vk_image *stage = rn_stage_lease(vk, scanId, scanW, scanH, &sl);
+        if (stage && rn_vk_batch_copy(vk, scanSrc, stage) == 0) { scanStaged = YES; scanSlot = sl; scanCopied = YES; }
+    }
+    if (vk && scanSrc && st != MTLCommandBufferStatusError && !scanStaged && !rn_defer_on()) {       // the scanout copy rides in the same submit as the passes
         rn_vk_image *scan = rn_scanout_image(vk, scanW, scanH);
         if (scan && rn_vk_batch_copy(vk, scanSrc, scan) == 0) scanCopied = YES;
     }
-    if (vk) { const int br = rn_vk_batch_end(vk); if (br) [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; }
+    if (vk) { const int br = rn_vk_batch_end(vk); if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } }
+    if (srcId) rn_log("srclib: command buffer %llu done", srcId);
+    {   // RN_PROBE_KERNELS=a,b: after the command buffer, what the buffers of those kernels hold (small ones in hex, others as nonzero words of the first 64 KB)
+        static const char *pk; static dispatch_once_t pko; dispatch_once(&pko, ^{ pk = getenv("RN_PROBE_KERNELS"); });
+        static atomic_uint probes;
+        if (pk && st != MTLCommandBufferStatusError && atomic_load(&probes) < 4000)
+            for (id rec in records) if ([rec isKindOfClass:[RNDispatch class]]) {
+                RNDispatch *d = rec; NSString *nm = d->pso ? d->pso->fname : nil;
+                if (!nm || !strstr(pk, nm.UTF8String)) continue;
+                atomic_fetch_add(&probes, 1);
+                NSMutableString *m = [NSMutableString string];
+                for (unsigned i = 0; i < RN_MTL_SLOTS; i++) {
+                    RedNaviMTLBuffer *x = d->bufs[i]; if (!x) continue;
+                    const uint8_t *c = (const uint8_t *)[x contents]; if (!c) continue;
+                    c += d->offs[i]; size_t n = x->len > d->offs[i] ? x->len - d->offs[i] : 0;
+                    [m appendFormat:@" {%p+%lu}", (__bridge void *)x, (unsigned long)d->offs[i]];
+                    if (n <= 64) { [m appendFormat:@" [%u]", i]; for (size_t j = 0; j + 4 <= n; j += 4) [m appendFormat:@" %08x", *(const uint32_t *)(c + j)]; }
+                    else { size_t lim = n < 65536 ? n : 65536, nz = 0; for (size_t j = 0; j + 4 <= lim; j += 4) nz += *(const uint32_t *)(c + j) != 0;
+                           [m appendFormat:@" [%u] %zu: %zu/%zu nz, %08x %08x %08x %08x", i, n, nz, lim / 4, ((const uint32_t *)c)[0], ((const uint32_t *)c)[1], ((const uint32_t *)c)[2], ((const uint32_t *)c)[3]]; }
+                }
+                rn_log("probe %s grid %lux%lux%lu:%s", nm.UTF8String, (unsigned long)d->threads.width, (unsigned long)d->threads.height, (unsigned long)d->threads.depth, m.UTF8String);
+            }
+    }
     [rn_batch_keep() removeAllObjects];
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
     {   struct stat tst2;
@@ -2645,7 +3197,8 @@ static void rn_frame_done(void) {      // RN_PRESENT_FRAME_DONE through the brid
             for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
     }
     { const uint64_t ph4 = mach_absolute_time(); if (st != MTLCommandBufferStatusError) [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:NO]; rn_ph(4, ph4); }
-    if (scanSrc && st != MTLCommandBufferStatusError && rn_defer_on()) { rn_frame_done(); rn_defer_frame(scanSrc, scanW, scanH); }
+    if (scanSrc && scanStaged && st != MTLCommandBufferStatusError) { uint32_t sl = scanSlot; if (rn_stage_commit(scanId, sl) == 0) { rn_frame_done(); rn_frame_note(scanSrc); @synchronized ([RedNaviMTLTexture class]) { g_last_shown = scanSrc; } } }
+    else if (scanSrc && st != MTLCommandBufferStatusError && rn_defer_on()) { rn_frame_done(); rn_defer_frame(scanSrc, scanW, scanH); }
     else if (scanSrc && st != MTLCommandBufferStatusError) {      // the frame reaches the scanout before the buffer is reported complete: a completion handler lets the client reuse the surface
         rn_vk_image *scan = scanCopied ? NULL : rn_scanout_image(rn_vk_shared(), scanW, scanH);
         if (scanCopied || (scan && rn_vk_image_copy(rn_vk_shared(), scanSrc, scan) == 0)) { rn_frame_done(); rn_frame_note(scanSrc); rn_scan_dump(scanSrc, scanW, scanH); }
@@ -2744,6 +3297,11 @@ static unsigned rn_data_type_size(MTLDataType t) {
     case MTLDataTypeShort4: case MTLDataTypeUShort4: case MTLDataTypeHalf4: case MTLDataTypeInt2: case MTLDataTypeUInt2: case MTLDataTypeFloat2: return 8;
     case MTLDataTypeInt3: case MTLDataTypeUInt3: case MTLDataTypeFloat3: return 12;
     case MTLDataTypeInt4: case MTLDataTypeUInt4: case MTLDataTypeFloat4: return 16;
+    // long and ulong (81 to 84 and 85 to 88; numbers, as the SDK names are newer than the deployment target): MetalPerformanceShaders specializes its kernels with them (Geekbench, 2026-11-22)
+    case 81: case 85: return 8;
+    case 82: case 86: return 16;
+    case 83: case 87: return 24;
+    case 84: case 88: return 32;
     default: return 0;
     }
 }
@@ -2785,12 +3343,35 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     NSString *label_;
     NSArray<NSDictionary *> *fcs;                    // function constants: @"index" (NSNumber) or @"name", and @"data" (NSData)
     NSArray<NSDictionary *> *args;                   // OpenGL functions: the buffers, textures and samplers of the AIR metadata (rn_gl_args), for the pipeline reflection
+    NSString *sname;                                 // the specialized name (MTLFunctionDescriptor.specializedName), which -name answers; `name` stays the symbol in the bitcode
+    id lib;                                          // the RedNaviMTLLibrary it came from (its visible functions are what its bitcode can refer to statically)
+    NSArray *deps;                                   // stitched and DAG functions: the visible functions of the callees' libraries that they call (rn_static_deps)
 }
 @end
+static void rn_probe_write_buf(rn_vk *vk, RedNaviMTLBuffer *x, const char *fn) {
+    const void *c = [x contents]; rn_vk_buffer *t = NULL;
+    if (!c) {       // a buffer in VRAM the CPU cannot map: copied on the card into a host buffer first
+        if (!x->b || !(t = rn_vk_buffer_create(vk, x->len))) return;
+        if (rn_vk_buffer_copy(vk, x->b, 0, t, 0, x->len)) { rn_vk_buffer_destroy(vk, t); return; }
+        c = rn_vk_buffer_contents(t);
+    }
+    FILE *f = fopen(fn, "wb");
+    if (f) { fwrite(c, 1, x->len, f); fclose(f); }
+    if (t) rn_vk_buffer_destroy(vk, t);
+}
+static void rn_probe_write_fcs(FILE *mf, id fn) {
+    if (![fn isKindOfClass:[RedNaviMTLFunction class]]) return;
+    for (NSDictionary *fc in ((RedNaviMTLFunction *)fn)->fcs) {
+        const uint8_t *fb = [fc[@"data"] bytes]; const NSUInteger fl = [fc[@"data"] length];
+        fprintf(mf, "fc %s ", fc[@"index"] ? [[fc[@"index"] description] UTF8String] : [fc[@"name"] UTF8String]);
+        for (NSUInteger j = 0; j < fl; j++) fprintf(mf, "%02x", fb[j]);
+        fprintf(mf, "\n");
+    }
+}
 @implementation RedNaviMTLFunction
 + (void)load { class_addProtocol(self, @protocol(MTLFunction)); }
 - (id<MTLDevice>)device { return dev; }
-- (NSString *)name { return name; }
+- (NSString *)name { return sname ?: name; }
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
 - (MTLFunctionType)functionType { return type; }
@@ -2868,7 +3449,7 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
     rn_log("function requested: %s%s", functionName.UTF8String, f ? "" : " (not in the library)");
     if (!f) return nil;
     RedNaviMTLFunction *c = [RedNaviMTLFunction new];
-    c->name = f->name; c->type = f->type; c->bitcode = f->bitcode; c->dev = f->dev;
+    c->name = f->name; c->type = f->type; c->bitcode = f->bitcode; c->dev = f->dev; c->lib = self; c->deps = f->deps;   // a stitched or DAG function keeps the visible functions it calls (MPS softmax: constantScalar_f calls MPSCore's emptyValueCoordSize_f)
     return (id)c;
 }
 - (id<MTLFunction>)newFunctionWithName:(NSString *)functionName constantValues:(MTLFunctionConstantValues *)constantValues error:(NSError **)error {
@@ -2891,8 +3472,10 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 - (id<MTLFunction>)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor error:(NSError **)error {
     if (error) *error = nil;
     if (descriptor.binaryArchives.count || descriptor.options) rn_log("newFunctionWithDescriptor: binary archives and options are ignored");
-    if (descriptor.specializedName) rn_log("newFunctionWithDescriptor: specializedName is ignored");
-    return [self newFunctionWithName:descriptor.name constantValues:descriptor.constantValues error:error];
+    RedNaviMTLFunction *f = (RedNaviMTLFunction *)[self newFunctionWithName:descriptor.name constantValues:descriptor.constantValues error:error];
+    // MetalPerformanceShaders names its specializations (read_0_268435488__f for read_f with two constants) and refers to them by that name in a DAG (newLibraryWithDAG:)
+    if (f && descriptor.specializedName.length) f->sname = [descriptor.specializedName copy];
+    return (id)f;
 }
 - (void)newFunctionWithDescriptor:(MTLFunctionDescriptor *)descriptor completionHandler:(void (^)(id<MTLFunction>, NSError *))completionHandler {
     NSError *e = nil;
@@ -2906,10 +3489,358 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 }
 @end
 
-// A compute pipeline state from a function of a library: the function's bitcode goes to the translator (rn_air.h), the SPIR-V to RADV.
-static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
+// ------------------------------------------------------------------------------------------------------------------------------------ stitched libraries
+// CoreImage compiles a whole filter graph into one kernel with newLibraryWithStitchedDescriptor: (SPI classes: MTLFunctionStitching*; the shapes are in docs/M6_WINDOWSERVER_STUDY.md, found
+// with tools/ci_stitch_dump.m on a Mac with a real GPU). The translator turns the graph and the stitchable functions' bitcode into the LLVM text of a kernel (rn_air_stitch); the
+// library answered here holds one RedNaviMTLFunction per graph, whose "bitcode" is that text, which rn_air_translate_stage_fc takes in place of bitcode.
+static BOOL rn_class_is(id o, const char *name) { return o && strcmp(class_getName(object_getClass(o)), name) == 0; }
+static BOOL rn_is_early_return(id n) {
+    if (strstr(class_getName(object_getClass(n)), "EarlyReturn")) return YES;
+    return [n respondsToSelector:@selector(isEarlyReturn)] && [[n valueForKey:@"isEarlyReturn"] boolValue];
+}
+// The index of node n in list, adding it (and what it refers to) when it is not there: graphs list their nodes, but an argument may be one that was not.
+static NSUInteger rn_stitch_index(NSMutableArray *list, id n) {
+    NSUInteger at = [list indexOfObjectIdenticalTo:n];
+    if (at != NSNotFound) return at;
+    at = list.count;
+    [list addObject:n];
+    if ([n respondsToSelector:@selector(arguments)]) for (id a in [n valueForKey:@"arguments"]) if ([a isKindOfClass:[MTLFunctionStitchingFunctionNode class]]) rn_stitch_index(list, a);
+    if ([n respondsToSelector:@selector(controlDependencies)]) for (id d in [n valueForKey:@"controlDependencies"]) rn_stitch_index(list, d);
+    if (rn_is_early_return(n)) { id c = [n valueForKey:@"condition"]; if (c) rn_stitch_index(list, c); }
+    return at;
+}
+
+// The visible functions that the functions fns call by name (a call through @X.MTL_VISIBLE_FN_REF to a function X of their own library, which Metal resolves when it links: MPS's
+// reductionStitched functions call emptyValueCoordSize_f of MPSCore's library), and the ones those call, without the ones in fns. The bitcode keeps the name as text.
+// withGiven: a function of fns that another one calls this way is listed too. A stitched function needs that: it links only the functions its nodes call, and MPS passes
+// emptyValueCoordSize_f among a reduction's stitched functions although no node calls it (softmax gave NaN: constantScalar_f's call to it became a stub, 2026-11-25).
+static NSArray *rn_static_deps(NSArray *fns, BOOL withGiven) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *have = [NSMutableSet set];
+    NSMutableArray *todo = [NSMutableArray array];
+    for (RedNaviMTLFunction *f in fns) if ([f isKindOfClass:[RedNaviMTLFunction class]]) { if (!withGiven) { [have addObject:f.name]; [have addObject:f->name]; } [todo addObject:f]; }
+    for (NSUInteger i = 0; i < todo.count; i++) {
+        RedNaviMTLFunction *f = todo[i];
+        if (getenv("RN_LOG_LINKED")) rn_log("static deps: %s (%s) lib %p names %lu deps %lu ref %d", f->name.UTF8String, f.name.UTF8String, f->lib, (unsigned long)((RedNaviMTLLibrary *)f->lib)->names.count, (unsigned long)f->deps.count, memmem(f->bitcode.bytes, f->bitcode.length, ".MTL_VISIBLE_FN_REF", 19) != NULL);
+        for (RedNaviMTLFunction *d in f->deps) if (![have containsObject:d->name]) { [have addObject:d->name]; [out addObject:d]; [todo addObject:d]; }
+        RedNaviMTLLibrary *l = f->lib;
+        if (!l || !memmem(f->bitcode.bytes, f->bitcode.length, ".MTL_VISIBLE_FN_REF", 19)) continue;
+        for (NSString *n in l->names) {
+            if ([have containsObject:n]) continue;
+            NSData *ref = [[n stringByAppendingString:@".MTL_VISIBLE_FN_REF"] dataUsingEncoding:NSUTF8StringEncoding];
+            if (!memmem(f->bitcode.bytes, f->bitcode.length, ref.bytes, ref.length)) continue;
+            RedNaviMTLFunction *d = (RedNaviMTLFunction *)[l newFunctionWithName:n];
+            if (!d) continue;
+            [have addObject:n]; [out addObject:d]; [todo addObject:d];
+        }
+    }
+    return out;
+}
+
+static NSString *rn_stitch_graph(id<MTLDevice> dev, id graph, NSArray *fnObjs, RedNaviMTLFunction *__autoreleasing *out) {
+    NSString *kernel = [graph valueForKey:@"functionName"];
+    if (!kernel.length) return @"a graph without a function name";
+    for (id a in [graph valueForKey:@"attributes"]) {
+        const char *cn = class_getName(object_getClass(a));
+        if (!strstr(cn, "AttributeKernel") && !strstr(cn, "AlwaysInline")) return [NSString stringWithFormat:@"graph attribute %s", cn];
+    }
+    NSMutableArray *list = [NSMutableArray arrayWithArray:[graph valueForKey:@"nodes"]];
+    // MetalPerformanceShaders (MPSKernelUserDAG) stitches visible functions too: a graph whose nodes take the function's arguments (MTLFunctionStitchingInputNode) and whose outputNode
+    // is the value it returns. It becomes a visible function (rn_air_stitch_function), which MPS links into a kernel as the DAG functions are (rn_linked_kernel).
+    id outNode = [graph respondsToSelector:@selector(outputNode)] ? [graph valueForKey:@"outputNode"] : nil;
+    if (outNode && [list indexOfObjectIdenticalTo:outNode] == NSNotFound) [list addObject:outNode];
+    for (NSUInteger i = 0; i < list.count; i++) rn_stitch_index(list, list[i]);       // appends what the listed nodes refer to
+    const NSUInteger nn = list.count;
+    BOOL isFunction = NO;
+    NSMutableData *argStore = [NSMutableData data], *depStore = [NSMutableData data];
+    NSMutableData *nodeStore = [NSMutableData dataWithLength:sizeof(rn_air_stitch_node) * MAX(nn, 1)];
+    rn_air_stitch_node *nodes = nodeStore.mutableBytes;
+    // two passes: the storage grows while the arguments are written, so the pointers are fixed up after
+    NSMutableArray<NSNumber *> *argOff = [NSMutableArray array], *depOff = [NSMutableArray array];
+    for (NSUInteger i = 0; i < nn; i++) {
+        id n = list[i];
+        rn_air_stitch_node *rn = &nodes[i];
+        [argOff addObject:@(argStore.length / sizeof(rn_air_stitch_arg))];
+        [depOff addObject:@(depStore.length / sizeof(uint32_t))];
+        if (rn_is_early_return(n)) {
+            id c = [n valueForKey:@"condition"];
+            if (!c || ![c isKindOfClass:[MTLFunctionStitchingFunctionNode class]]) return @"an early return whose condition is not a function node";
+            rn->name = NULL; rn->condition = (uint32_t)rn_stitch_index(list, c);
+        } else if ([n isKindOfClass:[MTLFunctionStitchingFunctionNode class]]) {
+            rn->name = [[n valueForKey:@"name"] UTF8String];
+            for (id a in [n valueForKey:@"arguments"]) {
+                rn_air_stitch_arg x = {0, 0, 0, 0};
+                const char *cn = class_getName(object_getClass(a));
+                if ([a isKindOfClass:[MTLFunctionStitchingFunctionNode class]]) { x.kind = 0; x.a = (uint32_t)rn_stitch_index(list, a); }
+                else if (!strcmp(cn, "MTLFunctionStitchingInputBufferAddress")) { x.kind = 1; x.a = [[a valueForKey:@"bindIndex"] unsignedIntValue]; x.b = [[a valueForKey:@"byteOffset"] unsignedLongLongValue]; x.c = [[a valueForKey:@"dereference"] boolValue]; }
+                else if (!strcmp(cn, "MTLFunctionStitchingInputBuffer")) { x.kind = 2; x.a = [[a valueForKey:@"bindIndex"] unsignedIntValue]; }
+                else if (!strcmp(cn, "MTLFunctionStitchingInputTexture")) { x.kind = 3; x.a = [[a valueForKey:@"bindIndex"] unsignedIntValue]; }
+                else if (!strcmp(cn, "MTLFunctionStitchingInputSampler")) { x.kind = 4; x.a = [[a valueForKey:@"bindIndex"] unsignedIntValue]; }
+                else if (!strcmp(cn, "MTLFunctionStitchingBuiltinThreadPositionInGrid")) x.kind = 5;
+                else if (!strcmp(cn, "MTLFunctionStitchingBuiltinThreadPositionInThreadgroup")) x.kind = 6;
+                else if ([a isKindOfClass:[MTLFunctionStitchingInputNode class]]) { x.kind = 9; x.a = (uint32_t)((MTLFunctionStitchingInputNode *)a).argumentIndex; isFunction = YES; }
+                else return [NSString stringWithFormat:@"a node argument of class %s", cn];
+                [argStore appendBytes:&x length:sizeof(x)];
+                rn->nargs++;
+            }
+            for (id d in [n valueForKey:@"controlDependencies"]) { uint32_t di = (uint32_t)rn_stitch_index(list, d); [depStore appendBytes:&di length:sizeof(di)]; rn->ndeps++; }
+        } else return [NSString stringWithFormat:@"a node of class %s", class_getName(object_getClass(n))];
+        if (list.count != nn) return @"the graph has nodes that nothing lists (internal error)";
+    }
+    for (NSUInteger i = 0; i < nn; i++) {
+        nodes[i].args = (const rn_air_stitch_arg *)((const uint8_t *)argStore.bytes) + [argOff[i] unsignedIntegerValue];
+        nodes[i].deps = (const uint32_t *)((const uint8_t *)depStore.bytes) + [depOff[i] unsignedIntegerValue];
+    }
+    if (isFunction) {
+        NSMutableData *dfStore = [NSMutableData dataWithLength:sizeof(rn_air_dag_fn) * MAX(fnObjs.count, 1)];
+        NSMutableData *dcStore = [NSMutableData dataWithLength:sizeof(rn_air_const) * 64 * MAX(fnObjs.count, 1)];
+        rn_air_dag_fn *dfs = dfStore.mutableBytes;
+        rn_air_const *dcs = dcStore.mutableBytes;
+        unsigned ndf = 0;
+        for (RedNaviMTLFunction *f in fnObjs) {
+            if (![f isKindOfClass:[RedNaviMTLFunction class]]) return [NSString stringWithFormat:@"function %@ is not from a RedNavi library", [(id)f name]];
+            rn_air_const *c = &dcs[64 * ndf];
+            const unsigned nc = rn_fc_array(f->fcs, c, 64);
+            dfs[ndf++] = (rn_air_dag_fn){f.name.UTF8String, f->name.UTF8String, f->bitcode.bytes, f->bitcode.length, c, nc};
+        }
+        const int output = outNode ? (int)[list indexOfObjectIdenticalTo:outNode] : -1;
+        char *text = NULL, err[400] = "";
+        size_t tb = 0;
+        if (rn_air_stitch_function(NULL, kernel.UTF8String, dfs, ndf, nodes, (unsigned)nn, output, &text, &tb, err, sizeof(err))) return [NSString stringWithUTF8String:err];
+        RedNaviMTLFunction *f = [RedNaviMTLFunction new];
+        f->name = kernel; f->type = MTLFunctionTypeVisible; f->bitcode = [NSData dataWithBytes:text length:tb]; f->dev = dev; f->deps = rn_static_deps(fnObjs, YES);
+        rn_air_stitch_free(text);
+        *out = f;
+        return nil;
+    }
+    NSMutableData *fnStore = [NSMutableData dataWithLength:sizeof(rn_air_stitch_fn) * MAX(fnObjs.count, 1)];
+    rn_air_stitch_fn *fns = fnStore.mutableBytes;
+    unsigned nf = 0;
+    // The function constants the stitchable functions were specialized with (CoreImage's coreimage::_texture2D_is_normalized, say) apply to the one kernel: they are merged, and two
+    // functions that give one constant different values cannot be stitched together.
+    NSMutableDictionary<id, NSDictionary *> *constants = [NSMutableDictionary dictionary];
+    for (RedNaviMTLFunction *f in fnObjs) {
+        if (![f isKindOfClass:[RedNaviMTLFunction class]]) return [NSString stringWithFormat:@"function %@ is not from a RedNavi library", [(id)f name]];
+        fns[nf++] = (rn_air_stitch_fn){f->name.UTF8String, f->bitcode.bytes, f->bitcode.length};
+        for (NSDictionary *c in f->fcs) {
+            id key = c[@"index"] ? (id)c[@"index"] : (id)c[@"name"];
+            NSDictionary *old = constants[key];
+            if (old && ![old[@"data"] isEqual:c[@"data"]]) return [NSString stringWithFormat:@"function constant %@ has two values among the stitched functions", key];
+            constants[key] = c;
+        }
+    }
+    char *text = NULL, err[400] = "";
+    size_t tb = 0;
+    if (rn_air_stitch(NULL, kernel.UTF8String, fns, nf, nodes, (unsigned)nn, &text, &tb, err, sizeof(err))) return [NSString stringWithUTF8String:err];
+    RedNaviMTLFunction *f = [RedNaviMTLFunction new];
+    f->name = kernel; f->type = MTLFunctionTypeKernel; f->bitcode = [NSData dataWithBytes:text length:tb]; f->dev = dev; f->fcs = constants.count ? constants.allValues : nil;
+    rn_air_stitch_free(text);
+    *out = f;
+    return nil;
+}
+
+static id rn_stitched_library(id<MTLDevice> dev, id desc, NSError **error) {
     if (error) *error = nil;
+    NSArray *fnObjs = [desc valueForKey:@"functions"];
+    RedNaviMTLLibrary *lib = [RedNaviMTLLibrary new];
+    lib->dev = dev; lib->funcs = [NSMutableDictionary new];
+    NSMutableArray *names = [NSMutableArray new];
+    NSString *why = nil;
+    for (id g in [desc valueForKey:@"functionGraphs"]) {
+        RedNaviMTLFunction *f = nil;
+        why = rn_stitch_graph(dev, g, fnObjs, &f);
+        if (why) break;
+        lib->funcs[f->name] = f;
+        [names addObject:f->name];
+    }
+    if (!why && !names.count) why = @"no function graphs";
+    if (why) {
+        rn_log("newLibraryWithStitchedDescriptor: %s", why.UTF8String);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"RedNavi cannot stitch this graph: %@", why]}];
+        return nil;
+    }
+    lib->names = names;
+    rn_log("newLibraryWithStitchedDescriptor: %lu kernels [%s]", (unsigned long)names.count, [names componentsJoinedByString:@" "].UTF8String);
+    return lib;
+}
+
+// ------------------------------------------------------------------------------------------------------------------------------------ DAG libraries
+// MetalPerformanceShaders builds the pieces of its uber-shaders with the private newLibraryWithDAG:functions:error: (shapes found with tools/mps_dag_dump.m on a Mac with a real GPU). The DAG
+// is text: DAGS { name { ALWAYS_INLINE; NODE(id) : FUNCTION(f), INPUT(n), NODE(id); ... OUTPUT(id) : FUNCTION(f), ...; } ... }, where f is the (specialized) name of one of the
+// functions given, INPUT(n) the DAG function's argument n and NODE(id) the result of an earlier node; OUTPUT marks the node whose value the function returns (a DAG without one returns
+// nothing). Each DAG becomes a visible function (MTLFunctionTypeVisible) whose "bitcode" is the LLVM text rn_air_stitch_function makes; MPS then passes them to a compute pipeline as
+// linked functions (rn_linked_kernel).
+static NSString *rn_dag_function(id<MTLDevice> dev, NSString *dname, NSString *body, NSArray *fnObjs, RedNaviMTLFunction *__autoreleasing *out) {
+    NSMutableArray<NSString *> *ids = [NSMutableArray array];
+    NSMutableArray<NSString *> *callees = [NSMutableArray array];
+    NSMutableArray<NSArray<NSString *> *> *argLists = [NSMutableArray array];
+    int output = -1;
+    for (NSString *raw in [body componentsSeparatedByString:@";"]) {
+        NSString *st = [raw stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
+        if (!st.length || [st isEqualToString:@"ALWAYS_INLINE"]) continue;
+        const BOOL isOut = [st hasPrefix:@"OUTPUT("];
+        if (!isOut && ![st hasPrefix:@"NODE("]) return [NSString stringWithFormat:@"DAG statement \"%@\"", st];
+        NSRange close = [st rangeOfString:@")"], colon = [st rangeOfString:@":"];
+        if (close.location == NSNotFound || colon.location == NSNotFound || colon.location < close.location) return [NSString stringWithFormat:@"DAG statement \"%@\"", st];
+        const NSUInteger open = isOut ? 7 : 5;
+        NSString *nid = [st substringWithRange:NSMakeRange(open, close.location - open)];
+        NSMutableArray<NSString *> *parts = [NSMutableArray array];
+        for (NSString *p in [[st substringFromIndex:colon.location + 1] componentsSeparatedByString:@","]) [parts addObject:[p stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet]];
+        if (!parts.count || ![parts[0] hasPrefix:@"FUNCTION("] || ![parts[0] hasSuffix:@")"]) return [NSString stringWithFormat:@"DAG statement \"%@\" names no function", st];
+        if (isOut) output = (int)ids.count;
+        [ids addObject:nid];
+        [callees addObject:[parts[0] substringWithRange:NSMakeRange(9, parts[0].length - 10)]];
+        [argLists addObject:[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)]];
+    }
+    const NSUInteger nn = ids.count;
+    if (!nn) return @"an empty DAG";
+    NSUInteger totalArgs = 0;
+    for (NSArray *l in argLists) totalArgs += l.count;
+    NSMutableData *argStore = [NSMutableData dataWithLength:sizeof(rn_air_stitch_arg) * MAX((NSUInteger)1, totalArgs)];
+    NSMutableData *nodeStore = [NSMutableData dataWithLength:sizeof(rn_air_stitch_node) * nn];
+    rn_air_stitch_arg *args = argStore.mutableBytes;
+    rn_air_stitch_node *nodes = nodeStore.mutableBytes;
+    NSUInteger na = 0;
+    for (NSUInteger i = 0; i < nn; i++) {
+        nodes[i] = (rn_air_stitch_node){callees[i].UTF8String, 0, &args[na], (uint32_t)argLists[i].count, NULL, 0};
+        for (NSString *a in argLists[i]) {
+            if (![a hasSuffix:@")"]) return [NSString stringWithFormat:@"DAG argument \"%@\"", a];
+            if ([a hasPrefix:@"INPUT("]) args[na++] = (rn_air_stitch_arg){9, (uint32_t)[[a substringWithRange:NSMakeRange(6, a.length - 7)] intValue], 0, 0};
+            else if ([a hasPrefix:@"NODE("]) {
+                NSUInteger j = [ids indexOfObject:[a substringWithRange:NSMakeRange(5, a.length - 6)]];
+                if (j == NSNotFound || j >= i) return [NSString stringWithFormat:@"DAG argument \"%@\" is not an earlier node", a];
+                args[na++] = (rn_air_stitch_arg){0, (uint32_t)j, 0, 0};
+            } else return [NSString stringWithFormat:@"DAG argument \"%@\"", a];
+        }
+    }
+    // the functions, under the name the DAG uses (the specialized name), with the symbol in their bitcode and their constants
+    NSMutableData *fnStore = [NSMutableData dataWithLength:sizeof(rn_air_dag_fn) * MAX(fnObjs.count, 1)];
+    NSMutableData *constStore = [NSMutableData dataWithLength:sizeof(rn_air_const) * 64 * MAX(fnObjs.count, 1)];
+    rn_air_dag_fn *fns = fnStore.mutableBytes;
+    rn_air_const *consts = constStore.mutableBytes;
+    unsigned nf = 0;
+    for (RedNaviMTLFunction *f in fnObjs) {
+        if (![f isKindOfClass:[RedNaviMTLFunction class]]) return [NSString stringWithFormat:@"function %@ is not from a RedNavi library", [(id)f name]];
+        rn_air_const *c = &consts[64 * nf];
+        const unsigned nc = rn_fc_array(f->fcs, c, 64);
+        fns[nf++] = (rn_air_dag_fn){f.name.UTF8String, f->name.UTF8String, f->bitcode.bytes, f->bitcode.length, c, nc};
+    }
+    char *text = NULL, err[400] = "";
+    size_t tb = 0;
+    if (rn_air_stitch_function(NULL, dname.UTF8String, fns, nf, nodes, (unsigned)nn, output, &text, &tb, err, sizeof(err))) return [NSString stringWithFormat:@"%@: %s", dname, err];
+    RedNaviMTLFunction *f = [RedNaviMTLFunction new];
+    f->name = dname; f->type = MTLFunctionTypeVisible; f->bitcode = [NSData dataWithBytes:text length:tb]; f->dev = dev; f->deps = rn_static_deps(fnObjs, YES);
+    rn_air_stitch_free(text);
+    *out = f;
+    return nil;
+}
+
+static id rn_dag_library(id<MTLDevice> dev, NSString *dag, NSArray *fnObjs, NSError **error) {
+    if (error) *error = nil;
+    RedNaviMTLLibrary *lib = [RedNaviMTLLibrary new];
+    lib->dev = dev; lib->funcs = [NSMutableDictionary new];
+    NSMutableArray *names = [NSMutableArray new];
+    NSString *why = nil;
+    // the innermost blocks are the DAGs (the outer DAGS { } holds braces, so it does not match)
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"([A-Za-z0-9_]+)\\s*\\{([^{}]*)\\}" options:0 error:nil];
+    for (NSTextCheckingResult *m in [re matchesInString:dag options:0 range:NSMakeRange(0, dag.length)]) {
+        RedNaviMTLFunction *f = nil;
+        why = rn_dag_function(dev, [dag substringWithRange:[m rangeAtIndex:1]], [dag substringWithRange:[m rangeAtIndex:2]], fnObjs, &f);
+        if (why) break;
+        lib->funcs[f->name] = f;
+        [names addObject:f->name];
+    }
+    if (!why && !names.count) why = @"no DAGs";
+    if (why) {
+        rn_log("newLibraryWithDAG: %s", why.UTF8String);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"RedNavi cannot build this DAG: %@", why]}];
+        return nil;
+    }
+    lib->names = names;
+    rn_log("newLibraryWithDAG: %lu functions [%s]", (unsigned long)names.count, [names componentsJoinedByString:@" "].UTF8String);
+    return lib;
+}
+
+// The kernel of a compute pipeline descriptor with its linked functions (MTLLinkedFunctions: visible functions of a DAG library, which the kernel calls through
+// @<name>.MTL_VISIBLE_FN_REF declarations) linked into it: a copy of the kernel whose "bitcode" is the LLVM text of rn_air_link_visible, with the kernel's constants. Without linked
+// functions it is the kernel itself.
+static id rn_linked_kernel(MTLComputePipelineDescriptor *desc, NSError **error) {
+    id k = desc.computeFunction;
+    MTLLinkedFunctions *lf = desc.linkedFunctions;
+    NSMutableArray *all = [NSMutableArray array];
+    if (lf.functions) [all addObjectsFromArray:lf.functions];
+    if (lf.privateFunctions) [all addObjectsFromArray:lf.privateFunctions];
+    if (getenv("RN_LOG_LINKED") || lf.binaryFunctions.count || lf.groups.count || desc.preloadedLibraries.count)
+        rn_log("compute pipeline for %s: linked functions %lu, private %lu, binary %lu, groups %lu, preloaded libraries %lu", [[k name] UTF8String], (unsigned long)lf.functions.count,
+               (unsigned long)lf.privateFunctions.count, (unsigned long)lf.binaryFunctions.count, (unsigned long)lf.groups.count, (unsigned long)desc.preloadedLibraries.count);
+    if (!all.count || ![k isKindOfClass:[RedNaviMTLFunction class]]) return k;
+    RedNaviMTLFunction *kf = k;
+    [all addObjectsFromArray:rn_static_deps(all, NO)];       // not the kernel's own references: those are what the pipeline links (and stubs when absent)
+    NSMutableData *fnStore = [NSMutableData dataWithLength:sizeof(rn_air_stitch_fn) * all.count];
+    rn_air_stitch_fn *fns = fnStore.mutableBytes;
+    unsigned nf = 0;
+    NSString *why = nil;
+    for (RedNaviMTLFunction *f in all) {
+        if (![f isKindOfClass:[RedNaviMTLFunction class]]) { why = [NSString stringWithFormat:@"linked function %@ is not from a RedNavi library", [(id)f name]]; break; }
+        fns[nf++] = (rn_air_stitch_fn){f.name.UTF8String, f->bitcode.bytes, f->bitcode.length};
+    }
+    char *text = NULL, err[400] = "";
+    size_t tb = 0;
+    if (!why && rn_air_link_visible(NULL, kf->bitcode.bytes, kf->bitcode.length, fns, nf, &text, &tb, err, sizeof(err))) why = [NSString stringWithUTF8String:err];
+    if (why) {
+        rn_log("compute pipeline for %s: linking its functions failed: %s", kf->name.UTF8String, why.UTF8String);
+        if (error) *error = [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorInternal userInfo:@{NSLocalizedDescriptionKey: why}];
+        return nil;
+    }
+    if (getenv("RN_DUMP_LINKED")) {
+        // the linked kernel and the names it was given, for debugging: /tmp/rednavi-linked-<kernel>.ll
+        NSMutableString *head = [NSMutableString stringWithString:@"; linked functions:"];
+        for (unsigned i = 0; i < nf; i++) [head appendFormat:@" %s", fns[i].name];
+        [head appendString:@"\n"];
+        NSMutableData *d = [[head dataUsingEncoding:NSUTF8StringEncoding] mutableCopy];
+        [d appendBytes:text length:tb];
+        NSString *safe = [[kf->name componentsSeparatedByCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"/: "]] componentsJoinedByString:@"_"];
+        [d writeToFile:[NSString stringWithFormat:@"/tmp/rednavi-linked-%@.ll", safe] atomically:NO];
+    }
+    RedNaviMTLFunction *c = [RedNaviMTLFunction new];
+    c->name = kf->name; c->sname = kf->sname; c->type = kf->type; c->dev = kf->dev; c->fcs = kf->fcs; c->bitcode = [NSData dataWithBytes:text length:tb];
+    rn_air_stitch_free(text);
+    return c;
+}
+
+// A compute pipeline state from a function of a library: the function's bitcode goes to the translator (rn_air.h), the SPIR-V to RADV.
+static RedNaviMTLFunction *rn_source_function(id f, id<MTLDevice> dev);
+static id rn_pso_build(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_tg_length *tgs, unsigned ntgs, NSError **error);
+static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
     RedNaviMTLFunction *f = (RedNaviMTLFunction *)fobj;
+    if (f && ![f isKindOfClass:[RedNaviMTLFunction class]]) { RedNaviMTLFunction *s = rn_source_function(fobj, dev); if (s) f = s; }
+    return rn_pso_build(dev, f, NULL, 0, error);
+}
+
+static RedNaviMTLComputePipelineState *rn_pso_for_tg(RedNaviMTLComputePipelineState *p, const uint32_t *tgLen) {
+    // the lengths set for every index are passed on: the translator applies the ones of the kernel's threadgroup buffers
+    BOOL same = YES;
+    for (unsigned k = 0; k < RN_TG_SLOTS; k++) if (tgLen[k] != p->tgBuilt[k]) same = NO;
+    if (same || !p->src) return p;
+    uint32_t want[RN_TG_SLOTS]; memcpy(want, tgLen, sizeof(want));
+    NSData *key = [NSData dataWithBytes:want length:sizeof(want)];
+    @synchronized (p) {
+        RedNaviMTLComputePipelineState *v = p->variants[key];
+        if (v) return v;
+        rn_air_tg_length tgs[RN_TG_SLOTS]; unsigned n = 0;
+        for (unsigned k = 0; k < RN_TG_SLOTS; k++) if (want[k]) tgs[n++] = (rn_air_tg_length){k, want[k]};
+        NSError *e = nil;
+        v = rn_pso_build(p->dev, (RedNaviMTLFunction *)p->src, tgs, n, &e);
+        if (!v) { rn_log("%s: no pipeline for the threadgroup lengths set, the default lengths are used", p->fname.UTF8String); v = p; }
+        else rn_log("%s: pipeline built for threadgroup lengths %u %u %u (indices 0-2; %u threadgroup buffers reported, %u in the variant)", p->fname.UTF8String, want[0], want[1], want[2], p->ntg, v->ntg);
+        if (!p->variants) p->variants = [NSMutableDictionary dictionary];
+        p->variants[key] = v;
+        return v;
+    }
+}
+
+static id rn_pso_build(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_tg_length *tgs, unsigned ntgs, NSError **error) {
+    if (error) *error = nil;
     NSString *why = nil;
     if (![f isKindOfClass:[RedNaviMTLFunction class]]) why = @"the function is not from a RedNavi library";
     else if (f->type != MTLFunctionTypeKernel) why = @"only kernel functions are supported";
@@ -2923,11 +3854,21 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
         memset(&info, 0, sizeof(info));
         rn_air_const fcc[64];
     const unsigned nfc = rn_fc_array(f->fcs, fcc, 64);
-    if (rn_air_translate_stage_fc(NULL, RN_AIR_KERNEL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
+    if (rn_air_translate_stage_tg(NULL, RN_AIR_KERNEL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, fcc, nfc, tgs, ntgs, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithUTF8String:err];
         } else {
             rn_vk_binding binds[RN_VK_MAX_BINDINGS];
             rn_vk_sampler_desc sds[RN_VK_MAX_BINDINGS];
+            // a threadgroup buffer (kind 7, [[threadgroup(n)]]) has no descriptor: the module holds it, at the length given in tgs or the translator's default (2048 bytes)
+            unsigned ntg = 0;
+            {
+                unsigned k = 0;
+                for (unsigned i = 0; i < info.binding_count && i < RN_AIR_MAX_BINDINGS; i++) {
+                    if (info.bindings[i].kind != 7) info.bindings[k++] = info.bindings[i];
+                    else ntg++;
+                }
+                info.binding_count = k;
+            }
             unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
             for (unsigned i = 0; i < n; i++) {
                 const rn_air_binding *ab = &info.bindings[i];
@@ -2943,8 +3884,10 @@ static id rn_pso_from_function(id<MTLDevice> dev, id fobj, NSError **error) {
             if (!c) why = n ? @"RADV refused the translated module" : @"the kernel uses no resources";
             else {
                 RedNaviMTLComputePipelineState *p = [RedNaviMTLComputePipelineState new];
-                p->c = c; p->nbind = n; p->push = 0; p->pushIndex = 0xffffffffu; p->spec = YES; p->dyn = YES; p->dev = dev;
-                for (unsigned i = 0; i < n; i++) { p->metalIndex[i] = info.bindings[i].metal_index; p->kind[i] = info.bindings[i].kind; }
+                p->c = c; p->nbind = n; p->push = 0; p->pushIndex = 0xffffffffu; p->spec = YES; p->dyn = YES; p->dev = dev; p->fname = f->name;
+                p->ntg = ntg; p->src = f;
+                for (unsigned t = 0; t < ntgs; t++) if (tgs[t].index < RN_TG_SLOTS) p->tgBuilt[tgs[t].index] = tgs[t].bytes;
+                for (unsigned i = 0; i < n; i++) { p->metalIndex[i] = info.bindings[i].metal_index; p->kind[i] = info.bindings[i].kind | (info.bindings[i].dim << 8); }   // dimension in the upper bits, as for render pipelines
                 for (int i = 0; i < 3; i++) p->localSize[i] = info.local_size[i];
                 return p;
             }
@@ -3020,6 +3963,46 @@ static id rn_render_reflection(id pso) {
 }
 
 // A render pipeline state from a descriptor: both functions go to the translator (vertex module in set 0, fragment module in set 1) and the Vulkan pipeline for triangles is built.
+// Translating a function to SPIR-V costs a hash of the whole library bitcode, a read of the translator's disk cache and a copy of the module, and QuartzCore asks for the same function with
+// the same constants again and again (the Launchpad animation: one 580 KB fragment module requested 77 times in 300 pipelines, 4 to 6 s of this in 5 s). The module is kept here by what it
+// depends on: the bitcode (by content), the entry name, the stage and the constant values; about 96 MB at most, oldest out first.
+// The caller gets the entry's own SPIR-V and info and must not free or change the module.
+static NSArray *rn_translate_memo(int stage, NSData *bitcode, const char *entry, const rn_air_const *fcc, unsigned nfc, char *err, size_t errlen) {
+    static NSMutableDictionary<NSData *, NSArray *> *cache; static NSMutableArray<NSData *> *order; static size_t total; static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
+    NSMutableData *key = [NSMutableData data];
+    // The bitcode is a new NSData for every function object QuartzCore makes, so it is known by content (64-bit FNV over its words), not by address.
+    uint64_t bh = 14695981039346656037ull; const uint64_t *bw = bitcode.bytes; const size_t bcl = bitcode.length;
+    for (size_t i = 0; i < bcl / 8; i++) bh = (bh ^ bw[i]) * 1099511628211ull;
+    const int st = stage;
+    [key appendBytes:&st length:sizeof(st)]; [key appendBytes:&bh length:sizeof(bh)]; [key appendBytes:&bcl length:sizeof(bcl)]; [key appendBytes:entry length:strlen(entry) + 1];
+    for (unsigned c = 0; c < nfc; c++) {
+        [key appendBytes:&fcc[c].index length:sizeof(int32_t)];
+        if (fcc[c].name) [key appendBytes:fcc[c].name length:strlen(fcc[c].name) + 1];
+        [key appendBytes:&fcc[c].size length:sizeof(uint32_t)]; [key appendBytes:fcc[c].data length:fcc[c].size];
+    }
+    pthread_mutex_lock(&mu);
+    NSArray *hit = cache[key];
+    pthread_mutex_unlock(&mu);
+    if (hit) return hit;
+    { NSMutableData *fk = [NSMutableData data]; for (unsigned c = 0; c < nfc; c++) { [fk appendBytes:&fcc[c].size length:4]; [fk appendBytes:fcc[c].data length:fcc[c].size]; }
+      uint64_t fh = 14695981039346656037ull; for (NSUInteger i = 0; i < fk.length; i++) fh = (fh ^ ((const uint8_t *)fk.bytes)[i]) * 1099511628211ull;
+      rn_log("translate miss: %s stage %d, bitcode %zu bytes hash %016llx, %u constants hash %016llx", entry, stage, bcl, (unsigned long long)bh, nfc, (unsigned long long)fh); }
+    rn_air_kernel_info info; memset(&info, 0, sizeof(info));
+    uint32_t *spv = NULL; size_t spvBytes = 0;
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    if (rn_air_translate_stage_fc(NULL, stage, bitcode.bytes, bitcode.length, entry, fcc, nfc, &info, &spv, &spvBytes, err, errlen)) return nil;
+    rn_log("translated %s in %.1f ms (a disk cache hit is a few ms)", entry, (clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0) / 1e6);
+    NSArray *e = @[[NSNull null], [NSData dataWithBytes:spv length:spvBytes], [NSData dataWithBytes:&info length:sizeof(info)]];
+    rn_air_free(spv, spvBytes);
+    pthread_mutex_lock(&mu);
+    if (!cache) { cache = [NSMutableDictionary new]; order = [NSMutableArray new]; }
+    if (!cache[key]) {
+        cache[key] = e; [order addObject:key]; total += spvBytes;
+        while (total > ((size_t)96 << 20) && order.count > 1) { total -= [(NSData *)cache[order[0]][1] length]; [cache removeObjectForKey:order[0]]; [order removeObjectAtIndex:0]; }
+    }
+    pthread_mutex_unlock(&mu);
+    return e;
+}
 static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error);
 static id rn_render_pso_from_descriptor(id<MTLDevice> dev, MTLRenderPipelineDescriptor *desc, NSError **error) {
     const uint64_t ph5 = mach_absolute_time();
@@ -3109,7 +4092,45 @@ static NSArray<NSDictionary *> *rn_gl_args(void *mod) {
     return out;
 }
 
+// A function of a library the base class made from Metal source (newLibraryWithSource:, which Chromium's Dawn and ANGLE use for every shader): an _MTLFunctionInternal whose
+// bitcodeData (bitcodeType 0) is the AIR bitcode Apple's compiler service wrote (verified 2026-11-22: 0x0B17C0DE wrapper, like a metallib entry). It goes on as one of our own.
+// Function constants given to the base class's newFunctionWithName:constantValues: are not carried over (not seen in use yet).
+// Opt-in (/Users/Shared/rednavi-srclib or RN_METAL_SRCLIB) since 2026-11-22: with it on by default, Brave and the Claude app (Electron) hung the GPU queue
+// soon after start, and every later command buffer of WindowServer timed out until a reboot. Not yet known which shader did it; ANGLE relies on function
+// constants, which this path drops.
+static RedNaviMTLFunction *rn_source_function(id f, id<MTLDevice> dev) {
+    static int on = -1;
+    if (on < 0) on = getenv("RN_METAL_SRCLIB") || access("/Users/Shared/rednavi-srclib", F_OK) == 0;
+    if (!on) return nil;
+    if (![f respondsToSelector:@selector(bitcodeData)] || ![f respondsToSelector:@selector(bitcodeType)] ||
+        ((NSUInteger (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType)) != 0) return nil;
+    id bd = [f performSelector:@selector(bitcodeData)];
+    NSData *bc = [bd isKindOfClass:[NSData class]] ? bd : nil;
+    if (!bc && bd) { const void *p0; size_t len; dispatch_data_t m = dispatch_data_create_map((dispatch_data_t)bd, &p0, &len); bc = [NSData dataWithBytes:p0 length:len]; (void)m; }
+    if (bc.length < 8) return nil;
+    const uint32_t magic = *(const uint32_t *)bc.bytes;
+    if (magic != 0x0B17C0DE && magic != 0xDEC04342) return nil;      // bitcode wrapper or raw bitcode ('BC' 0xC0DE)
+    RedNaviMTLFunction *w = [RedNaviMTLFunction new];
+    w->name = [(id<MTLFunction>)f name];
+    w->type = [(id<MTLFunction>)f functionType];
+    w->bitcode = bc;
+    w->dev = dev;
+    @synchronized ([RNRenderPass class]) {
+        if (!g_srcnames) g_srcnames = [NSMutableSet new];
+        if (w->name && ![g_srcnames containsObject:w->name]) {
+            [g_srcnames addObject:w->name];
+            NSUInteger nfc = [f respondsToSelector:@selector(functionConstantsDictionary)] ? [[f functionConstantsDictionary] count] : 0;
+            rn_log("srclib: function %s (%s), bitcode %lu bytes, %lu function constants", w->name.UTF8String, w->type == MTLFunctionTypeKernel ? "kernel" : w->type == MTLFunctionTypeVertex ? "vertex" : "fragment", (unsigned long)bc.length, (unsigned long)nfc);
+            if (getenv("RN_DUMP_SRCLIB")) {
+                char p[PATH_MAX]; snprintf(p, sizeof p, "/tmp/rednavi-src-%s.bc", w->name.UTF8String);
+                [bc writeToFile:@(p) atomically:NO];
+            }
+        }
+    }
+    return w;
+}
 static RedNaviMTLFunction *rn_gl_function(id f, id<MTLDevice> dev, NSString **why) {
+    { RedNaviMTLFunction *s = rn_source_function(f, dev); if (s) return s; }
     static void *(*ctx_create)(void), (*ctx_dispose)(void *), (*mod_dispose)(void *);
     static int (*to_fd)(void *, int, int, int);
     static void *(*gen)(void *, const void *, uint32_t);
@@ -3208,6 +4229,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
     RedNaviMTLFunction *fn[2] = {(RedNaviMTLFunction *)desc.vertexFunction, (RedNaviMTLFunction *)desc.fragmentFunction};
     rn_vk *vk = rn_vk_shared();
     RedNaviMTLRenderPipelineState *p = [RedNaviMTLRenderPipelineState new];
+    const uint64_t tStart = mach_absolute_time(); uint64_t tTranslated = 0;
     rn_log("render pipeline asked: vertex %s, fragment %s", fn[0] ? [fn[0].name UTF8String] : "-", fn[1] ? [fn[1].name UTF8String] : "-");
     if (!vk) why = @"RADV is not available";
     else if (!fn[0] || !fn[1]) why = @"a render pipeline needs a vertex and a fragment function";
@@ -3225,7 +4247,12 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             static unsigned llSeq;
             setenv("RN_AIR_DEBUG_LL", [NSString stringWithFormat:@"%s/%02u_%s_%s.ll", getenv("RN_DUMP_SPV"), llSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String].UTF8String, 1);
         }
-        if (rn_air_translate_stage_fc(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
+        NSArray *memo = nil;
+        if (!getenv("RN_DUMP_SPV") && access("/Users/Shared/rednavi-finederiv", F_OK) != 0) {
+            memo = rn_translate_memo(s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode, fn[s]->name.UTF8String, fcc, nfc, err, sizeof(err));
+            if (memo) { spv = (uint32_t *)[(NSData *)memo[1] bytes]; spvBytes = [(NSData *)memo[1] length]; memcpy(&info, [(NSData *)memo[2] bytes], sizeof(info)); }
+        }
+        if (!memo && rn_air_translate_stage_fc(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
             break;
         }
@@ -3240,6 +4267,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             }
         }
         p->spv[s] = [NSData dataWithBytes:spv length:spvBytes];
+        { uint32_t h = 2166136261u; for (size_t b = 0; b < spvBytes; b++) h = (h ^ ((const uint8_t *)spv)[b]) * 16777619u; p->spvHash[s] = h; }
         if (getenv("RN_SPV_OVERRIDE_DIR") || getenv("RN_DUMP_SPV")) {              // debugging: a module is known by the FNV-1a hash of its SPIR-V; a file <hash>.spv in the override directory replaces it
             uint32_t h = 2166136261u; for (size_t b = 0; b < spvBytes; b++) h = (h ^ ((const uint8_t *)spv)[b]) * 16777619u;
             if (getenv("RN_DUMP_SPV")) rn_log("spv hash %08x: %s %s (%lu bytes)", h, s ? "fragment" : "vertex", fn[s]->name.UTF8String, (unsigned long)spvBytes);
@@ -3253,7 +4281,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             NSString *f = [NSString stringWithFormat:@"%s/%02u_%s_%s.spv", getenv("RN_DUMP_SPV"), spvSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String];
             [p->spv[s] writeToFile:f atomically:NO];
         }
-        rn_air_free(spv, spvBytes);
+        if (!memo) rn_air_free(spv, spvBytes);
         unsigned n = info.binding_count < RN_VK_MAX_BINDINGS ? info.binding_count : RN_VK_MAX_BINDINGS;
         p->n[s] = n;
         {
@@ -3291,7 +4319,7 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
                 if (ab->kind == RN_AIR_BUFFER) [a addObject:@{@"type": @(MTLArgumentTypeBuffer), @"index": @(ab->metal_index), @"size": @0, @"writable": @(ab->writable)}];
                 else if (ab->kind == RN_AIR_SAMPLER) [a addObject:@{@"type": @(MTLArgumentTypeSampler), @"index": @(ab->metal_index)}];
                 else if (ab->kind == RN_AIR_TEXTURE || ab->kind == RN_AIR_STORAGE_IMAGE || ab->kind == RN_AIR_NULL_TEXTURE)
-                    [a addObject:@{@"type": @(MTLArgumentTypeTexture), @"index": @(ab->metal_index), @"textureType": @(tt[ab->dim & 7][(ab->dim >> 3) & 1]), @"dataType": @(MTLDataTypeFloat), @"writable": @(ab->kind == RN_AIR_STORAGE_IMAGE)}];
+                    [a addObject:@{@"type": @(MTLArgumentTypeTexture), @"index": @(ab->metal_index), @"textureType": @((ab->dim & RN_AIR_DIM_MS) ? ((ab->dim & 8) ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample) : tt[ab->dim & 7][(ab->dim >> 3) & 1]), @"dataType": @(MTLDataTypeFloat), @"writable": @(ab->kind == RN_AIR_STORAGE_IMAGE)}];
             }
             p->args[s] = a;
         }
@@ -3345,7 +4373,9 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             p->tfmt[0] = RN_VK_RGBA8; p->blend[0] = (rn_vk_blend){.src_rgb = 1, .src_a = 1, .write_mask = 0}; p->nt = 1;
         }
         if (!why && !p->nt) why = @"a render pipeline needs a colour attachment";
-        if (!why && desc.rasterSampleCount > 1) why = @"multisampling is not supported";
+        p->samples = desc.rasterSampleCount > 1 ? (unsigned)desc.rasterSampleCount : 1;
+        if (!why && p->samples > 1 && !(rn_vk_sample_counts(rn_vk_shared()) & p->samples)) why = [NSString stringWithFormat:@"rasterSampleCount %u is not supported", p->samples];
+        tTranslated = mach_absolute_time();
         if (!why && ![p renderForPrimitive:3 cull:0 clockwise:YES]) why = @"RADV refused the pipeline";
     }
     if (why) {
@@ -3354,6 +4384,9 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
         return nil;
     }
     p->dev = dev;
+    { static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb); const uint64_t tEnd = mach_absolute_time();
+      rn_log("render pipeline time: %.1f ms before RADV (translation, bindings), %.1f ms in RADV", (double)(tTranslated - tStart) * tb.numer / tb.denom / 1e6, (double)(tEnd - tTranslated) * tb.numer / tb.denom / 1e6);
+      if ((double)(tTranslated - tStart) * tb.numer / tb.denom / 1e6 > 100) rn_log("render pipeline slow: %s / %s : fragment %s", p->names[0].UTF8String ?: "-", p->names[1].UTF8String ?: "-", p->variant[1].UTF8String ?: "-"); }
     rn_log("render pipeline %p made: vertex %lu bytes of SPIR-V (%u bindings), fragment %lu (%u bindings), %u vertex attributes", p, (unsigned long)p->spv[0].length, p->n[0], (unsigned long)p->spv[1].length, p->n[1], p->nvattr);
     return p;
 }
@@ -3390,6 +4423,9 @@ static MTLSizeAndAlign rn_heap_texture_size(MTLTextureDescriptor *desc) {
     MTLHeapDescriptor *desc_;
     _Atomic NSUInteger used_;
     NSString *label_;
+    RNBacking *mem_;                                 // the heap's memory (nil when it could not be allocated: then each buffer gets its own, as before)
+    NSMutableArray *regions_;                        // NSValue pairs (offset, size) and the buffer that holds each: weak, in regionOwners_
+    NSPointerArray *regionOwners_;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc;
 @end
@@ -3403,8 +4439,25 @@ static char rn_heap_lease_key;
     if (!(self = [super init])) return nil;
     dev_ = d;
     desc_ = [desc copy];
-    rn_log("heap: %lu bytes, storage %lu, type %ld%s", (unsigned long)desc.size, (unsigned long)desc.storageMode, (long)desc.type,
-           desc.type == MTLHeapTypePlacement ? " (placement: resources at an offset are not supported)" : "");
+    regions_ = [NSMutableArray array];
+    regionOwners_ = [NSPointerArray weakObjectsPointerArray];
+    rn_vk *vk = rn_vk_shared();
+    // A Private heap's memory is one allocation in VRAM the CPU cannot map (its buffers are Private too); a Shared or Managed heap's is host memory within the per-process budget.
+    // When neither works the heap has no memory of its own and each resource gets its own (counted against the heap's size).
+    const char *where = "none";
+    if (vk && desc.size && desc.storageMode == MTLStorageModePrivate && !rn_is_ws()) {
+        mem_ = [RNBacking new];
+        mem_->b = rn_vk_buffer_create_device(vk, desc.size);
+        if (mem_->b) { mem_->host = NO; where = "VRAM"; } else mem_ = nil;
+    }
+    if (!mem_ && vk && desc.size && rn_buf_budget_take(desc.size)) {
+        mem_ = [RNBacking new];
+        mem_->b = rn_vk_buffer_create(vk, desc.size);
+        if (mem_->b) { mem_->host = YES; where = "host memory"; atomic_fetch_add(&g_proc_buf_bytes, (long)rn_vk_buffer_length(mem_->b) - (long)desc.size); }   // charged at its real length
+        else { mem_ = nil; rn_buf_budget_give(desc.size); }
+    }
+    if (mem_) { atomic_fetch_add(&g_hb_live, 1); atomic_fetch_add(&g_hb_bytes, (long)rn_vk_buffer_length(mem_->b)); }
+    rn_log("heap: %lu bytes, storage %lu, type %ld, memory in %s", (unsigned long)desc.size, (unsigned long)desc.storageMode, (long)desc.type, where);
     return self;
 }
 // Takes the bytes from the heap if they fit; NO when they do not.
@@ -3437,12 +4490,53 @@ static char rn_heap_lease_key;
     NSUInteger start = (atomic_load(&used_) + a - 1) / a * a;
     return start < desc_.size ? desc_.size - start : 0;
 }
+- (void)rn_aliased:(RedNaviMTLBuffer *)x {
+    atomic_fetch_add(&g_hb_alias, 1);
+    RNHeapLease *l = objc_getAssociatedObject(x, &rn_heap_lease_key);
+    if (l && l->bytes) { atomic_fetch_sub(&used_, l->bytes); l->bytes = 0; }
+}
+// The lowest offset (a multiple of 256) where `need` bytes fit between the ranges of the heap's buffers that are alive and not aliasable; NSNotFound when none. Ranges whose buffer
+// is gone are dropped.
+- (NSUInteger)placeBytes:(NSUInteger)need {
+    NSMutableArray<NSValue *> *busy = [NSMutableArray array];
+    for (NSInteger i = (NSInteger)regions_.count - 1; i >= 0; i--) {
+        RedNaviMTLBuffer *o = (__bridge RedNaviMTLBuffer *)[regionOwners_ pointerAtIndex:(NSUInteger)i];
+        if (!o) { [regions_ removeObjectAtIndex:(NSUInteger)i]; [regionOwners_ removePointerAtIndex:(NSUInteger)i]; continue; }
+        if (!o->aliasable_) [busy addObject:regions_[(NSUInteger)i]];
+    }
+    [busy sortUsingComparator:^NSComparisonResult(NSValue *p, NSValue *q) { return p.rangeValue.location < q.rangeValue.location ? NSOrderedAscending : p.rangeValue.location > q.rangeValue.location ? NSOrderedDescending : NSOrderedSame; }];
+    NSUInteger at = 0;
+    for (NSValue *v in busy) {
+        if (at + need <= v.rangeValue.location) break;
+        const NSUInteger end = NSMaxRange(v.rangeValue);
+        if (end > at) at = (end + 255) & ~(NSUInteger)255;
+    }
+    return at + need <= rn_vk_buffer_length(mem_->b) ? at : NSNotFound;
+}
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     NSUInteger need = (length + 255) & ~(NSUInteger)255;
+    if (!need) need = 256;
     if (![self reserve:need]) return nil;
-    id<MTLBuffer> b = [dev_ newBufferWithLength:length options:options];
-    [self lease:b bytes:need];
-    return b;
+    if (!mem_) {                                     // no memory of its own: a buffer of the device, counted against the heap
+        id<MTLBuffer> x = [dev_ newBufferWithLength:length options:options];
+        [self lease:x bytes:need];
+        return x;
+    }
+    RedNaviMTLBuffer *x = nil;
+    @synchronized(self) {
+        const NSUInteger at = [self placeBytes:need];
+        rn_vk_buffer *sub = at == NSNotFound ? NULL : rn_vk_buffer_create_in(rn_vk_shared(), mem_->b, at, need);
+        if (sub) {
+            x = [[RedNaviMTLBuffer alloc] initWithDevice:dev_ backing:mem_ buffer:sub length:length options:options heap:self];
+            x->heapOffset_ = at;
+            [regions_ addObject:[NSValue valueWithRange:NSMakeRange(at, need)]];
+            [regionOwners_ addPointer:(__bridge void *)x];
+        }
+    }
+    if (!x) { atomic_fetch_sub(&used_, need); atomic_fetch_add(&g_hb_reuse, 1); return nil; }   // fragmented: the caller makes another heap
+    atomic_fetch_add(&g_hb_new, 1);
+    [self lease:x bytes:need];
+    return x;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc {
     NSUInteger need = rn_heap_texture_size(desc).size;
@@ -3451,13 +4545,32 @@ static char rn_heap_lease_key;
     [self lease:t bytes:need];
     return t;
 }
+// Placement heaps: the app picks the offset, and resources over the same bytes alias on purpose (MPSGraph puts its temporary tensors there). A buffer is bound at that offset
+// of the heap's memory. A texture is not (textures here are images with a host copy of their own): it gets its own memory, so it does not share bytes with what overlaps it.
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset {
-    rn_log("heap: a buffer at offset %lu of a placement heap is not supported", (unsigned long)offset);
-    return nil;
+    const NSUInteger need = length ? length : 1;
+    if (desc_.type != MTLHeapTypePlacement || offset + need > desc_.size) {
+        static int said; if (said++ < 20) rn_log("heap: buffer of %lu bytes at offset %lu of a heap of %lu bytes (type %ld): not placeable, nil", (unsigned long)length, (unsigned long)offset, (unsigned long)desc_.size, (long)desc_.type);
+        return nil;
+    }
+    RedNaviMTLBuffer *x = nil;
+    rn_vk_buffer *sub = mem_ ? rn_vk_buffer_create_in(rn_vk_shared(), mem_->b, offset, need) : NULL;
+    if (sub) { x = [[RedNaviMTLBuffer alloc] initWithDevice:dev_ backing:mem_ buffer:sub length:length options:options heap:self]; x->heapOffset_ = offset; }
+    else {
+        static int said; if (said++ < 20) rn_log("heap: buffer of %lu bytes at offset %lu: %s, a buffer of its own", (unsigned long)length, (unsigned long)offset, mem_ ? "the offset is not aligned for the card" : "the heap has no memory");
+        x = [dev_ newBufferWithLength:length options:options];
+    }
+    if (!x) { static int said; if (said++ < 20) rn_log("heap: buffer of %lu bytes at offset %lu: allocation failed, nil", (unsigned long)length, (unsigned long)offset); return nil; }
+    NSUInteger cur = atomic_load(&used_);                // usedSize: the highest end placed so far
+    while (offset + need > cur && !atomic_compare_exchange_weak(&used_, &cur, offset + need)) {}
+    return x;
 }
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)desc offset:(NSUInteger)offset {
-    rn_log("heap: a texture at offset %lu of a placement heap is not supported", (unsigned long)offset);
-    return nil;
+    if (desc_.type != MTLHeapTypePlacement) { static int said; if (said++ < 20) rn_log("heap: texture at offset %lu of a heap that is not a placement heap, nil", (unsigned long)offset); return nil; }
+    static int said; if (said++ < 20) rn_log("heap: texture %lux%lu format %lu at offset %lu of a placement heap: memory of its own (not aliased)", (unsigned long)desc.width, (unsigned long)desc.height, (unsigned long)desc.pixelFormat, (unsigned long)offset);
+    id<MTLTexture> t = [dev_ newTextureWithDescriptor:desc];
+    if (!t) rn_log("heap: texture at offset %lu: allocation failed, nil", (unsigned long)offset);
+    return t;
 }
 @end
 
@@ -3502,9 +4615,9 @@ void rn_compute_install(Class k, Class sup) {
                 return rn_gate() && rn_vk_shared() ? @"AMD" : (ov ? ((id(*)(id, SEL))ov)(self, sv) : nil);
             }), "@16@0:8");
             // Queries the GL renderer makes while it creates its device. The generic stub of plugin.m cannot answer a struct (MTLSize comes back through a hidden pointer, which the
-            // stub took for self and crashed on). One sample per pixel only: the render encoder has no multisampling.
+            // stub took for self and crashed on). Sample counts: the ones RADV renders and samples (rn_vk_sample_counts), as supportsTextureSampleCount: answers.
             class_addMethod(k, sel_registerName("maxThreadsPerThreadgroup"), imp_implementationWithBlock(^MTLSize(id self) { return MTLSizeMake(1024, 1024, 1024); }), "{?=QQQ}16@0:8");
-            class_addMethod(k, sel_registerName("supportsSampleCount:"), imp_implementationWithBlock(^BOOL(id self, NSUInteger n) { return n == 1; }), "c24@0:8Q16");
+            class_addMethod(k, sel_registerName("supportsSampleCount:"), imp_implementationWithBlock(^BOOL(id self, NSUInteger n) { return rn_sample_count_ok(n); }), "c24@0:8Q16");
             class_addMethod(k, sel_registerName("gpuCoreCount"), imp_implementationWithBlock(^NSUInteger(id self) { return 60; }), "Q16@0:8");   // compute units of the RX 7800 XT
         }
     }
@@ -3521,8 +4634,10 @@ void rn_compute_install(Class k, Class sup) {
     rn_imp_bytes o2 = m2 ? (rn_imp_bytes)method_getImplementation(m2) : NULL;
     class_addMethod(k, s2, imp_implementationWithBlock(^uintptr_t(id self, const void *bytes, NSUInteger length, NSUInteger options) {
         if (!rn_gate()) return o2 ? o2(self, s2, bytes, length, options) : 0;
+        rn_force_host_ = YES;
         RedNaviMTLBuffer *b = [[RedNaviMTLBuffer alloc] initWithDevice:(id<MTLDevice>)self length:length options:options];
-        if (b && bytes) memcpy(rn_vk_buffer_contents(b->b), bytes, length);
+        rn_force_host_ = NO;
+        if (b && bytes && rn_vk_buffer_contents(b->b)) memcpy(rn_vk_buffer_contents(b->b), bytes, length);
         return (uintptr_t)CFBridgingRetain(b);
     }), m2 ? method_getTypeEncoding(m2) : "@40@0:8r^v16Q24Q32");
     SEL s2b = sel_registerName("newBufferWithBytesNoCopy:length:options:deallocator:");
@@ -3531,7 +4646,9 @@ void rn_compute_install(Class k, Class sup) {
     rn_imp_nocopy o2b = m2b ? (rn_imp_nocopy)method_getImplementation(m2b) : NULL;
     class_addMethod(k, s2b, imp_implementationWithBlock(^uintptr_t(id self, void *bytes, NSUInteger length, NSUInteger options, void (^dealloc)(void *, NSUInteger)) {
         if (!rn_gate()) return o2b ? o2b(self, s2b, bytes, length, options, dealloc) : 0;
+        rn_force_host_ = YES;
         RedNaviMTLBuffer *b = [[RedNaviMTLBuffer alloc] initWithDevice:(id<MTLDevice>)self length:length options:options];
+        rn_force_host_ = NO;
         if (!b) return 0;
         b->userPtr = bytes; b->userDealloc = [dealloc copy];
         memcpy(rn_vk_buffer_contents(b->b), bytes, length);
@@ -3712,8 +4829,8 @@ void rn_compute_install(Class k, Class sup) {
         }), mds ? method_getTypeEncoding(mds) : "@24@0:8@16");
     }
     // Stitched libraries (CoreImage compiles a whole filter graph into one compute pipeline with them; iconservicesagent and mediaanalysisd crashed on the first one): the base class reads
-    // the private data of the functions it is given, which a function of this plug-in does not have, and dereferenced a null script. The plug-in cannot stitch AIR functions yet, so the
-    // call fails with an error, which CoreImage handles.
+    // the private data of the functions it is given, which a function of this plug-in does not have, and dereferenced a null script. The plug-in stitches the graph itself (rn_stitched_library);
+    // a graph it cannot handle fails with an error, which CoreImage handles.
     {
         SEL ss = sel_registerName("newLibraryWithStitchedDescriptor:error:"), sa = sel_registerName("newLibraryWithStitchedDescriptor:completionHandler:");
         Method ms = class_getInstanceMethod(sup, ss), ma = class_getInstanceMethod(sup, sa);
@@ -3721,21 +4838,40 @@ void rn_compute_install(Class k, Class sup) {
         typedef void (*imp_stitch_async)(id, SEL, id, id);
         imp_stitch os = ms ? (imp_stitch)method_getImplementation(ms) : NULL;
         imp_stitch_async oa = ma ? (imp_stitch_async)method_getImplementation(ma) : NULL;
-        static NSError *(^unsupported)(void) = ^NSError *{
-            return [NSError errorWithDomain:MTLLibraryErrorDomain code:MTLLibraryErrorUnsupported userInfo:@{NSLocalizedDescriptionKey: @"stitched libraries are not supported by the RedNavi Metal plug-in"}];
-        };
         class_addMethod(k, ss, imp_implementationWithBlock(^uintptr_t(id self, id desc, NSError **error) {
             if (!rn_gate()) return os ? os(self, ss, desc, error) : 0;
-            rn_log("newLibraryWithStitchedDescriptor: not supported, answering an error");
-            if (error) *error = unsupported();
-            return 0;
+            return (uintptr_t)CFBridgingRetain(rn_stitched_library(self, desc, error));
         }), ms ? method_getTypeEncoding(ms) : "@32@0:8@16^@24");
         class_addMethod(k, sa, imp_implementationWithBlock(^(id self, id desc, id handler) {
             if (!rn_gate()) { if (oa) oa(self, sa, desc, handler); return; }
-            rn_log("newLibraryWithStitchedDescriptor (asynchronous): not supported, answering an error");
-            NSError *e = unsupported();
-            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{ ((void (^)(id, NSError *))handler)(nil, e); });
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+                NSError *e = nil;
+                id lib = rn_stitched_library(self, desc, &e);
+                ((void (^)(id, NSError *))handler)(lib, e);
+            });
         }), ma ? method_getTypeEncoding(ma) : "v32@0:8@16@?24");
+    }
+    // newLibraryWithDAG:functions:error: (private): MetalPerformanceShaders stitches its uber-shaders with it, a DAG in text and the functions it names (Geekbench's MPSGraph tests,
+    // 2026-11-22). The base class's version crashed on a null pointer with functions of this plug-in; rn_dag_library builds the library. RN_METAL_DAG_DUMP=1 writes each DAG and the
+    // names of its functions to /tmp/rednavi-dag-<pid>-<n>.txt (the first 20).
+    {
+        SEL sd = sel_registerName("newLibraryWithDAG:functions:error:");
+        Method md = class_getInstanceMethod(sup, sd);
+        typedef uintptr_t (*imp_dag)(id, SEL, id, id, NSError **);
+        imp_dag od = md ? (imp_dag)method_getImplementation(md) : NULL;
+        if (md) class_addMethod(k, sd, imp_implementationWithBlock(^uintptr_t(id self, NSString *dag, NSArray *fns, NSError **error) {
+            if (!rn_gate()) return od ? od(self, sd, dag, fns, error) : 0;
+            static atomic_int seen;
+            const int n = atomic_fetch_add(&seen, 1);
+            if (n < 20 && getenv("RN_METAL_DAG_DUMP")) {
+                NSMutableArray *names = [NSMutableArray array];
+                for (id f in fns) [names addObject:[NSString stringWithFormat:@"%@ (%s)", [f respondsToSelector:@selector(name)] ? [f name] : @"?", class_getName(object_getClass(f))]];
+                NSString *path = [NSString stringWithFormat:@"/tmp/rednavi-dag-%d-%d.txt", getpid(), n];
+                NSString *body = [NSString stringWithFormat:@"functions:\n%@\n\nDAG (%@):\n%@\n", [names componentsJoinedByString:@"\n"], [dag class], [dag description]];
+                [body writeToFile:path atomically:NO encoding:NSUTF8StringEncoding error:nil];
+            }
+            return (uintptr_t)CFBridgingRetain(rn_dag_library(self, [dag description], fns, error));
+        }), method_getTypeEncoding(md));
     }
     // Capabilities. The base class answers these from tables its own driver fills in, which a device made by this plug-in does not have (calling -supportsFamily: ended in a call through
     // a null pointer inside QuartzCore's Metal context setup), so they are answered here: what a discrete RDNA 3 card on macOS supports as far as the plug-in and the translator go (nothing here is read from the card; checked on the 7800 XT only). The Apple
@@ -3747,8 +4883,12 @@ void rn_compute_install(Class k, Class sup) {
         imp_bool_int ofam = mfam ? (imp_bool_int)method_getImplementation(mfam) : NULL, ofs = mfs ? (imp_bool_int)method_getImplementation(mfs) : NULL;
         class_addMethod(k, sfam, imp_implementationWithBlock(^BOOL(id self, NSInteger family) {
             if (!rn_gate()) return ofam ? ofam(self, sfam, family) : NO;
-            // MTLGPUFamilyMac1 2001, Mac2 2002, Common1..3 3001..3003, Metal3 5001
-            const BOOL yes = family == 2001 || family == 2002 || (family >= 3001 && family <= 3003) || family == 5001;
+            // MTLGPUFamilyMac1 2001, Mac2 2002, Common1..3 3001..3003, Metal3 5001. Metal 3 implies mesh shaders, function pointers and more that the translator does not do; the
+            // reference plug-in claims it only when it can. It stays YES for WindowServer, where it has run since QuartzCore's renderer came up, and is NO for every other
+            // process (Chromium's Dawn and ANGLE choose paths from it; one of them hung the GPU queue, 2026-11-22, cause not known yet).
+            static int ws = -1;
+            if (ws < 0) ws = strcmp(getprogname(), "WindowServer") == 0;
+            const BOOL yes = family == 2001 || family == 2002 || (family >= 3001 && family <= 3003) || (family == 5001 && ws);
             rn_log("supportsFamily: %ld -> %d", (long)family, yes);
             return yes;
         }), mfam ? method_getTypeEncoding(mfam) : "B24@0:8q16");
@@ -3771,6 +4911,10 @@ void rn_compute_install(Class k, Class sup) {
             {"supportsFixedLinePointFillDepthGradient", YES}, {"supportsRelaxedTextureViewRequirements", YES}, {"supportsTextureOutOfBoundsReads", YES}, {"supportsLinearTextureFromSharedBuffer", YES},
             {"supportsPullModelInterpolation", YES}, {"supportsSharedTextureHandles", YES}, {"supportsDynamicAttributeStride", YES}, {"supportsCountingOcclusionQuery", YES}};
         typedef BOOL (*imp_bool)(id, SEL);
+        // Multisampling, as the reference driver answers it: the sample counts Vulkan renders and samples, and 32-bit float multisample targets (RADV supports them on every count it offers).
+        // Dawn and Graphite ask these before they make multisample textures and their resolve shaders (texture2d_ms).
+        class_addMethod(k, sel_registerName("supportsTextureSampleCount:"), imp_implementationWithBlock(^BOOL(id self, NSUInteger n) { const BOOL y = rn_sample_count_ok(n); rn_log("supportsTextureSampleCount: %lu -> %d", (unsigned long)n, y); return y; }), "B24@0:8Q16");
+        class_addMethod(k, sel_registerName("supports32BitMSAA"), imp_implementationWithBlock(^BOOL(id self) { return rn_sample_count_ok(4); }), "B16@0:8");
         for (unsigned i = 0; i < sizeof(caps) / sizeof(caps[0]); i++) {
             SEL sc = sel_registerName(caps[i].name);
             Method mc = class_getInstanceMethod(sup, sc);
@@ -3821,13 +4965,40 @@ void rn_compute_install(Class k, Class sup) {
             default: rn_log("limit %s: return type %c not handled", limits[i].name, rt[0]); break;
             }
         }
+        // -maxThreadgroupMemoryLength (MTLDevice protocol) is not on the base class: without it the call reached the generic stub, which answers 0 (Geekbench asks for it, 2026-11-22).
+        // The same 32 KB as maxComputeThreadgroupMemory above.
+        class_addMethod(k, sel_registerName("maxThreadgroupMemoryLength"), imp_implementationWithBlock(^NSUInteger(id self) { return 32768; }), "Q16@0:8");
+        // Memory: the working set is the card's VRAM less 1 GB kept for the system (Private buffers and heaps live there), never 0; currentAllocatedSize is what this
+        // process holds in VRAM and in host buffers.
+        {
+            SEL sw = sel_registerName("recommendedMaxWorkingSetSize"), sa = sel_registerName("currentAllocatedSize"), su = sel_registerName("hasUnifiedMemory");
+            Method mw = class_getInstanceMethod(sup, sw), ma = class_getInstanceMethod(sup, sa), mu = class_getInstanceMethod(sup, su);
+            typedef uint64_t (*imp_q)(id, SEL);
+            typedef BOOL (*imp_b)(id, SEL);
+            imp_q ow = mw ? (imp_q)method_getImplementation(mw) : NULL, oa = ma ? (imp_q)method_getImplementation(ma) : NULL;
+            imp_b ou = mu ? (imp_b)method_getImplementation(mu) : NULL;
+            class_addMethod(k, sw, imp_implementationWithBlock(^uint64_t(id self) {
+                if (!rn_gate() || rn_is_ws()) return ow ? ow(self, sw) : 0;
+                const uint64_t v = rn_vk_vram_size(rn_vk_shared());
+                return v > (2ull << 30) ? v - (1ull << 30) : (v ? v : (4ull << 30));
+            }), mw ? method_getTypeEncoding(mw) : "Q16@0:8");
+            class_addMethod(k, sa, imp_implementationWithBlock(^NSUInteger(id self) {
+                if (!rn_gate() || rn_is_ws()) return oa ? (NSUInteger)oa(self, sa) : 0;
+                const long h = atomic_load(&g_proc_buf_bytes);
+                return (NSUInteger)rn_vk_device_bytes() + (NSUInteger)(h > 0 ? h : 0);
+            }), ma ? method_getTypeEncoding(ma) : "Q16@0:8");
+            class_addMethod(k, su, imp_implementationWithBlock(^BOOL(id self) { return rn_gate() && !rn_is_ws() ? NO : (ou ? ou(self, su) : NO); }), mu ? method_getTypeEncoding(mu) : "B16@0:8");
+        }
         SEL shb = sel_registerName("heapBufferSizeAndAlignWithLength:options:");
         Method mhb = class_getInstanceMethod(sup, shb);
         typedef MTLSizeAndAlign (*imp_hb)(id, SEL, NSUInteger, NSUInteger);
         imp_hb ohb = mhb ? (imp_hb)method_getImplementation(mhb) : NULL;
         class_addMethod(k, shb, imp_implementationWithBlock(^MTLSizeAndAlign(id self, NSUInteger len, NSUInteger opt) {
             if (!rn_gate() && ohb) return ohb(self, shb, len, opt);
-            return (MTLSizeAndAlign){len, 32};                      // as a real device answers
+            // what a heap here charges for it: whole 256-byte units, 256-aligned (a real device answers {len, 32}, but then the sizes MPS adds up for a heap do not cover what
+            // the heap takes, and the last buffers of the heap fail)
+            if (rn_is_ws()) return (MTLSizeAndAlign){len, 32};
+            return (MTLSizeAndAlign){((len ? len : 1) + 255) & ~(NSUInteger)255, 256};
         }), mhb ? method_getTypeEncoding(mhb) : "{?=QQ}32@0:8Q16Q24");
         SEL sht = sel_registerName("heapTextureSizeAndAlignWithDescriptor:");
         Method mht = class_getInstanceMethod(sup, sht);
@@ -3919,15 +5090,17 @@ void rn_compute_install(Class k, Class sup) {
     imp_fn_opt_refl_err o8p = cm8 ? (imp_fn_opt_refl_err)method_getImplementation(cm8) : NULL;
     class_addMethod(k, cs8, imp_implementationWithBlock(^uintptr_t(id self, MTLComputePipelineDescriptor *desc, NSUInteger options, void *reflection, NSError **error) {
         if (!rn_gate()) return o8p ? o8p(self, cs8, (id)desc, options, reflection, error) : 0;
-        return (uintptr_t)CFBridgingRetain(rn_pso_from_function((id<MTLDevice>)self, desc.computeFunction, error));
-    }), cm8 ? method_getTypeEncoding(cm8) : "@48@0:8@16Q24^@32^@40");
+        id kf = rn_linked_kernel(desc, error);
+        return kf ? (uintptr_t)CFBridgingRetain(rn_pso_from_function((id<MTLDevice>)self, kf, error)) : 0;
+    }), cm8 ?method_getTypeEncoding(cm8) : "@48@0:8@16Q24^@32^@40");
     SEL cs9 = sel_registerName("newComputePipelineStateWithDescriptor:options:completionHandler:");
     Method cm9 = class_getInstanceMethod(sup, cs9);
     imp_fn_opt_handler o9p = cm9 ? (imp_fn_opt_handler)method_getImplementation(cm9) : NULL;
     class_addMethod(k, cs9, imp_implementationWithBlock(^void(id self, MTLComputePipelineDescriptor *desc, NSUInteger options, void (^handler)(id, id, NSError *)) {
         if (!rn_gate()) { if (o9p) o9p(self, cs9, (id)desc, options, (id)handler); return; }
         NSError *error = nil;
-        id p = rn_pso_from_function((id<MTLDevice>)self, desc.computeFunction, &error);
+        id kf = rn_linked_kernel(desc, &error);
+        id p = kf ? rn_pso_from_function((id<MTLDevice>)self, kf, &error) : nil;
         handler(p, nil, error);
     }), cm9 ? method_getTypeEncoding(cm9) : "v40@0:8@16Q24@?32");
 }

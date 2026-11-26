@@ -347,6 +347,7 @@ public:
     unsigned int getHeight() const;
     unsigned int getBytesPerRow() const;
     unsigned int getPixelFormat() const;
+    unsigned int getSurfaceID() const;      // the id user space sees (IOSurfaceGetID); the plug-in's staged frames are named by it
     IOMemoryDescriptor *getMemoryDescriptor() const;
 };
 
@@ -600,7 +601,10 @@ long RedNaviDisplayPipe::performTransaction(IOAccelDisplayPipeTransaction2 *tx) 
         if (!framesSym) framesSym = OSSymbol::withCString("rednavi-gpu-frames");
         uint32_t direct = 0;
         if (prov && framesSym && prov->callPlatformFunction(framesSym, true, &direct, nullptr, nullptr, nullptr) == kIOReturnSuccess && direct) {
-            if (say) rnNote("  the plug-in puts the frames into the scanout itself: not copied");
+            if (say) rnNote("  the plug-in renders the frames on the card: the display flips to the staged one, nothing is copied");
+            static const OSSymbol *presentSym;
+            if (!presentSym) presentSym = OSSymbol::withCString("rednavi-gpu-present");
+            if (presentSym) prov->callPlatformFunction(presentSym, true, reinterpret_cast<void *>(static_cast<uintptr_t>(static_cast<IOSurface *>(surfP)->getSurfaceID())), nullptr, nullptr, nullptr);
             return 0;
         }
     }

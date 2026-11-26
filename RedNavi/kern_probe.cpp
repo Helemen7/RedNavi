@@ -365,23 +365,36 @@ class RedNaviProbe : public IOService {
     static constexpr uint64_t kVmEnd = 1ull << 48;           // the 48-bit space: the lower half 0 to 2^47 and the upper half, which a program sees sign-extended (0xffff800000000000 and up)
     static constexpr uint64_t kVmTables = 0x60000000ull;   // VRAM, 1.5 GB in: outside the PCI aperture, so that the aperture's free space can hold CPU-visible buffers
     static constexpr uint32_t kVmPoolPages = 8192;         // 32 MB per VMID: about 8000 tables (a table maps 2 MB), 16 GB of mapped buffers; 7 VMIDs take 224 MB of VRAM from kVmTables (the 4096 of before ran out at 31 buffers of 256 MB); the device-local pool starts above them
-    uint32_t vmPool[8][kVmPoolPages / 32];           // bit set: pool page in use
-    bool vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff);
-    uint64_t vmPageAlloc(int vmid);                  // a zeroed pool page (VRAM offset), 0 when the pool is empty
+    // Address spaces and VMIDs are different things, as in Linux (amdgpu_vmid.c): a connection owns an address space (a page table in VRAM, 1 to kVmSpaces) for as long as it is open, and
+    // the card has only seven user VMIDs. A VMID is bound to a space (rn_vm_bind) when the connection submits work and a VMID without work in flight is taken over by the next space
+    // that needs one: the page tables of all spaces come from one pool (kVmPoolTotal pages), each space remembers its pages so that they go back when it closes.
+    static constexpr uint32_t kVmSpaces = 1024;            // address spaces (open connections) at a time
+    static constexpr uint32_t kVmHw = 7;                   // the user VMIDs 1 to 7 (the MES owns the rest)
+    static constexpr uint32_t kVmPoolTotal = kVmHw * kVmPoolPages;
+    struct VmSpace { bool used; int vmid; uint64_t root; uint32_t *pages; uint32_t npages, cap; };   // vmid: the VMID it is bound to, 0 when it has none
+    struct VmSlot { int space; uint32_t pins; uint64_t lastUse; };                                      // what each VMID is bound to; pins: submits being made with it
+    VmSpace vmSpace[kVmSpaces + 1] {};
+    VmSlot vmSlot[kVmHw + 1] {};
+    uint64_t vmTick {0};
+    uint32_t vmPool[kVmPoolTotal / 32];              // bit set: pool page in use
+    uint32_t resetBefore[kVmSpaces + 1];              // resetQueue / resetGfxQueue, under queueLock
+    bool vmPtb(int space, uint64_t vaPage, bool create, uint64_t *ptbOff);
+    uint64_t vmPageAlloc(int space);                 // a zeroed pool page (VRAM offset) that belongs to the space, 0 when the pool is empty
     const struct rn_asic *asic {nullptr};            // the card's row of the ASIC table (RedNavi/asic.cpp); NULL: read-only
     const struct rn_asic_board *board {nullptr};
     uint32_t vramMbytes {16384};                     // RCC_CONFIG_MEMSIZE (the INFO queries answer with it)
-    uint32_t vmidUsed {0};                           // bit n: VMID n is a connection's
     bool vmReady {false};
-    int vmAlloc();                                   // a VMID with an empty page table bound to it, or -1
-    void vmFree(int vmid);
-    bool vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages);   // copies the buffer's GART PTEs into the VMID's tables; false: the pool ran out (nothing stays mapped)
-    void vmUnmap(int vmid, uint64_t vaPage, uint32_t pages);
+    int vmAlloc();                                   // an address space with an empty root table, or -1 when kVmSpaces are open
+    void vmFree(int space);
+    int vmGrab(class IOAccelRedNaviClient *c, int space);   // a VMID bound to the space, held (pinned) until vmUnpin; -1 when all seven have work in flight
+    void vmUnpin(int vmid);
+    bool vmMap(int space, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages);   // copies the buffer's GART PTEs into the VMID's tables; false: the pool ran out (nothing stays mapped)
+    void vmUnmap(int space, uint64_t vaPage, uint32_t pages);
     IOLock *queueLock {nullptr};                   // sequence numbers, submits and resets of the compute queue, in that order
     uint32_t queueResets {0};
     uint32_t gfxQueueResets {0};
     uint32_t hangMs {8000};                        // a wait this long without the fence moving resets the queue (rednavi_hang_ms)
-    IOAccelRedNaviClient *vmClient[8] {};                 // the connection of each VMID
+    IOAccelRedNaviClient *vmClient[kVmSpaces + 1] {};     // the connection of each address space
     int resetQueue(uint32_t info[4]);              // resets the compute queue and settles every connection's fence; with queueLock held by the caller
     int resetGfxQueue(uint32_t info[4]);           // the same for the graphics queue
     IOLock *boLock {nullptr};                      // the buffer table and the window allocator
@@ -438,6 +451,7 @@ private:
     }
 
     void dumpPci();
+    void enableAtomicOps();
     void dumpDiscovery();
     void publishAsic();
     void dumpVbios();
@@ -461,6 +475,22 @@ private:
     uint32_t selRate {0x06};       // DisplayPort link rate code for that mode
     uint32_t selPitch {1920};      // scanout pitch in pixels
     void selectMode();
+    // Staged frames (RN_PRESENT_LEASE / RN_PRESENT_COMMIT): which display surface holds the finished frame of which IOSurface. modeLock guards them.
+    struct StagedFrame { uint32_t id; uint32_t committed; uint64_t stamp; };
+    StagedFrame staged[3] {};                      // index = display surface number; id 0 = free
+    uint64_t stagedClock {0};
+    uint32_t prevFront {0};                        // the surface the display scanned before frontSurface (a non-waiting flip may not have latched yet)
+    uint32_t showPending {0};                      // an IOSurface WindowServer showed before its frame was committed: the commit flips to it
+    uint32_t frontId {0};                          // the IOSurface whose frame is on the display (0: none known); a later commit for it is the rest of that frame
+    uint32_t stagedStats[6] {};
+    uint32_t stagedExpiries {0};                   // transactions in a row whose wait for the previous flip ran out
+    bool stagedQuarantine {false};                 // the display did not take a flip: staged frames are off until the plug-in reconnects, surface 0 is shown                    // transactions: flipped at once, frame still on the card, nothing leased; commits: flipped as pending, flipped as the rest of the shown frame; waits that ran out
+    void publishStagedStats();
+    int scannedSurface();                          // the surface the display engine reads now (its earliest address in use), -1 if unknown
+    bool flipLatched(uint32_t surface);            // the display engine has taken surface's address (no flip pending, earliest address in use is it)
+    IOReturn leaseStaged(uint32_t id, uint32_t *surface);
+    IOReturn commitStaged(uint32_t surface, uint32_t id);
+    IOReturn presentStaged(uint32_t id);
     volatile uint32_t gpuDirect {0};   // 1 while the Metal plug-in puts the desktop into the scanout itself (RN_PRESENT_FRAME_DONE), cleared when its connection closes; the display pipe of RedNaviAccel2 reads it ("rednavi-gpu-frames")
     IOReturn callPlatformFunction(const OSSymbol *name, bool waitForFunction, void *p1, void *p2, void *p3, void *p4) APPLE_KEXT_OVERRIDE;
     void applyMode(const rn_mode &m);
@@ -512,6 +542,49 @@ public:
 };
 
 OSDefineMetaClassAndStructors(RedNaviProbe, IOService)
+
+// PCIe AtomicOps from the GPU to host memory, as Linux's pci_enable_atomic_ops_to_root (amdgpu asks for 32- and 64-bit completion). A shader atomic on a buffer in host memory
+// leaves the GPU as a PCIe AtomicOp request; with the requester bit off (macOS never sets it) the request is dropped and the atomic does nothing: measured 2026-11-23 with
+// tools/atomic_test.m, every device atomic on host memory was lost, the same test passed with the buffers in VRAM. Every switch port on the way needs AtomicOp routing, an upstream
+// port must not block AtomicOp egress, and the root port must complete 32- and 64-bit AtomicOps. Only then is AtomicOp Requester Enable set, on the GPU function only. The
+// path and the outcome are published as "pcie-atomics".
+void RedNaviProbe::enableAtomicOps() {
+    char text[512]; size_t at = 0;
+    auto add = [&](const char *fmt, auto... a) { if (at < sizeof(text)) { const int k = snprintf(text + at, sizeof(text) - at, fmt, a...); if (k > 0) at += static_cast<size_t>(k); } };
+    UInt8 cap = 0;
+    if (!pci->findPCICapability(kIOPCIPCIExpressCapability, &cap) || !cap) { setProperty("pcie-atomics", "the GPU has no PCIe capability"); return; }
+    bool ok = false;
+    const char *why = "no root port found";
+    IORegistryEntry *e = pci;
+    for (int depth = 0; depth < 8 && e; depth++) {
+        IORegistryEntry *up = e->getParentEntry(gIOServicePlane);
+        IOPCIDevice *br = nullptr;
+        while (up && !(br = OSDynamicCast(IOPCIDevice, up))) up = up->getParentEntry(gIOServicePlane);
+        if (!br) break;
+        e = br;
+        UInt8 bc = 0;
+        if (!br->findPCICapability(kIOPCIPCIExpressCapability, &bc) || !bc) { why = "a bridge without a PCIe capability"; break; }
+        const uint32_t type = (br->configRead16(bc + 2) >> 4) & 0xF;
+        const uint32_t cap2 = br->configRead32(bc + 0x24);
+        const uint16_t ctl2 = br->configRead16(bc + 0x28);
+        add("%02x:%02x.%x type %u cap2 0x%x ctl2 0x%x; ", br->getBusNumber(), br->getDeviceNumber(), br->getFunctionNumber(), type, cap2, ctl2);
+        if (type == 5 || type == 6) {                              // switch upstream / downstream port
+            if (!(cap2 & (1u << 6))) { why = "a switch port without AtomicOp routing"; break; }
+            if (type == 5 && (ctl2 & (1u << 7))) { why = "an upstream port blocks AtomicOp egress"; break; }
+            continue;
+        }
+        if (type == 4) {                                           // root port
+            if ((cap2 & (3u << 7)) != (3u << 7)) why = "the root port does not complete 32- and 64-bit AtomicOps";
+            else ok = true;
+            break;
+        }
+        why = "an unexpected port type on the way to the root"; break;
+    }
+    uint16_t ctl2 = pci->configRead16(cap + 0x28);
+    if (ok) { pci->configWrite16(cap + 0x28, ctl2 | (1u << 6)); ctl2 = pci->configRead16(cap + 0x28); }
+    add("GPU ctl2 0x%x: %s", ctl2, ok ? ((ctl2 & (1u << 6)) ? "requester enabled" : "requester bit did not stick") : why);
+    setProperty("pcie-atomics", text);
+}
 
 void RedNaviProbe::dumpPci() {
     uint32_t id = pci->configRead32(0x00);
@@ -1415,6 +1488,7 @@ void RedNaviProbe::applyMode(const rn_mode &m) {
     selRate = isBase ? 0x06 : static_cast<uint32_t>(rate < 0x06 ? 0x06 : rate);    // the base state was captured at RBR
     selPitch = rn_pitch_pixels(selMode.hactive);
     frontSurface = 0;                                                         // the replay points the plane at surface 0
+    prevFront = 0; showPending = 0; for (auto &f : staged) f = {};
     IOLog("RedNavi: mode %ux%u@%u pclk %u kHz, link rate 0x%02x, pitch %u pixels\n", selMode.hactive, selMode.vactive, selMode.refresh_hz, selMode.pclk_khz, selRate, selPitch);
     uint32_t vals[6] = {selMode.hactive, selMode.vactive, selMode.refresh_hz, selMode.pclk_khz, selRate, selPitch};
     const char *names[6] = {"width", "height", "refresh", "pclk_khz", "link_rate", "pitch_pixels"};
@@ -1580,10 +1654,135 @@ IOReturn RedNaviProbe::cursorState(int32_t x, int32_t y, bool visible) {
     return kIOReturnSuccess;
 }
 
+struct StageLock { IOLock *l; explicit StageLock(IOLock *lock) : l(lock) { IOLockLock(l); } ~StageLock() { IOLockUnlock(l); } };
+
+// A display surface for the next frame of IOSurface `id`: the one it already holds if it is not on the display, else a free one, else the oldest staged frame of another IOSurface
+// (a frame that was never shown is superseded). The scanned-out surface and the one before it are never given.
+IOReturn RedNaviProbe::leaseStaged(uint32_t id, uint32_t *surface) {
+    if (!modeLock || !fbReady || liveSwitch || !id) return kIOReturnNotReady;
+    const uint32_t n = scanoutSurfaces();
+    if (n < 3 || stagedQuarantine) return kIOReturnUnsupported;
+    StageLock guard(modeLock);
+    // The surface the engine reads now is never given. With non-waiting flips that is not always prevFront: two flips inside one frame leave the engine on the surface before both,
+    // and a lease of it had the next frame written while it was on the screen (flicker and black bands, 2026-11-22). When it cannot be read, frontSurface and prevFront are kept out.
+    const int scanned = scannedSurface();
+    int best = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i == frontSurface || static_cast<int>(i) == scanned || (scanned < 0 && i == prevFront)) continue;
+        if (staged[i].id == id) { best = static_cast<int>(i); break; }
+        if (best < 0 || (staged[i].id == 0 && staged[best].id != 0) || (staged[i].id != 0 && staged[best].id != 0 && staged[i].stamp < staged[best].stamp)) best = static_cast<int>(i);
+    }
+    if (best < 0) return kIOReturnNoResources;
+    for (uint32_t i = 0; i < n; i++) if (i != static_cast<uint32_t>(best) && staged[i].id == id) staged[i] = {};
+    staged[best] = {id, 0, ++stagedClock};
+    *surface = static_cast<uint32_t>(best);
+    return kIOReturnSuccess;
+}
+
+IOReturn RedNaviProbe::commitStaged(uint32_t surface, uint32_t id) {
+    if (!modeLock || surface >= 3) return kIOReturnBadArgument;
+    StageLock guard(modeLock);
+    if (staged[surface].id != id) return kIOReturnNotFound;      // evicted since the lease
+    staged[surface].committed = 1;
+    staged[surface].stamp = ++stagedClock;
+    // WindowServer showed this IOSurface before the frame was committed (its transaction can come before the plug-in's command buffer has finished): the flip it asked for happens now.
+    // A commit for the IOSurface already on the display is the rest of that frame: CoreDisplay draws one frame in about three command buffers, and the transaction comes before
+    // the later ones finish. Without this flip the display kept the frame as it was after its first command buffer until the next transaction (suspected cause of the lag with
+    // staged frames, 2026-11-22; not verified, stagedStats[4] counts these flips). WindowServer does not draw into a ring surface that is shown again before another one is shown.
+    const bool pending = showPending == id, rest = !pending && frontId == id;
+    if (pending || rest) {
+        showPending = 0;
+        if (surface != frontSurface && present(surface, false) < 0) return kIOReturnIOError;
+        staged[surface] = {};
+        frontId = id;
+        stagedStats[pending ? 3 : 4]++;
+    }
+    return kIOReturnSuccess;
+}
+
+void RedNaviProbe::publishStagedStats() {
+    static const char *const names[] = {"tx-flipped", "tx-pending", "tx-nothing", "commit-pending-flip", "commit-rest-flip", "tx-wait-timeout"};
+    uint32_t v[6];
+    IOLockLock(modeLock);
+    memcpy(v, stagedStats, sizeof(v));
+    IOLockUnlock(modeLock);
+    rnPublish(this, "staged-stats", names, v, 6);
+}
+
+bool RedNaviProbe::flipLatched(uint32_t surface) {
+    uint32_t b2 = 0;
+    if (!fbReady || liveSwitch || surface >= scanoutSurfaces() || !ipBase(kRNHwIdDmu, &b2, 2)) return true;
+    const uint64_t mc = kRNVramMcBase + scanoutOff(surface);
+    return !(rd((b2 + 0x61b) * 4) & (1u << 8)) && rd((b2 + 0x624) * 4) == static_cast<uint32_t>(mc) && rd((b2 + 0x625) * 4) == static_cast<uint32_t>(mc >> 32);
+}
+
+// WindowServer shows IOSurface `id` (the accelerator's display transaction): flip to its committed frame. Nothing committed: the frame on the display is already it.
+// Before the flip, the transaction waits for the previous flip to latch, for at most one refresh period and a quarter: that holds WindowServer to the refresh rate. Without
+// it the transaction was complete at once, WindowServer composed about 160 frames a second for a 60 Hz panel while dragging a window, and the desktop lagged badly. Waiting
+// after the flip instead (for its own latch) gave 30 transactions a second: WindowServer could not compose the next frame while the flip waited for the blank, and missed
+// every other one (2026-11-22). The shape is the reference driver's (NullMoth nvrm-accel.cpp, via the INTERMEDIARY session): a new transaction waits for the previous flip,
+// bounded to 1.25 refresh periods, re-checked in short sleeps. Unverified that the bound is right for modes other than 60 Hz.
+IOReturn RedNaviProbe::presentStaged(uint32_t id) {
+    if (!modeLock || !fbReady || liveSwitch || !id) return kIOReturnNotReady;
+    const uint32_t hz = selMode.refresh_hz ? selMode.refresh_hz : 60;
+    const uint32_t budgetMs = (1250 + hz - 1) / hz;     // 1.25 refresh periods, rounded up (21 ms at 60 Hz)
+    bool timedOut = true;
+    for (uint32_t ms = 0; ms < budgetMs; ms++) {        // the previous flip (frontSurface is the last surface flipped to); sleeps, does not spin
+        IOLockLock(modeLock);
+        const uint32_t prev = frontSurface;
+        IOLockUnlock(modeLock);
+        if (flipLatched(prev)) { timedOut = false; break; }
+        IOSleep(1);
+    }
+    // Stall detection (suggested by the author of a Navi 33 driver, who uses it): an expiry now and then is harmless, the next flip supersedes the pending one. Eight in a row
+    // mean the display may not be taking flips at all, while every transaction reports success: one long wait, and if the flip still has not latched, staged frames are turned
+    // off (the plug-in then copies into surface 0, which is shown again). Unverified on hardware: no expiry has happened yet.
+    if (timedOut && ++stagedExpiries >= 8) {
+        stagedExpiries = 0;
+        bool latched = false;
+        for (int i = 0; i < 100 && !latched; i++) { IOLockLock(modeLock); const uint32_t prev = frontSurface; IOLockUnlock(modeLock); latched = flipLatched(prev); if (!latched) IOSleep(1); }
+        if (!latched) {
+            StageLock guard(modeLock);
+            stagedQuarantine = true;
+            for (auto &f : staged) f = {};
+            showPending = 0; frontId = 0;
+            present(0, false);
+            IOLog("RedNavi: staged frames: the display did not take a flip in 100 ms after 8 expired waits; staged frames off, surface 0 shown\n");
+            setProperty("staged-quarantine", true);
+            return kIOReturnSuccess;
+        }
+    } else if (!timedOut) stagedExpiries = 0;
+    uint32_t total = 0;
+    {
+        StageLock guard(modeLock);
+        if (stagedQuarantine) return kIOReturnSuccess;
+        if (timedOut) stagedStats[5]++;
+        total = stagedStats[0] + stagedStats[1] + stagedStats[2] + 1;
+        int best = -1;
+        for (uint32_t i = 0; i < 3; i++) if (staged[i].id == id && staged[i].committed && (best < 0 || staged[i].stamp > staged[best].stamp)) best = static_cast<int>(i);
+        if (best < 0) {                              // its frame is still on the card: commitStaged flips when it arrives
+            bool leased = false;
+            for (uint32_t i = 0; i < 3; i++) if (staged[i].id == id) leased = true;
+            showPending = leased ? id : 0;
+            if (!leased) frontId = id;               // nothing new for it: the frame on the display is already it
+            stagedStats[leased ? 1 : 2]++;
+        } else {
+            showPending = 0;
+            if (static_cast<uint32_t>(best) != frontSurface && present(static_cast<uint32_t>(best), false) < 0) return kIOReturnIOError;
+            staged[best] = {};
+            frontId = id;
+            stagedStats[0]++;
+        }
+    }
+    if ((total & 511) == 0) publishStagedStats();
+    return kIOReturnSuccess;
+}
+
 IOReturn RedNaviProbe::callPlatformFunction(const OSSymbol *name, bool waitForFunction, void *p1, void *p2, void *p3, void *p4) {
     if (name && name->isEqualTo("rednavi-cursor-image")) return cursorImage(static_cast<const uint32_t *>(p1), static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p2)) >> 16, static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p2)) & 0xFFFF);
     if (name && name->isEqualTo("rednavi-cursor-state")) return cursorState(static_cast<int32_t>(reinterpret_cast<intptr_t>(p1)), static_cast<int32_t>(reinterpret_cast<intptr_t>(p2)), p3 != nullptr);
     if (name && name->isEqualTo("rednavi-set-mode")) return setModeLive(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p1)));
+    if (name && name->isEqualTo("rednavi-gpu-present")) return presentStaged(static_cast<uint32_t>(reinterpret_cast<uintptr_t>(p1)));
     if (name && name->isEqualTo("rednavi-gpu-frames")) { if (p1) *static_cast<uint32_t *>(p1) = gpuDirect; return kIOReturnSuccess; }
     return IOService::callPlatformFunction(name, waitForFunction, p1, p2, p3, p4);
 }
@@ -1992,6 +2191,7 @@ int RedNaviProbe::waitMsi(void *ctx, uint32_t timeoutMs) {
 class IOAccelRedNaviClient : public IOUserClient {
     OSDeclareDefaultStructors(IOAccelRedNaviClient)
     static constexpr uint32_t kMaxHandles = 32768;
+    uint32_t stageIdLo {0}, stageIdHi {0};          // the IOSurface the next lease or commit is for (RN_PRESENT_ID_LO / _HI)
     bool setDirect {false};                        // this connection set RedNaviProbe::gpuDirect
     RedNaviProbe *gpuOwner {nullptr};
     IOLock *lock {nullptr};
@@ -2001,7 +2201,7 @@ class IOAccelRedNaviClient : public IOUserClient {
     static constexpr uint32_t kMaxMaps = 65536;
     Map *maps {nullptr};                           // what is mapped in this connection's address space
     task_t ownerTask {nullptr};                    // the process that opened the connection (RN_UC_BO_USERPTR wires its memory)
-    int vmid {0};
+    int space {0};                                 // its address space (RedNaviProbe::vmAlloc); the VMID comes with each submit
     int fenceIdx {-1};                             // the context's fence: a kernel-owned page, the GPU writes the sequence number of each finished submit to its first dword
     uint32_t seqSubmitted {0};                     // the compute queue's counter (bit 31 clear)
     uint32_t gfxSeqSubmitted {0};                  // the graphics queue's: bit 31 set once something was submitted
@@ -2047,17 +2247,17 @@ class IOAccelRedNaviClient : public IOUserClient {
         return false;
     }
     void unmapSlot(uint32_t i) {
-        gpuOwner->vmUnmap(vmid, maps[i].va / 4096, static_cast<uint32_t>(maps[i].size / 4096));
+        gpuOwner->vmUnmap(space, maps[i].va / 4096, static_cast<uint32_t>(maps[i].size / 4096));
         maps[i].used = false;
     }
     void freeAll() {
         for (uint32_t i = 0; i < kMaxMaps; i++) if (maps[i].used) unmapSlot(i);   // the GPU must not reach a page after it is released
-        if (vmid > 0) {
+        if (space > 0) {
             IOLockLock(gpuOwner->queueLock);
-            if (gpuOwner->vmClient[vmid] == this) gpuOwner->vmClient[vmid] = nullptr;    // a reset must not look at this connection while its fence page goes away
+            if (gpuOwner->vmClient[space] == this) gpuOwner->vmClient[space] = nullptr;    // a reset must not look at this connection while its fence page goes away
             IOLockUnlock(gpuOwner->queueLock);
-            gpuOwner->vmFree(vmid);
-            vmid = 0;
+            gpuOwner->vmFree(space);
+            space = 0;
         }
         for (uint32_t i = 0; i < kMaxHandles; i++)
             if (boIdx[i] >= 0) { gpuOwner->destroyBo(boIdx[i]); boIdx[i] = -1; }
@@ -2070,6 +2270,10 @@ class IOAccelRedNaviClient : public IOUserClient {
     // Sequence numbers are 31-bit counters (bit 31 names the queue) compared modulo 2^31 against the fence of their queue.
     uint32_t fenceWord(uint32_t ring) const {
         return *reinterpret_cast<volatile uint32_t *>(static_cast<uint8_t *>(gpuOwner->bos[fenceIdx].md->getBytesNoCopy()) + ring * 8);
+    }
+    // Nothing submitted by this connection is still in a queue (a VMID bound to its space may be taken over).
+    bool idle() const {
+        return fenceIdx < 0 || ((!seqSubmitted || reached(seqSubmitted)) && (!gfxSeqSubmitted || reached(gfxSeqSubmitted)));
     }
     static bool seqDone(uint32_t fenceValue, uint32_t seq) { return ((fenceValue - seq) & 0x7fffffffu) < 0x40000000u; }
     bool reached(uint32_t seq) const { return seqDone(fenceWord(seq >> 31), seq); }
@@ -2232,12 +2436,12 @@ public:
         if (!gpuOwner || !lock) return false;
         memset(maps, 0, sizeof(Map) * kMaxMaps);
         memset(sync, 0, sizeof(Syncobj) * kMaxSync);
-        vmid = gpuOwner->vmAlloc();
-        if (vmid < 0) { vmid = 0; return false; }      // all seven address spaces are in use
+        space = gpuOwner->vmAlloc();
+        if (space < 0) { space = 0; return false; }    // kVmSpaces connections are open
         fenceIdx = gpuOwner->createHostBo(4096);
         if (fenceIdx < 0) return false;
         IOLockLock(gpuOwner->queueLock);
-        gpuOwner->vmClient[vmid] = this;
+        gpuOwner->vmClient[space] = this;
         IOLockUnlock(gpuOwner->queueLock);
         return IOUserClient::start(provider);
     }
@@ -2254,7 +2458,7 @@ public:
             IOLockLock(lock);
             freeAll();                                  // the PTEs go invalid before the pages are released, so a late GPU access faults instead of corrupting memory
             IOLockUnlock(lock);
-            if (setDirect) { gpuOwner->gpuDirect = 0; setDirect = false; }       // the plug-in is gone: the display pipe copies surfaces again
+            if (setDirect) { gpuOwner->gpuDirect = 0; setDirect = false; for (auto &f : gpuOwner->staged) f = {}; gpuOwner->stagedQuarantine = false; }       // the plug-in is gone: the display pipe copies surfaces again
             if (gpuOwner->frontSurface != 0) gpuOwner->present(0, false);   // a program that flipped to its own surface and went away: the desktop's surface is shown again
         }
         if (!isInactive()) terminate();
@@ -2300,7 +2504,7 @@ public:
                 o->bo_limit = kMaxHandles;
                 o->vm_va_start = RedNaviProbe::kVmMin;
                 o->vm_va_bytes = (1ull << 47) - RedNaviProbe::kVmMin;                // the lower half; the upper half is 0xffff800000000000 up to 2^64 - 4 MB
-                o->vmid = static_cast<uint32_t>(vmid);
+                o->vmid = static_cast<uint32_t>(space);          // the address space; the VMID changes from submit to submit
                 o->va_map_limit = kMaxMaps;
                 o->gfx_queue = gpuOwner->gfxQueueOk ? 1 : 0;
                 if (gpuOwner->fbReady) { o->fb_width = gpuOwner->selMode.hactive; o->fb_height = gpuOwner->selMode.vactive; o->fb_pitch = gpuOwner->selPitch * 4; o->fb_surfaces = gpuOwner->scanoutSurfaces(); }
@@ -2383,26 +2587,30 @@ public:
                 IOReturn waitRc = kIOReturnSuccess;                                 // the objects this work waits for, before anything goes to the ring
                 for (uint32_t i = 0; i < in->in_count && waitRc == kIOReturnSuccess; i++) waitRc = syncWaitOne(*findSync(in->in[i].handle), in->in[i].point, 10000, true, false);
                 if (waitRc != kIOReturnSuccess) { rc = waitRc; break; }
+                int hw = -1;                                                         // a VMID for this address space; one that has work in flight is not taken from another space
+                for (uint32_t waited = 0; hw < 0 && waited < 10000; waited++) { hw = gpuOwner->vmGrab(this, space); if (hw < 0) IOSleep(1); }
+                if (hw < 0) { rc = kIOReturnBusy; break; }
                 IOLockLock(gpuOwner->queueLock);
                 uint32_t seq = ((seqSubmitted + 1) & 0x7fffffffu) ? ((seqSubmitted + 1) & 0x7fffffffu) : 1;
                 if (gfx) seq = ((gfxSeqSubmitted + 1) & 0x7fffffffu) | 0x80000000u;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                int r = gfx ? rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(vmid))
-                            : rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                int r = gfx ? rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw))
+                            : rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(hw));
                 if (r == -EAGAIN && !gfx) {                                  // the ring stayed full for about 2 s: the queue is not draining, it is stuck
                     uint32_t info[4];
                     const int rr = gpuOwner->resetQueue(info);
                     IOLog("RedNavi: ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
-                    if (rr == 0) r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(vmid));
+                    if (rr == 0) r = rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(hw));
                 }
                 if (r == -EAGAIN && gfx) {
                     uint32_t info[4];
                     const int rr = gpuOwner->resetGfxQueue(info);
                     IOLog("RedNavi: graphics ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
-                    if (rr == 0) r = rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(vmid));
+                    if (rr == 0) r = rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw));
                 }
                 if (r == 0) { if (gfx) gfxSeqSubmitted = seq; else seqSubmitted = seq; }   // taken under the queue lock, in the order the packets reach the ring
                 IOLockUnlock(gpuOwner->queueLock);
+                gpuOwner->vmUnpin(hw);
                 if (r == 0) {
                     for (uint32_t i = 0; i < in->out_count; i++) attachWork(*findSync(in->out[i].handle), in->out[i].point, seq);
                     rn_uc_submit_result *o = static_cast<rn_uc_submit_result *>(args->structureOutput);
@@ -2457,6 +2665,18 @@ public:
                     rc = kIOReturnSuccess;
                     break;
                 }
+                if ((in->surface & 0xFFFE0000u) == 0xFFFC0000u || in->surface == RN_PRESENT_LEASE || (in->surface & ~0xFFu) == RN_PRESENT_COMMIT) {
+                    rn_uc_present_result *o = static_cast<rn_uc_present_result *>(args->structureOutput);
+                    memset(o, 0, sizeof(*o));
+                    if ((in->surface & 0xFFFF0000u) == RN_PRESENT_ID_LO) { stageIdLo = in->surface & 0xFFFFu; rc = kIOReturnSuccess; }
+                    else if ((in->surface & 0xFFFF0000u) == RN_PRESENT_ID_HI) { stageIdHi = in->surface & 0xFFFFu; rc = kIOReturnSuccess; }
+                    else if (in->surface == RN_PRESENT_LEASE) {
+                        uint32_t sf = 0;
+                        rc = gpuOwner->leaseStaged((stageIdHi << 16) | stageIdLo, &sf);
+                        if (rc == kIOReturnSuccess) o->status = sf;
+                    } else rc = gpuOwner->commitStaged(in->surface & 0xFFu, (stageIdHi << 16) | stageIdLo);
+                    break;
+                }
                 if ((in->flags & ~RN_PRESENT_WAIT) != 0) break;
                 const int pr = gpuOwner->present(in->surface, (in->flags & RN_PRESENT_WAIT) != 0);
                 if (pr < 0) break;
@@ -2508,7 +2728,7 @@ public:
                 }
                 if (clash) break;
                 if (slot == kMaxMaps) { rc = kIOReturnNoResources; break; }
-                if (!gpuOwner->vmMap(vmid, idx, static_cast<uint32_t>(in->offset / 4096), va / 4096, static_cast<uint32_t>(in->size / 4096))) { rc = kIOReturnNoResources; break; }
+                if (!gpuOwner->vmMap(space, idx, static_cast<uint32_t>(in->offset / 4096), va / 4096, static_cast<uint32_t>(in->size / 4096))) { rc = kIOReturnNoResources; break; }
                 maps[slot] = {va, in->size, in->handle, true};
                 rc = kIOReturnSuccess;
             }
@@ -2698,12 +2918,12 @@ OSDefineMetaClassAndStructors(IOAccelRedNaviClient, IOUserClient)
 // The queue is shared by every connection, so a reset drops everybody's work. Each connection's numbers from the last fence value it saw to the last it
 // submitted are lost; the fence then jumps to the last submitted number so that no wait is left hanging (the work that finished before keeps its result).
 int RedNaviProbe::resetQueue(uint32_t info[4]) {
-    uint32_t before[8];
-    for (int v = 1; v <= 7; v++) before[v] = vmClient[v] ? vmClient[v]->fenceNow() : 0;
+    uint32_t *const before = resetBefore;
+    for (uint32_t v = 1; v <= kVmSpaces; v++) before[v] = vmClient[v] ? vmClient[v]->fenceNow() : 0;
     const int rr = rn_compute_queue_reset(&gpu, info);
     queueResets++;
     if (rr != 0) return rr;
-    for (int v = 1; v <= 7; v++) {
+    for (uint32_t v = 1; v <= kVmSpaces; v++) {
         IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->lostFrom = before[v] + 1;
@@ -2715,12 +2935,12 @@ int RedNaviProbe::resetQueue(uint32_t info[4]) {
 
 // The graphics queue's reset: same bookkeeping, with the fence in dword 2 and sequence numbers that carry bit 31.
 int RedNaviProbe::resetGfxQueue(uint32_t info[4]) {
-    uint32_t before[8];
-    for (int v = 1; v <= 7; v++) before[v] = vmClient[v] ? vmClient[v]->fenceWord(1) : 0;
+    uint32_t *const before = resetBefore;
+    for (uint32_t v = 1; v <= kVmSpaces; v++) before[v] = vmClient[v] ? vmClient[v]->fenceWord(1) : 0;
     const int rr = rn_gfx_queue_reset(&gpu, info);
     gfxQueueResets++;
     if (rr != 0) return rr;
-    for (int v = 1; v <= 7; v++) {
+    for (uint32_t v = 1; v <= kVmSpaces; v++) {
         IOAccelRedNaviClient *c = vmClient[v];
         if (!c) continue;
         c->gfxLostFrom = (before[v] + 1) | 0x80000000u;
@@ -2779,14 +2999,23 @@ static inline uint64_t rnRd64(struct rn_device *adev, uint64_t off) {
     return static_cast<uint64_t>(rn_vram_rd32(adev, off)) | (static_cast<uint64_t>(rn_vram_rd32(adev, off + 4)) << 32);
 }
 
-uint64_t RedNaviProbe::vmPageAlloc(int vmid) {
-    uint32_t *pool = vmPool[vmid];
-    for (uint32_t w = 0; w < kVmPoolPages / 32; w++) {
-        if (pool[w] == 0xffffffffu) continue;
+uint64_t RedNaviProbe::vmPageAlloc(int space) {
+    VmSpace &sp = vmSpace[space];
+    if (sp.npages == sp.cap) {                                            // the list of the space's pages grows by doubling
+        const uint32_t ncap = sp.cap ? sp.cap * 2 : 16;
+        uint32_t *np = static_cast<uint32_t *>(IOMalloc(ncap * sizeof(uint32_t)));
+        if (!np) return 0;
+        if (sp.pages) { memcpy(np, sp.pages, sp.npages * sizeof(uint32_t)); IOFree(sp.pages, sp.cap * sizeof(uint32_t)); }
+        sp.pages = np; sp.cap = ncap;
+    }
+    for (uint32_t w = 0; w < kVmPoolTotal / 32; w++) {
+        if (vmPool[w] == 0xffffffffu) continue;
         uint32_t b = 0;
-        while (pool[w] & (1u << b)) b++;
-        pool[w] |= 1u << b;
-        const uint64_t off = kVmTables + (static_cast<uint64_t>(vmid - 1) * kVmPoolPages + w * 32 + b) * 4096;
+        while (vmPool[w] & (1u << b)) b++;
+        vmPool[w] |= 1u << b;
+        const uint32_t page = w * 32 + b;
+        sp.pages[sp.npages++] = page;
+        const uint64_t off = kVmTables + static_cast<uint64_t>(page) * 4096;
         for (uint32_t o = 0; o < 4096; o += 4) rn_vram_wr32(&gpu, off + o, 0);   // VRAM keeps its contents over a warm reboot
         return off;
     }
@@ -2795,13 +3024,13 @@ uint64_t RedNaviProbe::vmPageAlloc(int vmid) {
 
 // The page table (PTB) that holds the PTE of the 4 KB page `vaPage`, walking PDB2, PDB1, PDB0 from the root; with `create` the missing directories
 // and the table are made. A directory entry is the VRAM offset of the next table with the VALID bit (amdgpu_vm_pde_update, gmc_v11_0_get_vm_pde).
-bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff) {
-    uint64_t table = kVmTables + static_cast<uint64_t>(vmid - 1) * kVmPoolPages * 4096;   // the root is the first pool page
+bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOff) {   // vmid here is the address space
+    uint64_t table = vmSpace[vmid].root;
     uint64_t badSlot = 0, badEntry = 0; int badShift = 0;
     for (int shift = 27; shift >= 9; shift -= 9) {
         const uint64_t slot = table + ((vaPage >> shift) & 0x1ff) * 8;
         uint64_t entry = rnRd64(&gpu, slot);
-        if ((entry & 1) && ((entry & 0x0000FFFFFFFFF000ull) < kVmTables || (entry & 0x0000FFFFFFFFF000ull) >= kVmTables + 7ull * kVmPoolPages * 4096) && !badSlot) { badSlot = slot; badEntry = entry; badShift = shift; }
+        if ((entry & 1) && ((entry & 0x0000FFFFFFFFF000ull) < kVmTables || (entry & 0x0000FFFFFFFFF000ull) >= kVmTables + static_cast<uint64_t>(kVmPoolTotal) * 4096) && !badSlot) { badSlot = slot; badEntry = entry; badShift = shift; }
         if (!(entry & 1)) {
             if (!create) return false;
             const uint64_t next = vmPageAlloc(vmid);
@@ -2813,7 +3042,7 @@ bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOf
     }
     // A table outside the page-table pools would have PTEs written over whatever lives there (the scanout, in the observed case): refused, and the first offenders are
     // published as vm-bad-ptb so that the cause can be read off a boot.
-    if (table < kVmTables || table >= kVmTables + 7ull * kVmPoolPages * 4096) {
+    if (table < kVmTables || table >= kVmTables + static_cast<uint64_t>(kVmPoolTotal) * 4096) {
         static uint32_t bad;
         if (bad++ < 8) { char key[24]; snprintf(key, sizeof key, "vm-bad-ptb-%u", bad); char val[160]; snprintf(val, sizeof val, "vmid %d va page 0x%llx table 0x%llx shift %d slot 0x%llx entry 0x%llx", vmid, vaPage, table, badShift, badSlot, badEntry); setProperty(key, val); }
         return false;
@@ -2825,27 +3054,68 @@ bool RedNaviProbe::vmPtb(int vmid, uint64_t vaPage, bool create, uint64_t *ptbOf
 int RedNaviProbe::vmAlloc() {
     RNLockGuard g(boLock);
     if (!gpuLive) return -1;
-    int vmid = -1;
-    for (int v = 1; v <= 7; v++) if (!(vmidUsed & (1u << v))) { vmid = v; break; }
-    if (vmid < 0) return -1;
+    int space = -1;
+    for (uint32_t v = 1; v <= kVmSpaces; v++) if (!vmSpace[v].used) { space = static_cast<int>(v); break; }
+    if (space < 0) return -1;
     if (!vmReady) {
-        rn_vm_enable_contexts(&gpu, 0, kVmEnd - 1, 3, 1, 7);
+        rn_vm_enable_contexts(&gpu, 0, kVmEnd - 1, 3, 1, kVmHw);
         vmReady = true;
     }
-    memset(vmPool[vmid], 0, sizeof(vmPool[vmid]));
-    const uint64_t root = vmPageAlloc(vmid);
-    if (!root) return -1;
-    rn_vm_bind(&gpu, vmid, root);
-    vmidUsed |= 1u << vmid;
-    return vmid;
+    VmSpace &sp = vmSpace[space];
+    sp = VmSpace {};
+    sp.used = true;                                                       // so that vmPageAlloc has a space to put the page in
+    const uint64_t root = vmPageAlloc(space);
+    if (!root) { if (sp.pages) IOFree(sp.pages, sp.cap * sizeof(uint32_t)); sp = VmSpace {}; return -1; }
+    sp.root = root;
+    return space;
 }
 
-void RedNaviProbe::vmFree(int vmid) {
+void RedNaviProbe::vmFree(int space) {
     RNLockGuard g(boLock);
-    if (vmid < 1 || vmid > 7 || !(vmidUsed & (1u << vmid))) return;
-    rn_vm_bind(&gpu, vmid, 0);
-    memset(vmPool[vmid], 0, sizeof(vmPool[vmid]));
-    vmidUsed &= ~(1u << vmid);
+    if (space < 1 || space > static_cast<int>(kVmSpaces) || !vmSpace[space].used) return;
+    VmSpace &sp = vmSpace[space];
+    if (sp.vmid > 0) {
+        rn_vm_bind(&gpu, sp.vmid, 0);
+        vmSlot[sp.vmid].space = 0;
+    }
+    for (uint32_t i = 0; i < sp.npages; i++) vmPool[sp.pages[i] / 32] &= ~(1u << (sp.pages[i] % 32));
+    if (sp.pages) IOFree(sp.pages, sp.cap * sizeof(uint32_t));
+    sp = VmSpace {};
+}
+
+// A VMID for the work the connection is about to submit (amdgpu_vmid_grab): the one its space is bound to, else a free one, else the least recently used one whose space has nothing
+// in flight (both queues' fences have reached everything that space submitted). The bind drops the TLBs of that VMID. The VMID stays pinned until the packets are in the ring (vmUnpin):
+// from then on the space's own fence says whether it is busy.
+int RedNaviProbe::vmGrab(IOAccelRedNaviClient *c, int space) {
+    RNLockGuard g(boLock);
+    if (!gpuLive || space < 1 || !vmSpace[space].used) return -1;
+    VmSpace &sp = vmSpace[space];
+    int v = sp.vmid;
+    if (v <= 0) {
+        int best = -1;
+        for (uint32_t i = 1; i <= kVmHw; i++) {
+            if (vmSlot[i].space == 0) { best = static_cast<int>(i); break; }
+            if (vmSlot[i].pins) continue;
+            IOAccelRedNaviClient *o = vmClient[vmSlot[i].space];
+            if (o && !o->idle()) continue;
+            if (best < 0 || vmSlot[i].lastUse < vmSlot[best].lastUse) best = static_cast<int>(i);
+        }
+        if (best < 0) return -1;
+        if (vmSlot[best].space) vmSpace[vmSlot[best].space].vmid = 0;
+        rn_vm_bind(&gpu, best, sp.root);
+        vmSlot[best].space = space;
+        sp.vmid = best;
+        v = best;
+    }
+    vmSlot[v].pins++;
+    vmSlot[v].lastUse = ++vmTick;
+    (void)c;
+    return v;
+}
+
+void RedNaviProbe::vmUnpin(int vmid) {
+    RNLockGuard g(boLock);
+    if (vmid >= 1 && vmid <= static_cast<int>(kVmHw) && vmSlot[vmid].pins) vmSlot[vmid].pins--;
 }
 
 bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, uint32_t pages) {
@@ -2853,9 +3123,13 @@ bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, 
     const uint64_t *bus = bos[boIdx].bus;
     const bool vram = bos[boIdx].dom != 0;                 // a VRAM buffer is contiguous: page i is at kRNVramMcBase + vramOff + i * 4096
     const uint64_t vramPa = bos[boIdx].vramOff;           // the PTE of a local page holds the offset in VRAM, not the MC address (measured 2026-11-02: with 0x80_0000_0000 added the GPU's writes vanish)
-    static int ucUserptr = -1;                             // boot-arg rednavi_userptr_uc=1: map the buffers over a program's memory uncached like the rest of system memory (the way before 2026-11-08)
+    // System pages of a program's address space are mapped MTYPE_NC, as Linux maps GTT buffers (gmc_v11_0_get_vm_pte): the GL2 caches them and does device-scope atomics
+    // itself. With MTYPE_UC (all buffers but userptr ones until 2026-11-23) an atomic on host memory goes out as a PCIe AtomicOp, which macOS never enables on the GPU
+    // (Linux does, pci_enable_atomic_ops_to_root): every atomic was dropped, and Geekbench's histograms, counters and min/max came out empty. Coherence: each job starts with
+    // an ACQUIRE_MEM that invalidates the GL2 and ends with a RELEASE_MEM that writes it back (gfx11.cpp). The GART keeps MTYPE_UC.
+    static int ucUserptr = -1;                             // boot-arg rednavi_userptr_uc=1: map a program's system pages uncached, the way before 2026-11-08 (userptr) and 2026-11-23 (the rest)
     if (ucUserptr < 0) { uint32_t v = 0; ucUserptr = PE_parse_boot_argn("rednavi_userptr_uc", &v, sizeof(v)) && v == 1; }
-    const bool ncData = bos[boIdx].umd && !ucUserptr;
+    const bool ncData = !ucUserptr;
     uint64_t ptb = 0;
     bool ok = true;
     uint32_t done = 0;
@@ -2871,7 +3145,7 @@ bool RedNaviProbe::vmMap(int vmid, int boIdx, uint32_t boPage, uint64_t vaPage, 
             rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), 0);
         }
     }
-    rn_vm_flush(&gpu, vmid);
+    if (vmSpace[vmid].vmid > 0) rn_vm_flush(&gpu, vmSpace[vmid].vmid);         // an unbound space is flushed when a VMID is bound to it
     return ok;
 }
 
@@ -2884,7 +3158,7 @@ void RedNaviProbe::vmUnmap(int vmid, uint64_t vaPage, uint32_t pages) {
         if (p == 0 || (vp & 0x1ff) == 0) have = vmPtb(vmid, vp, false, &ptb);
         if (have) rn_vm_write_pte(&gpu, ptb, static_cast<uint32_t>(vp & 0x1ff), 0);
     }
-    rn_vm_flush(&gpu, vmid);
+    if (vmSpace[vmid].vmid > 0) rn_vm_flush(&gpu, vmSpace[vmid].vmid);
 }
 
 int RedNaviProbe::createHostBo(uint32_t size, bool writeCombine, bool gart, IOMemoryDescriptor *umd) {
@@ -2995,6 +3269,7 @@ int RedNaviProbe::present(uint32_t surface, bool wait) {
     wr(flipCtl, rd(flipCtl) & ~(1u << 1));
     wr(addrHi, static_cast<uint32_t>(mc >> 32));
     wr(addr, static_cast<uint32_t>(mc));
+    if (surface != frontSurface) prevFront = frontSurface;
     frontSurface = surface;
     if (!wait) return 0;
     for (int i = 0; i < 5000; i++) {                                         // up to 50 ms: three frames at 60 Hz
@@ -3002,6 +3277,15 @@ int RedNaviProbe::present(uint32_t surface, bool wait) {
         IODelay(10);
     }
     return 1;
+}
+
+// The surface HUBP0 reads now: its earliest address in use (HUBPREQ0_DCSURF_SURFACE_EARLIEST_INUSE, the register present() waits on). -1 when it is none of the scanout surfaces.
+int RedNaviProbe::scannedSurface() {
+    uint32_t b2 = 0;
+    if (!fbReady || liveSwitch || !ipBase(kRNHwIdDmu, &b2, 2)) return -1;
+    const uint64_t inUse = (static_cast<uint64_t>(rd((b2 + 0x625) * 4)) << 32) | rd((b2 + 0x624) * 4);
+    for (uint32_t i = 0; i < scanoutSurfaces(); i++) if (inUse == kRNVramMcBase + scanoutOff(i)) return static_cast<int>(i);
+    return -1;
 }
 
 int RedNaviProbe::createScanoutBo(uint32_t surface) {
@@ -3262,7 +3546,7 @@ void RedNaviProbe::sdmaTest() {
         const uint64_t apLen = bar0Mem ? static_cast<uint64_t>(bar0Mem->getLength()) : 0;
         // The pool ends 256 MB below the PSP TMR (the 7800 XT: TMR at 15.5 GB, pool end 0x3D0000000); a board without a known TMR offset keeps 768 MB free at the top.
         const uint64_t devTop = (board && board->psp_tmr_mb ? static_cast<uint64_t>(board->psp_tmr_mb) << 20 : (static_cast<uint64_t>(vramMbytes) << 20) - 0x20000000ull) - 0x10000000ull;
-        const uint64_t devBase = kVmTables + 7ull * kVmPoolPages * 4096;
+        const uint64_t devBase = kVmTables + static_cast<uint64_t>(kVmPoolTotal) * 4096;
         if (devTop > devBase) devPool.init(devBase, devTop - devBase);
         if (apLen >= 0x10000000ull) {
             visPool.init(kRNCursorVramOff + kRNCursorVramSize, 0x0C000000ull - (kRNCursorVramOff + kRNCursorVramSize));
@@ -3873,6 +4157,7 @@ bool RedNaviProbe::start(IOService *provider) {
     rn_compute_lock_init();
     pci->setMemoryEnable(true);
     dumpPci();
+    enableAtomicOps();
 
     regs = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0 + kRNRegBar * 4);
     if (!regs) {

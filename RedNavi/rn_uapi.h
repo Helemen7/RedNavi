@@ -86,6 +86,14 @@ struct rn_uc_info {
 // makes the display scan out one of them; when the connection that did so closes, the display goes back to surface 0.
 
 #define RN_PRESENT_FRAME_DONE 0xFFFF0001u   // rn_uc_present.surface: not a flip. The caller rendered the desktop into display surface 0 itself; the accelerator's next display transaction does not copy its surface
+// Staged frames (direct scanout of the desktop). The plug-in names an IOSurface (rn_uc_present.surface RN_PRESENT_ID_LO | low 16 bits of its id, then RN_PRESENT_ID_HI | high 16 bits),
+// leases a display surface for it (RN_PRESENT_LEASE; the answer's status is the surface number), copies the finished frame into it with the GPU, and commits it (RN_PRESENT_COMMIT | number).
+// The kext flips to it when the accelerator's display transaction shows that IOSurface (callPlatformFunction "rednavi-gpu-present"): the display never scans a surface that is being
+// written. The surface the display scans and the one before it are never leased. Encoded in the surface number so that the bridge's rn_bridge_present(surface, wait) carries it unchanged.
+#define RN_PRESENT_ID_LO 0xFFFD0000u
+#define RN_PRESENT_ID_HI 0xFFFC0000u
+#define RN_PRESENT_LEASE 0xFFFF0200u
+#define RN_PRESENT_COMMIT 0xFFFF0100u       // | surface number (0 to 2)
 #define RN_PRESENT_WAIT 1u     // return when the display uses the new surface (the next vertical blank), not before
 
 struct rn_uc_present {

@@ -20,7 +20,15 @@ typedef int (*translate_stage_fn)(unsigned, const void *, size_t, const char *, 
 static translate_stage_fn g_translate;
 typedef int (*translate_fc_fn)(unsigned, const void *, size_t, const char *, const rn_air_const *, unsigned, rn_air_kernel_info *, uint32_t **, size_t *, char *, size_t);
 static translate_fc_fn g_translate_fc;
+typedef int (*translate_tg_fn)(unsigned, const void *, size_t, const char *, const rn_air_const *, unsigned, const rn_air_tg_length *, unsigned, rn_air_kernel_info *, uint32_t **, size_t *, char *, size_t);
+static translate_tg_fn g_translate_tg;
 static free_fn g_free;
+typedef int (*stitch_fn)(const char *, const rn_air_stitch_fn *, unsigned, const rn_air_stitch_node *, unsigned, char **, size_t *, char *, size_t);
+static stitch_fn g_stitch;
+typedef int (*stitch_function_fn)(const char *, const rn_air_dag_fn *, unsigned, const rn_air_stitch_node *, unsigned, int, char **, size_t *, char *, size_t);
+static stitch_function_fn g_stitch_function;
+typedef int (*link_visible_fn)(const void *, size_t, const rn_air_stitch_fn *, unsigned, char **, size_t *, char *, size_t);
+static link_visible_fn g_link_visible;
 
 static int load(const char *dir, char *err, size_t errlen) {
     if (g_translate) return 0;
@@ -46,7 +54,11 @@ static int load(const char *dir, char *err, size_t errlen) {
     }
     g_translate = (translate_stage_fn)dlsym(g_lib, "rn_air_translate_stage");
     g_translate_fc = (translate_fc_fn)dlsym(g_lib, "rn_air_translate_stage_fc");
+    g_translate_tg = (translate_tg_fn)dlsym(g_lib, "rn_air_translate_stage_tg");
     g_free = (free_fn)dlsym(g_lib, "rn_air_free");
+    g_stitch = (stitch_fn)dlsym(g_lib, "rn_air_stitch");
+    g_stitch_function = (stitch_function_fn)dlsym(g_lib, "rn_air_stitch_function");
+    g_link_visible = (link_visible_fn)dlsym(g_lib, "rn_air_link_visible");
     if (!g_translate || !g_free) { snprintf(err, errlen, "%s does not export rn_air_translate_stage and rn_air_free", path); g_translate = NULL; return 1; }
     return 0;
 }
@@ -60,6 +72,15 @@ typedef struct { uint32_t magic; uint32_t info_size; uint64_t spirv_bytes; uint6
 
 static uint64_t fnv(uint64_t h, const void *p, size_t n) { const uint8_t *b = p; for (size_t i = 0; i < n; i++) h = (h ^ b[i]) * 1099511628211ull; return h; }
 
+static int dir_writable(const char *dir) {      // WindowServer's sandbox lets it stat and mkdir its cache directory but not create a file in it: only a file that can be made counts
+    char probe[1100];
+    snprintf(probe, sizeof(probe), "%s.probe.%d", dir, (int)getpid());
+    const int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    if (fd < 0) return 0;
+    close(fd); unlink(probe);
+    return 1;
+}
+
 static const char *cache_dir(void) {
     static char dir[1024];
     static int state;                              // 0 not tried, 1 usable, -1 not
@@ -72,7 +93,12 @@ static const char *cache_dir(void) {
             snprintf(dir, sizeof(dir), "%sorg.rednavi.metal", base);
             mkdir(dir, 0700);
             struct stat st;
-            if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & 022)) state = 1;
+            strlcat(dir, "/", sizeof(dir));
+            if (stat(dir, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == geteuid() && !(st.st_mode & 022) && dir_writable(dir)) state = 1;
+        }
+        if (state < 0 && !getenv("RN_AIR_NO_CACHE")) {            // WindowServer's sandbox lets it neither write its user cache directory nor make a directory under /private/var/tmp, but it can make files there: the same cache as flat files named with a prefix (the owner and mode of each file are checked on load)
+            snprintf(dir, sizeof(dir), "/private/var/tmp/rednavi-aircache-%d-", (int)geteuid());
+            if (dir_writable(dir)) state = 1;
         }
     }
     const int ok = state > 0;
@@ -120,9 +146,11 @@ static int forget(void *p) {
 
 static int cache_load(const char *cdir, uint64_t key, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes) {
     char path[1200];
-    snprintf(path, sizeof(path), "%s/%016llx.spv", cdir, (unsigned long long)key);
+    snprintf(path, sizeof(path), "%s%016llx.spv", cdir, (unsigned long long)key);
     int fd = open(path, O_RDONLY | O_NOFOLLOW);
     if (fd < 0) return 0;
+    struct stat fst;
+    if (fstat(fd, &fst) != 0 || !S_ISREG(fst.st_mode) || fst.st_uid != geteuid() || (fst.st_mode & 022)) { close(fd); return 0; }
     rn_cache_head h;
     int ok = 0;
     uint32_t *buf = NULL;
@@ -139,7 +167,7 @@ static int cache_load(const char *cdir, uint64_t key, rn_air_kernel_info *info, 
 
 static void cache_store(const char *cdir, uint64_t key, const rn_air_kernel_info *info, const uint32_t *spirv, size_t spirv_bytes) {
     char path[1200], tmp[1260];
-    snprintf(path, sizeof(path), "%s/%016llx.spv", cdir, (unsigned long long)key);
+    snprintf(path, sizeof(path), "%s%016llx.spv", cdir, (unsigned long long)key);
     snprintf(tmp, sizeof(tmp), "%s.%d.%p", path, (int)getpid(), (void *)&path);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd < 0) return;
@@ -154,17 +182,28 @@ int rn_air_translate_stage(const char *dir, int stage, const void *bitcode, size
 }
 
 int rn_air_translate_stage_fc(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen) {
+    return rn_air_translate_stage_tg(dir, stage, bitcode, bytes, entry, consts, nconsts, NULL, 0, info, spirv, spirv_bytes, err, errlen);
+}
+
+int rn_air_translate_stage_tg(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts, const rn_air_tg_length *tgs, unsigned ntgs, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen) {
     if (load(dir, err, errlen)) return 1;
     if (nconsts && !g_translate_fc) { snprintf(err, errlen, "the AIR translator library has no rn_air_translate_stage_fc (function constants)"); return 1; }
+    if (ntgs && !g_translate_tg) { snprintf(err, errlen, "the AIR translator library has no rn_air_translate_stage_tg (threadgroup lengths)"); return 1; }
     const char *cdir = cache_dir();
     uint64_t key = 0;
     if (cdir) {
         key = cache_key(dir, stage, bitcode, bytes, entry, consts, nconsts);
+        for (unsigned i = 0; i < ntgs; i++) key = fnv(key, &tgs[i], sizeof(tgs[i]));   // each set of lengths is its own module
         if (cache_load(cdir, key, info, spirv, spirv_bytes)) return 0;
     }
-    const int rc = nconsts ? g_translate_fc((unsigned)stage, bitcode, bytes, entry, consts, nconsts, info, spirv, spirv_bytes, err, errlen)
+    const int rc = ntgs ? g_translate_tg((unsigned)stage, bitcode, bytes, entry, consts, nconsts, tgs, ntgs, info, spirv, spirv_bytes, err, errlen)
+                 : nconsts ? g_translate_fc((unsigned)stage, bitcode, bytes, entry, consts, nconsts, info, spirv, spirv_bytes, err, errlen)
                            : g_translate((unsigned)stage, bitcode, bytes, entry, info, spirv, spirv_bytes, err, errlen);
     if (!rc && cdir) cache_store(cdir, key, info, *spirv, *spirv_bytes);
+    if (!rc && getenv("RN_DUMP_SPV_ALL")) {           // debugging: every module this process translates, as <dir>/<entry>.spv
+        char path[1100]; snprintf(path, sizeof(path), "%s/%s.spv", getenv("RN_DUMP_SPV_ALL"), entry);
+        FILE *f = fopen(path, "wb"); if (f) { fwrite(*spirv, 1, *spirv_bytes, f); fclose(f); }
+    }
     return rc;
 }
 
@@ -175,4 +214,24 @@ int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const c
 void rn_air_free(uint32_t *spirv, size_t bytes) {
     if (forget(spirv)) { free(spirv); return; }
     if (g_free) g_free(spirv, bytes);
+}
+
+int rn_air_stitch(const char *dir, const char *kernel, const rn_air_stitch_fn *fns, unsigned nfns, const rn_air_stitch_node *nodes, unsigned nnodes, char **text, size_t *text_bytes, char *err, size_t errlen) {
+    if (load(dir, err, errlen)) return 1;
+    if (!g_stitch) { snprintf(err, errlen, "the AIR translator library has no rn_air_stitch (function stitching)"); return 1; }
+    return g_stitch(kernel, fns, nfns, nodes, nnodes, text, text_bytes, err, errlen);
+}
+
+void rn_air_stitch_free(char *text) { free(text); }
+
+int rn_air_stitch_function(const char *dir, const char *function, const rn_air_dag_fn *fns, unsigned nfns, const rn_air_stitch_node *nodes, unsigned nnodes, int output, char **text, size_t *text_bytes, char *err, size_t errlen) {
+    if (load(dir, err, errlen)) return 1;
+    if (!g_stitch_function) { snprintf(err, errlen, "the AIR translator library has no rn_air_stitch_function (DAG functions)"); return 1; }
+    return g_stitch_function(function, fns, nfns, nodes, nnodes, output, text, text_bytes, err, errlen);
+}
+
+int rn_air_link_visible(const char *dir, const void *kernel, size_t bytes, const rn_air_stitch_fn *fns, unsigned nfns, char **text, size_t *text_bytes, char *err, size_t errlen) {
+    if (load(dir, err, errlen)) return 1;
+    if (!g_link_visible) { snprintf(err, errlen, "the AIR translator library has no rn_air_link_visible (linked functions)"); return 1; }
+    return g_link_visible(kernel, bytes, fns, nfns, text, text_bytes, err, errlen);
 }
