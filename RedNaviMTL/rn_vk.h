@@ -175,6 +175,17 @@ int rn_vk_image_verify(rn_vk *vk, rn_vk_image *im, size_t *ndiff, size_t *first,
 void rn_vk_host_lock(void);             // experiment: serialise a host write to an image's host copy with the batches (marker /Users/Shared/rednavi-hostlock); unlock after rn_vk_image_host_wrote
 void rn_vk_host_unlock(void);
 void rn_vk_batch_sync(rn_vk *vk);       // submits what is recorded and waits for it (a host access to a buffer a recorded pass reads or writes calls this first)
+void rn_vk_batch_bytes_begin(rn_vk *vk);   // before the bindings of a batched dispatch
+int rn_vk_batch_bytes(rn_vk *vk, const void *data, size_t len, rn_vk_buffer **buf, uint64_t *off);   // constant data in reused space; nonzero: make a buffer
+int rn_vk_image_buffer_copy(rn_vk *vk, rn_vk_image *im, rn_vk_buffer *buf, uint64_t off, size_t bpr, int to_image);   // a texture over a buffer, synchronised on the card in the open batch; nonzero: take the host path
+int rn_vk_image_skip_upload(rn_vk *vk, rn_vk_image *img, rn_vk_buffer *buf, uint64_t off, size_t bpr);   // a new texture over a buffer: 0 when the card fills it before every use and nothing is uploaded now
+// Copies recorded into the open batch; nonzero: not recorded, the caller syncs (rn_vk_batch_sync) and does it the old way.
+extern __thread const char *rn_vk_prof_name;       // the kernel of the next dispatch (profile)
+void rn_vk_prof_dump(void (*line)(const char *));
+int rn_vk_batch_image_buffer(rn_vk *vk, rn_vk_image *im, rn_vk_buffer *buf, uint64_t off, size_t bpr, uint32_t x, uint32_t y, uint32_t w, uint32_t h, int to_image);
+int rn_vk_batch_buffer_copy(rn_vk *vk, rn_vk_buffer *src, uint64_t soff, rn_vk_buffer *dst, uint64_t doff, uint64_t size);
+int rn_vk_batch_buffer_fill(rn_vk *vk, rn_vk_buffer *dst, uint64_t off, uint64_t size, uint32_t value);
+int rn_vk_batch_image_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
 int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // rn_vk_image_copy at the end of the open batch (the same submit)
 int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // whole image to an image of the same size and format on the card, waited for
 int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);   // a rectangle between two images of the same format on the card

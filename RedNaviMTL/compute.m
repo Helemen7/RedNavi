@@ -158,7 +158,9 @@ static _Atomic long g_proc_buf_bytes;
 // WindowServer keeps the memory behaviour of before (Private buffers and heaps in host memory or visible VRAM, Shared as the storage mode, the old size answers) until the
 // VRAM placement has been proven with apps: it is the process whose crash takes the desktop down.
 static BOOL rn_is_ws(void) { static int v = -1; if (v < 0) v = !strcmp(getprogname(), "WindowServer"); return v; }
-static __thread BOOL rn_force_host_;                 // newBufferWithBytes: a Private buffer is made where the CPU can write it (the bytes go in with the CPU) and still answers Private
+static __thread BOOL rn_force_host_;                 // newBufferWithBytesNoCopy: the buffer is made in host memory, which the caller's memory is copied into and out of
+// Large Managed buffers go to VRAM (not in WindowServer); the file /Users/Shared/rednavi-managedhost keeps them in host memory as before.
+static BOOL rn_managed_vram(void) { static int v = -1; if (v < 0) v = access("/Users/Shared/rednavi-managedhost", F_OK) != 0; return v; }
 static BOOL rn_buf_budget_take(size_t bytes) {
     static long cap = -1;
     if (cap < 0) {
@@ -179,6 +181,7 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
 @end
 @interface NSObject (RNHeapAlias)
 - (void)rn_aliased:(id)buffer;
+- (void)rn_unplace:(const void *)buffer at:(NSUInteger)offset;
 @end
 
 @interface RedNaviMTLBuffer : NSObject {
@@ -187,6 +190,7 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
     RNBacking *backing;                              // a heap's buffer: the heap's memory, which b is a range of
     id heap_;                                        // the RedNaviMTLHeap it was made from
     BOOL aliasable_;
+    BOOL placed_;                                    // its range is in the heap's list of taken ranges
     id<MTLDevice> dev;
     NSUInteger len;
     NSUInteger options;
@@ -197,8 +201,7 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
     BOOL hostBudget_;                                // its memory is host memory counted in rn_buf_budget_take
     NSUInteger heapOffset_;                          // a heap's buffer: its offset in the heap's memory
     BOOL managedDev_;                                // a Managed buffer in VRAM the CPU cannot map (the host budget refused it): the CPU works on shadow_
-    BOOL shadowStale_;                               // the card wrote it since shadow_ was filled (synchronizeResource): read back on the next contents
-    void *shadow_;                                   // managedDev_: the CPU's copy, made on the first contents
+    void *shadow_;                                   // managedDev_: the CPU's copy, made on the first contents; the card's bytes come into it only on synchronizeResource (rn_synchronized)
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o;
 - (instancetype)initWithDevice:(id<MTLDevice>)d backing:(RNBacking *)k buffer:(rn_vk_buffer *)sub length:(NSUInteger)l options:(NSUInteger)o heap:(id)h;
@@ -223,13 +226,21 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
                 b = rn_vk_buffer_create_device(vk, want);
                 if (!b) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Private buffer of %lu bytes: VRAM refused it, host memory", (unsigned long)l); }
             }
+            // A larger Managed buffer too, as Managed memory is on a discrete card: kernels read and write it at the card's rate, not over PCIe (measured 2026-11-26: copies 464 GB/s
+            // in VRAM against 27 GB/s with one side in host memory; every slow Geekbench kernel had only Managed buffers in host memory). The CPU gets its own copy (contents),
+            // sent to the card by didModifyRange and read back after synchronizeResource.
+            // The small ones the visible-VRAM budget refused stay in host memory: every didModifyRange on a device buffer waits for the card.
+            if (!b && sm == MTLResourceStorageModeManaged && want > (2u << 20) && !rn_force_host_ && !rn_is_ws() && rn_managed_vram() && (b = rn_vk_buffer_create_device(vk, want))) {
+                managedDev_ = YES;
+                static _Atomic unsigned long made, mb; const unsigned long k = atomic_fetch_add(&made, 1) + 1, m = atomic_fetch_add(&mb, want >> 20) + (want >> 20);
+                if (k <= 5 || k % 200 == 0) rn_log("Managed buffers in VRAM: %lu made so far, %lu MB", k, m);
+            }
             if (!b && rn_buf_budget_take(want)) {
                 b = rn_vk_buffer_create(vk, want);
                 if (b) host = YES; else rn_buf_budget_give(want);
             }
-            // A Managed buffer the host budget refused goes to VRAM, as Managed memory is on a discrete card: the CPU gets its own copy (contents), sent to the card by
-            // didModifyRange and read back after synchronizeResource. Geekbench's Feature Matching has a Managed buffer of 574 MB the GPU fills and reads.
-            if (!b && sm == MTLResourceStorageModeManaged && !rn_is_ws() && (b = rn_vk_buffer_create_device(vk, want))) {
+            // A Managed buffer the host budget refused goes to VRAM the same way.
+            if (!b && sm == MTLResourceStorageModeManaged && !rn_force_host_ && !rn_is_ws() && (b = rn_vk_buffer_create_device(vk, want))) {
                 managedDev_ = YES;
                 static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer of %lu bytes: over the host budget, in VRAM with a CPU copy", (unsigned long)l);
             }
@@ -258,6 +269,7 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
 }
 - (void)dealloc {
     rn_site_leave(site_);
+    if (placed_) [heap_ rn_unplace:(__bridge void *)self at:heapOffset_];
     if (userPtr) { @synchronized([RedNaviMTLBuffer class]) { [[RedNaviMTLBuffer noCopyBuffers] removeObject:self]; } if (userDealloc) userDealloc(userPtr, len); }
     if (shadow_) munmap(shadow_, len ? len : 1);
     if (b) { if (!backing && hostBudget_) rn_buf_budget_give(len ? len : 1); rn_vk_buffer_destroy(rn_vk_shared(), b); }   // a heap's buffer: only its range (the heap's memory is the backing's)
@@ -287,31 +299,58 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
     rn_vk *vk = rn_vk_shared(); if (!vk || !b || !shadow_) return NO;
     if (off >= len) return YES;
     if (n > len - off) n = len - off;
+    // One staging buffer for the process: making one for each call cost an allocation and a mapping in the kernel every time.
+    static rn_vk_buffer *t; static pthread_mutex_t tm = PTHREAD_MUTEX_INITIALIZER;
+    const size_t chunk = 32u << 20;
+    pthread_mutex_lock(&tm);
+    if (!t && !(t = rn_vk_buffer_create(vk, chunk))) { pthread_mutex_unlock(&tm); return NO; }
+    BOOL ok = YES;
+    for (NSUInteger at = 0; at < n && ok; at += chunk) {
+        const size_t m = n - at < chunk ? n - at : chunk;
+        // In an open batch the copy is only recorded: it has to run before the host buffer is read, or filled again for the next chunk (rn_vk_batch_sync does nothing outside one).
+        if (toCard) { memcpy(rn_vk_buffer_contents(t), (uint8_t *)shadow_ + off + at, m); ok = rn_vk_buffer_copy(vk, t, 0, b, off + at, m) == 0; rn_vk_batch_sync(vk); }
+        else if ((ok = rn_vk_buffer_copy(vk, b, off + at, t, 0, m) == 0)) { rn_vk_batch_sync(vk); memcpy((uint8_t *)shadow_ + off + at, rn_vk_buffer_contents(t), m); }
+    }
+    pthread_mutex_unlock(&tm);
+    if (!ok) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer %p in VRAM: copy %s the card failed", self, toCard ? "to" : "from"); }
+    return ok;
+}
+// The first contents of a new buffer (newBufferWithBytes:): written by the CPU where it can, else into the card's memory through host memory.
+- (BOOL)rn_fill:(const void *)bytes length:(NSUInteger)n {
+    if (n > len) n = len;
+    uint8_t *c = rn_vk_buffer_contents(b);
+    if (c) { memcpy(c, bytes, n); return YES; }
+    if (managedDev_) {
+        void *p = [self rn_shadow]; if (!p) return NO;
+        memcpy(p, bytes, n);
+        return [self rn_shadowSync:0 length:n toCard:YES];
+    }
+    rn_vk *vk = rn_vk_shared(); if (!vk) return NO;
     const size_t chunk = n < (32u << 20) ? n : (32u << 20);
     rn_vk_buffer *t = rn_vk_buffer_create(vk, chunk ? chunk : 1); if (!t) return NO;
     BOOL ok = YES;
     for (NSUInteger at = 0; at < n && ok; at += chunk) {
         const size_t m = n - at < chunk ? n - at : chunk;
-        if (toCard) { memcpy(rn_vk_buffer_contents(t), (uint8_t *)shadow_ + off + at, m); ok = rn_vk_buffer_copy(vk, t, 0, b, off + at, m) == 0; }
-        else if ((ok = rn_vk_buffer_copy(vk, b, off + at, t, 0, m) == 0)) memcpy((uint8_t *)shadow_ + off + at, rn_vk_buffer_contents(t), m);
+        memcpy(rn_vk_buffer_contents(t), (const uint8_t *)bytes + at, m);
+        ok = rn_vk_buffer_copy(vk, t, 0, b, at, m) == 0;
+        rn_vk_batch_sync(vk);
     }
     rn_vk_buffer_destroy(vk, t);
-    if (!ok) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer %p in VRAM: copy %s the card failed", self, toCard ? "to" : "from"); }
     return ok;
 }
-- (void *)contents {
-    if (userPtr) return userPtr;
-    if (managedDev_) {
-        @synchronized (self) {
-            if (!shadow_) {
-                void *p = mmap(NULL, len ? len : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-                if (p == MAP_FAILED) return NULL;
-                shadow_ = p; shadowStale_ = YES;
-            }
-            if (shadowStale_) { [self rn_shadowSync:0 length:len toCard:NO]; shadowStale_ = NO; }
-        }
+// The CPU's copy of a Managed buffer in VRAM, made on first use. It starts as zeros, like the card's buffer: nothing is read back here, so that what the CPU wrote
+// into it and has not yet announced with didModifyRange is never overwritten.
+- (void *)rn_shadow {
+    @synchronized (self) {
+        if (!shadow_) { void *p = mmap(NULL, len ? len : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (p != MAP_FAILED) shadow_ = p; }
         return shadow_;
     }
+}
+// synchronizeResource, once the work before it has run: the card's bytes into the CPU's copy.
+- (void)rn_synchronized { @synchronized (self) { if ([self rn_shadow]) [self rn_shadowSync:0 length:len toCard:NO]; } }
+- (void *)contents {
+    if (userPtr) return userPtr;
+    if (managedDev_) return [self rn_shadow];
     return rn_vk_buffer_contents(b);
 }
 - (NSUInteger)length { return len; }
@@ -332,6 +371,7 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
 - (void)makeAliasable {
     if (!heap_ || aliasable_) return;
     aliasable_ = YES;
+    if (placed_) { placed_ = NO; [heap_ rn_unplace:(__bridge void *)self at:heapOffset_]; }
     [heap_ rn_aliased:self];
 }
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state { return MTLPurgeableStateNonVolatile; }
@@ -598,21 +638,22 @@ static BOOL rn_sample_count_ok(NSUInteger n) { if (n == 1) return YES; rn_vk *vk
 // image with a host copy of its own, so the rows are copied from the buffer's memory (staged through host memory when the buffer is in VRAM) before each dispatch that uses the texture,
 // and back into the buffer after a dispatch that wrote it (rn_imageToBuffer). Geekbench's RAW workload blurs with MPS between two of its kernels over textures made inside its
 // buffers; with the rows copied only when the command buffer was committed the blur read the buffer from before the kernels ran and its result never reached the buffer.
-// inBatch: called inside an open batch (rn_vk_batch_begin), which a copy on the card has to leave so that it runs now.
+// inBatch: called inside an open batch (rn_vk_batch_begin), whose recorded work has to run before a copy on the card made now.
 static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSUInteger off, size_t span, BOOL inBatch, rn_vk_buffer **stage) {
     *stage = NULL;
     uint8_t *c = rn_vk_buffer_contents(bf->b);
     if (c) return c + off;
     if (!(*stage = rn_vk_buffer_create(vk, span))) return NULL;
-    if (inBatch) rn_vk_batch_end(vk);
+    if (inBatch) rn_vk_batch_sync(vk);                  // nothing recorded after this: the copy below is submitted and waited for by itself, with the lock held
     const int rc = rn_vk_buffer_copy(vk, bf->b, off, *stage, 0, span);
-    if (inBatch) rn_vk_batch_begin(vk);
     if (rc) { rn_vk_buffer_destroy(vk, *stage); *stage = NULL; return NULL; }
     return rn_vk_buffer_contents(*stage);
 }
 - (void)rn_bufferToImage:(BOOL)inBatch {
     rn_vk *vk = rn_vk_shared();
     if (!srcBuf || !img || !vk || !w || !h) return;
+    if (!rn_vk_image_buffer_copy(vk, img, srcBuf->b, srcOff, srcBpr, 1)) return;     // on the card, in the open batch
+    if (inBatch) rn_vk_batch_sync(vk);                                                // the host path reads the buffer: recorded work runs first
     const size_t row = w * texel, span = srcBpr * (h - 1) + row;
     rn_vk_buffer *stage;
     const uint8_t *src = rn_buf_bytes_for_host(vk, srcBuf, srcOff, span, inBatch, &stage);
@@ -628,6 +669,8 @@ static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSU
 - (void)rn_imageToBuffer:(BOOL)inBatch {
     rn_vk *vk = rn_vk_shared();
     if (!srcBuf || !img || !vk || !w || !h) return;
+    if (!rn_vk_image_buffer_copy(vk, img, srcBuf->b, srcOff, srcBpr, 0)) return;
+    if (inBatch) rn_vk_batch_sync(vk);
     const size_t row = w * texel, span = srcBpr * (h - 1) + row;
     const uint8_t *src = rn_vk_image_staging(img); const size_t pitch = rn_vk_image_row_bytes(img);
     uint8_t *c = rn_vk_buffer_contents(srcBuf->b);
@@ -637,12 +680,10 @@ static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSU
         uint8_t *dst = srcBpr == row ? ((stage = rn_vk_buffer_create(vk, span)) ? rn_vk_buffer_contents(stage) : NULL) : (uint8_t *)rn_buf_bytes_for_host(vk, srcBuf, srcOff, span, inBatch, &stage);   // rows with gaps: the gaps are kept
         if (!dst || !stage) { if (stage) rn_vk_buffer_destroy(vk, stage); static int said; if (said++ < 20) rn_log("texture over a buffer: the rows cannot be written back to the buffer"); return; }
         for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * srcBpr, src + y * pitch, row);
-        if (inBatch) rn_vk_batch_end(vk);
+        if (inBatch) rn_vk_batch_sync(vk);
         const int rc = rn_vk_buffer_copy(vk, stage, 0, srcBuf->b, srcOff, span);
-        if (inBatch) rn_vk_batch_begin(vk);
         rn_vk_buffer_destroy(vk, stage);
         if (rc) { static int said; if (said++ < 20) rn_log("texture over a buffer: copying the rows into the buffer on the card failed"); return; }
-        if (srcBuf->managedDev_) srcBuf->shadowStale_ = YES;
     }
 }
 - (void)syncFromBuffer {
@@ -786,6 +827,9 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     if (alen > 1 && slice && slice < alen && !region.origin.y && region.size.height == 1) { region.origin.y = slice; slice = 0; }   // a slice of a 1D array is one row
     if (slice || ![self clampRegion:region level:level]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored (type %ld, %lux%lux%lu, array %lu)", (unsigned long)level, (unsigned long)slice, (long)ttype, (unsigned long)w, (unsigned long)h, (unsigned long)d, (unsigned long)alen); return; }
     rn_tex_wait_idle(self);
+    // a texture made inside a buffer, written in part: the whole image goes back into the buffer below, so the host copy gets the buffer's rows first
+    { RedNaviMTLTexture *root = parent ? parent : self;
+      if (root->srcBuf && !level && (region.origin.x || region.origin.y || region.origin.z || region.size.width < w || region.size.height < h)) [root rn_bufferToImage:NO]; }
     rn_vk_host_lock();
     size_t pitch;                                         // a zero-copy IOSurface image has the surface's row pitch
     uint8_t *dst = rn_level_host(self, img, level, &pitch);
@@ -915,7 +959,13 @@ static BOOL rn_slot_ok(NSUInteger index, const char *what) {
 
 // The resources a Metal encoder has bound, turned into the rn_vk arguments of a pipeline's bindings (compute, vertex and fragment stages all use it). Returns an error text or nil.
 // setBytes data becomes a small buffer that is kept in `temps` until the work is done.
-static NSMutableArray *rn_batch_keep(void) { static NSMutableArray *k; static dispatch_once_t o; dispatch_once(&o, ^{ k = [NSMutableArray new]; }); return k; }
+// One per committing thread: it is emptied after the batch has ended, when another thread's batch may already be recording.
+static NSMutableArray *rn_batch_keep(void) {
+    NSMutableDictionary *d = [NSThread currentThread].threadDictionary;
+    NSMutableArray *k = d[@"rn_batch_keep"];
+    if (!k) d[@"rn_batch_keep"] = k = [NSMutableArray new];
+    return k;
+}
 // A texture of zeros for a texture argument with nothing behind it, by the translator's dimension (rn_air_binding.dim): 3D 1 x 1 x 2, a 2D array of one slice, otherwise 2D 1 x 1.
 // Made once each; they are never written.
 static rn_vk_image *rn_null_image(unsigned dim) {
@@ -932,13 +982,14 @@ static rn_vk_image *rn_null_image(unsigned dim) {
     return img[k];
 }
 static NSString *rn_bind_args(id<MTLDevice> dev, unsigned n, const unsigned *kind, const unsigned *mi, RedNaviMTLBuffer *const *bufs, const uint64_t *offs, NSData *const *bytesAt,
-                              RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps) {
+                              RedNaviMTLTexture *const *texs, RedNaviMTLSamplerState *const *samps, rn_vk_arg *av, NSMutableArray *temps, rn_vk *arena) {
     for (unsigned i = 0; i < n; i++) {
         const unsigned m = mi[i];
         switch (kind[i] & 0xff) {
         case RN_VK_BUFFER:
             if (m < RN_MTL_SLOTS && bufs[m]) { av[i].buffer = bufs[m]->b; av[i].offset = offs[m]; break; }
             if (m < RN_MTL_SLOTS && bytesAt[m]) {
+                if (arena && !rn_vk_batch_bytes(arena, bytesAt[m].bytes, bytesAt[m].length, &av[i].buffer, &av[i].offset)) break;
                 RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:bytesAt[m].length options:0];
                 if (!t) return @"no memory for constant data";
                 memcpy(rn_vk_buffer_contents(t->b), bytesAt[m].bytes, bytesAt[m].length);
@@ -1499,9 +1550,12 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
 @end
 
 static rn_vk_image *rn_display_vram_get(rn_vk *vk, RedNaviMTLTexture *rt, BOOL create);
+// A texture whose pixels are only its own image (and the host copy of it): not over a buffer or caller memory, not a view, not a surface or a depth texture.
+static BOOL rn_plain_image(RedNaviMTLTexture *t) { return t && t->img && !t->parent && !t->srcBuf && !t->srcRaw && !t->surf && !t->dep && !t->displayScan; }
 static NSString *rn_run_blit(RNBlit *b) {
-    // Render passes of the same command buffer are only recorded until the batch ends; a blit that reads or writes a buffer on the host runs now, so what was recorded before it must have run first.
-    if (b->kind != 2) { rn_vk *bvk = rn_vk_shared(); if (bvk) rn_vk_batch_sync(bvk); }
+    // The work before a blit is only recorded in the open batch. A copy the card can do is recorded after it (rn_vk_batch_*); one made on the host runs now, so the batch runs first (rn_vk_batch_sync).
+    rn_vk *bvk = rn_vk_shared();
+    if (b->kind == 5 && bvk) rn_vk_batch_sync(bvk);
     switch (b->kind) {
     case 0: case 1: {
         RedNaviMTLTexture *t = b->kind == 0 ? b->dt : b->st;
@@ -1520,6 +1574,11 @@ static NSString *rn_run_blit(RNBlit *b) {
         if (off + (b->sz.height - 1) * bpr + b->sz.width * t->texel > bf->len) return @"blit: the region is outside the buffer";
         rn_vk_image *card = b->kind == 1 && !lv ? rn_display_vram_peek((__bridge void *)t) : NULL;      // reading a scanout surface: its pixels are in the card's copy
         size_t tpitch;
+        if (!card && !lv && !o.z && b->sz.depth <= 1 && rn_plain_image(t) &&
+            !rn_vk_batch_image_buffer(bvk, t->img, bf->b, off, bpr, (uint32_t)o.x, (uint32_t)o.y, (uint32_t)b->sz.width, (uint32_t)b->sz.height, b->kind == 0)) {
+            return nil;
+        }
+        if (bvk) rn_vk_batch_sync(bvk);
         // A buffer in VRAM the CPU cannot map (Private): the rows go through a host buffer, copied from it on the card before (to a texture) or into it after (from a texture).
         const size_t span = (b->sz.height - 1) * bpr + b->sz.width * t->texel;
         rn_vk_buffer *stage = NULL;
@@ -1528,7 +1587,8 @@ static NSString *rn_run_blit(RNBlit *b) {
         else {
             rn_vk *svk = rn_vk_shared();
             if (!svk || !(stage = rn_vk_buffer_create(svk, span))) return @"blit: no host memory to stage a copy with a Private buffer";
-            if (b->kind == 0 && rn_vk_buffer_copy(svk, bf->b, off, stage, 0, span)) { rn_vk_buffer_destroy(svk, stage); return @"blit: reading the Private buffer on the card failed"; }
+            // into a buffer too when its rows have gaps: the whole span is written back below, and the gaps must keep their bytes
+            if ((b->kind == 0 || bpr != b->sz.width * t->texel) && rn_vk_buffer_copy(svk, bf->b, off, stage, 0, span)) { rn_vk_buffer_destroy(svk, stage); return @"blit: reading the Private buffer on the card failed"; }
             buf = (uint8_t *)rn_vk_buffer_contents(stage);
         }
         uint8_t *tex = rn_level_host(t, card ? card : t->img, lv, &tpitch);
@@ -1579,6 +1639,8 @@ static NSString *rn_run_blit(RNBlit *b) {
                 }
             }
         }
+        if (s2->pf == d2->pf && rn_plain_image(s2) && rn_plain_image(d2) && !rn_display_vram_peek((__bridge void *)s2) &&
+            !rn_vk_batch_image_region(bvk, s2->img, d2->img, (uint32_t)b->so.x, (uint32_t)b->so.y, (uint32_t)b->dorg.x, (uint32_t)b->dorg.y, (uint32_t)b->sz.width, (uint32_t)b->sz.height)) return nil;
         rn_vk_image *scard = rn_display_vram_peek((__bridge void *)s2);
         const uint8_t *sp = rn_vk_image_staging(scard ? scard : s2->img);
         uint8_t *dp = rn_vk_image_staging(d2->img);
@@ -1595,6 +1657,8 @@ static NSString *rn_run_blit(RNBlit *b) {
     }
     case 3:
         if (!b->sb || !b->db || b->soff + b->size > b->sb->len || b->doff + b->size > b->db->len) return @"blit: a buffer range is outside its buffer";
+        if (!rn_vk_batch_buffer_copy(bvk, b->sb->b, b->soff, b->db->b, b->doff, b->size)) return nil;
+        if (bvk) rn_vk_batch_sync(bvk);
         {
             uint8_t *dp = (uint8_t *)rn_vk_buffer_contents(b->db->b), *sp = (uint8_t *)rn_vk_buffer_contents(b->sb->b);
             if (dp && sp) { memmove(dp + b->doff, sp + b->soff, b->size); return nil; }
@@ -1612,6 +1676,8 @@ static NSString *rn_run_blit(RNBlit *b) {
         }
     case 4:
         if (!b->db || b->doff + b->size > b->db->len) return @"fillBuffer: the range is outside the buffer";
+        if (!rn_vk_batch_buffer_fill(bvk, b->db->b, b->doff, b->size, (uint32_t)(uint8_t)b->value * 0x01010101u)) return nil;
+        if (bvk) rn_vk_batch_sync(bvk);
         {
             uint8_t *dp = (uint8_t *)rn_vk_buffer_contents(b->db->b);
             if (dp) { memset(dp + b->doff, b->value, b->size); return nil; }
@@ -1704,10 +1770,13 @@ static NSString *rn_run_blit(RNBlit *b) {
     RNBlit *b = [self add:5];
     b->dt = (RedNaviMTLTexture *)texture;
 }
-- (void)synchronizeResource:(id<MTLResource>)resource {      // a Managed buffer in VRAM: its CPU copy is read back on the next contents (after the command buffer, when the caller looks)
-    if ([(id)resource isKindOfClass:[RedNaviMTLBuffer class]]) { RedNaviMTLBuffer *x = (RedNaviMTLBuffer *)resource; if (x->managedDev_) x->shadowStale_ = YES; }
+- (void)synchronizeResource:(id<MTLResource>)resource {      // a Managed buffer in VRAM: its CPU copy is read back when the work before this has run, before the command buffer completes
+    RedNaviMTLBuffer *x = nil;
+    if ([(id)resource isKindOfClass:[RedNaviMTLBuffer class]]) x = (RedNaviMTLBuffer *)resource;
+    else if ([(id)resource isKindOfClass:[RedNaviMTLTexture class]]) { RedNaviMTLTexture *t = (RedNaviMTLTexture *)resource; x = (t->parent ? t->parent : t)->srcBuf; }   // a texture over a buffer: its bytes are the buffer's
+    if (x && x->managedDev_) [self add:6]->db = x;
 }
-- (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
+- (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level { [self synchronizeResource:texture]; }
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture {}
 - (void)optimizeContentsForGPUAccess:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level {}
 - (void)optimizeContentsForCPUAccess:(id<MTLTexture>)texture {}
@@ -1860,6 +1929,10 @@ static NSString *rn_run_blit(RNBlit *b) {
 extern uint64_t rn_vk_fence_ticks;
 extern uint64_t rn_vk_bufstat[6];
 extern uint64_t rn_vk_imgstat[3];
+extern uint64_t rn_vk_cbstat[2];
+extern void (*rn_vk_cbatch_hook)(const char *prog, int on);
+static void rn_cbatch_said(const char *prog, int on) { rn_log("compute batching %s for %s", on ? "on" : "off", prog); }
+__attribute__((constructor)) static void rn_cbatch_hook_set(void) { rn_vk_cbatch_hook = rn_cbatch_said; }
 static _Atomic uint64_t g_ph[8];
 static inline void rn_ph(int i, uint64_t t0) { atomic_fetch_add(&g_ph[i], mach_absolute_time() - t0); }
 static _Atomic uint64_t g_frames, g_framegapmax, g_framelast, g_framelong, g_passes;   // frames that reached the scanout, the longest gap between two (ticks), gaps over 12 ms, render passes
@@ -1880,6 +1953,7 @@ static void rn_frame_note(void *src) {
     while (gap > m && !atomic_compare_exchange_weak(&g_framegapmax, &m, gap)) {}
     if (gap > 12000000ull) atomic_fetch_add(&g_framelong, 1);
 }
+static void rn_prof_line(const char *t) { rn_log("%s", t); }
 static void rn_commit_stats(uint64_t ticks) {
     if (!rn_diag) return;                                // the statistics are diagnostics: only with /Users/Shared/rednavi-log
     static mach_timebase_info_data_t tb;
@@ -1892,6 +1966,8 @@ static void rn_commit_stats(uint64_t ticks) {
     if (!since) since = now;
     if ((now - since) * tb.numer / tb.denom > 5000000000ull) {
         { double ph[8]; for (int i = 0; i < 8; i++) ph[i] = (double)atomic_exchange(&g_ph[i], 0) * tb.numer / tb.denom / 1e6; ph[2] = (double)__atomic_exchange_n(&rn_vk_fence_ticks, 0, __ATOMIC_RELAXED) * tb.numer / tb.denom / 1e6;
+          rn_log("compute: %llu dispatches batched, %llu batch submits", __atomic_exchange_n(&rn_vk_cbstat[0], 0, __ATOMIC_RELAXED), __atomic_exchange_n(&rn_vk_cbstat[1], 0, __ATOMIC_RELAXED));
+          rn_vk_prof_dump(rn_prof_line);
           rn_log("commit time in ms: render passes %.0f (vulkan %.0f, card wait %.0f), surfaces in %.0f, caller buffers %.0f, pipelines %.0f, handlers %.0f", ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6]); }
         { uint64_t bs[6]; for (int i = 0; i < 5; i++) bs[i] = __atomic_exchange_n(&rn_vk_bufstat[i], 0, __ATOMIC_RELAXED); bs[5] = rn_vk_bufstat[5];
           rn_log("buffer cache: %llu hits, %llu small misses, %llu big (largest %llu bytes), %llu kept, %llu dropped", bs[0], bs[1], bs[2], bs[5], bs[3], bs[4]); }
@@ -2596,8 +2672,8 @@ static NSString *rn_records_desc(NSArray *records) {
         else if ([rec isKindOfClass:[RNDispatch class]]) { RNDispatch *d = rec; [m appendFormat:@" %@", d->pso && d->pso->fname ? d->pso->fname : @"?"]; }
         else if ([rec isKindOfClass:[RNBlit class]]) {
             RNBlit *b = rec;
-            static const char *kn[] = {"buf>tex", "tex>buf", "tex>tex", "buf>buf", "fill", "mips"};
-            [m appendFormat:@" blit:%s", b->kind >= 0 && b->kind < 6 ? kn[b->kind] : "?"];
+            static const char *kn[] = {"buf>tex", "tex>buf", "tex>tex", "buf>buf", "fill", "mips", "sync"};
+            [m appendFormat:@" blit:%s", b->kind >= 0 && b->kind < 7 ? kn[b->kind] : "?"];
             if (b->kind == 3 || b->kind == 4) [m appendFormat:@"(%lu)", (unsigned long)b->size];
             else if (b->st || b->dt) { RedNaviMTLTexture *t = b->dt ? b->dt : b->st; [m appendFormat:@"(%lux%lu fmt %lu)", (unsigned long)b->sz.width, (unsigned long)b->sz.height, (unsigned long)t.pixelFormat]; }
         } else [m appendFormat:@" %s", class_getName([rec class])];
@@ -2817,8 +2893,8 @@ static void rn_log_failed_records(NSArray *records) {
         }
         rn_vk_render *r = [p renderForPrimitive:d->prim cull:d->cull clockwise:d->clockwise];
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
-        bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps);
-        if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps);
+        bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps, NULL);
+        if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps, NULL);
         for (unsigned i = 0; !bad && i < p->n[1]; i++)                    // [[color(n)]] inputs read the pass's render target n
             if ((p->kind[1][i] & 0xff) == RN_AIR_COLOR_INPUT) {
                 const unsigned m = p->mi[1][i];
@@ -3020,7 +3096,7 @@ static void rn_log_failed_records(NSArray *records) {
         if (written) [surfWritten addObject:t];
     };
     [self eachTexture:note];
-    { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { [t syncFromSurface]; [t syncFromBuffer]; } rn_ph(3, ph3); }
+    { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { [t syncFromSurface]; if (!t->srcBuf) [t syncFromBuffer]; } rn_ph(3, ph3); }
     {   // /Users/Shared/rednavi-trace: what each command buffer draws (a client such as WindowServer has no environment to set)
         struct stat tst;
         if (rn_diag && stat("/Users/Shared/rednavi-trace", &tst) == 0)
@@ -3073,15 +3149,21 @@ static void rn_log_failed_records(NSArray *records) {
     if (srcUsed) { srcId = atomic_fetch_add(&srcSeq, 1) + 1; rn_log("srclib: command buffer %llu submits: %s", srcId, srcUsed.UTF8String); }
     { static int tr = -1; if (tr < 0) tr = getenv("RN_CB_TRACE") != NULL; if (tr && records.count) rn_log("cb %p:%s", self, rn_records_desc(records).UTF8String); }
     if (vk) rn_vk_batch_begin(vk);
+    for (RedNaviMTLTexture *t in surfUsed) if (t->srcBuf) [t rn_bufferToImage:YES];   // textures over buffers go in inside the batch: on the card
+    BOOL blitRec = NO;                          // a blit may still be only recorded: a render pass can read buffers on the CPU
+    NSMutableOrderedSet *toSync = [NSMutableOrderedSet new];      // Managed buffers in VRAM named by synchronizeResource: read back once the batch has run
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
-        if ([rec isKindOfClass:[RNRenderPass class]]) { atomic_fetch_add(&g_passes, 1); const uint64_t ph0 = mach_absolute_time(); [self runRenderPass:rec]; rn_ph(0, ph0); continue; }
-        if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; continue; }
+        if ([rec isKindOfClass:[RNRenderPass class]]) { if (blitRec && vk) { rn_vk_batch_sync(vk); blitRec = NO; } atomic_fetch_add(&g_passes, 1); const uint64_t ph0 = mach_absolute_time(); [self runRenderPass:rec]; rn_ph(0, ph0); continue; }
+        if ([rec isKindOfClass:[RNBlit class]] && ((RNBlit *)rec)->kind == 6) { [toSync addObject:((RNBlit *)rec)->db]; continue; }
+        if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; blitRec = YES; continue; }
         if ([rec isKindOfClass:[RNEventOp class]]) {
             RNEventOp *o = rec;
             if (![o->event isKindOfClass:[RedNaviMTLSharedEvent class]]) { [self fail:@"an event that is not from RedNavi"]; break; }
             // the batch ends first: a signal must not run ahead of the work before it, and a wait must not hold the card lock
             { const int br = vk ? rn_vk_batch_end(vk) : 0; if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } [rn_batch_keep() removeAllObjects]; }
+            for (RedNaviMTLBuffer *x in toSync) [x rn_synchronized];     // before a signal lets the CPU look
+            [toSync removeAllObjects];
             BOOL got = YES;
             if (!o->wait) { if (o->event.signaledValue < o->value) o->event.signaledValue = o->value; }
             else got = [o->event waitFor:o->value timeoutMS:10000];
@@ -3094,7 +3176,8 @@ static void rn_log_failed_records(NSArray *records) {
         rn_vk_arg av[RN_VK_MAX_BINDINGS];
         memset(av, 0, sizeof(av));
         NSMutableArray *temps = [NSMutableArray new];       // buffers made from setBytes data, alive until the dispatch is done
-        NSString *bad = rn_bind_args(dev, p->nbind, p->kind, p->metalIndex, d->bufs, d->offs, d->bytesAt, d->texs, d->samps, av, temps);
+        rn_vk_batch_bytes_begin(vk);
+        NSString *bad = rn_bind_args(dev, p->nbind, p->kind, p->metalIndex, d->bufs, d->offs, d->bytesAt, d->texs, d->samps, av, temps, vk);
         if (bad) { [self fail:bad]; break; }
         const uint32_t groups[3] = {(uint32_t)d->groups.width, (uint32_t)d->groups.height, (uint32_t)d->groups.depth};
         const uint32_t local[3] = {(uint32_t)d->tpt.width, (uint32_t)d->tpt.height, (uint32_t)d->tpt.depth};
@@ -3108,7 +3191,7 @@ static void rn_log_failed_records(NSArray *records) {
             if (k < 2) {
                 snprintf(pdir, sizeof(pdir), "/tmp/rnprobe/%s-%d", p->fname.UTF8String, k);
                 mkdir("/tmp/rnprobe", 0755); mkdir(pdir, 0755);
-                rn_vk_batch_end(vk);
+                rn_vk_batch_sync(vk);
                 char fn[320]; FILE *mf; snprintf(fn, sizeof(fn), "%s/meta.txt", pdir);
                 if ((mf = fopen(fn, "w"))) {
                     fprintf(mf, "groups %u %u %u\nlocal %u %u %u\ngrid %u %u %u\ndyn %d\n", groups[0], groups[1], groups[2], local[0], local[1], local[2], grid[0], grid[1], grid[2], (int)p->dyn);
@@ -3131,7 +3214,6 @@ static void rn_log_failed_records(NSArray *records) {
                     fclose(mf);
                 }
                 for (unsigned i = 0; i < RN_MTL_SLOTS; i++) if (d->bufs[i]) { snprintf(fn, sizeof(fn), "%s/pre_%u.bin", pdir, i); rn_probe_write_buf(vk, d->bufs[i], fn); }
-                rn_vk_batch_begin(vk);
             } else pdir[0] = 0;
         }
         // textures made inside buffers: the buffer's rows in before, the rows a kernel wrote back into the buffer after (rn_bufferToImage)
@@ -3146,14 +3228,15 @@ static void rn_log_failed_records(NSArray *records) {
             if (kd == RN_VK_STORAGE_IMAGE) overW[j] = YES;
         }
         for (unsigned j = 0; j < nOver; j++) [overBuf[j] rn_bufferToImage:YES];
+        rn_vk_prof_name = p->fname.UTF8String;
         int rc = p->dyn ? rn_vk_dispatch_threads(vk, p->c, av, grid, local) : rn_vk_dispatch(vk, p->c, av, d->pushLen ? d->push : NULL, groups, local);
         if (!rc) for (unsigned j = 0; j < nOver; j++) if (overW[j]) [overBuf[j] rn_imageToBuffer:YES];
+        if (temps.count) [rn_batch_keep() addObjectsFromArray:temps];   // the dispatch is only recorded: its setBytes buffers stay alive until the batch has run
         if (pdir[0]) {
-            const int br = rn_vk_batch_end(vk);
+            rn_vk_batch_sync(vk);
             char fn[320];
             for (unsigned i = 0; i < RN_MTL_SLOTS; i++) if (d->bufs[i]) { snprintf(fn, sizeof(fn), "%s/post_%u.bin", pdir, i); rn_probe_write_buf(vk, d->bufs[i], fn); }
-            rn_log("probe dump %s (rc %d, submit %d)", pdir, rc, br);
-            rn_vk_batch_begin(vk);
+            rn_log("probe dump %s (rc %d)", pdir, rc);
         }
         if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
         else if (rc == 6) [self fail:@"a resource of the pipeline is missing or cannot be used as bound (a texture whose format cannot be a storage image?)"];
@@ -3168,6 +3251,7 @@ static void rn_log_failed_records(NSArray *records) {
         if (scan && rn_vk_batch_copy(vk, scanSrc, scan) == 0) scanCopied = YES;
     }
     if (vk) { const int br = rn_vk_batch_end(vk); if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } }
+    if (st != MTLCommandBufferStatusError) for (RedNaviMTLBuffer *x in toSync) [x rn_synchronized];
     if (srcId) rn_log("srclib: command buffer %llu done", srcId);
     {   // RN_PROBE_KERNELS=a,b: after the command buffer, what the buffers of those kernels hold (small ones in hex, others as nonzero words of the first 64 KB)
         static const char *pk; static dispatch_once_t pko; dispatch_once(&pko, ^{ pk = getenv("RN_PROBE_KERNELS"); });
@@ -3239,7 +3323,9 @@ static void rn_log_failed_records(NSArray *records) {
         return nil;
     }
     t->srcBuf = self; t->srcOff = offset; t->srcBpr = bytesPerRow;
-    [t syncFromBuffer];
+    // A command buffer that uses the texture copies the rows in on the card first (commitBody), so nothing is read here when the card can do that copy: the read back through a staging
+    // buffer was a large part of the CPU time of Geekbench's Photo and RAW workloads. Where it cannot (WindowServer, rows the card cannot address), the rows go through the host copy.
+    if (rn_is_ws() || !t->img || rn_vk_image_skip_upload(rn_vk_shared(), t->img, b, offset, bytesPerRow)) [t syncFromBuffer];
     return t;
 }
 @end
@@ -3839,6 +3925,28 @@ static RedNaviMTLComputePipelineState *rn_pso_for_tg(RedNaviMTLComputePipelineSt
     }
 }
 
+// Compute pipeline states, by what the module depends on: the bitcode (by content), the entry name, the constant values and the threadgroup lengths. Translating a kernel and
+// compiling it for the card costs tens to hundreds of milliseconds, and Geekbench and MetalPerformanceShaders ask for the same kernels again at every iteration (a CPU sample of
+// 2026-11-26: about 60% of the main thread in the AI workloads). The same request is answered with the same object; the first 4096 are kept until the process ends.
+// Off with the file /Users/Shared/rednavi-nopsocache.
+static NSData *rn_pso_key(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_const *fcc, unsigned nfc, const rn_air_tg_length *tgs, unsigned ntgs) {
+    NSMutableData *key = [NSMutableData data];
+    const uint8_t *bc = f->bitcode.bytes; const size_t bcl = f->bitcode.length;
+    uint64_t h1 = 14695981039346656037ull, h2 = 0x9e3779b97f4a7c15ull;          // two hashes of the bitcode (it is a new NSData for every function object)
+    for (size_t i = 0; i < bcl; i += 8) { uint64_t w = 0; memcpy(&w, bc + i, bcl - i < 8 ? bcl - i : 8); h1 = (h1 ^ w) * 1099511628211ull; h2 = ((h2 << 7 | h2 >> 57) + w) * 0xff51afd7ed558ccdull; }
+    const void *dv = (__bridge const void *)dev; const char *nm = f->name.UTF8String;
+    [key appendBytes:&dv length:sizeof(dv)]; [key appendBytes:&h1 length:8]; [key appendBytes:&h2 length:8]; [key appendBytes:&bcl length:sizeof(bcl)]; [key appendBytes:nm length:strlen(nm) + 1];
+    [key appendBytes:&nfc length:sizeof(nfc)];
+    for (unsigned c = 0; c < nfc; c++) {
+        [key appendBytes:&fcc[c].index length:sizeof(int32_t)];
+        const char *cn = fcc[c].name ? fcc[c].name : ""; [key appendBytes:cn length:strlen(cn) + 1];
+        [key appendBytes:&fcc[c].size length:sizeof(uint32_t)]; [key appendBytes:fcc[c].data length:fcc[c].size];
+    }
+    for (unsigned t = 0; t < ntgs; t++) { [key appendBytes:&tgs[t].index length:sizeof(tgs[t].index)]; [key appendBytes:&tgs[t].bytes length:sizeof(tgs[t].bytes)]; }
+    return key;
+}
+static NSMutableDictionary<NSData *, RedNaviMTLComputePipelineState *> *rn_pso_cache(void) { static NSMutableDictionary *c; static dispatch_once_t o; dispatch_once(&o, ^{ c = [NSMutableDictionary new]; }); return c; }
+
 static id rn_pso_build(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_tg_length *tgs, unsigned ntgs, NSError **error) {
     if (error) *error = nil;
     NSString *why = nil;
@@ -3854,6 +3962,10 @@ static id rn_pso_build(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_tg
         memset(&info, 0, sizeof(info));
         rn_air_const fcc[64];
     const unsigned nfc = rn_fc_array(f->fcs, fcc, 64);
+    // WindowServer does not share pipelines: it does not batch dispatches, and a module has one descriptor set that two of its threads could rewrite.
+    static int nocache = -1; if (nocache < 0) nocache = rn_is_ws() || access("/Users/Shared/rednavi-nopsocache", F_OK) == 0;
+    NSData *key = nocache ? nil : rn_pso_key(dev, f, fcc, nfc, tgs, ntgs);
+    if (key) { NSMutableDictionary *pc = rn_pso_cache(); @synchronized (pc) { RedNaviMTLComputePipelineState *hit = pc[key]; if (hit) return hit; } }
     if (rn_air_translate_stage_tg(NULL, RN_AIR_KERNEL, f->bitcode.bytes, f->bitcode.length, f->name.UTF8String, fcc, nfc, tgs, ntgs, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithUTF8String:err];
         } else {
@@ -3889,6 +4001,14 @@ static id rn_pso_build(id<MTLDevice> dev, RedNaviMTLFunction *f, const rn_air_tg
                 for (unsigned t = 0; t < ntgs; t++) if (tgs[t].index < RN_TG_SLOTS) p->tgBuilt[tgs[t].index] = tgs[t].bytes;
                 for (unsigned i = 0; i < n; i++) { p->metalIndex[i] = info.bindings[i].metal_index; p->kind[i] = info.bindings[i].kind | (info.bindings[i].dim << 8); }   // dimension in the upper bits, as for render pipelines
                 for (int i = 0; i < 3; i++) p->localSize[i] = info.local_size[i];
+                if (key) {
+                    NSMutableDictionary *pc = rn_pso_cache();
+                    @synchronized (pc) {
+                        if (pc[key]) return pc[key];                  // another thread built it meanwhile
+                        if (pc.count < 4096) pc[key] = p;
+                        if (pc.count % 100 == 0) rn_log("compute pipeline cache: %lu pipelines", (unsigned long)pc.count);
+                    }
+                }
                 return p;
             }
         }
@@ -4417,6 +4537,7 @@ static MTLSizeAndAlign rn_heap_texture_size(MTLTextureDescriptor *desc) {
 @class RedNaviMTLHeap;
 @interface RNHeapLease : NSObject { @public RedNaviMTLHeap *__weak heap; NSUInteger bytes; }
 @end
+struct rn_range { NSUInteger off, len; const void *owner; };
 @interface RedNaviMTLHeap : NSObject <MTLHeap> {
 @public
     id<MTLDevice> dev_;
@@ -4424,8 +4545,9 @@ static MTLSizeAndAlign rn_heap_texture_size(MTLTextureDescriptor *desc) {
     _Atomic NSUInteger used_;
     NSString *label_;
     RNBacking *mem_;                                 // the heap's memory (nil when it could not be allocated: then each buffer gets its own, as before)
-    NSMutableArray *regions_;                        // NSValue pairs (offset, size) and the buffer that holds each: weak, in regionOwners_
-    NSPointerArray *regionOwners_;
+    // The taken ranges of mem_, sorted by offset: one for each buffer that is alive and not aliasable (a C array: Geekbench keeps more than 30000 buffers in one heap, and building and
+    // sorting a list of objects for each new buffer took most of the CPU time there). The first packed_ ranges touch each other from offset 0, so the search starts after them.
+    struct rn_range *ranges_; size_t nranges_, cranges_, packed_;
 }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLHeapDescriptor *)desc;
 @end
@@ -4439,8 +4561,6 @@ static char rn_heap_lease_key;
     if (!(self = [super init])) return nil;
     dev_ = d;
     desc_ = [desc copy];
-    regions_ = [NSMutableArray array];
-    regionOwners_ = [NSPointerArray weakObjectsPointerArray];
     rn_vk *vk = rn_vk_shared();
     // A Private heap's memory is one allocation in VRAM the CPU cannot map (its buffers are Private too); a Shared or Managed heap's is host memory within the per-process budget.
     // When neither works the heap has no memory of its own and each resource gets its own (counted against the heap's size).
@@ -4495,24 +4615,39 @@ static char rn_heap_lease_key;
     RNHeapLease *l = objc_getAssociatedObject(x, &rn_heap_lease_key);
     if (l && l->bytes) { atomic_fetch_sub(&used_, l->bytes); l->bytes = 0; }
 }
-// The lowest offset (a multiple of 256) where `need` bytes fit between the ranges of the heap's buffers that are alive and not aliasable; NSNotFound when none. Ranges whose buffer
-// is gone are dropped.
-- (NSUInteger)placeBytes:(NSUInteger)need {
-    NSMutableArray<NSValue *> *busy = [NSMutableArray array];
-    for (NSInteger i = (NSInteger)regions_.count - 1; i >= 0; i--) {
-        RedNaviMTLBuffer *o = (__bridge RedNaviMTLBuffer *)[regionOwners_ pointerAtIndex:(NSUInteger)i];
-        if (!o) { [regions_ removeObjectAtIndex:(NSUInteger)i]; [regionOwners_ removePointerAtIndex:(NSUInteger)i]; continue; }
-        if (!o->aliasable_) [busy addObject:regions_[(NSUInteger)i]];
-    }
-    [busy sortUsingComparator:^NSComparisonResult(NSValue *p, NSValue *q) { return p.rangeValue.location < q.rangeValue.location ? NSOrderedAscending : p.rangeValue.location > q.rangeValue.location ? NSOrderedDescending : NSOrderedSame; }];
-    NSUInteger at = 0;
-    for (NSValue *v in busy) {
-        if (at + need <= v.rangeValue.location) break;
-        const NSUInteger end = NSMaxRange(v.rangeValue);
-        if (end > at) at = (end + 255) & ~(NSUInteger)255;
-    }
+// The lowest offset where `need` bytes (a multiple of 256, like every range) fit between the taken ranges, and in *index the place of the new range in the list; NSNotFound when none.
+- (NSUInteger)placeBytes:(NSUInteger)need index:(size_t *)index {
+    size_t i = packed_;
+    NSUInteger at = i ? ranges_[i - 1].off + ranges_[i - 1].len : 0;
+    for (; i < nranges_ && at + need > ranges_[i].off; i++) at = ranges_[i].off + ranges_[i].len;
+    *index = i;
     return at + need <= rn_vk_buffer_length(mem_->b) ? at : NSNotFound;
 }
+- (BOOL)take:(NSUInteger)need at:(NSUInteger)at index:(size_t)i owner:(const void *)owner {
+    if (nranges_ == cranges_) {
+        const size_t c = cranges_ ? cranges_ * 2 : 64;
+        struct rn_range *r = realloc(ranges_, c * sizeof(*r));
+        if (!r) return NO;
+        ranges_ = r; cranges_ = c;
+    }
+    memmove(ranges_ + i + 1, ranges_ + i, (nranges_ - i) * sizeof(*ranges_));
+    ranges_[i] = (struct rn_range){at, need, owner};
+    nranges_++;
+    while (packed_ < nranges_ && ranges_[packed_].off == (packed_ ? ranges_[packed_ - 1].off + ranges_[packed_ - 1].len : 0)) packed_++;
+    return YES;
+}
+// A buffer died or was made aliasable: its range is free again.
+- (void)rn_unplace:(const void *)buffer at:(NSUInteger)offset {
+    @synchronized(self) {
+        size_t lo = 0, hi = nranges_;
+        while (lo < hi) { const size_t m = (lo + hi) / 2; if (ranges_[m].off < offset) lo = m + 1; else hi = m; }
+        if (lo >= nranges_ || ranges_[lo].off != offset || ranges_[lo].owner != buffer) return;
+        memmove(ranges_ + lo, ranges_ + lo + 1, (nranges_ - lo - 1) * sizeof(*ranges_));
+        nranges_--;
+        if (lo < packed_) packed_ = lo;
+    }
+}
+- (void)dealloc { free(ranges_); }
 - (id<MTLBuffer>)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options {
     NSUInteger need = (length + 255) & ~(NSUInteger)255;
     if (!need) need = 256;
@@ -4524,13 +4659,14 @@ static char rn_heap_lease_key;
     }
     RedNaviMTLBuffer *x = nil;
     @synchronized(self) {
-        const NSUInteger at = [self placeBytes:need];
+        size_t index = 0;
+        const NSUInteger at = [self placeBytes:need index:&index];
         rn_vk_buffer *sub = at == NSNotFound ? NULL : rn_vk_buffer_create_in(rn_vk_shared(), mem_->b, at, need);
         if (sub) {
             x = [[RedNaviMTLBuffer alloc] initWithDevice:dev_ backing:mem_ buffer:sub length:length options:options heap:self];
             x->heapOffset_ = at;
-            [regions_ addObject:[NSValue valueWithRange:NSMakeRange(at, need)]];
-            [regionOwners_ addPointer:(__bridge void *)x];
+            if ([self take:need at:at index:index owner:(__bridge void *)x]) x->placed_ = YES;
+            else x = nil;
         }
     }
     if (!x) { atomic_fetch_sub(&used_, need); atomic_fetch_add(&g_hb_reuse, 1); return nil; }   // fragmented: the caller makes another heap
@@ -4634,10 +4770,8 @@ void rn_compute_install(Class k, Class sup) {
     rn_imp_bytes o2 = m2 ? (rn_imp_bytes)method_getImplementation(m2) : NULL;
     class_addMethod(k, s2, imp_implementationWithBlock(^uintptr_t(id self, const void *bytes, NSUInteger length, NSUInteger options) {
         if (!rn_gate()) return o2 ? o2(self, s2, bytes, length, options) : 0;
-        rn_force_host_ = YES;
         RedNaviMTLBuffer *b = [[RedNaviMTLBuffer alloc] initWithDevice:(id<MTLDevice>)self length:length options:options];
-        rn_force_host_ = NO;
-        if (b && bytes && rn_vk_buffer_contents(b->b)) memcpy(rn_vk_buffer_contents(b->b), bytes, length);
+        if (b && bytes && ![b rn_fill:bytes length:length]) return 0;
         return (uintptr_t)CFBridgingRetain(b);
     }), m2 ? method_getTypeEncoding(m2) : "@40@0:8r^v16Q24Q32");
     SEL s2b = sel_registerName("newBufferWithBytesNoCopy:length:options:deallocator:");

@@ -3,6 +3,7 @@
 
 #include "rn_air.h"
 #include "rn_vk.h"
+#include <mach-o/loader.h>
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -65,7 +66,7 @@ static int load(const char *dir, char *err, size_t errlen) {
 
 // ---------------------------------------------------------------------------------------------------------------------------------- translation cache
 // Translating one function takes seconds (QuartzCore asks for a hundred specializations when WindowServer starts), so the result is kept on disk, keyed by a hash of everything that
-// goes into it: the translator library (size and time), the stage, the entry, the bitcode and the function constants. Only successes are kept. The directory is the user's own cache
+// goes into it: the translator library (its build UUID), the stage, the entry, the bitcode and the function constants. Only successes are kept. The directory is the user's own cache
 // directory (confstr), mode 0700, and is used only if it belongs to this user and nobody else can write it: SPIR-V from there goes to the GPU. RN_AIR_NO_CACHE=1 turns it off.
 #define RN_CACHE_MAGIC 0x31434e52u            // "RNC1"
 typedef struct { uint32_t magic; uint32_t info_size; uint64_t spirv_bytes; uint64_t key; } rn_cache_head;
@@ -106,12 +107,36 @@ static const char *cache_dir(void) {
     return ok ? dir : NULL;
 }
 
+// What identifies this build of the translator: the linker's UUID of the library (the same after the installer copies and signs it again, which changes its time and size on disk);
+// without one, its size and time.
+static uint64_t lib_identity(const char *path) {
+    uint64_t id = 0;
+    const int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        struct mach_header_64 mh;
+        if (pread(fd, &mh, sizeof(mh), 0) == (ssize_t)sizeof(mh) && mh.magic == MH_MAGIC_64 && mh.sizeofcmds < (1u << 20)) {
+            uint8_t *cmds = malloc(mh.sizeofcmds);
+            if (cmds && pread(fd, cmds, mh.sizeofcmds, sizeof(mh)) == (ssize_t)mh.sizeofcmds)
+                for (size_t at = 0; at + sizeof(struct load_command) <= mh.sizeofcmds;) {
+                    struct load_command lc; memcpy(&lc, cmds + at, sizeof(lc));
+                    if (lc.cmdsize < sizeof(lc) || at + lc.cmdsize > mh.sizeofcmds) break;
+                    if (lc.cmd == LC_UUID && lc.cmdsize >= sizeof(struct uuid_command)) { id = fnv(14695981039346656037ull, cmds + at + sizeof(lc), 16); break; }
+                    at += lc.cmdsize;
+                }
+            free(cmds);
+        }
+        close(fd);
+    }
+    struct stat st;
+    if (!id) id = stat(path, &st) == 0 ? ((uint64_t)st.st_size << 20) ^ (uint64_t)st.st_mtimespec.tv_sec : 1;
+    return id;
+}
 static uint64_t lib_stamp;
 static uint64_t cache_key(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts) {
     if (!lib_stamp) {
-        struct stat st; char path[1100];
+        char path[1100];
         snprintf(path, sizeof(path), "%s/librn_air2spirv.dylib", dir ? dir : rn_vk_dir());
-        lib_stamp = stat(path, &st) == 0 ? ((uint64_t)st.st_size << 20) ^ (uint64_t)st.st_mtimespec.tv_sec : 1;
+        lib_stamp = lib_identity(path);
     }
     uint64_t h = 14695981039346656037ull;
     h = fnv(h, &lib_stamp, sizeof(lib_stamp));
@@ -177,6 +202,28 @@ static void cache_store(const char *cdir, uint64_t key, const rn_air_kernel_info
     if (ok) rename(tmp, path); else unlink(tmp);
 }
 
+// With the file /Users/Shared/rednavi-airmiss, each cache miss is written to /private/var/tmp/rednavi-airmiss-<uid>.log: what went into the key, part by part, to find the part that
+// differs between two runs of the same program.
+static void cache_miss_log(uint64_t key, int stage, const void *bitcode, size_t bytes, const char *entry, const rn_air_const *consts, unsigned nconsts) {
+    static int on = -1; if (on < 0) on = access("/Users/Shared/rednavi-airmiss", F_OK) == 0;
+    if (!on) return;
+    char line[4096];
+    size_t n = (size_t)snprintf(line, sizeof(line), "pid %d key %016llx stage %d entry %s bytes %zu bitcode %016llx consts %u", (int)getpid(), (unsigned long long)key, stage, entry, bytes,
+                                (unsigned long long)fnv(14695981039346656037ull, bitcode, bytes), nconsts);
+    for (unsigned i = 0; i < nconsts && n < sizeof(line) - 200; i++) {
+        n += (size_t)snprintf(line + n, sizeof(line) - n, " [%d %s %u:", consts[i].index, consts[i].name ? consts[i].name : "", consts[i].size);
+        for (unsigned b = 0; b < consts[i].size && b < 32; b++) n += (size_t)snprintf(line + n, sizeof(line) - n, "%02x", ((const uint8_t *)consts[i].data)[b]);
+        n += (size_t)snprintf(line + n, sizeof(line) - n, "]");
+    }
+    char path[128];
+    snprintf(path, sizeof(path), "/private/var/tmp/rednavi-airmiss-%d.log", (int)geteuid());
+    const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW, 0600);
+    if (fd < 0) return;
+    line[n++] = '\n';
+    if (write(fd, line, n) != (ssize_t)n) {}
+    close(fd);
+}
+
 int rn_air_translate_stage(const char *dir, int stage, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen) {
     return rn_air_translate_stage_fc(dir, stage, bitcode, bytes, entry, NULL, 0, info, spirv, spirv_bytes, err, errlen);
 }
@@ -195,6 +242,7 @@ int rn_air_translate_stage_tg(const char *dir, int stage, const void *bitcode, s
         key = cache_key(dir, stage, bitcode, bytes, entry, consts, nconsts);
         for (unsigned i = 0; i < ntgs; i++) key = fnv(key, &tgs[i], sizeof(tgs[i]));   // each set of lengths is its own module
         if (cache_load(cdir, key, info, spirv, spirv_bytes)) return 0;
+        cache_miss_log(key, stage, bitcode, bytes, entry, consts, nconsts);
     }
     const int rc = ntgs ? g_translate_tg((unsigned)stage, bitcode, bytes, entry, consts, nconsts, tgs, ntgs, info, spirv, spirv_bytes, err, errlen)
                  : nconsts ? g_translate_fc((unsigned)stage, bitcode, bytes, entry, consts, nconsts, info, spirv, spirv_bytes, err, errlen)
