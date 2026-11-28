@@ -1137,6 +1137,18 @@ void RedNaviProbe::smuProbe(const char *property, bool send) {
             rnPublishOne(out, "gfxclk_soft_max_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc1)));
             rnPublishOne(out, "gfxclk_soft_min_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc2)));
         }
+        // Opt-in (rednavi_uclk=<MHz>): pin the memory clock (PPCLK_UCLK 2) the same way. The value is a level of the card's own DPM table (96 to 1218 MHz on the 7800 XT).
+        uint32_t uclk = 0;
+        if (!PE_parse_boot_argn("rednavi_uclk", &uclk, sizeof(uclk))) { OSNumber *n = OSDynamicCast(OSNumber, getProperty("rednavi_uclk")); if (n) uclk = n->unsigned32BitValue(); }
+        if (uclk >= 96 && uclk <= 1300) {
+            uint32_t result = 0, resp = 0;
+            int rc1 = rn_smu13_send(adev, PPSMC_MSG_SetSoftMaxByFreq, (2u << 16) | uclk, &result, &resp, 1000000);
+            int rc2 = rn_smu13_send(adev, PPSMC_MSG_SetSoftMinByFreq, (2u << 16) | uclk, &result, &resp, 1000000);
+            IOLog("RedNavi: SMU uclk %u MHz: soft max rc %d, soft min rc %d, response 0x%x\n", uclk, rc1, rc2, resp);
+            rnPublishOne(out, "uclk_request_mhz", uclk);
+            rnPublishOne(out, "uclk_soft_max_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc1)));
+            rnPublishOne(out, "uclk_soft_min_rc", static_cast<uint64_t>(static_cast<uint32_t>(rc2)));
+        }
         // Opt-in (rednavi_smu_setup=1): the rest of what Linux's smu_smc_hw_setup/smu_hw_init/smu_late_init send after the features
         // are on and that we did not: the combo pptable transfer, the DPM tables (level count and frequency of every clock), the power
         // source. With SCPM the allowed mask is rejected by the firmware, as above, so Linux does not send it either.
@@ -2571,14 +2583,27 @@ public:
             }
             break;
         case RN_UC_SUBMIT:
-            if (sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) && fenceIdx >= 0) {
-                const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);
+            if ((sized(args, sizeof(rn_uc_submit), sizeof(rn_uc_submit_result)) || sized(args, sizeof(rn_uc_submit_chain), sizeof(rn_uc_submit_result))) && fenceIdx >= 0) {
+                const rn_uc_submit *in = static_cast<const rn_uc_submit *>(args->structureInput);   // the first member of rn_uc_submit_chain
+                const rn_uc_submit_chain *more = args->structureInputSize == sizeof(rn_uc_submit_chain) ? static_cast<const rn_uc_submit_chain *>(args->structureInput) : nullptr;
                 uint64_t ibVa = 0;
                 const bool gfx = (in->flags & RN_SUBMIT_GFX) != 0;
                 if ((in->flags & ~RN_SUBMIT_GFX) != 0 || (gfx && !gpuOwner->gfxQueueOk) || in->ib_dwords == 0 || in->ib_dwords > 0xFFFFF || (in->ib_va & 3) || !canonical(in->ib_va, in->ib_dwords * 4ull, &ibVa) || !inMap(ibVa, in->ib_dwords * 4ull)) break;
                 // A command buffer in the upper half of the address space hangs the compute queue (docs/COMPAT.md): the command processor does not run it and later
                 // dispatches of every connection stay dead until the next boot, a reset does not bring them back. Data and shaders up there work, so only this is refused.
                 if (ibVa >= (1ull << 47)) { rc = kIOReturnUnsupported; break; }
+                rn_gfx_ib chain[RN_UC_SUBMIT_MAX_IB] = {{ibVa, in->ib_dwords}};
+                const uint32_t ibCount = more ? more->ib_count : 1;
+                if (ibCount == 0 || ibCount > RN_UC_SUBMIT_MAX_IB || (!gfx && ibCount != 1)) break;
+                bool badIb = false;
+                for (uint32_t i = 1; i < ibCount && !badIb; i++) {                   // the same rules as for the first one
+                    const uint64_t va = more->chain_va[i - 1];
+                    const uint32_t dwords = more->chain_dwords[i - 1];
+                    uint64_t v = 0;
+                    badIb = dwords == 0 || dwords > 0xFFFFF || (va & 3) || !canonical(va, dwords * 4ull, &v) || v >= (1ull << 47) || !inMap(v, dwords * 4ull);
+                    chain[i] = {v, dwords};
+                }
+                if (badIb) break;
                 if (in->in_count > RN_UC_SUBMIT_SYNC_MAX || in->out_count > RN_UC_SUBMIT_SYNC_MAX) break;
                 bool badSync = false;
                 for (uint32_t i = 0; i < in->in_count; i++) if (!findSync(in->in[i].handle)) badSync = true;
@@ -2594,7 +2619,7 @@ public:
                 uint32_t seq = ((seqSubmitted + 1) & 0x7fffffffu) ? ((seqSubmitted + 1) & 0x7fffffffu) : 1;
                 if (gfx) seq = ((gfxSeqSubmitted + 1) & 0x7fffffffu) | 0x80000000u;
                 rn_gc_safe_mode(&gpuOwner->gpu, 1);                  // the graphics block stays awake until the wait returns
-                int r = gfx ? rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw))
+                int r = gfx ? rn_gfx_submit_chain(&gpuOwner->gpu, chain, ibCount, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw))
                             : rn_compute_submit_ib(&gpuOwner->gpu, kRNVramMcBase, gpuOwner->computeRingOff, 4096, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa, seq, static_cast<uint32_t>(hw));
                 if (r == -EAGAIN && !gfx) {                                  // the ring stayed full for about 2 s: the queue is not draining, it is stuck
                     uint32_t info[4];
@@ -2606,7 +2631,7 @@ public:
                     uint32_t info[4];
                     const int rr = gpuOwner->resetGfxQueue(info);
                     IOLog("RedNavi: graphics ring full and not draining, queue reset: %d (step %u)\n", rr, info[0]);
-                    if (rr == 0) r = rn_gfx_submit_ib(&gpuOwner->gpu, ibVa, in->ib_dwords, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw));
+                    if (rr == 0) r = rn_gfx_submit_chain(&gpuOwner->gpu, chain, ibCount, gpuOwner->bos[fenceIdx].gpuVa + 8, seq, static_cast<uint32_t>(hw));
                 }
                 if (r == 0) { if (gfx) gfxSeqSubmitted = seq; else seqSubmitted = seq; }   // taken under the queue lock, in the order the packets reach the ring
                 IOLockUnlock(gpuOwner->queueLock);

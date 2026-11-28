@@ -2363,9 +2363,9 @@ void rn_gfx_ring_pointers(struct rn_device *adev, u32 *rptr, u32 *wptr) {
     *wptr = gGfxBlk ? gGfxWptr : 0;
 }
 
-int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa, u32 fenceValue, u32 vmid) {
-    if (!gGfxBlk) return -EINVAL;
-    u32 pk[40];
+int rn_gfx_submit_chain(struct rn_device *adev, const struct rn_gfx_ib *ibs, u32 count, u64 fenceVa, u32 fenceValue, u32 vmid) {
+    if (!gGfxBlk || !count || count > 8) return -EINVAL;
+    u32 pk[72];
     u32 n = 0;
     // What amdgpu_ib_schedule sends for a job on the graphics ring: FRAME_CONTROL start, CONTEXT_CONTROL (load enable, plus the load flags when the context changed since the
     // last job: gfx_v11_0_ring_emit_cntxcntl), the INDIRECT_BUFFER (no INDIRECT_BUFFER_VALID bit on the graphics ring: gfx_v11_0_ring_emit_ib_gfx), the fence, FRAME_CONTROL end.
@@ -2374,10 +2374,12 @@ int rn_gfx_submit_ib(struct rn_device *adev, u64 ibVa, u32 ibDwords, u64 fenceVa
     pk[n++] = RN_PACKET3(0x90u, 0); pk[n++] = 0;                              // PACKET3_FRAME_CONTROL, FRAME_CMD(0) = start
     pk[n++] = RN_PACKET3(0x28u, 1); pk[n++] = 0x80000000u | (ctxSwitch ? (0x8001u | 0x01000000u | 0x10002u) : 0u); pk[n++] = 0;
     n = emitMemSync(pk, n);
-    pk[n++] = RN_PACKET3(0x3Fu, 2);                                          // INDIRECT_BUFFER
-    pk[n++] = lower_32_bits(ibVa) & 0xfffffffcu;
-    pk[n++] = upper_32_bits(ibVa) & 0xFFFFu;
-    pk[n++] = (ibDwords & 0xFFFFFu) | ((vmid & 0xFu) << 24);
+    for (u32 i = 0; i < count; i++) {
+        pk[n++] = RN_PACKET3(0x3Fu, 2);                                      // INDIRECT_BUFFER
+        pk[n++] = lower_32_bits(ibs[i].va) & 0xfffffffcu;
+        pk[n++] = upper_32_bits(ibs[i].va) & 0xFFFFu;
+        pk[n++] = (ibs[i].dwords & 0xFFFFFu) | ((vmid & 0xFu) << 24);
+    }
     pk[n++] = RN_PACKET3(RN_PACKET3_RELEASE_MEM, 6);
     pk[n++] = (1u << 22) | (1u << 21) | (1u << 13) | (1u << 12) | (3u << 25) | RN_CACHE_FLUSH_AND_INV_TS_EVENT | (5u << 8);
     pk[n++] = (1u << 29);

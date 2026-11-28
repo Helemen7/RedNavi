@@ -20,6 +20,8 @@
 #include <IOKit/IOKitLib.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -231,10 +233,38 @@ static void rn_dump_methods(Class k, const char *label) {
     free(m);
 }
 
+// Debugging (RN_CRASH_LOG in the environment, with the log to the file on): a crash of the process (SIGSEGV, SIGBUS, SIGILL, SIGTRAP) writes the faulting address and a backtrace
+// into the plug-in's log file, then the earlier handler is put back and the fault happens again for it (Chromium's crash reporter, which keeps the report to itself).
+static struct sigaction rn_old_sa[32];
+static void rn_crash_handler(int sig, siginfo_t *si, void *uc) {
+    (void)uc;
+    char path[64], line[160];
+    snprintf(path, sizeof(path), access("/Users/Shared/rednavi-log", F_OK) == 0 ? "/private/var/tmp/rednavi-metal-%d.log" : "/tmp/rednavi-metal-%d.log", (int)getuid());
+    const int fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0666);
+    if (fd >= 0) {
+        const int n = snprintf(line, sizeof(line), "0.000 pid %d crash: signal %d at address %p, backtrace:\n", getpid(), sig, si ? si->si_addr : NULL);
+        write(fd, line, n);
+        void *bt[48]; const int nb = backtrace(bt, 48); backtrace_symbols_fd(bt, nb, fd);
+        close(fd);
+    }
+    sigaction(sig, &rn_old_sa[sig], NULL);
+}
+static void rn_crash_log_install(void) {
+    if (!getenv("RN_CRASH_LOG")) return;
+    const int sigs[] = {SIGSEGV, SIGBUS, SIGILL, SIGTRAP};
+    for (unsigned i = 0; i < sizeof(sigs) / sizeof(sigs[0]); i++) {
+        struct sigaction sa; memset(&sa, 0, sizeof(sa));
+        sa.sa_sigaction = rn_crash_handler; sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+        sigaction(sigs[i], &sa, &rn_old_sa[sigs[i]]);
+    }
+    rn_log("crash log: on (RN_CRASH_LOG)");
+}
+
 extern void rn_compute_install(Class k, Class sup);
 
 __attribute__((constructor)) static void rn_load(void) {
     rn_log("bundle loaded");
+    rn_crash_log_install();
     Class sup = objc_getClass("MTLIOAccelDevice");
     if (!sup) { rn_log("MTLIOAccelDevice not found, falling back to NSObject"); sup = [NSObject class]; }
     for (Class c = sup; c; c = class_getSuperclass(c)) {

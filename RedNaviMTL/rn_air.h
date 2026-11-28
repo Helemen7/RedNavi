@@ -82,6 +82,9 @@ void rn_air_free(uint32_t *spirv, size_t bytes);
 typedef struct { const char *name; const void *bitcode; size_t bytes; } rn_air_stitch_fn;
 typedef struct { uint32_t kind; uint32_t a; uint64_t b; uint32_t c; } rn_air_stitch_arg;
 typedef struct { const char *name; uint32_t condition; const rn_air_stitch_arg *args; uint32_t nargs; const uint32_t *deps; uint32_t ndeps; } rn_air_stitch_node;
+// 1 when the translator takes the raster sample count of the pipeline a fragment function is translated for (air.get_num_samples) in bits 8 and up of the stage
+// argument: stage RN_AIR_FRAGMENT | samples << 8. Without them, or with an older translator, a fragment function is translated for one sample.
+int rn_air_raster_samples_supported(void);
 int rn_air_stitch(const char *dir, const char *kernel, const rn_air_stitch_fn *fns, unsigned nfns, const rn_air_stitch_node *nodes, unsigned nnodes, char **text, size_t *text_bytes, char *err, size_t errlen);
 void rn_air_stitch_free(char *text);
 

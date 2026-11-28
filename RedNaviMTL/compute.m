@@ -144,6 +144,7 @@ BOOL rn_compute_usable(void) { return rn_gate() && rn_vk_shared() != NULL; }
 static void rn_probe_write_fcs(FILE *mf, id fn);     // RN_PROBE_DUMP: "fc <index or name> <hex bytes>" lines (defined after RedNaviMTLFunction)
 @class RedNaviMTLBuffer;
 static void rn_probe_write_buf(rn_vk *vk, RedNaviMTLBuffer *x, const char *fn);     // RN_PROBE_DUMP: a whole buffer to a file, staged through host memory when the CPU cannot map it
+static NSMutableArray *rn_batch_keep(void);
 static RedNaviMTLComputePipelineState *rn_pso_for_tg(RedNaviMTLComputePipelineState *p, const uint32_t *tgLen);
 
 // The memory of a heap: one allocation of the heap's size, which the heap's buffers are ranges of (rn_vk_buffer_create_in). Each of them holds it, so it lives as long as the
@@ -202,7 +203,9 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
     NSUInteger heapOffset_;                          // a heap's buffer: its offset in the heap's memory
     BOOL managedDev_;                                // a Managed buffer in VRAM the CPU cannot map (the host budget refused it): the CPU works on shadow_
     void *shadow_;                                   // managedDev_: the CPU's copy, made on the first contents; the card's bytes come into it only on synchronizeResource (rn_synchronized)
+    NSRange *dirty_; unsigned ndirty_, cdirty_;      // managedDev_: the ranges didModifyRange announced and the card has not got yet (under g_dirty_mu; a buffer with some is in g_dirty)
 }
++ (void)rn_flushDirty:(RedNaviMTLBuffer *)one;
 - (instancetype)initWithDevice:(id<MTLDevice>)d length:(NSUInteger)l options:(NSUInteger)o;
 - (instancetype)initWithDevice:(id<MTLDevice>)d backing:(RNBacking *)k buffer:(rn_vk_buffer *)sub length:(NSUInteger)l options:(NSUInteger)o heap:(id)h;
 @end
@@ -272,6 +275,7 @@ static _Atomic long g_hb_live, g_hb_bytes, g_hb_alias, g_hb_reuse, g_hb_new;
     if (placed_) [heap_ rn_unplace:(__bridge void *)self at:heapOffset_];
     if (userPtr) { @synchronized([RedNaviMTLBuffer class]) { [[RedNaviMTLBuffer noCopyBuffers] removeObject:self]; } if (userDealloc) userDealloc(userPtr, len); }
     if (shadow_) munmap(shadow_, len ? len : 1);
+    free(dirty_);
     if (b) { if (!backing && hostBudget_) rn_buf_budget_give(len ? len : 1); rn_vk_buffer_destroy(rn_vk_shared(), b); }   // a heap's buffer: only its range (the heap's memory is the backing's)
 }
 + (NSHashTable *)noCopyBuffers { static NSHashTable *t; static dispatch_once_t o; dispatch_once(&o, ^{ t = [NSHashTable weakObjectsHashTable]; }); return t; }
@@ -294,8 +298,8 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
         if (!ok && said++ < 20) rn_log("buffer over caller memory %p (%lu bytes): the memory cannot be %s, skipped", x->userPtr, (unsigned long)x->len, in ? "read" : "written");
     }
 }
-// managedDev_: a range between the card's buffer and shadow_, through a host buffer of at most 32 MB at a time. toCard: shadow_ to the card, else the card to shadow_.
-- (BOOL)rn_shadowSync:(NSUInteger)off length:(NSUInteger)n toCard:(BOOL)toCard {
+// managedDev_: a range of the card's buffer into shadow_, through a host buffer of at most 32 MB at a time.
+- (BOOL)rn_readShadow:(NSUInteger)off length:(NSUInteger)n {
     rn_vk *vk = rn_vk_shared(); if (!vk || !b || !shadow_) return NO;
     if (off >= len) return YES;
     if (n > len - off) n = len - off;
@@ -307,12 +311,11 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
     BOOL ok = YES;
     for (NSUInteger at = 0; at < n && ok; at += chunk) {
         const size_t m = n - at < chunk ? n - at : chunk;
-        // In an open batch the copy is only recorded: it has to run before the host buffer is read, or filled again for the next chunk (rn_vk_batch_sync does nothing outside one).
-        if (toCard) { memcpy(rn_vk_buffer_contents(t), (uint8_t *)shadow_ + off + at, m); ok = rn_vk_buffer_copy(vk, t, 0, b, off + at, m) == 0; rn_vk_batch_sync(vk); }
-        else if ((ok = rn_vk_buffer_copy(vk, b, off + at, t, 0, m) == 0)) { rn_vk_batch_sync(vk); memcpy((uint8_t *)shadow_ + off + at, rn_vk_buffer_contents(t), m); }
+        // In an open batch the copy is only recorded: it has to run before the host buffer is read (rn_vk_batch_sync does nothing outside one).
+        if ((ok = rn_vk_buffer_copy(vk, b, off + at, t, 0, m) == 0)) { rn_vk_batch_sync(vk); memcpy((uint8_t *)shadow_ + off + at, rn_vk_buffer_contents(t), m); }
     }
     pthread_mutex_unlock(&tm);
-    if (!ok) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer %p in VRAM: copy %s the card failed", self, toCard ? "to" : "from"); }
+    if (!ok) { static _Atomic unsigned said; if (atomic_fetch_add(&said, 1) < 20) rn_log("Managed buffer %p in VRAM: copy from the card failed", self); }
     return ok;
 }
 // The first contents of a new buffer (newBufferWithBytes:): written by the CPU where it can, else into the card's memory through host memory.
@@ -323,7 +326,8 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
     if (managedDev_) {
         void *p = [self rn_shadow]; if (!p) return NO;
         memcpy(p, bytes, n);
-        return [self rn_shadowSync:0 length:n toCard:YES];
+        [self didModifyRange:NSMakeRange(0, n)];
+        return YES;
     }
     rn_vk *vk = rn_vk_shared(); if (!vk) return NO;
     const size_t chunk = n < (32u << 20) ? n : (32u << 20);
@@ -342,12 +346,18 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
 // into it and has not yet announced with didModifyRange is never overwritten.
 - (void *)rn_shadow {
     @synchronized (self) {
-        if (!shadow_) { void *p = mmap(NULL, len ? len : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (p != MAP_FAILED) shadow_ = p; }
+        if (!shadow_) { void *p = mmap(NULL, len ? len : 1, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0); if (p != MAP_FAILED) __atomic_store_n(&shadow_, p, __ATOMIC_RELEASE); }
         return shadow_;
     }
 }
-// synchronizeResource, once the work before it has run: the card's bytes into the CPU's copy.
-- (void)rn_synchronized { @synchronized (self) { if ([self rn_shadow]) [self rn_shadowSync:0 length:len toCard:NO]; } }
+// synchronizeResource, once the work before it has run: the card's bytes into the CPU's copy. What the CPU announced meanwhile goes to the card first, so the read does not undo it.
+- (void)rn_synchronized {
+    if (![self rn_shadow]) return;
+    rn_vk_batch_lock();
+    [RedNaviMTLBuffer rn_flushDirty:self];
+    [self rn_readShadow:0 length:len];
+    rn_vk_batch_unlock();
+}
 - (void *)contents {
     if (userPtr) return userPtr;
     if (managedDev_) return [self rn_shadow];
@@ -360,7 +370,81 @@ static BOOL rn_copy_to_caller(void *dst, const void *src, size_t n) {
 - (MTLCPUCacheMode)cpuCacheMode { return (MTLCPUCacheMode)((options & MTLResourceCPUCacheModeMask) >> MTLResourceCPUCacheModeShift); }
 - (MTLHazardTrackingMode)hazardTrackingMode { return MTLHazardTrackingModeUntracked; }
 - (NSUInteger)allocatedSize { return len; }
-- (void)didModifyRange:(NSRange)range { if (managedDev_ && shadow_) @synchronized (self) { [self rn_shadowSync:range.location length:range.length toCard:YES]; } }
+// Managed buffers in VRAM: didModifyRange only notes the range. The next command buffer that runs (or whoever reads the card's bytes first) copies all noted ranges to the card in
+// its batch, so announcing costs no submit and no wait. The ranges are kept exact (merged only when they overlap or touch): the bytes between two of them are stale in the CPU's
+// copy wherever a kernel wrote the card's.
+static pthread_mutex_t g_dirty_mu = PTHREAD_MUTEX_INITIALIZER;
+static NSMutableArray *g_dirty;                      // buffers with noted ranges, held until the copy is recorded
+static _Atomic unsigned g_ndirty;
+- (void)didModifyRange:(NSRange)range {
+    if (!managedDev_ || !__atomic_load_n(&shadow_, __ATOMIC_ACQUIRE) || range.location >= len || !range.length) return;
+    if (range.length > len - range.location) range.length = len - range.location;
+    NSUInteger lo = range.location, hi = NSMaxRange(range);
+    pthread_mutex_lock(&g_dirty_mu);
+    const unsigned had = ndirty_;
+    for (unsigned i = 0; i < ndirty_;) {             // take in every noted range that overlaps or touches this one (growing it can reach more of them: start over)
+        if (dirty_[i].location > hi || NSMaxRange(dirty_[i]) < lo) { i++; continue; }
+        lo = MIN(lo, dirty_[i].location); hi = MAX(hi, NSMaxRange(dirty_[i]));
+        dirty_[i] = dirty_[--ndirty_]; i = 0;
+    }
+    if (ndirty_ == cdirty_) {
+        const unsigned c = cdirty_ ? 2 * cdirty_ : 4;
+        NSRange *p = realloc(dirty_, c * sizeof(*p));
+        if (p) { dirty_ = p; cdirty_ = c; }
+    }
+    if (ndirty_ < cdirty_) dirty_[ndirty_++] = NSMakeRange(lo, hi - lo);
+    else { static unsigned said; if (said++ < 8) rn_log("Managed buffer %p in VRAM: no memory to note a modified range", self); }
+    if (!had && ndirty_) { if (!g_dirty) g_dirty = [NSMutableArray new]; [g_dirty addObject:self]; atomic_fetch_add(&g_ndirty, 1); }
+    pthread_mutex_unlock(&g_dirty_mu);
+}
+// The noted ranges of one buffer, or of all (one nil), to the card. Inside an open batch the copies are only recorded, from a host buffer of the process that is not written again
+// before the batch has run; outside one they are submitted and waited for. Everything is under the batch lock, so no other work can start between taking the ranges and recording them.
++ (void)rn_flushDirty:(RedNaviMTLBuffer *)one {
+    rn_vk *vk = rn_vk_shared(); if (!vk) return;
+    NSMutableArray *taken = [NSMutableArray new];    // released after both locks (a buffer's dealloc must not run inside)
+    rn_vk_batch_lock();
+    if (atomic_load(&g_ndirty)) {
+        static rn_vk_buffer *t; static size_t used;
+        const size_t chunk = 32u << 20;
+        NSRange **ranges = NULL; unsigned *counts = NULL;
+        pthread_mutex_lock(&g_dirty_mu);
+        if (one) { if (one->ndirty_) [taken addObject:one]; }
+        else [taken addObjectsFromArray:g_dirty];
+        if (taken.count) { ranges = calloc(taken.count, sizeof(*ranges)); counts = calloc(taken.count, sizeof(*counts)); }
+        if (ranges && counts) {
+            for (NSUInteger i = 0; i < taken.count; i++) {
+                RedNaviMTLBuffer *x = taken[i];
+                ranges[i] = x->dirty_; counts[i] = x->ndirty_; x->dirty_ = NULL; x->ndirty_ = x->cdirty_ = 0;
+                if (one) [g_dirty removeObjectIdenticalTo:x];
+                atomic_fetch_sub(&g_ndirty, 1);
+            }
+            if (!one) [g_dirty removeAllObjects];
+        }
+        pthread_mutex_unlock(&g_dirty_mu);
+        if (ranges && counts && taken.count) {
+            if (!t) t = rn_vk_buffer_create(vk, chunk);
+            if (used) { rn_vk_batch_sync(vk); used = 0; }        // copies recorded earlier from the start of the host buffer run before it is filled again
+            for (NSUInteger i = 0; i < taken.count; i++) {
+                RedNaviMTLBuffer *x = taken[i];
+                BOOL ok = t != NULL, recorded = NO;
+                for (unsigned r = 0; r < counts[i] && ok; r++)
+                    for (NSUInteger at = 0; at < ranges[i][r].length && ok;) {
+                        if (used >= chunk) { rn_vk_batch_sync(vk); used = 0; }
+                        const NSUInteger off = ranges[i][r].location + at, m = MIN(ranges[i][r].length - at, chunk - used);
+                        memcpy((uint8_t *)rn_vk_buffer_contents(t) + used, (uint8_t *)x->shadow_ + off, m);
+                        if (!rn_vk_batch_buffer_copy(vk, t, used, x->b, off, m)) recorded = YES;
+                        else if ((ok = rn_vk_buffer_copy(vk, t, used, x->b, off, m) == 0)) rn_vk_batch_sync(vk);     // if it was recorded after all (batching off, a pass open): run it now
+                        used = (used + m + 255) & ~(size_t)255; at += m;
+                    }
+                if (recorded) [rn_batch_keep() addObject:x];     // the card's buffer lives until the batch has run
+                if (!ok) { static unsigned said; if (said++ < 20) rn_log("Managed buffer %p in VRAM: copy to the card failed", x); }
+                free(ranges[i]);
+            }
+        }
+        free(ranges); free(counts);
+    }
+    rn_vk_batch_unlock();
+}
 - (NSString *)label { return label_; }
 - (void)setLabel:(NSString *)l { label_ = [l copy]; }
 - (id<MTLHeap>)heap { return heap_; }
@@ -441,6 +525,7 @@ static int rn_depth_format_of(MTLPixelFormat pf) {
     uint32_t surfSeed;                            // the surface's seed when the image and the surface last agreed: an unchanged surface is not copied again
     BOOL displayScan;                             // one of CoreDisplay's scanout surfaces (IOSurfaceName "CoreDisplay Scanout"): its render passes go straight into the display's own memory
     BOOL zeroCopy;                                // the image is the IOSurface's own memory (rn_vk_image_from_host): no copy in either direction
+    rn_vk_image *shadow;                          // see rn_zc_gpucopy: the image over the surface's pages; img stays in VRAM and the card copies between the two around a command buffer
     NSUInteger surfPlane;                         // the plane of a multi-planar surface this texture shows (0 for the others)                               // set for a texture made from an IOSurface: copied in and out at the borders of a command buffer
     RedNaviMTLTexture *parent;                       // a texture view: the texture it is a view of (it shares its image, memory and host copy)
     MTLTextureSwizzleChannels swz;
@@ -503,6 +588,9 @@ static BOOL rn_slice_rows_l(RedNaviMTLTexture *t, NSUInteger slice, NSUInteger l
 // rasterSampleCount > 1 rasterize with that many samples, and the multisample resolve store action resolves on the card after the pass. The sample counts offered are the ones RADV
 // renders and samples (supportsTextureSampleCount:). Shaders read the samples with texture2d_ms (the translator's dim flag RN_AIR_DIM_MS).
 static BOOL rn_sample_count_ok(NSUInteger n) { if (n == 1) return YES; rn_vk *vk = rn_vk_shared(); return vk && n <= 64 && !(n & (n - 1)) && (rn_vk_sample_counts(vk) & n); }
+// Rendering straight into a surface's pages (zero copy) made Chromium's pages flicker while scrolling: the surface changed for as long as the card was drawing into it. Outside WindowServer
+// the card now draws into an image in VRAM and copies it to the surface at the end of the same submit (the shadow ivar). RN_ZC_DIRECT=1 draws straight into the surface, for comparison.
+static BOOL rn_zc_gpucopy(void) { static int v = -1; if (v < 0) v = !rn_is_ws() && getenv("RN_ZC_DIRECT") == NULL; return v; }
 @implementation RedNaviMTLTexture
 + (void)load { class_addProtocol(self, @protocol(MTLTexture)); class_addProtocol(self, @protocol(MTLResource)); }
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc {
@@ -539,7 +627,7 @@ static BOOL rn_sample_count_ok(NSUInteger n) { if (n == 1) return YES; rn_vk *vk
     counted_ = YES; atomic_fetch_add(&g_tex_live, 1); atomic_fetch_add(&g_tex_made, 1); atomic_fetch_add(&g_tex_bytes, (unsigned long)w * h * self->d * texel);
     return self;
 }
-- (void)dealloc { rn_site_leave(site_); if (srcDealloc) srcDealloc(srcBase, srcLen); if (counted_) { atomic_fetch_sub(&g_tex_live, 1); atomic_fetch_sub(&g_tex_bytes, (unsigned long)w * h * self->d * texel); } if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (dep) rn_vk_depth_destroy(rn_vk_shared(), dep); if (surf) CFRelease(surf); }
+- (void)dealloc { rn_site_leave(site_); if (srcDealloc) srcDealloc(srcBase, srcLen); if (counted_) { atomic_fetch_sub(&g_tex_live, 1); atomic_fetch_sub(&g_tex_bytes, (unsigned long)w * h * self->d * texel); } if (img) rn_vk_image_destroy(rn_vk_shared(), img); if (shadow) rn_vk_image_destroy(rn_vk_shared(), shadow); if (dep) rn_vk_depth_destroy(rn_vk_shared(), dep); if (surf) CFRelease(surf); }
 // IOSurface-backed textures (no host memory import in the kext, so a copy): the surface's rows are copied into the host copy of the image before the command buffer runs and, for
 // what the command buffer wrote, back afterwards. The surface's row pitch is its own; the host copy is packed.
 - (instancetype)initWithDevice:(id<MTLDevice>)d descriptor:(MTLTextureDescriptor *)desc iosurface:(IOSurfaceRef)io plane:(NSUInteger)plane {
@@ -564,7 +652,8 @@ static BOOL rn_sample_count_ok(NSUInteger n) { if (n == 1) return YES; rn_vk *vk
             void *zbase = IOSurfaceGetBaseAddress(io);
             rn_vk_image *z = zvk && zf && zbase ? rn_vk_image_from_host(zvk, zf, (uint32_t)w, (uint32_t)h, zbase, IOSurfaceGetBytesPerRow(io), IOSurfaceGetAllocSize(io)) : NULL;
             static unsigned said;
-            if (z) { rn_vk_image_destroy(zvk, img); img = z; zeroCopy = YES; if (said++ < 6) rn_log("iosurface %u %lux%lu: zero copy", (unsigned)IOSurfaceGetID(io), (unsigned long)w, (unsigned long)h); }
+            if (z && !displayScan && rn_zc_gpucopy()) { shadow = z; if (said++ < 6) rn_log("iosurface %u %lux%lu: copies on the card", (unsigned)IOSurfaceGetID(io), (unsigned long)w, (unsigned long)h); }
+            else if (z) { rn_vk_image_destroy(zvk, img); img = z; zeroCopy = YES; if (said++ < 6) rn_log("iosurface %u %lux%lu: zero copy", (unsigned)IOSurfaceGetID(io), (unsigned long)w, (unsigned long)h); }
             else if (w >= 256 && said++ < 6) rn_log("iosurface %u %lux%lu: copies (%s)", (unsigned)IOSurfaceGetID(io), (unsigned long)w, (unsigned long)h, rn_vk_image_last_error());
         }
         [self syncFromSurface];
@@ -644,6 +733,7 @@ static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSU
     uint8_t *c = rn_vk_buffer_contents(bf->b);
     if (c) return c + off;
     if (!(*stage = rn_vk_buffer_create(vk, span))) return NULL;
+    if (bf->managedDev_) [RedNaviMTLBuffer rn_flushDirty:bf];
     if (inBatch) rn_vk_batch_sync(vk);                  // nothing recorded after this: the copy below is submitted and waited for by itself, with the lock held
     const int rc = rn_vk_buffer_copy(vk, bf->b, off, *stage, 0, span);
     if (rc) { rn_vk_buffer_destroy(vk, *stage); *stage = NULL; return NULL; }
@@ -680,6 +770,7 @@ static const uint8_t *rn_buf_bytes_for_host(rn_vk *vk, RedNaviMTLBuffer *bf, NSU
         uint8_t *dst = srcBpr == row ? ((stage = rn_vk_buffer_create(vk, span)) ? rn_vk_buffer_contents(stage) : NULL) : (uint8_t *)rn_buf_bytes_for_host(vk, srcBuf, srcOff, span, inBatch, &stage);   // rows with gaps: the gaps are kept
         if (!dst || !stage) { if (stage) rn_vk_buffer_destroy(vk, stage); static int said; if (said++ < 20) rn_log("texture over a buffer: the rows cannot be written back to the buffer"); return; }
         for (NSUInteger y = 0; y < h; y++) memcpy(dst + y * srcBpr, src + y * pitch, row);
+        if (srcBuf->managedDev_) [RedNaviMTLBuffer rn_flushDirty:srcBuf];
         if (inBatch) rn_vk_batch_sync(vk);
         const int rc = rn_vk_buffer_copy(vk, stage, 0, srcBuf->b, srcOff, span);
         rn_vk_buffer_destroy(vk, stage);
@@ -823,6 +914,10 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     return l < (levels_ ? levels_ : 1) && r.origin.x + r.size.width <= rn_lvl(w, l) && r.origin.y + r.size.height <= rn_lvl(h, l) && r.origin.z + r.size.depth <= rn_lvl_depth(self, l);
 }
 - (void)replaceRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice withBytes:(const void *)bytes bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi {
+    if (!img) {   // a depth or stencil texture (rn_vk_depth: no host copy; ANGLE fills WebGL's depth buffer this way) or one with no image: nothing to write into
+        static atomic_int said; if (atomic_fetch_add(&said, 1) < 4) rn_log("replaceRegion: texture with no host image ignored (pixel format %lu, %lux%lu, depth %d)", (unsigned long)pf, (unsigned long)w, (unsigned long)h, dep != NULL);
+        return;
+    }
     if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }   // a slice of a 2D array is stored like a depth slice
     if (alen > 1 && slice && slice < alen && !region.origin.y && region.size.height == 1) { region.origin.y = slice; slice = 0; }   // a slice of a 1D array is one row
     if (slice || ![self clampRegion:region level:level]) { rn_log("replaceRegion: level %lu slice %lu or region outside the texture ignored (type %ld, %lux%lux%lu, array %lu)", (unsigned long)level, (unsigned long)slice, (long)ttype, (unsigned long)w, (unsigned long)h, (unsigned long)d, (unsigned long)alen); return; }
@@ -851,6 +946,12 @@ static BOOL rn_whole_view(RedNaviMTLTexture *t, MTLTextureType type, NSRange lev
     [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:bpr bytesPerImage:0];
 }
 - (void)getBytes:(void *)out bytesPerRow:(NSUInteger)bpr bytesPerImage:(NSUInteger)bpi fromRegion:(MTLRegion)region mipmapLevel:(NSUInteger)level slice:(NSUInteger)slice {
+    if (!img) {   // a depth or stencil texture: its contents are never read back (rn_vk_depth has no host copy); zeros
+        static atomic_int said; if (atomic_fetch_add(&said, 1) < 4) rn_log("getBytes: texture with no host image read as zeros (pixel format %lu, %lux%lu, depth %d)", (unsigned long)pf, (unsigned long)w, (unsigned long)h, dep != NULL);
+        if (!bpi) bpi = bpr * region.size.height;
+        for (NSUInteger z = 0; z < region.size.depth; z++) for (NSUInteger y = 0; y < region.size.height; y++) memset((uint8_t *)out + z * bpi + y * bpr, 0, MIN(bpr, region.size.width * (texel ? texel : 4)));
+        return;
+    }
     if (RN_LAYERED(ttype) && slice && !region.origin.z && region.size.depth == 1) { region.origin.z = slice; slice = 0; }
     if (alen > 1 && slice && slice < alen && !region.origin.y && region.size.height == 1) { region.origin.y = slice; slice = 0; }
     if (slice || ![self clampRegion:region level:level]) { rn_log("getBytes: level %lu slice %lu or region outside the texture ignored (type %ld, %lux%lux%lu, array %lu)", (unsigned long)level, (unsigned long)slice, (long)ttype, (unsigned long)w, (unsigned long)h, (unsigned long)d, (unsigned long)alen); return; }
@@ -1134,6 +1235,8 @@ static int rn_vk_blend_factor(MTLBlendFactor f, unsigned *out) {
     case MTLBlendFactorBlendColor: *out = 10; return 1;                case MTLBlendFactorOneMinusBlendColor: *out = 11; return 1;
     case MTLBlendFactorBlendAlpha: *out = 12; return 1;                case MTLBlendFactorOneMinusBlendAlpha: *out = 13; return 1;
     case MTLBlendFactorSourceAlphaSaturated: *out = 14; return 1;
+    case MTLBlendFactorSource1Color: *out = 15; return 1;              case MTLBlendFactorOneMinusSource1Color: *out = 16; return 1;   // dual-source (dualSrcBlend)
+    case MTLBlendFactorSource1Alpha: *out = 17; return 1;              case MTLBlendFactorOneMinusSource1Alpha: *out = 18; return 1;
     default: return 0;
     }
 }
@@ -1425,6 +1528,8 @@ static void rn_add_default_resolver(Class c) { class_addMethod(object_getClass(c
     NSError *err;
     NSString *label_;
     dispatch_semaphore_t done;
+    dispatch_semaphore_t schedDone;             // signalled by publishScheduled
+    BOOL schedPublished;                        // guarded by @synchronized(scheduled)
     NSMutableDictionary *userDict_;             // MPS keeps its per-command-buffer state here
 }
 - (NSMutableDictionary *)userDictionary;
@@ -1556,6 +1661,10 @@ static NSString *rn_run_blit(RNBlit *b) {
     // The work before a blit is only recorded in the open batch. A copy the card can do is recorded after it (rn_vk_batch_*); one made on the host runs now, so the batch runs first (rn_vk_batch_sync).
     rn_vk *bvk = rn_vk_shared();
     if (b->kind == 5 && bvk) rn_vk_batch_sync(bvk);
+    if ((b->st && !b->st->img) || (b->dt && !b->dt->img)) {   // a depth or stencil texture (rn_vk_depth, no host copy, not copied by these paths): skipped rather than read through a NULL image
+        static atomic_int said; if (atomic_fetch_add(&said, 1) < 8) rn_log("blit kind %d with a depth or stencil texture skipped (source pf %lu, destination pf %lu)", b->kind, b->st ? (unsigned long)b->st->pf : 0ul, b->dt ? (unsigned long)b->dt->pf : 0ul);
+        return nil;
+    }
     switch (b->kind) {
     case 0: case 1: {
         RedNaviMTLTexture *t = b->kind == 0 ? b->dt : b->st;
@@ -2683,6 +2792,22 @@ static NSString *rn_records_desc(NSArray *records) {
 
 // After a batch failed (the card did not finish it in time: a hung shader, most likely), what was in it: one line per record, with the SPIR-V hash of each pipeline stage
 // (RN_DUMP_SPV logs the same hashes when the modules are made and writes the modules out), the targets and the draw counts. The card cannot be asked which draw hung.
+// Debugging: RN_SKIP_SPV=hash,hash,... (the FNV-1a hashes of SPIR-V modules, as the failed-batch report and RN_DUMP_SPV print them, 8 hex digits). A draw whose vertex or fragment module
+// is listed is recorded with no instances: the way to find which of a hung batch's shaders hangs the card without running it.
+static BOOL rn_skip_spv(RedNaviMTLRenderPipelineState *p) {
+    static uint32_t list[32]; static unsigned n; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *e = getenv("RN_SKIP_SPV");
+        for (char *q = (char *)e; q && *q && n < 32; ) { char *end; unsigned long v = strtoul(q, &end, 16); if (end == q) break; list[n++] = (uint32_t)v; q = *end ? end + 1 : end; }
+        if (n) rn_log("RN_SKIP_SPV: %u modules skipped", n);
+    });
+    if (!n || !p) return NO;
+    for (unsigned i = 0; i < n; i++) if (list[i] == p->spvHash[0] || list[i] == p->spvHash[1]) {
+        static atomic_int said; if (atomic_fetch_add(&said, 1) < 20) rn_log("RN_SKIP_SPV: draw with %08x/%08x skipped", p->spvHash[0], p->spvHash[1]);
+        return YES;
+    }
+    return NO;
+}
 static void rn_log_failed_records(NSArray *records) {
     unsigned i = 0;
     for (id rec in records) {
@@ -2694,7 +2819,8 @@ static void rn_log_failed_records(NSArray *records) {
             rn_log("failed batch: record %u: render pass, %lu draws, targets%s", i, (unsigned long)rp->draws.count, t.UTF8String);
             unsigned j = 0;
             for (RNDraw *d in rp->draws) {
-                if (j < 40) rn_log("failed batch:   draw %u: pipeline %p spv %08x/%08x, prim %u, %u %s from %u, %u instances", j, (__bridge void *)d->pso, d->pso ? d->pso->spvHash[0] : 0, d->pso ? d->pso->spvHash[1] : 0,
+                if (j < 40) rn_log("failed batch:   draw %u: pipeline %p (%s/%s) spv %08x/%08x, prim %u, %u %s from %u, %u instances", j, (__bridge void *)d->pso,
+                                   d->pso && d->pso->names[0] ? d->pso->names[0].UTF8String : "?", d->pso && d->pso->names[1] ? d->pso->names[1].UTF8String : "?", d->pso ? d->pso->spvHash[0] : 0, d->pso ? d->pso->spvHash[1] : 0,
                                    d->prim, d->vertexCount, d->indexBuf ? "indices" : "vertices", d->vertexStart, d->instanceCount);
                 j++;
             }
@@ -2710,6 +2836,19 @@ static void rn_log_failed_records(NSArray *records) {
     }
 }
 
+// The card-side copies between a surface and its VRAM image (inside the open batch), and the seed moves of the surfaces so written (an empty write lock, as the CPU copy does).
+static void rn_shadow_load(rn_vk *vk, NSOrderedSet<RedNaviMTLTexture *> *used) {
+    for (RedNaviMTLTexture *t in used) if (t->shadow && rn_vk_batch_copy_open(vk, t->shadow, t->img)) { static unsigned said; if (said++ < 20) rn_log("iosurface %u: the copy into the card's image failed", (unsigned)IOSurfaceGetID(t->surf)); }
+}
+static void rn_shadow_store(rn_vk *vk, NSOrderedSet<RedNaviMTLTexture *> *dirty) {
+    for (RedNaviMTLTexture *t in dirty) if (rn_vk_batch_copy_open(vk, t->img, t->shadow)) { static unsigned said; if (said++ < 20) rn_log("iosurface %u: the copy back from the card's image failed", (unsigned)IOSurfaceGetID(t->surf)); }
+}
+static void rn_seed_bump(NSOrderedSet<RedNaviMTLTexture *> *written, NSOrderedSet<RedNaviMTLTexture *> *stored) {
+    for (RedNaviMTLTexture *t in written)
+        if (t->shadow && [stored containsObject:t])
+            if (IOSurfaceLock(t->surf, 0, NULL) == kIOReturnSuccess) IOSurfaceUnlock(t->surf, 0, NULL);
+}
+
 @implementation RedNaviMTLCommandBuffer
 + (void)load { class_addProtocol(self, @protocol(MTLCommandBuffer)); }
 - (NSMutableDictionary *)userDictionary { @synchronized (self) { if (!userDict_) userDict_ = [NSMutableDictionary new]; return userDict_; } }
@@ -2718,6 +2857,7 @@ static void rn_log_failed_records(NSArray *records) {
         queue = q; dev = d; records = [NSMutableArray new]; completed = [NSMutableArray new]; scheduled = [NSMutableArray new]; presents = [NSMutableArray new];
         st = MTLCommandBufferStatusNotEnqueued;
         done = dispatch_semaphore_create(0);
+        schedDone = dispatch_semaphore_create(0);
     }
     return self;
 }
@@ -2735,14 +2875,28 @@ static void rn_log_failed_records(NSArray *records) {
 - (void)enqueue { if (st == MTLCommandBufferStatusNotEnqueued) st = MTLCommandBufferStatusEnqueued; }
 // A handler added after the commit has nothing left to wait for (the commit is synchronous): it runs now. The arrays are guarded because other threads add handlers while a commit walks them.
 - (void)addScheduledHandler:(MTLCommandBufferHandler)block {
-    BOOL now; @synchronized(scheduled) { now = st >= MTLCommandBufferStatusCommitted; if (!now) [scheduled addObject:[block copy]]; }
+    BOOL now; @synchronized(scheduled) { now = schedPublished; if (!now) [scheduled addObject:[block copy]]; }
     if (now) block((id)self);
 }
 - (void)addCompletedHandler:(MTLCommandBufferHandler)block {
     BOOL now; @synchronized(completed) { now = st == MTLCommandBufferStatusCompleted || (st == MTLCommandBufferStatusError && handlersRun); if (!now) [completed addObject:[block copy]]; }
     if (now) block((id)self);
 }
-- (void)waitUntilScheduled {}
+// "Scheduled" tells a client that others may now use what the buffer writes: Chromium hands the IOSurface to CoreAnimation at that point. Apple's drivers make WindowServer's read wait for
+// the GPU; nothing does that here, so a buffer that writes an IOSurface is published only after the card has finished and the surface holds the result (publishing at the start of the body
+// is the suspected cause of Brave's widgets and YouTube's controls flickering). Any other buffer is published when its body starts, which also means that everything committed before it on
+// the queue is done. WindowServer keeps the earlier behaviour (published at the start, waitUntilScheduled returns at once).
+- (void)publishScheduled {
+    NSArray *handlers;
+    @synchronized(scheduled) { if (schedPublished) return; schedPublished = YES; handlers = [scheduled copy]; [scheduled removeAllObjects]; }
+    dispatch_semaphore_signal(schedDone);       // before the handlers: one of them may call waitUntilScheduled
+    for (MTLCommandBufferHandler h in handlers) h((id)self);
+}
+- (void)waitUntilScheduled {
+    if (rn_is_ws() || st < MTLCommandBufferStatusCommitted || dispatch_get_specific(g_commit_key) == g_commit_key) return;     // on the commit queue itself waiting would never end
+    dispatch_semaphore_wait(schedDone, DISPATCH_TIME_FOREVER);
+    dispatch_semaphore_signal(schedDone);
+}
 // Private MTLCommandBuffer selectors that MetalPerformanceShaders sends (Geekbench, 2026-11-22). The root of a buffer that wraps no other is the buffer itself; with nil, MPSAutoCache
 // crashed on a recursive os_unfair_lock in the next call.
 - (id)rootCommandBuffer { return self; }
@@ -2856,6 +3010,9 @@ static void rn_log_failed_records(NSArray *records) {
     rn_vk_vbuf (*vbs)[16] = calloc(na, sizeof(*vbs));
     NSMutableArray *temps = rn_batch_keep();     // setBytes buffers stay alive until the batch has run (a freed one goes to the buffer cache and the next pass would overwrite it)
     NSString *bad = (dr && va && fa && vbs) ? nil : @"out of memory";
+    // setBytes data goes into the batch's reused host buffers, as a dispatch's does: a buffer of its own per binding and draw cost an allocation and a mapping in the kernel each,
+    // and WebGL Aquarium in Brave ran at 1 frame per second. Once per pass, before the first binding.
+    rn_vk_batch_bytes_begin(vk);
     for (NSUInteger k = 0; k < nd && !bad; k++) {
         RNDraw *d = rp->draws[k];
         RedNaviMTLRenderPipelineState *p = d->pso;
@@ -2893,8 +3050,8 @@ static void rn_log_failed_records(NSArray *records) {
         }
         rn_vk_render *r = [p renderForPrimitive:d->prim cull:d->cull clockwise:d->clockwise];
         if (!r) { bad = [NSString stringWithFormat:@"RADV has no pipeline for primitive type %u", d->prim]; break; }
-        bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps, NULL);
-        if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps, NULL);
+        bad = rn_bind_args(dev, p->n[0], p->kind[0], p->mi[0], d->bufs[0], d->offs[0], d->bytesAt[0], d->texs[0], d->samps[0], va[k], temps, vk);
+        if (!bad) bad = rn_bind_args(dev, p->n[1], p->kind[1], p->mi[1], d->bufs[1], d->offs[1], d->bytesAt[1], d->texs[1], d->samps[1], fa[k], temps, vk);
         for (unsigned i = 0; !bad && i < p->n[1]; i++)                    // [[color(n)]] inputs read the pass's render target n
             if ((p->kind[1][i] & 0xff) == RN_AIR_COLOR_INPUT) {
                 const unsigned m = p->mi[1][i];
@@ -2905,6 +3062,7 @@ static void rn_log_failed_records(NSArray *records) {
             const unsigned bi = p->vlayout[i].binding;
             if (d->bufs[0][bi]) { vbs[k][bi] = (rn_vk_vbuf){d->bufs[0][bi]->b, d->offs[0][bi]}; continue; }
             if (d->bytesAt[0][bi]) {
+                if (!rn_vk_batch_bytes(vk, d->bytesAt[0][bi].bytes, d->bytesAt[0][bi].length, &vbs[k][bi].buffer, &vbs[k][bi].offset)) continue;
                 RedNaviMTLBuffer *t = [[RedNaviMTLBuffer alloc] initWithDevice:dev length:d->bytesAt[0][bi].length options:0];
                 if (!t) { bad = @"no memory for vertex data"; break; }
                 memcpy(rn_vk_buffer_contents(t->b), d->bytesAt[0][bi].bytes, d->bytesAt[0][bi].length);
@@ -2916,6 +3074,7 @@ static void rn_log_failed_records(NSArray *records) {
         }
         dr[k] = (rn_vk_draw){.pipe = r, .vbufs = vbs[k], .has_blend_color = d->hasBlendColor, .vargs = va[k], .fargs = fa[k], .has_viewport = d->hasViewport, .has_scissor = d->hasScissor, .first_vertex = d->vertexStart, .vertex_count = d->vertexCount,
                              .instance_count = d->instanceCount, .first_instance = d->baseInstance};
+        if (rn_skip_spv(p)) dr[k].instance_count = 0;   // debugging (RN_SKIP_SPV): a draw whose shaders are listed runs no instances
         if (d->indexBuf) { dr[k].index_buffer = d->indexBuf->b; dr[k].index_offset = d->indexOffset; dr[k].index32 = d->index32; dr[k].base_vertex = d->baseVertex; }
         dr[k].ds = d->ds;
         memcpy(dr[k].blend_color, d->blendColor, sizeof(dr[k].blend_color));
@@ -2979,7 +3138,7 @@ static void rn_log_failed_records(NSArray *records) {
     else if (rc == 4) [self fail:@"a buffer offset is not a multiple of the storage buffer offset alignment, or beyond the buffer"];
     else if (rc == 5) [self fail:@"the render pipeline does not match the attachments of the pass"];
     else if (rc == 6) [self fail:@"a resource of the render pipeline is missing or cannot be used as bound"];
-    else if (rc) [self fail:[NSString stringWithFormat:@"render pass failed (%d)", rc]];
+    else if (rc) { [self fail:[NSString stringWithFormat:@"render pass failed (%d)", rc]]; rn_log_failed_records(@[rp]); }
 }
 - (void)dealloc {
     static unsigned said;
@@ -3050,7 +3209,9 @@ static void rn_log_failed_records(NSArray *records) {
 }
 // Every texture the records use (nil entries included), with whether the record writes it.
 - (void)eachTexture:(void (^)(RedNaviMTLTexture *, BOOL))note {
-    for (id rec in records) {
+    for (id rec in records) [self eachTextureOf:rec note:note];
+}
+- (void)eachTextureOf:(id)rec note:(void (^)(RedNaviMTLTexture *, BOOL))note {
         if ([rec isKindOfClass:[RNRenderPass class]]) {
             RNRenderPass *rp = rec;
             for (unsigned i = 0; i < rp->nt; i++) { note(rp->tex[i], rp->store[i]); if (rp->resolve[i]) note(rp->resolve[i], YES); }
@@ -3065,7 +3226,6 @@ static void rn_log_failed_records(NSArray *records) {
             RNDispatch *dp = rec;
             for (int i = 0; i < RN_MTL_SLOTS; i++) note(dp->texs[i], dp->texs[i] && (dp->texs[i]->usage_ & MTLTextureUsageShaderWrite));
         }
-    }
 }
 - (void)commitBody {
     if ((rn_diag && getenv("RN_LOG_BUFFERS"))) rn_log("commit: command buffer %p, %lu records, thread %p", self, (unsigned long)records.count, (void *)pthread_self());
@@ -3080,8 +3240,6 @@ static void rn_log_failed_records(NSArray *records) {
         });
     }
     st = MTLCommandBufferStatusCommitted;
-    NSArray *schedHandlers; @synchronized(scheduled) { st = MTLCommandBufferStatusCommitted; schedHandlers = [scheduled copy]; [scheduled removeAllObjects]; }
-    for (MTLCommandBufferHandler h in schedHandlers) h((id)self);
     rn_vk *vk = rn_vk_shared();
     if (!vk) [self fail:@"RADV is not available"];
     // IOSurface-backed textures: what the surface holds goes to the images first, what the command buffer wrote goes back to the surface afterwards
@@ -3096,7 +3254,8 @@ static void rn_log_failed_records(NSArray *records) {
         if (written) [surfWritten addObject:t];
     };
     [self eachTexture:note];
-    { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { [t syncFromSurface]; if (!t->srcBuf) [t syncFromBuffer]; } rn_ph(3, ph3); }
+    if (rn_is_ws() || !surfWritten.count) [self publishScheduled];     // WindowServer composes and shows by itself: it keeps the early publication
+    { const uint64_t ph3 = mach_absolute_time(); for (RedNaviMTLTexture *t in surfUsed) { if (!t->shadow) [t syncFromSurface]; if (!t->srcBuf) [t syncFromBuffer]; } rn_ph(3, ph3); }
     {   // /Users/Shared/rednavi-trace: what each command buffer draws (a client such as WindowServer has no environment to set)
         struct stat tst;
         if (rn_diag && stat("/Users/Shared/rednavi-trace", &tst) == 0)
@@ -3146,14 +3305,18 @@ static void rn_log_failed_records(NSArray *records) {
     { const uint64_t ph4i = mach_absolute_time(); [RedNaviMTLBuffer syncNoCopy:noCopyUsed in:YES]; rn_ph(4, ph4i); }
     static atomic_ullong srcSeq; unsigned long long srcId = 0;
     NSString *srcUsed = rn_srclib_used(records);
-    if (srcUsed) { srcId = atomic_fetch_add(&srcSeq, 1) + 1; rn_log("srclib: command buffer %llu submits: %s", srcId, srcUsed.UTF8String); }
+    if (srcUsed && atomic_load(&srcSeq) < 20) { srcId = atomic_fetch_add(&srcSeq, 1) + 1; rn_log("srclib: command buffer %llu submits: %s", srcId, srcUsed.UTF8String); }
     { static int tr = -1; if (tr < 0) tr = getenv("RN_CB_TRACE") != NULL; if (tr && records.count) rn_log("cb %p:%s", self, rn_records_desc(records).UTF8String); }
-    if (vk) rn_vk_batch_begin(vk);
+    if (vk) { rn_vk_batch_begin(vk); [RedNaviMTLBuffer rn_flushDirty:nil]; }   // what the CPU announced goes to the card before anything reads it
     for (RedNaviMTLTexture *t in surfUsed) if (t->srcBuf) [t rn_bufferToImage:YES];   // textures over buffers go in inside the batch: on the card
     BOOL blitRec = NO;                          // a blit may still be only recorded: a render pass can read buffers on the CPU
     NSMutableOrderedSet *toSync = [NSMutableOrderedSet new];      // Managed buffers in VRAM named by synchronizeResource: read back once the batch has run
+    // The surfaces with a VRAM image go into their VRAM images at the start of a batch, and what was written goes back at its end, in the same submit
+    NSMutableOrderedSet<RedNaviMTLTexture *> *shadowDirty = [NSMutableOrderedSet orderedSet];
+    if (vk) rn_shadow_load(vk, surfUsed);
     for (id rec in records) {
         if (st == MTLCommandBufferStatusError) break;
+        [self eachTextureOf:rec note:^(RedNaviMTLTexture *t, BOOL written) { RedNaviMTLTexture *r = t && t->parent ? t->parent : t; if (written && r && r->shadow) [shadowDirty addObject:r]; }];
         if ([rec isKindOfClass:[RNRenderPass class]]) { if (blitRec && vk) { rn_vk_batch_sync(vk); blitRec = NO; } atomic_fetch_add(&g_passes, 1); const uint64_t ph0 = mach_absolute_time(); [self runRenderPass:rec]; rn_ph(0, ph0); continue; }
         if ([rec isKindOfClass:[RNBlit class]] && ((RNBlit *)rec)->kind == 6) { [toSync addObject:((RNBlit *)rec)->db]; continue; }
         if ([rec isKindOfClass:[RNBlit class]]) { NSString *why = rn_run_blit(rec); if (why) [self fail:why]; blitRec = YES; continue; }
@@ -3161,13 +3324,16 @@ static void rn_log_failed_records(NSArray *records) {
             RNEventOp *o = rec;
             if (![o->event isKindOfClass:[RedNaviMTLSharedEvent class]]) { [self fail:@"an event that is not from RedNavi"]; break; }
             // the batch ends first: a signal must not run ahead of the work before it, and a wait must not hold the card lock
+            if (vk) rn_shadow_store(vk, shadowDirty);
             { const int br = vk ? rn_vk_batch_end(vk) : 0; if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } [rn_batch_keep() removeAllObjects]; }
+            if (st != MTLCommandBufferStatusError) { rn_seed_bump(surfWritten, shadowDirty); [shadowDirty removeAllObjects]; }
             for (RedNaviMTLBuffer *x in toSync) [x rn_synchronized];     // before a signal lets the CPU look
             [toSync removeAllObjects];
+            if (!o->wait && st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) if (!t->shadow) [t syncToSurface];     // whoever waits for the signal reads the surfaces too
             BOOL got = YES;
             if (!o->wait) { if (o->event.signaledValue < o->value) o->event.signaledValue = o->value; }
             else got = [o->event waitFor:o->value timeoutMS:10000];
-            if (vk) rn_vk_batch_begin(vk);
+            if (vk) { rn_vk_batch_begin(vk); [RedNaviMTLBuffer rn_flushDirty:nil]; rn_shadow_load(vk, surfUsed); }   // also what was announced while we waited
             if (!got) [self fail:[NSString stringWithFormat:@"waiting for an event to reach %llu timed out after 10 s (it is at %llu)", o->value, o->event.signaledValue]];
             continue;
         }
@@ -3250,6 +3416,7 @@ static void rn_log_failed_records(NSArray *records) {
         rn_vk_image *scan = rn_scanout_image(vk, scanW, scanH);
         if (scan && rn_vk_batch_copy(vk, scanSrc, scan) == 0) scanCopied = YES;
     }
+    if (vk) rn_shadow_store(vk, shadowDirty);
     if (vk) { const int br = rn_vk_batch_end(vk); if (br) { [self fail:[NSString stringWithFormat:@"render passes failed (%d)", br]]; rn_log_failed_records(records); } }
     if (st != MTLCommandBufferStatusError) for (RedNaviMTLBuffer *x in toSync) [x rn_synchronized];
     if (srcId) rn_log("srclib: command buffer %llu done", srcId);
@@ -3275,7 +3442,7 @@ static void rn_log_failed_records(NSArray *records) {
             }
     }
     [rn_batch_keep() removeAllObjects];
-    if (st != MTLCommandBufferStatusError) for (RedNaviMTLTexture *t in surfWritten) [t syncToSurface];
+    if (st != MTLCommandBufferStatusError) { rn_seed_bump(surfWritten, shadowDirty); for (RedNaviMTLTexture *t in surfWritten) if (!t->shadow) [t syncToSurface]; }
     {   struct stat tst2;
         if (rn_diag && stat("/Users/Shared/rednavi-trace", &tst2) == 0)
             for (id rec in records) if ([rec isKindOfClass:[RNRenderPass class]]) { RNRenderPass *rp = rec; if (rp->nt && rp->tex[0]) rn_trace_dump(rp->tex[0], (unsigned)rp->draws.count); }
@@ -3295,6 +3462,7 @@ static void rn_log_failed_records(NSArray *records) {
         pthread_mutex_unlock(&g_texq_mu);
         queuedTex = nil;
     }
+    [self publishScheduled];                    // a buffer that wrote an IOSurface: only now
     if (st != MTLCommandBufferStatusError) st = MTLCommandBufferStatusCompleted;
     NSArray *doneHandlers; @synchronized(completed) { handlersRun = YES; doneHandlers = [completed copy]; [completed removeAllObjects]; }
     { const uint64_t ph6 = mach_absolute_time(); for (MTLCommandBufferHandler h in doneHandlers) h((id)self); rn_ph(6, ph6); }
@@ -3435,7 +3603,8 @@ static unsigned rn_fc_array(NSArray<NSDictionary *> *fcs, rn_air_const *out, uns
 }
 @end
 static void rn_probe_write_buf(rn_vk *vk, RedNaviMTLBuffer *x, const char *fn) {
-    const void *c = [x contents]; rn_vk_buffer *t = NULL;
+    const void *c = x->managedDev_ ? NULL : [x contents]; rn_vk_buffer *t = NULL;     // a Managed buffer in VRAM: its CPU copy is not what the card holds
+    if (x->managedDev_) [RedNaviMTLBuffer rn_flushDirty:x];
     if (!c) {       // a buffer in VRAM the CPU cannot map: copied on the card into a host buffer first
         if (!x->b || !(t = rn_vk_buffer_create(vk, x->len))) return;
         if (rn_vk_buffer_copy(vk, x->b, 0, t, 0, x->len)) { rn_vk_buffer_destroy(vk, t); return; }
@@ -4215,12 +4384,12 @@ static NSArray<NSDictionary *> *rn_gl_args(void *mod) {
 // A function of a library the base class made from Metal source (newLibraryWithSource:, which Chromium's Dawn and ANGLE use for every shader): an _MTLFunctionInternal whose
 // bitcodeData (bitcodeType 0) is the AIR bitcode Apple's compiler service wrote (verified 2026-11-22: 0x0B17C0DE wrapper, like a metallib entry). It goes on as one of our own.
 // Function constants given to the base class's newFunctionWithName:constantValues: are not carried over (not seen in use yet).
-// Opt-in (/Users/Shared/rednavi-srclib or RN_METAL_SRCLIB) since 2026-11-22: with it on by default, Brave and the Claude app (Electron) hung the GPU queue
-// soon after start, and every later command buffer of WindowServer timed out until a reboot. Not yet known which shader did it; ANGLE relies on function
-// constants, which this path drops.
+// Opt-in from 2026-11-22 to 2026-11-28, because Brave and the Claude app (Electron) hung the GPU queue with it. The hang was the bridge sending a frame's preamble and command stream as two
+// jobs, so another process could run in between; with them sent as one job it did not come back in the runs made. On by default except in WindowServer (not tried there);
+// /Users/Shared/rednavi-nosrclib or RN_METAL_NOSRCLIB turns it off; RN_METAL_SRCLIB turns it on for one process whatever the file says.
 static RedNaviMTLFunction *rn_source_function(id f, id<MTLDevice> dev) {
     static int on = -1;
-    if (on < 0) on = getenv("RN_METAL_SRCLIB") || access("/Users/Shared/rednavi-srclib", F_OK) == 0;
+    if (on < 0) on = getenv("RN_METAL_SRCLIB") || (!rn_is_ws() && !getenv("RN_METAL_NOSRCLIB") && access("/Users/Shared/rednavi-nosrclib", F_OK) != 0);
     if (!on) return nil;
     if (![f respondsToSelector:@selector(bitcodeData)] || ![f respondsToSelector:@selector(bitcodeType)] ||
         ((NSUInteger (*)(id, SEL))objc_msgSend)(f, @selector(bitcodeType)) != 0) return nil;
@@ -4368,11 +4537,15 @@ static id rn_render_pso_from_descriptor_body(id<MTLDevice> dev, MTLRenderPipelin
             setenv("RN_AIR_DEBUG_LL", [NSString stringWithFormat:@"%s/%02u_%s_%s.ll", getenv("RN_DUMP_SPV"), llSeq++, s ? "frag" : "vert", fn[s]->name.UTF8String].UTF8String, 1);
         }
         NSArray *memo = nil;
+        // A fragment function is translated for the pipeline's raster sample count (air.get_num_samples, which ANGLE's WebGL shaders read), in bits 8 and up of the stage word,
+        // so the memo and the disk cache keep one module per count. Without it the translator assumes one sample.
+        const unsigned rsc = desc.rasterSampleCount > 1 ? (unsigned)desc.rasterSampleCount : 1;
+        const int stageWord = s ? (RN_AIR_FRAGMENT | (rsc > 1 && rn_air_raster_samples_supported() ? (int)(rsc << 8) : 0)) : RN_AIR_VERTEX;
         if (!getenv("RN_DUMP_SPV") && access("/Users/Shared/rednavi-finederiv", F_OK) != 0) {
-            memo = rn_translate_memo(s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode, fn[s]->name.UTF8String, fcc, nfc, err, sizeof(err));
+            memo = rn_translate_memo(stageWord, fn[s]->bitcode, fn[s]->name.UTF8String, fcc, nfc, err, sizeof(err));
             if (memo) { spv = (uint32_t *)[(NSData *)memo[1] bytes]; spvBytes = [(NSData *)memo[1] length]; memcpy(&info, [(NSData *)memo[2] bytes], sizeof(info)); }
         }
-        if (!memo && rn_air_translate_stage_fc(NULL, s ? RN_AIR_FRAGMENT : RN_AIR_VERTEX, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
+        if (!memo && rn_air_translate_stage_fc(NULL, stageWord, fn[s]->bitcode.bytes, fn[s]->bitcode.length, fn[s]->name.UTF8String, fcc, nfc, &info, &spv, &spvBytes, err, sizeof(err))) {
             why = [NSString stringWithFormat:@"%s function %s: %s", s ? "fragment" : "vertex", fn[s]->name.UTF8String, err];
             break;
         }

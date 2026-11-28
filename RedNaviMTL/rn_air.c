@@ -31,19 +31,14 @@ static stitch_function_fn g_stitch_function;
 typedef int (*link_visible_fn)(const void *, size_t, const rn_air_stitch_fn *, unsigned, char **, size_t *, char *, size_t);
 static link_visible_fn g_link_visible;
 
+static int g_raster_samples;
 static int load(const char *dir, char *err, size_t errlen) {
     if (g_translate) return 0;
     if (!dir) dir = rn_vk_dir();
     char path[1024];
     snprintf(path, sizeof(path), "%s/librn_air2spirv.dylib", dir);
-    // The translator runs llvm-dis and spirv-val from DIR; they find their libraries (libLLVM, libSPIRV-Tools) there only through the library path, which a child process takes from the
-    // environment (inside a process that did not start with it, such as WindowServer, it is only for the children).
-    {
-        const char *old = getenv("DYLD_LIBRARY_PATH");
-        char lp[2048];
-        snprintf(lp, sizeof(lp), "%s%s%s", dir, old && *old ? ":" : "", old && *old ? old : "");
-        setenv("DYLD_LIBRARY_PATH", lp, 1);
-    }
+    // No DYLD_LIBRARY_PATH here: children and relaunched copies of the app inherit it, and DIR's libiconv.2.dylib then takes the place of the system's, so they die at launch with
+    // "Symbol not found: _iconv" (DaVinci Resolve, 2026-11-27). The libraries in DIR find each other by @loader_path, and the translator loads LLVM in this process.
     g_lib = dlopen(path, RTLD_NOW | RTLD_LOCAL);
     if (!g_lib) { snprintf(err, errlen, "no AIR translator: %s", dlerror()); return 1; }
     // tools next to the library, if any
@@ -60,6 +55,7 @@ static int load(const char *dir, char *err, size_t errlen) {
     g_stitch = (stitch_fn)dlsym(g_lib, "rn_air_stitch");
     g_stitch_function = (stitch_function_fn)dlsym(g_lib, "rn_air_stitch_function");
     g_link_visible = (link_visible_fn)dlsym(g_lib, "rn_air_link_visible");
+    g_raster_samples = dlsym(g_lib, "rn_air_raster_samples_supported") != NULL;
     if (!g_translate || !g_free) { snprintf(err, errlen, "%s does not export rn_air_translate_stage and rn_air_free", path); g_translate = NULL; return 1; }
     return 0;
 }
@@ -253,6 +249,11 @@ int rn_air_translate_stage_tg(const char *dir, int stage, const void *bitcode, s
         FILE *f = fopen(path, "wb"); if (f) { fwrite(*spirv, 1, *spirv_bytes, f); fclose(f); }
     }
     return rc;
+}
+
+int rn_air_raster_samples_supported(void) {
+    char err[256];
+    return !load(NULL, err, sizeof(err)) && g_raster_samples;
 }
 
 int rn_air_translate(const char *dir, const void *bitcode, size_t bytes, const char *entry, rn_air_kernel_info *info, uint32_t **spirv, size_t *spirv_bytes, char *err, size_t errlen) {

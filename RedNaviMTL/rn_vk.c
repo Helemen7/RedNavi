@@ -16,6 +16,24 @@
 
 extern void rn_log(const char *fmt, ...) __attribute__((weak_import));
 
+// A fence wait that ends only after the hang time. The bridge (ac_apple_iokit.c) resets a queue whose fence has not moved for 7 s while a wait goes on: the work in flight
+// is lost but its fences count as signalled, so the wait returns VK_SUCCESS. Such a wait is a failure here (VK_TIMEOUT: the caller's "rc 3"), so the command buffer
+// ends in an error and the failed-batch report names its draws, instead of looking complete with its results missing.
+static PFN_vkWaitForFences g_wait_real;
+static void (*g_fault_report)(void);   // rn_bridge_fault_report of the bridge in RADV: the VM fault and this process's mappings at that address (stderr)
+#define RN_HANG_WAIT_NS 6900000000ull
+static VKAPI_ATTR VkResult VKAPI_CALL rn_wait_fences(VkDevice dev, uint32_t n, const VkFence *f, VkBool32 all, uint64_t timeout) {
+    const uint64_t t0 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    const VkResult r = g_wait_real(dev, n, f, all, timeout);
+    const uint64_t dt = clock_gettime_nsec_np(CLOCK_MONOTONIC) - t0;
+    if (r == VK_SUCCESS && timeout >= RN_HANG_WAIT_NS && dt >= RN_HANG_WAIT_NS) {
+        if (rn_log) rn_log("rn_vk: a fence wait took %.1f s: the queue was reset as hung, the work is lost", dt / 1e9);
+        if (g_fault_report) g_fault_report();
+        return VK_TIMEOUT;
+    }
+    return r;
+}
+
 // Local sizes one compute pipeline keeps a specialized pipeline for. Geekbench tries a kernel with many threadgroup sizes (more than 16 on 2026-11-22; up to 1024 x 1 x 1).
 
 #define FUNCS(X) \
@@ -71,11 +89,20 @@ struct rn_vk {
 };
 
 struct rn_vk_buffer { VkBuffer buf; VkDeviceMemory mem; void *map; size_t size; int sub; int vram; int dev; };   // vram: in CPU-visible VRAM (rn_vk_buffer_create_vram), counted in g_vram_bytes   // sub: bound to the memory of another buffer (rn_vk_buffer_create_in), which owns mem
-struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view, view0; uint32_t levels, blevel; size_t hbytes; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; int array; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; size_t hostpitch; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; uint32_t samples; };   // gpudirty: a render pass wrote the image and the host copy is older; samples: 0 or 1 for a plain image, else a multisample image (rn_vk_image_create_ms)
+struct rn_vk_image { int rnfmt; int pending; rn_vk_image *base; VkImage img; VkImageView view, view0; uint32_t levels, blevel; size_t hbytes; VkDeviceMemory mem; rn_vk_buffer *stage; VkFormat fmt; uint32_t w, h, d; int array; unsigned texel; int storage, color, initialized, dirty; int hostmem; void *hostptr; size_t hostpitch; int gpudirty; uint8_t *rec, *sub, *aft; size_t recn; int aftok; uint32_t samples; int unzeroed; };   // unzeroed: the host copy stands for zeros that have not been written into it yet (stage_zero); gpudirty: a render pass wrote the image and the host copy is older; samples: 0 or 1 for a plain image, else a multisample image (rn_vk_image_create_ms)
 #define RN_IMG_MS(im) ((im)->samples > 1)
 // A 2D array keeps its layers in d like the depth of a 3D image (the host copy is the same: slice after slice), but Vulkan wants them as array layers.
 #define RN_IMG_LAYERS(im) ((im)->array ? (im)->d : 1u)
 #define RN_IMG_DEPTH(im) ((im)->array ? 1u : (im)->d)
+// A new image's host copy reads as zeros, but writing them takes milliseconds for a large image, and most images never use the copy (the card writes them, or fills them from a
+// buffer). So they are written at the first use of the copy: every path that reads it, or hands it to the host, calls this first on the root image.
+static pthread_mutex_t g_zero_mu = PTHREAD_MUTEX_INITIALIZER;
+static void stage_zero(rn_vk_image *r) {
+    if (!__atomic_load_n(&r->unzeroed, __ATOMIC_ACQUIRE)) return;
+    pthread_mutex_lock(&g_zero_mu);
+    if (r->unzeroed) { memset(rn_vk_buffer_contents(r->stage), 0, r->hbytes); __atomic_store_n(&r->unzeroed, 0, __ATOMIC_RELEASE); }
+    pthread_mutex_unlock(&g_zero_mu);
+}
 // Mipmap levels: the host copy holds them one after the other, level 0 first, each with all its layers (or depth slices). A level halves width, height and the depth of a 3D image,
 // never the layers of an array. `view` spans every level (sampling), `view0` only level 0 (attachments and storage images, which Vulkan allows one level for); one level: the same view.
 static uint32_t lvl_dim(uint32_t v, uint32_t l) { v >>= l; return v ? v : 1u; }
@@ -220,6 +247,8 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
     want.shaderInt64 = have.shaderInt64;                        // the translated vertex shaders declare Int64
     want.vertexPipelineStoresAndAtomics = have.vertexPipelineStoresAndAtomics;
     want.fragmentStoresAndAtomics = have.fragmentStoresAndAtomics;
+    want.dualSrcBlend = have.dualSrcBlend;                      // MTLBlendFactorSource1Color and the like ([[color(0), index(1)]]): Skia Graphite blends coverage with them
+    want.independentBlend = have.independentBlend;              // a Metal pipeline sets blending per colour attachment
     VkDeviceCreateInfo dci = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO, .queueCreateInfoCount = 1, .pQueueCreateInfos = &qci, .pEnabledFeatures = &want};
     static const char *const hostExt[] = {"VK_EXT_external_memory_host"};
     // The depth and stencil state of a draw (Metal sets it on the encoder) is dynamic state of the pipeline: first try with VK_EXT_extended_dynamic_state, then without it (no depth then).
@@ -235,6 +264,7 @@ rn_vk *rn_vk_open(const char *dir, char *err, size_t errlen) {
 #define X(n) vk->n = (PFN_vk##n)vk->GetDeviceProcAddr(vk->dev, "vk" #n);
     DFUNCS(X)
 #undef X
+    g_wait_real = vk->WaitForFences; vk->WaitForFences = rn_wait_fences; g_fault_report = (void (*)(void))dlsym(vk->lib, "rn_bridge_fault_report");
     vk->GetDeviceQueue(vk->dev, vk->family, 0, &vk->queue);
     VkCommandPoolCreateInfo cpci = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, .queueFamilyIndex = vk->family};
     r = vk->CreateCommandPool(vk->dev, &cpci, NULL, &vk->pool);
@@ -777,7 +807,7 @@ static rn_vk_image *image_pool_take(int format, uint32_t w, uint32_t h, uint32_t
     }
     pthread_mutex_unlock(&g_img_pool_lock);
     if (hit) {
-        memset(rn_vk_buffer_contents(hit->stage), 0, hit->hbytes);
+        hit->unzeroed = 1;
         hit->dirty = 1; hit->gpudirty = 0; hit->pending = 0;
         __atomic_fetch_add(&rn_vk_imgstat[0], 1, __ATOMIC_RELAXED);
     }
@@ -835,7 +865,7 @@ rn_vk_image *rn_vk_image_create_mips(rn_vk *vk, int format, uint32_t w, uint32_t
     if (levels > 1) { vci.subresourceRange.levelCount = 1; if (vk->CreateImageView(vk->dev, &vci, NULL, &im->view0) != VK_SUCCESS) { im->view0 = VK_NULL_HANDLE; g_image_err = "vkCreateImageView (level 0)"; goto fail; } }
     im->stage = rn_vk_buffer_create(vk, im->hbytes);
     if (!im->stage) { g_image_err = "the host copy of the image (buffer allocation failed)"; goto fail; }
-    memset(rn_vk_buffer_contents(im->stage), 0, im->hbytes);
+    im->unzeroed = 1;
     im->dirty = 1;                              // the zeroes reach the image at its first use
     return im;
 fail:
@@ -879,7 +909,7 @@ rn_vk_image *rn_vk_image_create_ms(rn_vk *vk, int format, uint32_t w, uint32_t h
     im->view0 = im->view;
     im->stage = rn_vk_buffer_create(vk, im->hbytes);
     if (!im->stage) { g_image_err = "the host copy of the image (buffer allocation failed)"; goto fail; }
-    memset(rn_vk_buffer_contents(im->stage), 0, im->hbytes);
+    im->unzeroed = 1;
     im->dirty = 1;                              // cleared to zero at its first use (images_in)
     return im;
 fail:
@@ -989,7 +1019,9 @@ void *rn_vk_image_staging(rn_vk_image *im) {
     if (r->pending && g_readback_vk) bsync(g_readback_vk);
     // The readback uses the one command pool and queue: under the batch lock, because this is also reached from threads other than the one that commits (replaceRegion, getBytes).
     if (r->gpudirty && !r->hostmem && g_readback_vk) { batch_lock(); if (r->gpudirty) image_readback_now(g_readback_vk, r); batch_unlock(); }
-    return r->hostmem ? r->hostptr : rn_vk_buffer_contents(im->stage);
+    if (r->hostmem) return r->hostptr;
+    stage_zero(r);
+    return rn_vk_buffer_contents(im->stage);
 }
 void rn_vk_image_host_wrote(rn_vk_image *im) { (im->base ? im->base : im)->dirty = 1; }
 static void image_really_destroy(rn_vk *vk, rn_vk_image *im);
@@ -1087,6 +1119,8 @@ static pthread_mutex_t g_bmu; static pthread_once_t g_bmu_once = PTHREAD_ONCE_IN
 static void bmu_init(void) { pthread_mutexattr_t a; pthread_mutexattr_init(&a); pthread_mutexattr_settype(&a, PTHREAD_MUTEX_RECURSIVE); pthread_mutex_init(&g_bmu, &a); }
 static void batch_lock(void) { pthread_once(&g_bmu_once, bmu_init); pthread_mutex_lock(&g_bmu); }
 static void batch_unlock(void) { pthread_mutex_unlock(&g_bmu); }
+void rn_vk_batch_lock(void) { batch_lock(); }
+void rn_vk_batch_unlock(void) { batch_unlock(); }
 uint64_t rn_vk_fence_ticks;
 uint64_t rn_vk_cbstat[2];                       // dispatches recorded into a batch, batch submits (logged with the commit times)
 static void batch_hold(rn_vk *vk, rn_vk_image *im) {
@@ -1243,6 +1277,7 @@ static void images_in(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, uns
             VkBufferImageCopy bc = level_copy(r, 0), bcl[16];
             const uint32_t nl = r->levels > 16 ? 16 : r->levels ? r->levels : 1;
             for (uint32_t l = 0; l < nl; l++) bcl[l] = level_copy(r, l);
+            stage_zero(r);
             vk->CmdCopyBufferToImage(cb, r->stage->buf, r->img, VK_IMAGE_LAYOUT_GENERAL, nl, bcl);
             r->dirty = 0;
             copied = 1;
@@ -1285,6 +1320,9 @@ static void images_out(rn_vk *vk, VkCommandBuffer cb, rn_vk_image *const *im, un
         VkBufferImageCopy bcl[16];
         const uint32_t nl = r->levels > 16 ? 16 : r->levels ? r->levels : 1;
         for (uint32_t l = 0; l < nl; l++) bcl[l] = level_copy(r, l);
+        pthread_mutex_lock(&g_zero_mu);                           // the card writes every level and layer of the copy: no zeroes owed any more (and none being written now)
+        __atomic_store_n(&r->unzeroed, 0, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_zero_mu);
         vk->CmdCopyImageToBuffer(cb, r->img, VK_IMAGE_LAYOUT_GENERAL, r->stage->buf, nl, bcl);
         r->gpudirty = 0;
         done++;
@@ -1464,6 +1502,7 @@ int rn_vk_image_verify(rn_vk *vk, rn_vk_image *im, size_t *ndiff, size_t *first,
                 if (vk->EndCommandBuffer(cb) == VK_SUCCESS && vk->CreateFence(vk->dev, &fci, NULL, &fence) == VK_SUCCESS) {
                     VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &cb};
                     if (vk->QueueSubmit(vk->queue, 1, &si, fence) == VK_SUCCESS && vk->WaitForFences(vk->dev, 1, &fence, VK_TRUE, 8000000000ull) == VK_SUCCESS) {
+                        stage_zero(im);
                         const uint8_t *a = rn_vk_buffer_contents(im->stage), *b = rn_vk_buffer_contents(tmp);
                         size_t n = 0, f = 0;
                         for (size_t k = 0; k < bytes; k++) if (a[k] != b[k]) { if (!n) f = k; n++; }
@@ -2370,6 +2409,15 @@ done:
     vk->FreeCommandBuffers(vk->dev, vk->pool, 1, &cb);
     batch_unlock();
     return rc;
+}
+// rn_vk_batch_copy for a batch that may not be recording yet: it is begun; without an open batch the copy is submitted and waited for.
+int rn_vk_batch_copy_open(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {
+    if (!src || !dst || src->w != dst->w || src->h != dst->h || src->fmt != dst->fmt || RN_IMG_MS(src) || RN_IMG_MS(dst)) return 6;
+    batch_lock();
+    VkCommandBuffer cb = batch_cb(vk);
+    if (cb) { record_copy(vk, cb, src, dst); batch_hold(vk, src); batch_hold(vk, dst); }
+    batch_unlock();
+    return cb ? 0 : rn_vk_image_copy(vk, src, dst);
 }
 // The same copy recorded at the end of the open batch: it runs on the card after the passes, in the same submit.
 int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst) {

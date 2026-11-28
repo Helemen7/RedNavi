@@ -191,6 +191,24 @@ int main(int argc, char **argv) {
         IOServiceClose(c);
         return kr || rr.status ? 2 : 0;
     }
+    if (argc > 1 && !strcmp(argv[1], "fault")) {               // fault: print the latched GPU VM fault (status, address, decoded) and clear it
+        struct rn_uc_diag d;
+        if (diag(c, RN_UC_DIAG_CLEAR_FAULT, &d) == KERN_SUCCESS) {
+            const uint64_t va = ((uint64_t)d.fault_addr_hi << 44) | ((uint64_t)d.fault_addr_lo << 12);
+            printf("fault status 0x%x: %s; VMID %u, client 0x%x, %s, permission bits 0x%x, address 0x%llx (cleared)\n", d.fault_status, d.fault_status ? "a fault" : "none",
+                   (d.fault_status >> 20) & 0xf, (d.fault_status >> 9) & 0x1ff, (d.fault_status >> 18) & 1 ? "write" : "read", (d.fault_status >> 4) & 0xf, (unsigned long long)va);
+        }
+        IOServiceClose(c);
+        return 0;
+    }
+    if (argc > 1 && !strcmp(argv[1], "resetgfx")) {            // reset the graphics queue and nothing else (after a Metal client left it stuck)
+        uint32_t one = 1;
+        struct rn_uc_reset_result rr; size_t rrSize = sizeof(rr);
+        kr = IOConnectCallStructMethod(c, RN_UC_QUEUE_RESET, &one, sizeof(one), &rr, &rrSize);
+        printf("graphics queue reset: 0x%x, status %u, resets so far %u, lost 0x%x..0x%x\n", kr, rr.status, rr.resets, rr.lost_from, rr.lost_to);
+        IOServiceClose(c);
+        return kr || rr.status ? 2 : 0;
+    }
     if (argc > 1 && !strcmp(argv[1], "vram")) {                 // vram [visible]: the plain dispatch, its result dword in a VRAM buffer (device-local, or CPU-visible); the result is read back by peek (and by the mapping)
         const int visible = argc > 2 && !strcmp(argv[2], "visible");
         Bo code;

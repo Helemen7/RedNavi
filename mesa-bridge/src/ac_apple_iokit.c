@@ -17,7 +17,9 @@
 #include "ac_apple_iokit.h"
 
 #include <IOKit/IOKitLib.h>
+#include <dlfcn.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -25,6 +27,9 @@
 #include <string.h>
 #include <time.h>
 
+#define RN_HANG_RESET_MS 7000u                                /* no progress of a queue for this long inside one wait: reset it (the kext's own hang time is 8 s) */
+#define RN_HANG_SLICE_MS 1000u
+#define RN_TRACE_FRAMES 10
 #define RN_WAIT_SLICE_MS 5000u                                /* the kext waits at most 10 s per call; longer waits are made of slices */
 
 struct amdgpu_bo {
@@ -51,6 +56,12 @@ struct amdgpu_va {
    uint64_t base, size;
 };
 
+/* RN_BRIDGE_TRACE=1: who mapped and who unmapped a range, for the fault report */
+struct rn_trace {
+   void *frame[RN_TRACE_FRAMES];
+   int n;
+};
+
 struct ac_drm_device {
    io_connect_t conn;
    struct rn_uc_info info;
@@ -60,13 +71,18 @@ struct ac_drm_device {
    struct amdgpu_bo **bos;                                    /* indexed by the kext's buffer handle, 1 to info.bo_limit */
    uint32_t nbos;
    uint32_t next_ctx;
-   struct { uint32_t handle; uint64_t va, offset, size; } maps[4096];   /* what is mapped where, for RN_BRIDGE_DUMP only */
+   struct { uint32_t handle; uint64_t va, offset, size, when; struct rn_trace by; } maps[4096];   /* what is mapped where, for RN_BRIDGE_DUMP and the fault report */
    uint32_t nmaps;
    int refs;                                                  /* the device and every clone of its sync provider (vk_device keeps one past the winsys) */
    void *scan_cpu[3];                                         /* the display surfaces, once rn_bridge_scanout mapped them: a host-pointer import of such a range gets the surface itself */
    size_t scan_len[3];
    int scan_index[3];
    struct util_sync_provider sync;
+   struct { uint32_t handle; uint64_t va, size, mapped, when; struct rn_trace map_by, unmap_by; } unmapped[256];  /* the last ranges unmapped, for the hang report */
+   uint32_t nunmapped;
+   uint32_t last_seq[2];                                      /* the last sequence this device submitted to the compute (0) and graphics (1) queue, for the hang check */
+   uint64_t submitted_at[2][64];                              /* when sequence n of a queue was submitted, at n % 64 */
+   int trace;                                                 /* RN_BRIDGE_TRACE */
 };
 
 /* The display geometry as the last opened device saw it. RADV opens a device to probe the physical device and closes it again before the logical device exists, but the surface
@@ -190,6 +206,108 @@ static void vamgr_free(struct vamgr *m, uint64_t base, uint64_t size)
 
 #define PROVIDER_DEV(p) ((struct ac_drm_device *)((char *)(p) - offsetof(struct ac_drm_device, sync)))
 
+/* Hang check of a long wait. The kext resets a stuck queue only when one of its wait calls sees no progress for its whole hang time (8 s), and the waits here are
+ * slices: a hung queue was never reset and every client of the card (WindowServer too) stayed blocked until a reboot. So a wait that goes on looks at the fence word of
+ * each queue this device has work on (a wait for its last sequence with no timeout) between slices, and when the word has not moved for RN_HANG_RESET_MS while that work is
+ * not done, it asks the kext to reset that queue: the work in flight is reported lost and the queue runs again. */
+static void trace_take(struct ac_drm_device *dev, struct rn_trace *t)
+{
+   t->n = dev->trace ? backtrace(t->frame, RN_TRACE_FRAMES) : 0;
+}
+
+static void trace_print(const char *what, const struct rn_trace *t)
+{
+   for (int i = 1; i < t->n; i++) {                            /* frame 0 is trace_take's caller inside this file */
+      Dl_info d;
+      if (dladdr(t->frame[i], &d) && d.dli_fname) {
+         const char *file = strrchr(d.dli_fname, '/');
+         fprintf(stderr, "rn bridge:       %s %s %s+0x%lx (image offset 0x%lx)\n", what, file ? file + 1 : d.dli_fname, d.dli_sname ? d.dli_sname : "?",
+                 d.dli_saddr ? (unsigned long)((char *)t->frame[i] - (char *)d.dli_saddr) : 0, (unsigned long)((char *)t->frame[i] - (char *)d.dli_fbase));
+      }
+   }
+}
+
+/* What the card's VM fault latch holds (the first fault since it was cleared, of any process), and what this device has mapped at that address or unmapped there lately:
+ * a hang that comes with a fault in this process's own range is a read of an address nothing is mapped at (with retry faults the wave waits for the page forever). */
+static void fault_report(struct ac_drm_device *dev)
+{
+   struct rn_uc_diag_req req = {RN_UC_DIAG_CLEAR_FAULT, 0};
+   struct rn_uc_diag d;
+   if (call(dev, RN_UC_DIAG, &req, sizeof(req), &d, sizeof(d)))
+      return;
+   const uint64_t va = ((uint64_t)d.fault_addr_hi << 44) | ((uint64_t)d.fault_addr_lo << 12);
+   fprintf(stderr, "rn bridge: VM fault status 0x%x: VMID %u, client 0x%x, %s, permission bits 0x%x, page 0x%llx; gfx rptr 0x%x wptr 0x%x\n", d.fault_status,
+           (d.fault_status >> 20) & 0xf, (d.fault_status >> 9) & 0x1ff, (d.fault_status >> 18) & 1 ? "write" : "read", (d.fault_status >> 4) & 0xf,
+           (unsigned long long)va, d.gfx_rptr, d.gfx_wptr);
+   if (d.flush_failures)
+      fprintf(stderr, "rn bridge:   %u TLB flushes without acknowledge since boot (last acknowledge 0x%x)\n", d.flush_failures, d.flush_last_ack);
+   if (!d.fault_status)
+      return;
+   pthread_mutex_lock(&dev->lock);
+   const uint64_t now = now_ns();
+   int hit = 0;
+   for (uint32_t i = 0; i < dev->nmaps; i++) {
+      const uint64_t b = dev->maps[i].va, e = b + dev->maps[i].size;
+      if (va + 0x10000 > b && va < e + 0x10000) {
+         fprintf(stderr, "rn bridge:   mapped 0x%llx-0x%llx handle %u, %.1f ms ago%s\n", (unsigned long long)b, (unsigned long long)e, dev->maps[i].handle,
+                 (now - dev->maps[i].when) / 1e6, va >= b && va < e ? " (holds the page)" : "");
+         if (va >= b && va < e)
+            trace_print("map", &dev->maps[i].by);
+         hit = 1;
+      }
+   }
+   const uint32_t n = dev->nunmapped < 256 ? dev->nunmapped : 256;
+   for (uint32_t j = 0; j < n; j++) {
+      const uint32_t k = (dev->nunmapped - 1 - j) % 256;
+      const uint64_t b = dev->unmapped[k].va, e = b + dev->unmapped[k].size;
+      if (va >= b && va < e) {
+         fprintf(stderr, "rn bridge:   unmapped %.1f ms ago (mapped %.1f ms ago): 0x%llx-0x%llx handle %u\n", (now - dev->unmapped[k].when) / 1e6, (now - dev->unmapped[k].mapped) / 1e6,
+                 (unsigned long long)b, (unsigned long long)e, dev->unmapped[k].handle);
+         trace_print("map", &dev->unmapped[k].map_by);
+         trace_print("unmap", &dev->unmapped[k].unmap_by);
+         hit = 1;
+      }
+   }
+   if (!hit)
+      fprintf(stderr, "rn bridge:   nothing of this process is mapped near that page (%u mappings, %u unmaps)\n", dev->nmaps, dev->nunmapped);
+   pthread_mutex_unlock(&dev->lock);
+}
+
+struct hang_watch { uint32_t word[2]; uint64_t since[2]; int seen[2], reset[2]; };
+static void hang_check(struct ac_drm_device *dev, struct hang_watch *w)
+{
+   for (uint32_t q = 0; q < 2; q++) {
+      const uint32_t seq = __atomic_load_n(&dev->last_seq[q], __ATOMIC_RELAXED);
+      if (!seq || w->reset[q])
+         continue;
+      struct rn_uc_wait_seq in = {seq, 0};
+      struct rn_uc_wait_seq_result out;
+      if (call(dev, RN_UC_WAIT_SEQ, &in, sizeof(in), &out, sizeof(out)) || out.reached) {
+         w->seen[q] = 0;
+         continue;
+      }
+      const uint64_t now = now_ns();
+      if (!w->seen[q] || out.signaled != w->word[q]) {
+         w->word[q] = out.signaled;
+         w->since[q] = now;
+         w->seen[q] = 1;
+         continue;
+      }
+      if (now - w->since[q] < (uint64_t)RN_HANG_RESET_MS * 1000000)
+         continue;
+      const uint64_t at = __atomic_load_n(&dev->submitted_at[q][(out.signaled + 1) % 64], __ATOMIC_RELAXED);
+      fprintf(stderr, "rn bridge: the first unfinished sequence 0x%x was submitted %.1f ms ago\n", out.signaled + 1, at ? (now - at) / 1e6 : -1.0);
+      fault_report(dev);
+      uint32_t which = q;
+      struct rn_uc_reset_result rr;
+      memset(&rr, 0, sizeof(rr));
+      int rc = call(dev, RN_UC_QUEUE_RESET, &which, sizeof(which), &rr, sizeof(rr));
+      fprintf(stderr, "rn bridge: %s queue made no progress for %u ms (fence word 0x%x, waiting for 0x%x): reset -> %d, status %u, resets %u\n",
+              q ? "graphics" : "compute", RN_HANG_RESET_MS, out.signaled, seq, rc, rr.status, rr.resets);
+      w->reset[q] = 1;
+   }
+}
+
 /* DRM's syncobj wait takes an absolute CLOCK_MONOTONIC deadline in nanoseconds; the kext takes a relative timeout of at most 10 s. A longer wait is a loop of slices. */
 static int syncobj_wait_points(struct ac_drm_device *dev, uint32_t *handles, const uint64_t *points, unsigned n, int64_t deadline_ns, unsigned flags,
                                uint32_t *first_signaled)
@@ -198,11 +316,13 @@ static int syncobj_wait_points(struct ac_drm_device *dev, uint32_t *handles, con
       return -EINVAL;
    struct rn_uc_syncobj_wait in;
    struct rn_uc_syncobj_wait_result out;
+   struct hang_watch hw;
+   memset(&hw, 0, sizeof(hw));
    for (;;) {
       int64_t now = (int64_t)now_ns();
       int64_t rel = deadline_ns > now ? deadline_ns - now : 0;
-      if (rel > (int64_t)RN_WAIT_SLICE_MS * 1000000)
-         rel = (int64_t)RN_WAIT_SLICE_MS * 1000000;
+      if (rel > (int64_t)RN_HANG_SLICE_MS * 1000000)            /* short slices, so the hang check runs between them */
+         rel = (int64_t)RN_HANG_SLICE_MS * 1000000;
       memset(&in, 0, sizeof(in));
       in.timeout_nsec = rel;
       in.count = n;
@@ -221,6 +341,7 @@ static int syncobj_wait_points(struct ac_drm_device *dev, uint32_t *handles, con
          return r;
       if ((int64_t)now_ns() >= deadline_ns)
          return -ETIME;
+      hang_check(dev, &hw);
    }
 }
 
@@ -364,6 +485,7 @@ int ac_drm_device_initialize(int fd, bool is_virtio, uint32_t *major_version, ui
       return errno_of(kr);
    }
    pthread_mutex_init(&dev->lock, NULL);
+   dev->trace = getenv("RN_BRIDGE_TRACE") != NULL;
    int r = call(dev, RN_UC_INFO, NULL, 0, &dev->info, sizeof(dev->info));
    if (r == 0 && dev->info.version != RN_UAPI_VERSION)
       r = -EPROTO;                                            /* the kext and the bridge were built for different interfaces */
@@ -942,6 +1064,8 @@ static void track_map(struct ac_drm_device *dev, uint32_t handle, uint64_t va, u
       dev->maps[dev->nmaps].va = va;
       dev->maps[dev->nmaps].offset = offset;
       dev->maps[dev->nmaps].size = size;
+      dev->maps[dev->nmaps].when = now_ns();
+      trace_take(dev, &dev->maps[dev->nmaps].by);
       dev->nmaps++;
    }
    pthread_mutex_unlock(&dev->lock);
@@ -952,6 +1076,14 @@ static void track_unmap(struct ac_drm_device *dev, uint64_t va)
    pthread_mutex_lock(&dev->lock);
    for (uint32_t i = 0; i < dev->nmaps; i++) {
       if (dev->maps[i].va == va) {
+         const uint32_t k = dev->nunmapped++ % 256;
+         dev->unmapped[k].handle = dev->maps[i].handle;
+         dev->unmapped[k].va = va;
+         dev->unmapped[k].size = dev->maps[i].size;
+         dev->unmapped[k].when = now_ns();
+         dev->unmapped[k].mapped = dev->maps[i].when;
+         dev->unmapped[k].map_by = dev->maps[i].by;
+         trace_take(dev, &dev->unmapped[k].unmap_by);
          dev->maps[i] = dev->maps[--dev->nmaps];
          break;
       }
@@ -1094,16 +1226,41 @@ int ac_drm_cs_query_fence_status(ac_drm_device *dev, uint32_t ctx_id, uint32_t i
       deadline = timeout_ns;
    else
       deadline = now_ns() + timeout_ns;
+   /* The kext resets a stuck queue only when one wait call sees no progress for its whole hang time (8 s), and the waits here are slices of at most 5 s: a hung
+    * queue was never reset and every client of the card (WindowServer too) stayed blocked until a reboot. So the slices are watched here: when the queue's
+    * fence has not moved for RN_HANG_RESET_MS within one wait, the queue is reset (the work in flight is reported lost, the queue runs again). */
+   uint64_t last_progress = now_ns();
+   uint32_t last_signaled = 0;
+   int have_signaled = 0, reset_done = 0;
    for (;;) {
       uint64_t now = now_ns();
       uint64_t rel_ms = deadline > now ? (deadline - now) / 1000000 : 0;
       if (rel_ms > RN_WAIT_SLICE_MS)
          rel_ms = RN_WAIT_SLICE_MS;
+      if (!reset_done && rel_ms > 1000)                       /* short slices near the hang time, so the check below runs in time */
+         rel_ms = 1000;
       struct rn_uc_wait_seq in = {(uint32_t)fence_seq_no, (uint32_t)rel_ms};
       struct rn_uc_wait_seq_result out;
       int r = call(dev, RN_UC_WAIT_SEQ, &in, sizeof(in), &out, sizeof(out));
       if (r)
          return r;
+      if (!out.reached && !reset_done) {
+         if (!have_signaled || out.signaled != last_signaled) {
+            last_signaled = out.signaled;                      /* progress (or the first look): the hang time starts again */
+            have_signaled = 1;
+            last_progress = now_ns();
+         }
+      }
+      if (!out.reached && !reset_done && have_signaled && out.signaled == last_signaled && now_ns() - last_progress >= (uint64_t)RN_HANG_RESET_MS * 1000000) {
+         uint32_t which = (uint32_t)(fence_seq_no >> 31);      /* 1 graphics queue, 0 compute */
+         struct rn_uc_reset_result rr;
+         memset(&rr, 0, sizeof(rr));
+         int rc = call(dev, RN_UC_QUEUE_RESET, &which, sizeof(which), &rr, sizeof(rr));
+         fprintf(stderr, "rn bridge: %s queue made no progress for %u ms waiting for sequence 0x%x: reset -> %d, status %u, resets %u\n",
+                 which ? "graphics" : "compute", RN_HANG_RESET_MS, (uint32_t)fence_seq_no, rc, rr.status, rr.resets);
+         reset_done = 1;
+         continue;
+      }
       if (out.reached) {
          *expired = 1;                                         /* a sequence lost in a queue reset counts as expired, out.status says it was not run */
          return 0;
@@ -1216,6 +1373,40 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
       for (unsigned i = 0; i < n_ibs; i++)
          fprintf(stderr, "rn-bridge: dumped, ib %u at 0x%llx, %u bytes\n", i, (unsigned long long)ibs[i]->va_start, ibs[i]->ib_bytes);
    }
+   /* The IBs of a graphics job go to the kext in one call and into the ring as one frame (rn_uc_submit_chain, after Darren's 957280b). A kext without it
+    * refuses the larger struct, and the loop below sends them one by one. */
+   unsigned n_gfx = 0;
+   for (unsigned i = 0; i < n_ibs; i++)
+      if (ibs[i]->ip_type == AMDGPU_HW_IP_GFX && ibs[i]->ib_bytes && !(ibs[i]->ib_bytes & 3))
+         n_gfx++;
+   if (n_ibs > 1 && n_gfx == n_ibs && n_in <= RN_UC_SUBMIT_SYNC_MAX && n_out <= RN_UC_SUBMIT_SYNC_MAX) {
+      struct rn_uc_submit_chain job;
+      memset(&job, 0, sizeof(job));
+      job.first.ib_va = ibs[0]->va_start;
+      job.first.ib_dwords = ibs[0]->ib_bytes / 4;
+      job.first.flags = RN_SUBMIT_GFX;
+      job.first.in_count = n_in;
+      memcpy(job.first.in, in, n_in * sizeof(in[0]));
+      job.first.out_count = n_out;
+      memcpy(job.first.out, out, n_out * sizeof(out[0]));
+      job.ib_count = n_ibs;
+      for (unsigned i = 1; i < n_ibs; i++) {
+         job.chain_va[i - 1] = ibs[i]->va_start;
+         job.chain_dwords[i - 1] = ibs[i]->ib_bytes / 4;
+      }
+      struct rn_uc_submit_result res;
+      if (getenv("RN_BRIDGE_DEBUG"))
+         fprintf(stderr, "rn-bridge: submit a chain of %u IBs, %u waits, %u signals\n", n_ibs, n_in, n_out);
+      int r = call(dev, RN_UC_SUBMIT, &job, sizeof(job), &res, sizeof(res));
+      if (r != -EINVAL) {
+         if (r)
+            return r;
+         __atomic_store_n(&dev->submitted_at[1][res.seq % 64], now_ns(), __ATOMIC_RELAXED);
+         __atomic_store_n(&dev->last_seq[1], res.seq, __ATOMIC_RELAXED);
+         *seq_no = res.seq;
+         return 0;
+      }
+   }
    for (unsigned i = 0; i < n_ibs; i++) {
       if ((ibs[i]->ip_type != AMDGPU_HW_IP_COMPUTE && ibs[i]->ip_type != AMDGPU_HW_IP_GFX) || ibs[i]->ib_bytes == 0 || (ibs[i]->ib_bytes & 3))
          return -EINVAL;
@@ -1244,7 +1435,17 @@ int ac_drm_cs_submit_raw2(ac_drm_device *dev, uint32_t ctx_id, uint32_t bo_list_
       if (r)
          return r;
       last_seq = res.seq;
+      __atomic_store_n(&dev->submitted_at[res.seq >> 31][res.seq % 64], now_ns(), __ATOMIC_RELAXED);
+      __atomic_store_n(&dev->last_seq[res.seq >> 31], res.seq, __ATOMIC_RELAXED);
    }
    *seq_no = last_seq;
    return 0;
+}
+
+/* For the Metal plug-in: after it learns that work was lost to a queue reset, what the VM fault latch holds and what this process has (or had lately) mapped there. */
+__attribute__((visibility("default"))) void rn_bridge_fault_report(void);
+__attribute__((visibility("default"))) void rn_bridge_fault_report(void)
+{
+   if (last_dev)
+      fault_report(last_dev);
 }

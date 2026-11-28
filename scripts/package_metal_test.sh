@@ -62,6 +62,8 @@ if [ -n "$HARNESS" ]; then
   cp "$HARNESS" "$OUT/mtl_init_harness"; codesign -f -s - "$OUT/mtl_init_harness" >/dev/null 2>&1
   # Every test of the program (run_all_tests.sh) with the .metallib files of mesa-bridge/test, built here with Xcode's Metal toolchain.
   cp "$ROOT/scripts/run_all_metal_tests.sh" "$OUT/run_all_tests.sh"
+  # The one script testers run (install the plug-in, tests, Geekbench, a zip of the results): scripts/rn_tester.sh
+  cp "$ROOT/scripts/rn_tester.sh" "$OUT/rn_tester.sh"
   for m in tri quad fc texcopy dispatch; do
     xcrun metal -c "$ROOT/mesa-bridge/test/vk_$m.metal" -o "$OUT/vk_$m.air" && xcrun metallib "$OUT/vk_$m.air" -o "$OUT/vk_$m.metallib" || echo "vk_$m.metallib not built (no Metal toolchain?)"
     rm -f "$OUT/vk_$m.air"

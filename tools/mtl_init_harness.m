@@ -117,6 +117,153 @@ int main(int argc, char **argv) {
                 printf("stitched libraries through Metal on RADV: %s\n", bad ? "FAILED" : "all checks passed");
                 return bad;
             }
+            if (getenv("RN_DUALSRC_TEST")) {
+                // Dual-source blending, from source (RN_METAL_SRCLIB=1), as Skia Graphite blends coverage: the fragment writes colour (0.5, 0, 0, 1) at index 0 and
+                // (0, 1, 1, 1) at index 1; blend One / OneMinusSource1Color over a clear of 0.2 gives (0.5 + 0.2, 0, 0) = about 178, 0, 0.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                    "struct V { float4 p [[position]]; };\n"
+                    "struct F { float4 c [[color(0), index(0)]]; float4 m [[color(0), index(1)]]; };\n"
+                    "vertex V full_v(uint vid [[vertex_id]]) { const float2 c[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)}; V v; v.p = float4(c[vid], 0, 1); return v; }\n"
+                    "fragment F dual_f(V in [[stage_in]]) { F f; f.c = float4(0.5, 0, 0, 1); f.m = float4(0, 1, 1, 1); return f; }\n";
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithSource:src options:nil error:&e];
+                if (!lib) { printf("no library: %s\n", e.localizedDescription.UTF8String); return 50; }
+                MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                pd.vertexFunction = [lib newFunctionWithName:@"full_v"]; pd.fragmentFunction = [lib newFunctionWithName:@"dual_f"];
+                pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+                pd.colorAttachments[0].blendingEnabled = YES;
+                pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorOne; pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSource1Color;
+                pd.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne; pd.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSource1Alpha;
+                id<MTLRenderPipelineState> ps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                printf("dual-source pipeline %p, error: %s\n", (__bridge void *)ps, e ? e.localizedDescription.UTF8String : "none");
+                if (!ps) return 51;
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:8 height:8 mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                id<MTLTexture> t = [d newTextureWithDescriptor:td];
+                id<MTLCommandBuffer> cb = [[d newCommandQueue] commandBuffer];
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1);
+                id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+                [en setRenderPipelineState:ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                uint8_t px[8 * 8 * 4];
+                [t getBytes:px bytesPerRow:32 fromRegion:MTLRegionMake2D(0, 0, 8, 8) mipmapLevel:0];
+                const int ok = cb.status == MTLCommandBufferStatusCompleted && px[0] > 170 && px[0] < 186 && px[1] < 4 && px[2] < 4;
+                printf("status %ld, pixel %u %u %u %u (expect about 178 0 0)\ndual-source blending: %s\n", (long)cb.status, px[0], px[1], px[2], px[3], ok ? "all checks passed" : "FAILED");
+                return !ok;
+            }
+            if (getenv("RN_HANG_TEST")) {
+                // Hang recovery, from source (RN_METAL_SRCLIB=1): a kernel that spins until a buffer word turns nonzero (it never does) must end with an error after the
+                // driver's hang time instead of blocking the card, and a command buffer committed afterwards must complete.
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                    "kernel void spin(device atomic_uint *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { uint n = 0; while (atomic_load_explicit(b, memory_order_relaxed) == 0u) atomic_store_explicit(b + 1 + i, ++n, memory_order_relaxed); }\n"
+                    "kernel void store(device uint *b [[buffer(0)]], uint i [[thread_position_in_grid]]) { b[i] = 0x600dc0deu; }\n";
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithSource:src options:nil error:&e];
+                if (!lib) { printf("no library: %s\n", e.localizedDescription.UTF8String); return 50; }
+                id<MTLComputePipelineState> spin = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"spin"] error:&e];
+                id<MTLComputePipelineState> store = [d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"store"] error:&e];
+                if (!spin || !store) { printf("no pipelines: %s\n", e.localizedDescription.UTF8String); return 51; }
+                id<MTLBuffer> zero = [d newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+                id<MTLBuffer> out = [d newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+                memset(zero.contents, 0, 4096); memset(out.contents, 0, 4096);
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                NSDate *t0 = [NSDate date];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:spin]; [ce setBuffer:zero offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; [ce endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                printf("spinning kernel: status %ld after %.1f s, error %s\n", (long)cb.status, -t0.timeIntervalSinceNow, cb.error ? cb.error.localizedDescription.UTF8String : "none");
+                const int spinErr = cb.status == MTLCommandBufferStatusError;   // the lost work must be reported
+                t0 = [NSDate date];
+                cb = [q commandBuffer]; ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:store]; [ce setBuffer:out offset:0 atIndex:0];
+                [ce dispatchThreads:MTLSizeMake(64, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; [ce endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                const uint32_t v = ((uint32_t *)out.contents)[63];
+                printf("next command buffer: status %ld after %.1f s, word 0x%08x\n", (long)cb.status, -t0.timeIntervalSinceNow, v);
+                const int ok = spinErr && cb.status == MTLCommandBufferStatusCompleted && v == 0x600dc0deu;
+                printf("hang recovery: %s\n", ok ? "all checks passed" : "FAILED");
+                return !ok;
+            }
+            if (getenv("RN_MSFRAG_TEST")) {
+                // Skia Graphite's MSAA path pattern, from source (RN_METAL_SRCLIB=1): pass 1 draws an instanced triangle into a 16 x 16 four-sample BGRA8 texture with a four-sample
+                // Depth32Float_Stencil8 texture, stored (no resolve); pass 2, in the same command buffer, draws a full-screen triangle into a plain 16 x 16 target whose fragment
+                // shader averages the four samples with texture2d_ms::read. Pass 3 is a four-sample pipeline whose fragment function writes get_num_samples() / 8 (expect 4 / 8).
+                id<MTLDevice> d = (id<MTLDevice>)r;
+                NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                    "struct V { float4 p [[position]]; int2 o [[flat]]; };\n"
+                    "vertex V tri_v(uint vid [[vertex_id]], uint iid [[instance_id]]) { const float2 c[3] = {float2(-1, 1), float2(1, 1), float2(-1, -1)}; V v; v.p = float4(c[vid] * (1.0 - 0.1 * iid), 0.5, 1); v.o = int2(0); return v; }\n"
+                    "fragment float4 green_f(V in [[stage_in]]) { return float4(0, 1, 0, 1); }\n"
+                    "vertex V full_v(uint vid [[vertex_id]]) { const float2 c[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)}; V v; v.p = float4(c[vid], 0, 1); v.o = int2(0); return v; }\n"
+                    "fragment float4 resolve_f(V in [[stage_in]], texture2d_ms<float> t [[texture(0)]]) { uint2 c = uint2(in.p.xy) - uint2(in.o); float4 s = 0; for (uint i = 0; i < 4; i++) s += t.read(c, i); return s * 0.25; }\n"
+                    "fragment float4 nsamp_f(V in [[stage_in]]) { return float4(float(get_num_samples()) / 8.0, 0, 0, 1); }\n";
+                NSError *e = nil;
+                id<MTLLibrary> lib = [d newLibraryWithSource:src options:nil error:&e];
+                if (!lib) { printf("no library: %s\n", e.localizedDescription.UTF8String); return 50; }
+                id<MTLRenderPipelineState> ps[3]; const char *names[3][2] = {{"tri_v", "green_f"}, {"full_v", "resolve_f"}, {"full_v", "nsamp_f"}};
+                for (int i = 0; i < 3; i++) {
+                    MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+                    pd.vertexFunction = [lib newFunctionWithName:@(names[i][0])]; pd.fragmentFunction = [lib newFunctionWithName:@(names[i][1])];
+                    pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+                    if (i != 1) pd.rasterSampleCount = 4;
+                    if (i == 0) { pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8; pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8; }
+                    e = nil; ps[i] = [d newRenderPipelineStateWithDescriptor:pd error:&e];
+                    printf("pipeline %s/%s: %p, error: %s\n", names[i][0], names[i][1], (__bridge void *)ps[i], e ? e.localizedDescription.UTF8String : "none");
+                }
+                if (!ps[0] || !ps[1]) return 51;
+                MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];
+                md.textureType = MTLTextureType2DMultisample; md.sampleCount = 4; md.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead; md.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> ms = [d newTextureWithDescriptor:md];
+                MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:16 height:16 mipmapped:NO];
+                zd.textureType = MTLTextureType2DMultisample; zd.sampleCount = 4; zd.usage = MTLTextureUsageRenderTarget; zd.storageMode = MTLStorageModePrivate;
+                id<MTLTexture> z = [d newTextureWithDescriptor:zd];
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:16 height:16 mipmapped:NO];
+                td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+                id<MTLTexture> target = [d newTextureWithDescriptor:td];
+                if (!ms || !z || !target) { printf("no textures\n"); return 52; }
+                id<MTLCommandQueue> q = [d newCommandQueue];
+                id<MTLCommandBuffer> cb = [q commandBuffer];
+                MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = ms; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(1, 0, 0, 1);
+                rp.depthAttachment.texture = z; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionDontCare;
+                rp.stencilAttachment.texture = z; rp.stencilAttachment.loadAction = MTLLoadActionClear; rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
+                id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+                [en setRenderPipelineState:ps[0]];
+                [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3 instanceCount:getenv("RN_MSFRAG_INST") ? atoi(getenv("RN_MSFRAG_INST")) : 8];
+                [en endEncoding];
+                rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                rp.colorAttachments[0].texture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+                rp.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1);
+                en = [cb renderCommandEncoderWithDescriptor:rp];
+                if (!getenv("RN_MSFRAG_NOREAD")) { [en setRenderPipelineState:ps[1]]; [en setFragmentTexture:ms atIndex:0]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; }
+                [en endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                uint8_t px[16 * 16 * 4];
+                [target getBytes:px bytesPerRow:64 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+                const uint8_t *tl = px + (1 * 16 + 1) * 4, *br = px + (14 * 16 + 14) * 4;   // BGRA: inside the triangle green, outside the clear red
+                int fails = cb.status != MTLCommandBufferStatusCompleted;
+                printf("status %ld, error %s; top-left BGRA %u %u %u, bottom-right %u %u %u\n", (long)cb.status, cb.error ? cb.error.localizedDescription.UTF8String : "none", tl[0], tl[1], tl[2], br[0], br[1], br[2]);
+                if (!getenv("RN_MSFRAG_NOREAD") && !(tl[1] > 200 && tl[2] < 50 && br[2] > 200 && br[1] < 50)) fails++;
+                if (ps[2]) {
+                    id<MTLCommandBuffer> c2 = [q commandBuffer];
+                    rp = [MTLRenderPassDescriptor renderPassDescriptor];
+                    rp.colorAttachments[0].texture = ms; rp.colorAttachments[0].resolveTexture = target; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve;
+                    en = [c2 renderCommandEncoderWithDescriptor:rp];
+                    [en setRenderPipelineState:ps[2]]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; [en endEncoding];
+                    [c2 commit]; [c2 waitUntilCompleted];
+                    [target getBytes:px bytesPerRow:64 fromRegion:MTLRegionMake2D(0, 0, 16, 16) mipmapLevel:0];
+                    printf("get_num_samples pass: status %ld, red %u (expect about 128)\n", (long)c2.status, px[2]);
+                    if (px[2] < 120 || px[2] > 136) fails++;
+                } else fails++;
+                printf("multisample texture read in a fragment shader: %s\n", fails ? "FAILED" : "all checks passed");
+                return fails;
+            }
             if (getenv("RN_DEPTH_TEST")) {
                 // Depth test through the official API, on vk_tri.metallib: a 40 x 24 RGBA8 target and a Depth32Float_Stencil8 texture. Triangle A (z 0.3, vertex colours) is drawn first, then triangle B
                 // (same corners, z 0.7, farther, tint black). With a Less depth state B must be rejected, the corners of A stay red, green and blue. With Always B overwrites A and the pixel is black.
@@ -133,6 +280,8 @@ int main(int argc, char **argv) {
                 pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
                 pd.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
                 pd.stencilAttachmentPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
+                const BOOL dmsaa = getenv("RN_DEPTH_MSAA") != NULL;   // RN_DEPTH_MSAA=1: the same cases with 4 samples (colour resolved into the target, a 4-sample depth and stencil texture), as Skia Graphite draws paths
+                if (dmsaa) pd.rasterSampleCount = 4;
                 id<MTLRenderPipelineState> rps = [d newRenderPipelineStateWithDescriptor:pd error:&e];
                 printf("render pipeline %p with depth, error: %s\n", (__bridge void *)rps, e ? e.localizedDescription.UTF8String : "none");
                 if (!rps) return 51;
@@ -141,7 +290,15 @@ int main(int argc, char **argv) {
                 id<MTLTexture> target = [d newTextureWithDescriptor:td];
                 MTLTextureDescriptor *zd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8 width:40 height:24 mipmapped:NO];
                 zd.usage = MTLTextureUsageRenderTarget; zd.storageMode = MTLStorageModePrivate;
+                if (dmsaa) { zd.textureType = MTLTextureType2DMultisample; zd.sampleCount = 4; }
                 id<MTLTexture> ztex = [d newTextureWithDescriptor:zd];
+                id<MTLTexture> mstex = nil;
+                if (dmsaa) {
+                    MTLTextureDescriptor *md = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:40 height:24 mipmapped:NO];
+                    md.textureType = MTLTextureType2DMultisample; md.sampleCount = 4; md.usage = MTLTextureUsageRenderTarget; md.storageMode = MTLStorageModePrivate;
+                    mstex = [d newTextureWithDescriptor:md];
+                    if (!mstex) { printf("no multisample colour texture\n"); return 54; }
+                }
                 printf("depth texture %p\n", (__bridge void *)ztex);
                 if (!target || !ztex) return 52;
                 id<MTLCommandQueue> q = [d newCommandQueue];
@@ -157,6 +314,7 @@ int main(int argc, char **argv) {
                     MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
                     rpd.colorAttachments[0].texture = target; rpd.colorAttachments[0].loadAction = MTLLoadActionClear; rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
                     rpd.colorAttachments[0].clearColor = MTLClearColorMake(0.2, 0.2, 0.2, 1.0);
+                    if (dmsaa) { rpd.colorAttachments[0].texture = mstex; rpd.colorAttachments[0].resolveTexture = target; rpd.colorAttachments[0].storeAction = MTLStoreActionMultisampleResolve; }
                     rpd.depthAttachment.texture = ztex; rpd.depthAttachment.loadAction = MTLLoadActionClear; rpd.depthAttachment.storeAction = MTLStoreActionDontCare; rpd.depthAttachment.clearDepth = 1.0;
                     rpd.stencilAttachment.texture = ztex; rpd.stencilAttachment.loadAction = MTLLoadActionClear; rpd.stencilAttachment.storeAction = MTLStoreActionDontCare; rpd.stencilAttachment.clearStencil = 0;
                     MTLDepthStencilDescriptor *dsd = [MTLDepthStencilDescriptor new];

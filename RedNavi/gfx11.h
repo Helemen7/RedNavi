@@ -191,7 +191,9 @@ void rn_gfx_ring_pointers(struct rn_device *adev, u32 *rptr, u32 *wptr);   // th
 int rn_gfx_queue_reset(struct rn_device *adev, u32 info[4]);   // see gfx11.cpp; info as for rn_compute_queue_reset
 // An indirect buffer on the graphics queue followed by a fence write (the same two packets rn_compute_submit_ib sends); 0, -EAGAIN when the ring stayed full for 2 s without the
 // read position moving (nothing was written), -EINVAL.
-int rn_gfx_submit_ib(struct rn_device *adev, u64 ib_va, u32 ib_dwords, u64 fence_va, u32 fence_value, u32 vmid);
+// One IB of a job: its address inside a mapping of the connection and its length. All the IBs of a job go into the ring as one frame.
+struct rn_gfx_ib { u64 va; u32 dwords; };
+int rn_gfx_submit_chain(struct rn_device *adev, const struct rn_gfx_ib *ibs, u32 count, u64 fence_va, u32 fence_value, u32 vmid);
 int rn_compute_queue_reset(struct rn_device *adev, u32 info[4]);   // see gfx11.cpp; info: [0] failed step, [1] HQD_ACTIVE after the dequeue, [2] api status of the failing frame, [3] HQD_ACTIVE after the re-map
 void rn_compute_ring_state(struct rn_device *adev, u32 out[4]);   // [0] rptr write-back word, [1] wptr word, [2] driver wptr of the mapped compute ring, all in dwords, [3] submits that had to wait for room
 void rn_compute_diag2(struct rn_device *adev, u32 out[8]);

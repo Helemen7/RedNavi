@@ -166,6 +166,8 @@ void rn_vk_bandwidth_probe(rn_vk *vk, int format, unsigned n, double *up_ms, dou
 void *rn_vk_symbol(rn_vk *vk, const char *name);   // dlsym in the Vulkan driver library
 void rn_vk_batch_begin(rn_vk *vk);      // render passes are recorded and submitted together at rn_vk_batch_end (0, or the failure of the submit); calls that need the card's results submit earlier
 int rn_vk_batch_end(rn_vk *vk);
+void rn_vk_batch_lock(void);          // the (recursive) lock a batch is recorded and run under, for work that has to be ordered against it without opening a batch
+void rn_vk_batch_unlock(void);
 // Debug aid for a pass capture: while rn_vk_snap_on is set, a render pass into a window-sized BGRA8 target copies the target after some of its draws (the first six, every 16th, the last) and
 // hands the pixels to rn_vk_snap_hook once the batch has run. It shows which draw of a pass changes a given region.
 extern int rn_vk_snap_on, rn_vk_snap_small; extern unsigned rn_vk_snap_seq;
@@ -187,6 +189,7 @@ int rn_vk_batch_buffer_copy(rn_vk *vk, rn_vk_buffer *src, uint64_t soff, rn_vk_b
 int rn_vk_batch_buffer_fill(rn_vk *vk, rn_vk_buffer *dst, uint64_t off, uint64_t size, uint32_t value);
 int rn_vk_batch_image_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);
 int rn_vk_batch_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // rn_vk_image_copy at the end of the open batch (the same submit)
+int rn_vk_batch_copy_open(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // the same, beginning the batch if nothing is recorded yet
 int rn_vk_image_copy(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst);   // whole image to an image of the same size and format on the card, waited for
 int rn_vk_image_copy_region(rn_vk *vk, rn_vk_image *src, rn_vk_image *dst, uint32_t sx, uint32_t sy, uint32_t dx, uint32_t dy, uint32_t w, uint32_t h);   // a rectangle between two images of the same format on the card
 int rn_vk_render_pass(rn_vk *vk, const rn_vk_target *targets, unsigned ntargets, const rn_vk_draw *draws, unsigned ndraws);

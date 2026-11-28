@@ -94,3 +94,28 @@ On the RX 7800 XT (GC 11.0.3, the same ring code), **verified 2026-11-21**: with
 ## Tools added
 
 `tools/ws_*.sh`, `tools/k_*.sh`: dtrace scripts, run as root on the desktop, each a single question (comments at the top say what and how to run). `tools/ws_msgs_decode.py` turns selector addresses into names on the same boot. `tools/rn_iopmap.c` calls `IOPresentmentGetMap`. `tools/rn_peek*.c` read the scanout through the probe's user client: heavy, they stalled the desktop's network once; do not run them while the machine is in use. `scripts/rn_install.sh` and `scripts/rn_install_plugin.sh` install the kexts and the plug-in executable from `/Users/Shared`.
+
+## WebGL in Brave and the scrolling flicker (2026-11-28)
+
+All of this ran on the RX 7800 XT development machine only.
+
+**Graphics queue hang.** WebGL pages hung the graphics queue. The preamble and the command stream of a frame were two submits, so a job of another process could run between them, and the command stream then read that process's ring addresses from the registers. darrenintr found and fixed this first (their commit of 2026-11-19, "Submit the preamble and the command stream of a frame as one job"). Ported here: `rn_uc_submit_chain` in `RedNavi/rn_uapi.h` (up to 8 IBs in one ring frame, graphics queue only, interface version unchanged), and the bridge uses it when a submit has several graphics IBs. After it, four 60 s Aquarium runs caused no new queue reset. The compute queue still takes one IB per submit.
+
+**Aquarium at 1 frame per second.** Render passes allocated and freed a GPU buffer for every `setBytes` of every draw. The data now goes into the batch arena, as for compute. About 40 frames per second afterwards.
+
+**Flicker of Brave's widgets.** `waitUntilScheduled` returned at once with the asynchronous commit. A command buffer that writes an IOSurface is now reported scheduled only after the surface is written.
+
+**Flicker while scrolling.** With zero copy (the image made over the surface's pages) YouTube flickered while scrolling. What was tried, each by eye in a Brave with its own profile:
+
+| Variant | Flicker |
+|---|---|
+| zero copy | yes |
+| zero copy off (copies by the CPU) | no, but slower (32.6 frames per second in a scripted scroll against 47 to 60) |
+| zero copy, synchronous commit | yes |
+| zero copy, the surface's seed moved after each write | yes |
+| draw into VRAM, the card copies to the surface at the end of the submit | no |
+
+The last one is the default outside WindowServer; `RN_ZC_DIRECT=1` draws straight into the surface again. The surface is loaded into the VRAM image at the start of each batch and what was written is stored at its end. The likely reason for the flicker is that the surface changed for as long as the card was drawing into it, while another process could read it; this is an inference from the table, not observed directly.
+
+Open: the new path costs bandwidth (every surface a command buffer uses is copied in, changed or not). In a scripted scroll the card wait per command buffer was 9 to 11 ms against about 4 ms with direct zero copy, and 55 to 57 frames per second against 103 to 113, with worst pauses of 171 to 239 ms against about 2 s. The two modes did not create the same load (up to 1435 textures and 928 MB alive against about 200), the reason is not known, and one 1024x1024 texture allocation failed in such a run. The branch for shared events with the new path has no test of its own. DaVinci Resolve and Geekbench have not been run since.
+

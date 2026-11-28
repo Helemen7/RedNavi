@@ -214,6 +214,17 @@ struct rn_uc_submit {
     rn_uc_sync_ref out[RN_UC_SUBMIT_SYNC_MAX];
 };
 
+// RN_UC_SUBMIT also takes this larger struct: the IBs of one job (preamble and command stream), graphics queue only. As on Linux (amdgpu_ib_schedule) they go into the
+// ring as one frame, so that no job of another connection comes between them: sent one by one, a command stream ran after another process's preamble, with that
+// process's ring addresses in the registers, and the queue hung. A kext without it answers kIOReturnBadArgument. The version is unchanged: the small struct still works.
+#define RN_UC_SUBMIT_MAX_IB 8
+struct rn_uc_submit_chain {
+    struct rn_uc_submit first;                      // its IB, flags and syncobjs
+    uint64_t chain_va[RN_UC_SUBMIT_MAX_IB - 1];     // the IBs after the first
+    uint32_t chain_dwords[RN_UC_SUBMIT_MAX_IB - 1];
+    uint32_t ib_count;                              // 1 (only first) to RN_UC_SUBMIT_MAX_IB
+};
+
 struct rn_uc_submit_result {
     uint32_t seq;
     uint32_t pad;
